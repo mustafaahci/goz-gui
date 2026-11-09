@@ -39,6 +39,11 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     (CTRL, key(b'2'), menu::SORT_PATH),
     (CTRL, key(b'3'), menu::SORT_SIZE),
     (CTRL, key(b'6'), menu::SORT_DATE),
+    // Everything 1.5's views.
+    (CTRL | SHIFT, key(b'1'), menu::VIEW_EXTRA_LARGE),
+    (CTRL | SHIFT, key(b'2'), menu::VIEW_LARGE),
+    (CTRL | SHIFT, key(b'3'), menu::VIEW_MEDIUM),
+    (CTRL | SHIFT, key(b'6'), menu::VIEW_DETAILS),
     (CTRL, key(b'I'), menu::MATCH_CASE),
     (CTRL, key(b'U'), menu::MATCH_PATH),
     (ALT, VK_RETURN, menu::PROPERTIES),

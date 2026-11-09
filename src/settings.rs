@@ -27,6 +27,7 @@ use crate::menu;
 use crate::places::Places;
 use crate::store::ini::Ini;
 use crate::theme::ThemeMode;
+use crate::view::View;
 
 /// View > On Top (`ontop`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -309,6 +310,9 @@ pub struct Settings {
     pub utf8_bom: bool,
     /// `last_export_type`: File > Export's file type (0 EFU, 1 CSV, 2 TXT).
     pub export_type: usize,
+    /// Details or thumbnails (`view`, `thumbnail_size`,
+    /// `statusbar_view_thumbnail_size`).
+    pub view: View,
 }
 
 /// Running in the background, the tray icon and the global hotkeys, under
@@ -374,6 +378,7 @@ impl Default for Settings {
             live_update_ms: LIVE_UPDATE_MS,
             utf8_bom: false,
             export_type: 0,
+            view: View::default(),
         }
     }
 }
@@ -559,6 +564,7 @@ impl Settings {
                 .and_then(|n| usize::try_from(n).ok())
                 .filter(|&n| n < 3)
                 .unwrap_or(d.export_type),
+            view: View::from_keys(|k| ini.get(k)),
         }
     }
 
@@ -652,6 +658,7 @@ impl Settings {
         put("live_update_interval_ms", self.live_update_ms.to_string());
         out.extend(self.columns.to_keys());
         out.extend(self.places.to_keys());
+        out.extend(self.view.to_keys());
         out
     }
 
@@ -821,6 +828,7 @@ mod tests {
             live_update_ms: 0,
             utf8_bom: true,
             export_type: 2,
+            view: View::thumbnails(crate::view::EXTRA_LARGE),
         };
         let mut ini = Ini::default();
         for (k, v) in s.to_pairs() {
@@ -836,6 +844,9 @@ mod tests {
             "sort_ascending=1",
             "window_dpi=144",
             "status_bar_visible=0",
+            "view=1",
+            "thumbnail_size=256",
+            "statusbar_view_thumbnail_size=256",
             "maximized=1",
             "session_store_save_delay=2500",
             "session_store_restore_on_first_new_window=1",

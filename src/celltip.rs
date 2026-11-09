@@ -145,6 +145,8 @@ fn cell_at(app: &App, row: usize, pt: POINT) -> Option<(usize, RECT, RECT)> {
 /// The mouse is at `pt` over `row` (none: not over a row): a new cell
 /// hides the tip, and shows its own once the mouse rests there.
 pub fn moved(app: &App, row: Option<usize>, pt: POINT) {
+    // Thumbnails have no columns: their names wrap under the picture.
+    let row = row.filter(|_| !app.view().thumbnails);
     let cell = row.and_then(|r| cell_at(app, r, pt).map(|(id, _, _)| (r, id)));
     if app.cell_tip.cell.replace(cell) == cell {
         return;

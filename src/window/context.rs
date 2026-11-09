@@ -20,8 +20,8 @@ use windows_sys::Win32::Foundation::{LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::Controls::{
-    LVHITTESTINFO, LVIR_BOUNDS, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_SUBITEMHITTEST, LVNI_FOCUSED,
-    ODT_MENU,
+    LVHITTESTINFO, LVIR_BOUNDS, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_HITTEST, LVM_SUBITEMHITTEST,
+    LVNI_FOCUSED, ODT_MENU,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -111,8 +111,14 @@ impl App {
             iSubItem: -1,
             iGroup: 0,
         };
-        let item = send(self.list, LVM_SUBITEMHITTEST, 0, (&raw mut hit) as isize);
-        (item >= 0).then_some((item as usize, hit.iSubItem))
+        // Icon view has no columns: the item, as the name's column.
+        let msg = if self.view().thumbnails {
+            LVM_HITTEST
+        } else {
+            LVM_SUBITEMHITTEST
+        };
+        let item = send(self.list, msg, 0, (&raw mut hit) as isize);
+        (item >= 0).then_some((item as usize, hit.iSubItem.max(0)))
     }
 
     /// The row menu at the mouse (`Some`, screen) or, from the keyboard,

@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use windows_sys::Win32::UI::Controls::{
-    LVM_GETCOUNTPERPAGE, LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_SCROLL, LVNI_FOCUSED,
+    LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_SCROLL, LVNI_FOCUSED,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowPlacement, IsIconic, IsWindowVisible, IsZoomed, KillTimer,
@@ -221,7 +221,7 @@ impl App {
             // selected.
             return (0, None, Vec::new());
         }
-        let top = send(self.list, LVM_GETTOPINDEX, 0, 0).max(0) as u64;
+        let top = self.top_index() as u64;
         let focused = usize::try_from(send(
             self.list,
             LVM_GETNEXTITEM,
@@ -328,7 +328,12 @@ impl App {
     /// again as their rows arrive.
     pub(super) fn apply_view(&self, view: PendingView, total: u64) {
         self.quietly(|| self.clear_selection());
-        if total > 0 {
+        if total > 0 && self.view().thumbnails {
+            // Rows of cells, not of the rows' height: the saved item in
+            // view.
+            let top = view.top.min(total - 1) as usize;
+            send(self.list, LVM_ENSUREVISIBLE, top, 0);
+        } else if total > 0 {
             let now = send(self.list, LVM_GETTOPINDEX, 0, 0).max(0) as u64;
             let dy = scroll_by(view.top, now, total, self.row_height());
             if dy != 0 {
@@ -339,9 +344,8 @@ impl App {
         if !reselect.is_done() {
             *self.reselect.borrow_mut() = Some(reselect);
         }
-        let top = send(self.list, LVM_GETTOPINDEX, 0, 0).max(0) as usize;
-        let page = send(self.list, LVM_GETCOUNTPERPAGE, 0, 0).max(1) as usize;
-        self.request_rows(top, top + page);
+        let shown = self.visible_items();
+        self.request_rows(shown.start, shown.end.max(shown.start + 1));
     }
 
     /// Puts the window where `pos` was (on the monitors there are now) and

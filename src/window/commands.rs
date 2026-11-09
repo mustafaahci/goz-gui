@@ -25,8 +25,20 @@ use crate::copytext::Field;
 use crate::filter::Filter;
 use crate::settings::OnTop;
 use crate::theme::ThemeMode;
+use crate::view::{self, View};
 use crate::wide::wz;
 use crate::{menu, syntax};
+
+/// The View menu item that shows `v`: a size between Everything's three
+/// (from a hand-edited INI) shows as the nearest.
+fn view_id(v: View) -> u16 {
+    match v.size {
+        _ if !v.thumbnails => menu::VIEW_DETAILS,
+        s if s > (view::LARGE + view::EXTRA_LARGE) / 2 => menu::VIEW_EXTRA_LARGE,
+        s if s > (view::MEDIUM + view::LARGE) / 2 => menu::VIEW_LARGE,
+        _ => menu::VIEW_MEDIUM,
+    }
+}
 
 fn sort_key(id: u16) -> SortKey {
     match id {
@@ -212,6 +224,10 @@ impl App {
             menu::NEXT_FILTER => self.set_filter(o.filter.cycle(true)),
             menu::PREV_FILTER => self.set_filter(o.filter.cycle(false)),
             menu::EXPORT => self.export(),
+            menu::VIEW_EXTRA_LARGE => self.set_view(View::thumbnails(view::EXTRA_LARGE)),
+            menu::VIEW_LARGE => self.set_view(View::thumbnails(view::LARGE)),
+            menu::VIEW_MEDIUM => self.set_view(View::thumbnails(view::MEDIUM)),
+            menu::VIEW_DETAILS => self.set_view(self.view().details()),
             menu::THEME_USER_DEFAULT => self.set_theme_mode(ThemeMode::UserDefault),
             menu::THEME_STANDARD => self.set_theme_mode(ThemeMode::Standard),
             menu::THEME_DARK => self.set_theme_mode(ThemeMode::Dark),
@@ -341,6 +357,7 @@ impl App {
                 ThemeMode::Dark => menu::THEME_DARK,
             },
             on_top: self.on_top.get().menu_id(),
+            view: view_id(self.view()),
             can_go_back: self.can_go_back(),
             can_go_forward: self.can_go_forward(),
         }

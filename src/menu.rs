@@ -74,6 +74,11 @@ pub const THEME_DARK: u16 = 1232;
 pub const ON_TOP_NEVER: u16 = 1240;
 pub const ON_TOP_ALWAYS: u16 = 1241;
 pub const ON_TOP_SEARCHING: u16 = 1242;
+/// View > Extra Large, Large and Medium Thumbnails, and Details.
+pub const VIEW_EXTRA_LARGE: u16 = 1280;
+pub const VIEW_LARGE: u16 = 1281;
+pub const VIEW_MEDIUM: u16 = 1282;
+pub const VIEW_DETAILS: u16 = 1283;
 
 // The header's menu; each column is COLUMN_FIRST + its id.
 pub const COLUMN_FIRST: u16 = 1250;
@@ -284,6 +289,11 @@ pub fn menu_bar(run_history: bool) -> Bar {
     let view = popup(&[
         Cmd(FILTER_BAR, "Filt&er Bar"),
         Cmd(STATUS_BAR, "Status &Bar"),
+        Sep,
+        Radio(VIEW_EXTRA_LARGE, "E&xtra Large Thumbnails\tCtrl+Shift+1"),
+        Radio(VIEW_LARGE, "&Large Thumbnails\tCtrl+Shift+2"),
+        Radio(VIEW_MEDIUM, "&Medium Thumbnails\tCtrl+Shift+3"),
+        Radio(VIEW_DETAILS, "&Details\tCtrl+Shift+6"),
         Sep,
         Sub("&Zoom", zoom),
         Sub("S&ort By", sort),
@@ -527,6 +537,8 @@ pub struct State {
     pub theme: u16,
     /// The `ON_TOP_*` id of the On Top mode.
     pub on_top: u16,
+    /// The `VIEW_*` id of the view.
+    pub view: u16,
     pub can_go_back: bool,
     pub can_go_forward: bool,
 }
@@ -583,6 +595,11 @@ pub fn update(menu: HMENU, s: &State) {
         menu,
         &[ON_TOP_NEVER, ON_TOP_ALWAYS, ON_TOP_SEARCHING],
         s.on_top,
+    );
+    radio(
+        menu,
+        &[VIEW_EXTRA_LARGE, VIEW_LARGE, VIEW_MEDIUM, VIEW_DETAILS],
+        s.view,
     );
     enable(menu, COPY, s.can_copy);
     enable(menu, CUT, s.can_copy);
@@ -684,6 +701,8 @@ const _: () = {
     assert!(DELETE_PERMANENT < COPY_EXT && COPY_TYPE < SELECT_ALL);
     assert!(PREV_FILTER < FILTER_FIRST);
     assert!(ZOOM_RESET < SORT_NAME);
+    assert!(RESET_COLUMNS < VIEW_EXTRA_LARGE);
+    assert!(VIEW_DETAILS < MATCH_CASE);
     assert!(FILTER_FIRST + Filter::ALL.len() as u16 <= INDEX_STATUS);
     assert!(NAV_ENTRY_FIRST + NAV_ENTRIES as u16 <= BOOKMARK_ADD);
     assert!(ABOUT < BOOKMARK_FIRST);
