@@ -4,14 +4,160 @@
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    ETO_CLIPPED, ExtTextOutW, HDC, PtInRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DC_BRUSH, DC_PEN, ETO_CLIPPED, ExtTextOutW, GetStockObject, HDC, PtInRect, RoundRect,
+    SelectObject, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::LVM_GETSELECTEDCOUNT;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
 
 use crate::format;
 use crate::paint::{fill, width};
 use crate::window::App;
+
+/// The view buttons at the status bar's right end, as in Everything 1.5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewButton {
+    Details,
+    Thumbnails,
+}
+
+/// Where the view buttons go in the status bar `rc` (its top line
+/// included): squares of `side`, `gap` apart, the last `margin` from the
+/// right edge, centred below the line. None when the bar is hidden.
+pub fn view_buttons(rc: &RECT, side: i32, gap: i32, margin: i32) -> [(ViewButton, RECT); 2] {
+    let top = rc.top + 1 + (rc.bottom - rc.top - 1 - side) / 2;
+    let square = |right: i32| RECT {
+        left: right - side,
+        top,
+        right,
+        bottom: top + side,
+    };
+    let thumbs = square(rc.right - margin);
+    let details = square(thumbs.left - gap);
+    [
+        (ViewButton::Details, details),
+        (ViewButton::Thumbnails, thumbs),
+    ]
+}
+
+/// The view buttons' places in the window's status bar now.
+fn buttons_of(app: &App) -> Option<[(ViewButton, RECT); 2]> {
+    let rc = app.status_rc.get();
+    // The button fills the bar but for a little room above and below.
+    let side = (rc.bottom - rc.top - 1 - app.scale(4)).min(app.scale(20));
+    (side > 0).then(|| view_buttons(&rc, side, app.scale(2), app.scale(4)))
+}
+
+/// The button of `buttons` at `pt`.
+pub fn button_at(buttons: &[(ViewButton, RECT)], pt: POINT) -> Option<ViewButton> {
+    buttons
+        .iter()
+        // SAFETY: reads two plain structs.
+        .find(|(_, rc)| unsafe { PtInRect(rc, pt) } != 0)
+        .map(|&(b, _)| b)
+}
+
+/// The view button at `pt`, in the main window's client coordinates.
+pub fn view_button_at(app: &App, pt: POINT) -> Option<ViewButton> {
+    button_at(&buttons_of(app)?, pt)
+}
+
+/// The mouse moved to `pt` (None: it left the window): the button under
+/// it lights up.
+pub fn view_hover(app: &App, pt: Option<POINT>) {
+    let hot = pt.and_then(|pt| view_button_at(app, pt));
+    if hot.is_some() {
+        let mut tme = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: app.hwnd,
+            dwHoverTime: 0,
+        };
+        // SAFETY: asks for WM_MOUSELEAVE on this thread's window.
+        unsafe { TrackMouseEvent(&mut tme) };
+    }
+    if app.view_hot.replace(hot) != hot {
+        app.invalidate_status();
+    }
+}
+
+/// Draws the view buttons: the view shown pressed (a lighter rounded
+/// square), the one under the mouse lit; Details' glyph four lines,
+/// Thumbnails' four squares.
+fn paint_view_buttons(app: &App, hdc: HDC, buttons: &[(ViewButton, RECT)]) {
+    let pal = app.pal.get();
+    let thumbnails = app.view().thumbnails;
+    let hot = app.view_hot.get();
+    let px = app.scale(1).max(1);
+    for &(button, rc) in buttons {
+        let active = (button == ViewButton::Thumbnails) == thumbnails;
+        let bg = if active {
+            pal.glyph_hot_bg
+        } else if hot == Some(button) {
+            pal.header_hot
+        } else {
+            pal.chrome
+        };
+        if bg != pal.chrome {
+            round_fill(hdc, &rc, bg, app.scale(4));
+        }
+        let fg = if active || hot == Some(button) {
+            pal.glyph_hot
+        } else {
+            pal.glyph
+        };
+        // A 12 px glyph (at 96 DPI) in the middle.
+        let g = app.scale(12);
+        let left = rc.left + (rc.right - rc.left - g) / 2;
+        let top = rc.top + (rc.bottom - rc.top - g) / 2;
+        let bar = |l: i32, t: i32, r: i32, b: i32| {
+            fill(
+                hdc,
+                &RECT {
+                    left: l,
+                    top: t,
+                    right: r,
+                    bottom: b,
+                },
+                fg,
+            );
+        };
+        match button {
+            ViewButton::Details => {
+                for i in 0..4 {
+                    let t = top + i * g / 4 + px;
+                    bar(left, t, left + g, t + 2 * px);
+                }
+            }
+            ViewButton::Thumbnails => {
+                let half = (g - px) / 2;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let l = left + dx * (g - half);
+                    let t = top + dy * (g - half);
+                    bar(l, t, l + half, t + half);
+                }
+            }
+        }
+    }
+}
+
+/// Fills `rc` with `colour`, its corners rounded by `radius`.
+fn round_fill(hdc: HDC, rc: &RECT, colour: u32, radius: i32) {
+    // SAFETY: the stock DC brush and pen paint in the colours set here; the
+    // DC's own are put back.
+    unsafe {
+        SetDCBrushColor(hdc, colour);
+        SetDCPenColor(hdc, colour);
+        let old_brush = SelectObject(hdc, GetStockObject(DC_BRUSH));
+        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN));
+        RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+    }
+}
 
 /// A search option the status bar shows while it is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,8 +361,13 @@ pub fn paint(app: &App, hdc: HDC) {
                 core::ptr::null(),
             );
         };
-        // Right side first, so the left side can stop short of it.
+        // Right side first, so the left side can stop short of it: the
+        // view buttons at the end, then the parts right to left.
         let mut x_right = rc.right - pad;
+        if let Some(buttons) = buttons_of(app) {
+            paint_view_buttons(app, hdc, &buttons);
+            x_right = buttons[0].1.left - pad;
+        }
         for part in right.iter().rev() {
             let t: Vec<u16> = part.text.encode_utf16().collect();
             let w = width(hdc, &t);
@@ -269,6 +420,36 @@ pub fn indicator_at(app: &App, pt: POINT) -> Option<Indicator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_buttons_sit_at_the_right_end() {
+        // A 23 px bar (its top line included) 1000 px wide, at 100 %.
+        let bar = RECT {
+            left: 0,
+            top: 600,
+            right: 1000,
+            bottom: 623,
+        };
+        let [(d, details), (t, thumbs)] = view_buttons(&bar, 19, 2, 4);
+        assert_eq!((d, t), (ViewButton::Details, ViewButton::Thumbnails));
+        assert_eq!(
+            (thumbs.left, thumbs.top, thumbs.right, thumbs.bottom),
+            (977, 602, 996, 621)
+        );
+        assert_eq!((details.left, details.right), (956, 975));
+        assert_eq!((details.top, details.bottom), (thumbs.top, thumbs.bottom));
+        let buttons = view_buttons(&bar, 19, 2, 4);
+        let at = |x, y| button_at(&buttons, POINT { x, y });
+        assert_eq!(at(980, 610), Some(ViewButton::Thumbnails));
+        assert_eq!(at(995, 620), Some(ViewButton::Thumbnails));
+        assert_eq!(at(956, 602), Some(ViewButton::Details));
+        // The gap between them, past the right edge, above and below.
+        assert_eq!(at(976, 610), None);
+        assert_eq!(at(996, 610), None);
+        assert_eq!(at(960, 601), None);
+        assert_eq!(at(960, 621), None);
+        assert_eq!(at(500, 610), None);
+    }
 
     #[test]
     fn counts_items() {

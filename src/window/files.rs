@@ -503,6 +503,9 @@ impl App {
         let Some((row, sub)) = self.hit_row(pt) else {
             return false;
         };
+        if self.view().thumbnails {
+            return row == index && self.on_thumb_name(index, pt);
+        }
         if row != index || self.column_id(sub.max(0) as usize) != Some(COL_NAME) {
             return false;
         }
@@ -530,6 +533,10 @@ impl App {
     /// the icon) to the end of the Name column, its text where the row's
     /// is. `edit` is the box, for its margin.
     fn rename_box(&self, index: usize, edit: HWND) -> Option<RECT> {
+        if self.view().thumbnails {
+            // Under the thumbnail, over the name's lines.
+            return self.thumb_rename_box(index);
+        }
         let cell = self.name_cell(index)?;
         // The box's border and its own margin come before its text.
         let margin = (send(edit, EM_GETMARGINS, 0, 0) & 0xffff) as i32;

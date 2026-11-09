@@ -51,6 +51,8 @@ use crate::settings::{OnTop, Settings};
 use crate::status::Indicator;
 use crate::store::writer::Writer;
 use crate::theme::{Palette, ThemeMode};
+use crate::thumbs::{ThumbReply, Thumbs};
+use crate::view::View;
 use crate::wide::{is_wide, window_text, wz};
 use crate::{
     dialog, dropdown, format, header, hover, keys, menu, msgbox, paint, places, searchbox, shell,
@@ -74,6 +76,7 @@ mod results;
 mod runs;
 mod searches;
 mod session;
+mod thumbview;
 
 pub const WM_REPLY: u32 = WM_APP + 1;
 pub const WM_ICON: u32 = WM_APP + 2;
@@ -104,6 +107,9 @@ const WM_RENAME_AGAIN: u32 = WM_APP + 11;
 const WM_TRAY: u32 = WM_APP + 12;
 /// A command line from a second start: a `Box<Vec<String>>` in lParam.
 const WM_LAUNCH: u32 = WM_APP + 13;
+/// A thumbnail was made: a `Box<thumbs::ThumbReply>` in lParam. Kept apart
+/// from the numbers above so others can be added there.
+const WM_THUMB: u32 = WM_APP + 30;
 
 const ID_EDIT: usize = 100;
 const ID_LIST: usize = 101;
@@ -314,6 +320,16 @@ pub struct App {
     tray_on: Cell<bool>,
     /// Explorer's "TaskbarCreated" message: the tray icon goes back.
     taskbar_created: u32,
+    /// Details or thumbnails, and the thumbnails' size.
+    view: Cell<View>,
+    /// The thumbnails made, and the thread making them.
+    pub thumbs: Thumbs,
+    /// The system's 48 px and 256 px icon lists (HIMAGELIST), once asked.
+    big_icons: Cell<[usize; 2]>,
+    /// The icon view's layout while the list paints (taken as it starts).
+    thumb_grid: Cell<Option<thumbview::Grid>>,
+    /// The status bar's view button under the mouse.
+    pub view_hot: Cell<Option<status::ViewButton>>,
 }
 
 /// How the program that started goz-gui asked for its window to be shown
@@ -771,6 +787,11 @@ impl App {
                 background: Cell::new(crate::settings::Background::default()),
                 tray_on: Cell::new(false),
                 taskbar_created: crate::tray::taskbar_created(),
+                view: Cell::new(s.view),
+                thumbs: Thumbs::new(hwnd, WM_THUMB),
+                big_icons: Cell::new([0; 2]),
+                thumb_grid: Cell::new(None),
+                view_hot: Cell::new(None),
             })
         }
     }
@@ -810,6 +831,9 @@ impl App {
         self.apply_theme();
         self.set_window_icons();
         self.show_sort();
+        if self.view.get().thumbnails {
+            self.put_view();
+        }
         if default_size {
             // SAFETY: sizes the window for its monitor's DPI before it shows.
             unsafe {
@@ -1080,15 +1104,21 @@ impl App {
                 }
                 WM_MOUSEMOVE => {
                     searchbox::mouse_move(self, point(l));
+                    status::view_hover(self, Some(point(l)));
                     0
                 }
                 WM_MOUSELEAVE => {
                     searchbox::mouse_leave(self);
+                    status::view_hover(self, None);
                     0
                 }
                 WM_LBUTTONDOWN => {
                     let pt = point(l);
-                    if !searchbox::button_down(self, pt) && in_rect(&self.search_rc.get(), pt) {
+                    if let Some(button) = status::view_button_at(self, pt) {
+                        self.view_button(button);
+                    } else if !searchbox::button_down(self, pt)
+                        && in_rect(&self.search_rc.get(), pt)
+                    {
                         // The frame round the text is the search box too.
                         self.focus_box();
                     }
@@ -1106,8 +1136,10 @@ impl App {
                 }
                 WM_LBUTTONDBLCLK => {
                     let pt = point(l);
-                    // A quick second click on a search box button is a click.
-                    if !searchbox::button_down(self, pt)
+                    // A quick second click on a button is a click.
+                    if let Some(button) = status::view_button_at(self, pt) {
+                        self.view_button(button);
+                    } else if !searchbox::button_down(self, pt)
                         && let Some(indicator) = status::indicator_at(self, pt)
                     {
                         self.turn_off(indicator);
@@ -1284,6 +1316,11 @@ impl App {
                     self.on_icon(&reply);
                     0
                 }
+                WM_THUMB => {
+                    let reply = Box::from_raw(l as *mut ThumbReply);
+                    self.on_thumb(*reply);
+                    0
+                }
                 WM_ACTIVATE => {
                     if u32::from(loword(w)) == WA_INACTIVE {
                         dropdown::close(self);
@@ -1433,6 +1470,9 @@ impl App {
                 }
                 NM_CUSTOMDRAW => {
                     let cd = &*(l as *const NMCUSTOMDRAW);
+                    if self.view.get().thumbnails {
+                        return self.thumb_custom_draw(cd);
+                    }
                     return match cd.dwDrawStage {
                         CDDS_PREPAINT => CDRF_NOTIFYPOSTPAINT as LRESULT,
                         CDDS_POSTPAINT => {
@@ -1474,9 +1514,9 @@ impl App {
 
     /// The blocks holding the rows in view.
     fn view_blocks(&self) -> Range<u32> {
-        let top = send(self.list, LVM_GETTOPINDEX, 0, 0).max(0) as u32;
-        let page = send(self.list, LVM_GETCOUNTPERPAGE, 0, 0).max(0) as u32;
-        top / BLOCK_ROWS..top.saturating_add(page) / BLOCK_ROWS + 1
+        let items = self.visible_items();
+        let (top, end) = (items.start as u32, items.end as u32);
+        top / BLOCK_ROWS..end / BLOCK_ROWS + 1
     }
 
     pub fn request_rows(&self, from: usize, to: usize) {
@@ -1594,7 +1634,7 @@ impl App {
         if keep_place {
             // Fetch where the user is looking too, so a refresh repaints in
             // place instead of row by row.
-            let top = send(self.list, LVM_GETTOPINDEX, 0, 0).max(0) as u32;
+            let top = self.top_index() as u32;
             let block = top / BLOCK_ROWS;
             if block > 0 {
                 self.worker.push(Job::Block {
@@ -1743,6 +1783,10 @@ impl App {
                 match adopted {
                     Some(keep) => {
                         self.icons.reset(epoch);
+                        if !keep {
+                            // Other files: their thumbnails are not wanted.
+                            self.reset_thumbs();
+                        }
                         // Taken first: the count's own selection changes
                         // must not drop it.
                         let view = self.take_view(epoch);
@@ -2060,6 +2104,10 @@ impl App {
         }
         self.set_window_icons();
         self.layout();
+        if self.view.get().thumbnails {
+            // The thumbnails' size and spacing follow the DPI.
+            self.put_view();
+        }
     }
 
     /// An information box over the window. Nothing of `App` is borrowed

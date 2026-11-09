@@ -746,6 +746,10 @@ impl App {
     /// The column under `pt` (the list's client coordinates) on a row, by
     /// its id, wherever it has been dragged to.
     fn column_at(&self, pt: POINT) -> Option<usize> {
+        if self.view().thumbnails {
+            // No columns: an item is its name.
+            return None;
+        }
         let mut hit = LVHITTESTINFO {
             pt,
             flags: 0,

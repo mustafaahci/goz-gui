@@ -179,6 +179,7 @@ impl App {
         s.on_top = self.on_top.get();
         s.status_bar = self.status_bar_visible();
         s.columns = self.layout.get();
+        s.view = self.view();
         // The dialogs' places, the Search Syntax window's as it is now if
         // it is open.
         syntax::keep_place();

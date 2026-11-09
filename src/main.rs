@@ -52,7 +52,9 @@ mod status;
 mod store;
 mod syntax;
 mod theme;
+mod thumbs;
 mod tray;
+mod view;
 mod wide;
 mod window;
 

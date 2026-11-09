@@ -200,7 +200,7 @@ pub fn width(hdc: HDC, text: &[u16]) -> i32 {
 
 /// Draws `text` in `rc`, bold over `spans`, ending in an ellipsis when it
 /// does not fit. `right` aligns it to the right edge when it fits.
-fn runs(hdc: HDC, rc: &RECT, text: &[u16], spans: &[Span], fonts: &Fonts, right: bool) {
+pub fn runs(hdc: HDC, rc: &RECT, text: &[u16], spans: &[Span], fonts: &Fonts, right: bool) {
     if text.is_empty() || rc.right <= rc.left {
         return;
     }
