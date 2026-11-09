@@ -286,6 +286,110 @@ impl Worker {
     }
 }
 
+/// Stops a [`stream`] running on another thread: its read is abandoned
+/// (after the grace a stale search gets) and the stream ends.
+#[derive(Clone)]
+pub struct Stop(Arc<Shared>);
+
+impl Stop {
+    pub fn new() -> Stop {
+        // Nothing is ever posted through this one: only its quit flag and
+        // its cancel event are used.
+        Stop(Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                latest: 0,
+                jobs: Vec::new(),
+                quit: false,
+            }),
+            work: Event::new(),
+            cancel: Event::new(),
+            hwnd: 0,
+            msg: 0,
+        }))
+    }
+
+    pub fn stop(&self) {
+        self.0.lock().quit = true;
+        self.0.cancel.set();
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.0.lock().quit
+    }
+}
+
+/// How a [`stream`] ended.
+pub enum Streamed {
+    /// Every row went to the callback; how many.
+    Done(u64),
+    Stopped,
+    Failed(Failure),
+}
+
+/// Runs `search` whole (no limit) on a connection of its own, handing each
+/// page gozd sends (up to `PAGE_ROWS` rows) and the total to `page` as it
+/// arrives; `page` returns an error to end it. Meant for a thread of its
+/// own (File > Export): the worker's searches go on meanwhile, and no page
+/// is kept once `page` has had it.
+pub fn stream(
+    stop: &Stop,
+    search: &Search,
+    mut page: impl FnMut(Vec<Row>, u64) -> Result<(), String>,
+) -> Streamed {
+    let shared = &*stop.0;
+    let mut conn = None;
+    let pipe = match connect(&mut conn, shared) {
+        Ok(p) => p,
+        Err(_) if stop.stopped() => return Streamed::Stopped,
+        Err(f) => return Streamed::Failed(f),
+    };
+    let request = Request::Query(QueryRequest {
+        query: search.query.clone(),
+        scope: None,
+        sort: search.sort,
+        offset: 0,
+        limit: None,
+        want_size: true,
+        want_mtime: true,
+        match_case: search.match_case,
+        want_total_size: false,
+    });
+    if let Err(e) = pipe.send(&request) {
+        return match e {
+            Io::Cancelled => Streamed::Stopped,
+            Io::Lost(m) => Streamed::Failed(Failure::Other(m)),
+        };
+    }
+    let mut rows = 0u64;
+    loop {
+        if stop.stopped() {
+            return Streamed::Stopped;
+        }
+        match pipe.response(shared, None) {
+            Ok(Response::Results(p)) => {
+                let more = p.more;
+                rows += p.items.len() as u64;
+                let items = p.items.into_iter().map(Row::from_item).collect();
+                if let Err(why) = page(items, p.total) {
+                    return Streamed::Failed(Failure::Other(why));
+                }
+                if !more {
+                    return Streamed::Done(rows);
+                }
+            }
+            Ok(Response::Error { message, .. }) => {
+                return Streamed::Failed(Failure::Refused(message));
+            }
+            Ok(_) => {
+                return Streamed::Failed(Failure::Other("unexpected reply from gozd".into()));
+            }
+            Err(Io::Cancelled) => return Streamed::Stopped,
+            Err(Io::Lost(_)) if stop.stopped() => return Streamed::Stopped,
+            Err(Io::Lost(m)) => return Streamed::Failed(Failure::Other(m)),
+        }
+    }
+}
+
 fn run(shared: &Shared) {
     let mut conn: Option<Pipe> = None;
     loop {

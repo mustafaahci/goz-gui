@@ -48,7 +48,7 @@ struct FileDialogVtbl {
     show: unsafe extern "system" fn(Raw, HWND) -> HRESULT,
     set_file_types: unsafe extern "system" fn(Raw, u32, *const COMDLG_FILTERSPEC) -> HRESULT,
     set_file_type_index: unsafe extern "system" fn(Raw, u32) -> HRESULT,
-    get_file_type_index: Unused,
+    get_file_type_index: unsafe extern "system" fn(Raw, *mut u32) -> HRESULT,
     advise: Unused,
     unadvise: Unused,
     set_options: unsafe extern "system" fn(Raw, u32) -> HRESULT,
@@ -149,6 +149,8 @@ struct Ask<'a> {
     kinds: &'a [Kind],
     extension: &'a str,
     check: Option<Check<'a>>,
+    /// The file type listed first (from 1).
+    kind: u32,
 }
 
 /// Asks for a file to read, owned by `owner`; `None` when cancelled.
@@ -160,8 +162,9 @@ pub fn open(owner: HWND, title: &str, kinds: &[Kind], extension: &str) -> Option
         kinds,
         extension,
         check: None,
+        kind: 1,
     };
-    show(owner, &ask).map(|(path, _)| path)
+    show(owner, &ask).map(|(path, _, _)| path)
 }
 
 /// Asks where to write a file, suggesting `file_name`; with `check`, also
@@ -182,11 +185,37 @@ pub fn save(
         kinds,
         extension,
         check,
+        kind: 1,
     };
-    show(owner, &ask)
+    show(owner, &ask).map(|(path, checked, _)| (path, checked))
 }
 
-fn show(owner: HWND, ask: &Ask<'_>) -> Option<(PathBuf, bool)> {
+/// Asks where to write a file of one of `kinds`, suggesting `file_name` and
+/// the kind at `kind` (from 0); the path and the kind chosen (from 0).
+/// `None` when cancelled. Writing over a file is asked about first.
+pub fn save_kind(
+    owner: HWND,
+    title: &str,
+    file_name: &str,
+    kinds: &[Kind],
+    kind: usize,
+) -> Option<(PathBuf, usize)> {
+    let extension = kinds.get(kind).map_or("", |k| k.1.trim_start_matches("*."));
+    let ask = Ask {
+        save: true,
+        title,
+        file_name,
+        kinds,
+        extension,
+        check: None,
+        kind: kind as u32 + 1,
+    };
+    show(owner, &ask).map(|(path, _, kind)| (path, kind))
+}
+
+/// The path chosen, whether the check box was ticked, and the file type
+/// chosen (from 0).
+fn show(owner: HWND, ask: &Ask<'_>) -> Option<(PathBuf, bool, usize)> {
     let (clsid, iid) = if ask.save {
         (&FileSaveDialog, &IID_IFILESAVEDIALOG)
     } else {
@@ -236,7 +265,7 @@ fn show(owner: HWND, ask: &Ask<'_>) -> Option<(PathBuf, bool)> {
         (v.set_title)(dialog.0, title.as_ptr());
         if !specs.is_empty() {
             (v.set_file_types)(dialog.0, specs.len() as u32, specs.as_ptr());
-            (v.set_file_type_index)(dialog.0, 1);
+            (v.set_file_type_index)(dialog.0, ask.kind);
         }
         (v.set_default_extension)(dialog.0, extension.as_ptr());
         if !ask.file_name.is_empty() {
@@ -279,6 +308,9 @@ fn show(owner: HWND, ask: &Ask<'_>) -> Option<(PathBuf, bool)> {
         return None;
     }
     let item = Com(item);
+    let mut kind = 1u32;
+    // SAFETY: a plain out-value; the dialog's type index counts from 1.
+    unsafe { (dialog.vtbl::<FileDialogVtbl>().get_file_type_index)(dialog.0, &mut kind) };
     let mut name: *mut u16 = core::ptr::null_mut();
     // SAFETY: the item is an IShellItem; the name it gives is a
     // NUL-terminated string from the COM allocator, read and then freed.
@@ -291,6 +323,6 @@ fn show(owner: HWND, ask: &Ask<'_>) -> Option<(PathBuf, bool)> {
         let len = (0..).take_while(|&i| *name.add(i) != 0).count();
         let path = PathBuf::from(OsString::from_wide(core::slice::from_raw_parts(name, len)));
         CoTaskMemFree(name.cast());
-        Some((path, checked))
+        Some((path, checked, kind.saturating_sub(1) as usize))
     }
 }

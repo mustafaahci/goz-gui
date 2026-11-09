@@ -23,14 +23,14 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::{
-    APPCOMMAND_BROWSER_BACKWARD, APPCOMMAND_BROWSER_FORWARD, APPCOMMAND_BROWSER_HOME,
+    APPCOMMAND_BROWSER_BACKWARD, APPCOMMAND_BROWSER_FORWARD, APPCOMMAND_BROWSER_HOME, MK_CONTROL,
 };
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_MENU, VK_SHIFT, VK_TAB,
+    GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT, VK_TAB,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, DragAcceptFiles, HDROP, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -67,7 +67,9 @@ mod cols;
 mod commands;
 mod context;
 mod edit;
+mod export;
 mod files;
+mod live;
 mod nav;
 mod opts;
 mod prefs;
@@ -77,6 +79,7 @@ mod runs;
 mod searches;
 mod session;
 mod typing;
+mod view;
 
 pub const WM_REPLY: u32 = WM_APP + 1;
 pub const WM_ICON: u32 = WM_APP + 2;
@@ -107,6 +110,9 @@ const WM_RENAME_AGAIN: u32 = WM_APP + 11;
 const WM_TRAY: u32 = WM_APP + 12;
 /// A command line from a second start: a `Box<Vec<String>>` in lParam.
 const WM_LAUNCH: u32 = WM_APP + 13;
+/// File > Export's thread: wParam `crate::export::PROGRESS` or `ENDED`
+/// (lParam a `Box<crate::export::Ended>`).
+const WM_EXPORT: u32 = WM_APP + 14;
 
 const ID_EDIT: usize = 100;
 const ID_LIST: usize = 101;
@@ -128,6 +134,8 @@ const TIMER_RUNS: usize = 8;
 const TIMER_STORE_RETRY: usize = 9;
 /// Files changed (a delete, paste, drag): time to search again.
 const TIMER_SETTLE: usize = 10;
+/// Time to search again, so the results follow the files (`live.rs`).
+const TIMER_LIVE: usize = 11;
 
 /// The search options; the default is History > Home's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -146,7 +154,8 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    fn new(dpi: u32) -> Fonts {
+    /// The message font at `dpi`, `zoom` % its size (View > Zoom).
+    fn new(dpi: u32, zoom: u32) -> Fonts {
         // SAFETY: plain out-structs; the font handles are owned by `Fonts`.
         unsafe {
             let mut ncm: NONCLIENTMETRICSW = core::mem::zeroed();
@@ -158,8 +167,12 @@ impl Fonts {
                 0,
                 dpi,
             );
-            let normal = CreateFontIndirectW(&ncm.lfMessageFont);
             let mut lf = ncm.lfMessageFont;
+            if zoom != crate::zoom::DEFAULT {
+                lf.lfHeight = crate::zoom::scale(lf.lfHeight, 96, zoom);
+                lf.lfWidth = crate::zoom::scale(lf.lfWidth, 96, zoom);
+            }
+            let normal = CreateFontIndirectW(&lf);
             lf.lfWeight = 700;
             let bold = CreateFontIndirectW(&lf);
             let dc = GetDC(core::ptr::null_mut());
@@ -203,7 +216,25 @@ pub struct App {
     pub list: HWND,
     pub header: HWND,
     pub dpi: Cell<u32>,
+    /// The result list's fonts, at View > Zoom's size: its rows, header,
+    /// rename box and the status bar.
     pub fonts: RefCell<Fonts>,
+    /// The rest of the window's: the search box, its dropdown, the filter
+    /// bar, which Zoom leaves as they are.
+    pub ui_fonts: RefCell<Fonts>,
+    /// View > Zoom, in percent.
+    zoom: Cell<u32>,
+    /// Ctrl+wheel turns not yet a whole zoom step.
+    wheel: Cell<i32>,
+    /// View > Filter Bar, where it is, and whether its list is open.
+    filter_bar: Cell<bool>,
+    filter_rc: Cell<RECT>,
+    filter_open: Cell<bool>,
+    /// A menu is up (the menu bar's, or a popup's): no live update then.
+    in_menu: Cell<bool>,
+    /// File > Export under way, and the file type it last wrote.
+    export: RefCell<Option<crate::export::Running>>,
+    export_type: Cell<usize>,
     pub pal: Cell<Palette>,
     theme_mode: Cell<ThemeMode>,
     pub model: RefCell<Model>,
@@ -565,6 +596,14 @@ See Help > Search Syntax and the README for goz-gui's switches."
             // Shortcuts are the main window's; another window of the thread
             // (Help > Search Syntax) keeps its keys.
             let ours = msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd) != 0;
+            // Esc stops an export first, wherever the keyboard is.
+            if ours
+                && msg.message == WM_KEYDOWN
+                && msg.wParam == usize::from(VK_ESCAPE)
+                && app.cancel_export()
+            {
+                continue;
+            }
             if ours && TranslateAcceleratorW(hwnd, accel, &msg) != 0 {
                 continue;
             }
@@ -713,7 +752,16 @@ impl App {
                 list,
                 header,
                 dpi: Cell::new(dpi),
-                fonts: RefCell::new(Fonts::new(dpi)),
+                fonts: RefCell::new(Fonts::new(dpi, s.zoom)),
+                ui_fonts: RefCell::new(Fonts::new(dpi, crate::zoom::DEFAULT)),
+                zoom: Cell::new(s.zoom),
+                wheel: Cell::new(0),
+                filter_bar: Cell::new(s.filter_bar),
+                filter_rc: Cell::new(RECT::default()),
+                filter_open: Cell::new(false),
+                in_menu: Cell::new(false),
+                export: RefCell::new(None),
+                export_type: Cell::new(s.export_type),
                 pal: Cell::new(Palette::new(mode.is_dark())),
                 theme_mode: Cell::new(mode),
                 model: RefCell::new(Model::new(Arc::new(Search {
@@ -845,27 +893,42 @@ impl App {
             send(self.edit, EM_SETSEL, 0, 0);
             send(self.edit, EM_SETSEL, len, len as isize);
         }
+        self.arm_live();
     }
 
     pub fn scale(&self, v: i32) -> i32 {
         v * self.dpi.get() as i32 / 96
     }
 
+    /// `v` pixels at 96 DPI scaled for the DPI and View > Zoom: the result
+    /// list's measures.
+    pub fn zscale(&self, v: i32) -> i32 {
+        crate::zoom::scale(v, self.dpi.get(), self.zoom.get())
+    }
+
+    /// The search box's font (Zoom leaves it as it is).
+    pub fn ui_font(&self) -> HFONT {
+        self.ui_fonts.borrow().normal
+    }
+
     /// A result row: 19 px at 100 % with the usual 9 pt message font, as
-    /// in Everything 1.5.
+    /// in Everything 1.5; never shorter than the row's icon.
     pub fn row_height(&self) -> i32 {
-        let text = self.fonts.borrow().height + self.scale(4);
-        text.max(self.scale(19))
+        let text = self.fonts.borrow().height + self.zscale(4);
+        // SAFETY: reads metrics.
+        let icon = unsafe { GetSystemMetricsForDpi(SM_CYSMICON, self.dpi.get()) };
+        text.max(self.zscale(19)).max(icon + self.scale(1))
     }
 
     /// The header, its top and bottom lines included: 27 px at 100 %.
     pub fn header_height(&self) -> i32 {
-        self.fonts.borrow().height + self.scale(12)
+        self.fonts.borrow().height + self.zscale(12)
     }
 
     fn apply_fonts(&self) {
+        let ui = self.ui_font();
+        send(self.edit, WM_SETFONT, ui as usize, 1);
         let font = self.fonts.borrow().normal;
-        send(self.edit, WM_SETFONT, font as usize, 1);
         send(self.list, WM_SETFONT, font as usize, 1);
         celltip::set_font(self);
     }
@@ -991,10 +1054,11 @@ impl App {
         // SAFETY: reads and moves this thread's windows.
         unsafe { GetClientRect(self.hwnd, &mut rc) };
         let (side, above, below) = (self.scale(3), self.scale(5), self.scale(3));
-        let fh = self.fonts.borrow().height;
+        let fh = self.ui_fonts.borrow().height;
         let search_h = fh + self.scale(8);
+        // The status bar is the result list's: it zooms with it.
         let status_h = if self.status_visible.get() {
-            fh + self.scale(8)
+            self.fonts.borrow().height + self.zscale(8)
         } else {
             0
         };
@@ -1003,12 +1067,35 @@ impl App {
         } else {
             0
         };
+        // The filter bar, `filters_wide` (128 px at 100 %) and a gap, right
+        // of the search frame, as long as the frame keeps some room.
+        let filter_w = if self.filter_bar.get() {
+            let w = self.scale(view::FILTER_BAR_WIDE);
+            let gap = self.scale(searchbox::NAV_GAP);
+            let room = rc.right - 2 * side - nav;
+            if room - w - gap >= self.scale(64) {
+                w + gap
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         let search = RECT {
             left: side + nav,
             top: above,
-            right: (rc.right - side).max(side + nav),
+            right: (rc.right - side - filter_w).max(side + nav),
             bottom: above + search_h,
         };
+        self.filter_rc.set(if filter_w > 0 {
+            RECT {
+                left: rc.right - side - self.scale(view::FILTER_BAR_WIDE),
+                right: rc.right - side,
+                ..search
+            }
+        } else {
+            RECT::default()
+        });
         let status = RECT {
             left: 0,
             top: (rc.bottom - status_h).max(0),
@@ -1065,8 +1152,17 @@ impl App {
                         // The user maximized it: the state is the window's.
                         self.maximize_deferred.set(false);
                     }
+                    if w != SIZE_MINIMIZED as usize {
+                        self.arm_live();
+                    }
                     self.settings_changed();
                     0
+                }
+                WM_SHOWWINDOW => {
+                    if w != 0 {
+                        self.arm_live();
+                    }
+                    DefWindowProcW(self.hwnd, msg, w, l)
                 }
                 WM_MOVE => {
                     dropdown::close(self);
@@ -1075,6 +1171,11 @@ impl App {
                 }
                 WM_ENTERMENULOOP => {
                     dropdown::close(self);
+                    self.in_menu.set(true);
+                    DefWindowProcW(self.hwnd, msg, w, l)
+                }
+                WM_EXITMENULOOP => {
+                    self.in_menu.set(false);
                     DefWindowProcW(self.hwnd, msg, w, l)
                 }
                 WM_PAINT => {
@@ -1100,7 +1201,11 @@ impl App {
                 }
                 WM_LBUTTONDOWN => {
                     let pt = point(l);
-                    if !searchbox::button_down(self, pt) && in_rect(&self.search_rc.get(), pt) {
+                    if in_rect(&self.filter_rc.get(), pt) {
+                        self.filter_bar_click();
+                    } else if !searchbox::button_down(self, pt)
+                        && in_rect(&self.search_rc.get(), pt)
+                    {
                         // The frame round the text is the search box too.
                         self.focus_box();
                     }
@@ -1223,6 +1328,17 @@ impl App {
                         self.settle_tick();
                     } else if w == celltip::TIMER {
                         celltip::timer(self);
+                    } else if w == TIMER_LIVE {
+                        self.live_tick();
+                    }
+                    0
+                }
+                WM_EXPORT => {
+                    if w == crate::export::ENDED {
+                        let ended = Box::from_raw(l as *mut crate::export::Ended);
+                        self.export_ended(*ended);
+                    } else {
+                        self.export_progress();
                     }
                     0
                 }
@@ -1307,6 +1423,7 @@ impl App {
                         }
                     } else {
                         self.refresh_if_idle();
+                        self.arm_live();
                     }
                     DefWindowProcW(self.hwnd, msg, w, l)
                 }
@@ -1380,6 +1497,12 @@ impl App {
                 }
                 WM_DESTROY => {
                     self.remove_tray();
+                    // An export still running stops, and takes its tmp file
+                    // with it.
+                    let export = self.export.borrow_mut().take();
+                    if let Some(export) = export {
+                        export.finish();
+                    }
                     // The window is still there to read its placement from.
                     self.save_and_flush();
                     self.worker.quit();
@@ -1625,11 +1748,19 @@ impl App {
         } else {
             format!("{text} - goz")
         };
-        // SAFETY: a NUL-terminated title for this thread's window.
-        unsafe { SetWindowTextW(self.hwnd, wz(&title).as_ptr()) };
+        // Set only when it changed: a refresh (every live update) would
+        // repaint the title bar for nothing.
+        if window_text(self.hwnd) != title {
+            // SAFETY: a NUL-terminated title for this thread's window.
+            unsafe { SetWindowTextW(self.hwnd, wz(&title).as_ptr()) };
+        }
         self.apply_on_top();
-        // Back and Forward may have somewhere to go now, or not.
-        searchbox::invalidate_nav(self);
+        if !keep_place {
+            // Back and Forward may have somewhere to go now, or not; the
+            // filter bar shows the filter, however it was chosen.
+            searchbox::invalidate_nav(self);
+            self.invalidate_filter_bar();
+        }
     }
 
     /// The search box's text changed: a new search, not yet in the history;
@@ -2065,7 +2196,8 @@ impl App {
         // The user's last widths first, at the old DPI.
         self.sync_columns();
         self.dpi.set(dpi);
-        *self.fonts.borrow_mut() = Fonts::new(dpi);
+        *self.fonts.borrow_mut() = Fonts::new(dpi, self.zoom.get());
+        *self.ui_fonts.borrow_mut() = Fonts::new(dpi, crate::zoom::DEFAULT);
         self.apply_fonts();
         self.rescale_columns();
         // SAFETY: moves this thread's window to the rectangle Windows chose.
@@ -2271,6 +2403,11 @@ unsafe extern "system" fn list_proc(
             // (LVN_ODFINDITEMW).
             WM_CHAR => {
                 app.type_ahead(w as u16);
+                return 0;
+            }
+            // Ctrl+wheel zooms the list (View > Zoom).
+            WM_MOUSEWHEEL if (w & MK_CONTROL as usize) != 0 => {
+                app.zoom_wheel(hiword(w) as i16 as i32);
                 return 0;
             }
             // Rows move under a mouse that stays put.

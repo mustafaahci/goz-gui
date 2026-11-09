@@ -67,6 +67,10 @@ pub struct Model {
     /// again with whatever is at those rows now, which a file added or
     /// removed above them moves.
     dropped: HashMap<u32, u64>,
+    /// A refresh's blocks still to come: the rows held before it, only
+    /// drawn in their place meanwhile (never acted on), so a refresh does
+    /// not blink the list; their icons pass on to the same files.
+    previous: HashMap<u32, Block>,
     tick: Cell<u64>,
 }
 
@@ -99,6 +103,7 @@ impl Model {
             requested: HashSet::new(),
             pinned: HashSet::new(),
             dropped: HashMap::new(),
+            previous: HashMap::new(),
             tick: Cell::new(0),
         }
     }
@@ -108,7 +113,12 @@ impl Model {
         self.shown = pending.epoch;
         self.search = pending.search;
         self.highlight = pending.highlight;
-        self.blocks.clear();
+        if pending.keep_place {
+            self.previous = std::mem::take(&mut self.blocks);
+        } else {
+            self.previous.clear();
+            self.blocks.clear();
+        }
         self.requested.clear();
         self.pinned.clear();
         self.dropped.clear();
@@ -118,6 +128,16 @@ impl Model {
         self.total_size = None;
         self.failure = None;
         self.partial_failure = None;
+    }
+
+    /// Row `index` as it was before the refresh on its way, to draw until
+    /// the refresh's own row comes.
+    pub fn previous_row(&self, index: usize) -> Option<&Row> {
+        if index as u64 >= self.total {
+            return None;
+        }
+        let block = self.previous.get(&((index / BLOCK_ROWS as usize) as u32))?;
+        block.rows.get(index % BLOCK_ROWS as usize)
     }
 
     /// Row `index`, if held; its block counts as just used.
@@ -299,6 +319,15 @@ impl Model {
             .remove(&block)
             .is_some_and(|f| f != fingerprint(&rows));
         rows.shrink_to_fit();
+        // The same file in the same row keeps the icon it had: looked up
+        // again, it would show its type's icon for a moment.
+        if let Some(old) = self.previous.remove(&block) {
+            for (new, old) in rows.iter().zip(&old.rows) {
+                if old.icon.get() >= 0 && new.path == old.path {
+                    new.icon.set(old.icon.get());
+                }
+            }
+        }
         let tick = self.tick.get() + 1;
         self.tick.set(tick);
         self.blocks.insert(

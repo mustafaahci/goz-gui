@@ -634,6 +634,67 @@ pub fn tooltip_text(app: &App, info: &mut NMTTDISPINFOW) {
     info.lpszText = info.szText.as_mut_ptr();
 }
 
+/// The filter bar (View > Filter Bar) right of the search frame, `rc`: a
+/// frame like the search box's holding the filter's name and a ▾ as wide
+/// as the search box's buttons, lit while its list is `open`. Its list is
+/// a menu (`App::filter_bar_click`), so it follows the theme as the
+/// menus do.
+pub fn paint_filter_bar(app: &App, hdc: HDC, rc: RECT, name: &str, open: bool) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, SelectObject,
+        SetBkMode, SetTextColor, TRANSPARENT,
+    };
+    if rc.right - rc.left < 3 {
+        return;
+    }
+    let pal = app.pal.get();
+    fill(hdc, &rc, pal.border);
+    let inner = RECT {
+        left: rc.left + 1,
+        top: rc.top + 1,
+        right: rc.right - 1,
+        bottom: rc.bottom - 1,
+    };
+    fill(hdc, &inner, pal.bg);
+    let button = RECT {
+        left: (inner.right - app.scale(17)).max(inner.left),
+        ..inner
+    };
+    let (fg, bg) = colours(&pal, open);
+    fill(hdc, &button, bg);
+    let scale = app.dpi.get() as f32 / 96.0;
+    let (cx, cy) = (
+        (button.left + button.right) / 2,
+        (button.top + button.bottom) / 2,
+    );
+    if pal.dark {
+        triangle(hdc, cx, cy, scale, fg);
+    } else {
+        draw(hdc, cx, cy, &chevron(scale), fg, bg);
+    }
+    let mut text: Vec<u16> = name.encode_utf16().collect();
+    let mut room = RECT {
+        left: inner.left + app.scale(4),
+        right: button.left - app.scale(2),
+        ..inner
+    };
+    let font = app.ui_font();
+    // SAFETY: draws into the paint buffer; the old font is put back.
+    unsafe {
+        let old = SelectObject(hdc, font);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, pal.fg);
+        DrawTextW(
+            hdc,
+            text.as_mut_ptr(),
+            text.len() as i32,
+            &mut room,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old);
+    }
+}
+
 /// A button's glyph and background colours, lit (under the mouse, held
 /// down, or its dropdown open) or not.
 fn colours(pal: &Palette, lit: bool) -> (u32, u32) {

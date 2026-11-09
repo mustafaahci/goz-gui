@@ -18,6 +18,7 @@ mod copytext;
 mod csv;
 mod dialog;
 mod dropdown;
+mod export;
 mod filedlg;
 mod fileops;
 mod filetype;
@@ -58,6 +59,7 @@ mod tray;
 mod typeahead;
 mod wide;
 mod window;
+mod zoom;
 
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,

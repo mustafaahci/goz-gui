@@ -9,7 +9,7 @@
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_ADD, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F4, VK_F5, VK_HOME, VK_INSERT, VK_LEFT,
-    VK_RETURN, VK_RIGHT,
+    VK_NUMPAD0, VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, CreateAcceleratorTableW, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL,
@@ -60,6 +60,15 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     (CTRL, key(b'P'), menu::OPTIONS),
     // Everything's (and Explorer's) Ctrl+Num +.
     (CTRL, VK_ADD, menu::SIZE_ALL_COLUMNS_TO_FIT),
+    // Everything's File > Export..., Search > Next and Previous Filter, and
+    // View > Zoom (`view_zoom_*_keys`: Ctrl+=, Ctrl+-, Ctrl+0 and Ctrl+Num0).
+    (CTRL, key(b'S'), menu::EXPORT),
+    (CTRL, VK_OEM_6, menu::NEXT_FILTER),
+    (CTRL, VK_OEM_4, menu::PREV_FILTER),
+    (CTRL, VK_OEM_PLUS, menu::ZOOM_IN),
+    (CTRL, VK_OEM_MINUS, menu::ZOOM_OUT),
+    (CTRL, key(b'0'), menu::ZOOM_RESET),
+    (CTRL, VK_NUMPAD0, menu::ZOOM_RESET),
 ];
 
 pub fn accelerators() -> HACCEL {
@@ -214,6 +223,18 @@ mod tests {
     fn search_history_keys() {
         assert!(ACCELERATORS.contains(&(CTRL, key(b'H'), menu::FIND_SEARCH_HISTORY)));
         assert!(ACCELERATORS.contains(&(CTRL | SHIFT, key(b'H'), menu::ORGANIZE_SEARCH_HISTORY)));
+    }
+
+    #[test]
+    fn export_filter_and_zoom_keys() {
+        assert!(ACCELERATORS.contains(&(CTRL, key(b'S'), menu::EXPORT)));
+        // Ctrl+] and Ctrl+[ on a US layout.
+        assert!(ACCELERATORS.contains(&(CTRL, 0xdd, menu::NEXT_FILTER)));
+        assert!(ACCELERATORS.contains(&(CTRL, 0xdb, menu::PREV_FILTER)));
+        // 443, 445 and 304 in Everything's ini: 0x100 is Ctrl.
+        assert!(ACCELERATORS.contains(&(CTRL, 443 - 0x100, menu::ZOOM_IN)));
+        assert!(ACCELERATORS.contains(&(CTRL, 445 - 0x100, menu::ZOOM_OUT)));
+        assert!(ACCELERATORS.contains(&(CTRL, 304 - 0x100, menu::ZOOM_RESET)));
     }
 
     #[test]

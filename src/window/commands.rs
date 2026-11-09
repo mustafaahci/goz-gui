@@ -205,6 +205,13 @@ impl App {
                 self.set_sort(o.sort);
             }
             menu::STATUS_BAR => self.set_status_bar_visible(!self.status_bar_visible()),
+            menu::FILTER_BAR => self.set_filter_bar_visible(!self.filter_bar_visible()),
+            menu::ZOOM_IN => self.zoom_step(Some(true)),
+            menu::ZOOM_OUT => self.zoom_step(Some(false)),
+            menu::ZOOM_RESET => self.zoom_step(None),
+            menu::NEXT_FILTER => self.set_filter(o.filter.cycle(true)),
+            menu::PREV_FILTER => self.set_filter(o.filter.cycle(false)),
+            menu::EXPORT => self.export(),
             menu::THEME_USER_DEFAULT => self.set_theme_mode(ThemeMode::UserDefault),
             menu::THEME_STANDARD => self.set_theme_mode(ThemeMode::Standard),
             menu::THEME_DARK => self.set_theme_mode(ThemeMode::Dark),
@@ -253,10 +260,7 @@ impl App {
             ),
             _ => {
                 if let Some(filter) = Filter::from_menu_id(id) {
-                    o.filter = filter;
-                    self.opts.set(o);
-                    self.start_search(false);
-                    self.invalidate_status();
+                    self.set_filter(filter);
                 } else if let Some(i) = index_in(id, menu::NAV_ENTRY_FIRST, menu::NAV_ENTRIES) {
                     self.go_to_history(i);
                 } else if let Some(i) = index_in(id, menu::BOOKMARK_FIRST, menu::BOOKMARKS) {
@@ -330,6 +334,7 @@ impl App {
             sort: sort_id(o.sort.key),
             ascending: o.sort.dir == SortDir::Asc,
             status_bar: self.status_bar_visible(),
+            filter_bar: self.filter_bar_visible(),
             theme: match self.theme_mode() {
                 ThemeMode::UserDefault => menu::THEME_USER_DEFAULT,
                 ThemeMode::Standard => menu::THEME_STANDARD,

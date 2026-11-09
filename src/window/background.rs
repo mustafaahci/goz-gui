@@ -98,7 +98,7 @@ impl App {
     }
 
     /// Whether the window is on screen and not minimized.
-    fn shown(&self) -> bool {
+    pub(super) fn shown(&self) -> bool {
         // SAFETY: reads this thread's window's state.
         unsafe { IsWindowVisible(self.hwnd) != 0 && IsIconic(self.hwnd) == 0 }
     }

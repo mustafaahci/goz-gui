@@ -19,6 +19,8 @@
 //! - `GOZ_GUI_FILEOP_SILENT=1`: file operations ask nothing and show no
 //!   progress (`crate::shell::fileop_flags`, and the shell verbs invoked
 //!   from the row menu).
+//! - `GOZ_GUI_EXPORT_TO=<path>`: File > Export writes there without asking,
+//!   in the format its extension names (.efu, .csv, .txt).
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -37,6 +39,7 @@ pub const MENU_DUMP_VAR: &str = "GOZ_GUI_MENU_DUMP";
 pub const MENU_PICK_VAR: &str = "GOZ_GUI_MENU_PICK";
 pub const FILEOP_SILENT_VAR: &str = "GOZ_GUI_FILEOP_SILENT";
 pub const MENU_DUMP_LOG: &str = "menu-dump.log";
+pub const EXPORT_TO_VAR: &str = "GOZ_GUI_EXPORT_TO";
 
 /// Which rule chose the data folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,6 +209,13 @@ pub fn menu_pick() -> Option<&'static str> {
 pub fn fileop_silent() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| dry_run_value(std::env::var_os(FILEOP_SILENT_VAR)))
+}
+
+/// Where File > Export writes without asking (`GOZ_GUI_EXPORT_TO`), if set.
+pub fn export_to() -> Option<PathBuf> {
+    std::env::var_os(EXPORT_TO_VAR)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Appends `text` to the data folder's file `name` (a test's log); false
