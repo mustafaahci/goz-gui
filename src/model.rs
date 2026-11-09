@@ -7,7 +7,8 @@
 //! count.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,7 +62,23 @@ pub struct Model {
     /// Blocks of a selection an action waits for (`window::results`): never
     /// dropped to make room while pinned, even past `MAX_BLOCKS`.
     pinned: HashSet<u32>,
+    /// The blocks of this search dropped to make room, with a fingerprint
+    /// of the files they held, row by row: gozd answers a block fetched
+    /// again with whatever is at those rows now, which a file added or
+    /// removed above them moves.
+    dropped: HashMap<u32, u64>,
     tick: Cell<u64>,
+}
+
+/// The files of a block's rows, in order, as one number: two blocks with
+/// the same fingerprint hold the same files in the same rows.
+fn fingerprint(rows: &[Row]) -> u64 {
+    let mut h = DefaultHasher::new();
+    rows.len().hash(&mut h);
+    for row in rows {
+        row.path.hash(&mut h);
+    }
+    h.finish()
 }
 
 impl Model {
@@ -81,6 +98,7 @@ impl Model {
             blocks: HashMap::new(),
             requested: HashSet::new(),
             pinned: HashSet::new(),
+            dropped: HashMap::new(),
             tick: Cell::new(0),
         }
     }
@@ -93,6 +111,7 @@ impl Model {
         self.blocks.clear();
         self.requested.clear();
         self.pinned.clear();
+        self.dropped.clear();
         self.total = 0;
         self.incomplete = false;
         self.metadata_pending = false;
@@ -158,6 +177,23 @@ impl Model {
     /// cache shrinks back to its size as the next blocks come).
     pub fn set_pins(&mut self, blocks: impl IntoIterator<Item = u32>) {
         self.pinned = blocks.into_iter().collect();
+    }
+
+    /// An action is to wait for `blocks` (each block with a selected row):
+    /// unless all are held (`None`, nothing changes), they are kept from
+    /// now on, in place of the blocks kept for an action before; the ones
+    /// not held are given, and of those the ones to ask gozd for. Nothing
+    /// is dropped here, so no block counted as held goes before it is
+    /// kept; the caller lets the cache shrink back after
+    /// ([`make_room`](Self::make_room)).
+    pub fn pin_for(&mut self, blocks: &[u32]) -> Option<(BTreeSet<u32>, Vec<u32>)> {
+        let waiting: BTreeSet<u32> = blocks.iter().copied().filter(|&b| !self.holds(b)).collect();
+        if waiting.is_empty() {
+            return None;
+        }
+        self.set_pins(blocks.iter().copied());
+        let missing = self.request(waiting.iter().copied());
+        Some((waiting, missing))
     }
 
     /// Whether `block` is kept from being dropped.
@@ -252,8 +288,16 @@ impl Model {
     /// rows in view, which nothing repaints and so nothing marks as used.
     /// Pinned blocks are never dropped, and do not count: while there are
     /// some, the cache holds them and `MAX_BLOCKS` others.
-    pub fn insert(&mut self, block: u32, mut rows: Vec<Row>, on_screen: Range<u32>) {
+    ///
+    /// True when `block` was held before, dropped, and now holds other
+    /// files in its rows: the result changed meanwhile, and the list's
+    /// selection on those rows (row numbers) is not on the files chosen.
+    pub fn insert(&mut self, block: u32, mut rows: Vec<Row>, on_screen: Range<u32>) -> bool {
         self.requested.remove(&block);
+        let moved = self
+            .dropped
+            .remove(&block)
+            .is_some_and(|f| f != fingerprint(&rows));
         rows.shrink_to_fit();
         let tick = self.tick.get() + 1;
         self.tick.set(tick);
@@ -265,6 +309,7 @@ impl Model {
             },
         );
         self.make_room(on_screen);
+        moved
     }
 
     /// Drops the blocks used longest ago, as [`insert`](Self::insert) says,
@@ -288,7 +333,9 @@ impl Model {
             let Some(victim) = oldest(true).or_else(|| oldest(false)) else {
                 break;
             };
-            self.blocks.remove(&victim);
+            if let Some(gone) = self.blocks.remove(&victim) {
+                self.dropped.insert(victim, fingerprint(&gone.rows));
+            }
         }
     }
 }
@@ -399,6 +446,79 @@ mod tests {
             keep_place: false,
         });
         assert!(!m.pinned(3));
+    }
+
+    #[test]
+    fn a_replacing_action_keeps_every_block_it_counts_as_held() {
+        let mut m = model();
+        m.total = u64::from(BLOCK_ROWS) * 100;
+        // An action waits: its blocks 10-21 are here and kept, with the
+        // cache's own four, so more than MAX_BLOCKS are held.
+        let first: Vec<u32> = (10..22).collect();
+        assert!(m.pin_for(&first).is_some());
+        for &b in &first {
+            m.insert(b, vec![row(None, false)], 0..1);
+        }
+        for b in 50..54 {
+            m.insert(b, vec![row(None, false)], 0..1);
+        }
+        assert_eq!(m.blocks.len(), first.len() + MAX_BLOCKS);
+        // All held: nothing to wait for, and the pins stay as they were.
+        assert_eq!(m.pin_for(&[10, 50]), None);
+        assert!(m.pinned(21) && !m.pinned(50));
+        // Another action replaces it before block 30 has come: every block
+        // with a selected row is held (and kept) or waited for, also after
+        // the cache shrinks back.
+        let second: Vec<u32> = (12..22).chain([30]).collect();
+        let (waiting, missing) = m.pin_for(&second).unwrap();
+        assert_eq!(waiting.into_iter().collect::<Vec<_>>(), [30]);
+        assert_eq!(missing, [30]);
+        m.make_room(0..1);
+        assert!((12..22).all(|b| m.holds(b)), "none counted as held dropped");
+        assert!(!m.pinned(10) && !m.holds(10), "the first's own block goes");
+        assert_eq!(m.blocks.len(), 10 + MAX_BLOCKS);
+    }
+
+    #[test]
+    fn a_block_fetched_again_says_whether_its_files_moved() {
+        let mut m = model();
+        m.total = u64::from(BLOCK_ROWS) * 100;
+        let rows = |names: &[&str]| -> Vec<Row> {
+            names
+                .iter()
+                .map(|n| {
+                    let mut r = row(None, false);
+                    r.path = n.encode_utf16().collect::<Vec<u16>>().into();
+                    r
+                })
+                .collect()
+        };
+        let drop_block_0 = |m: &mut Model| {
+            for b in 1..=MAX_BLOCKS as u32 {
+                m.insert(b, rows(&["x"]), 99..100);
+            }
+            assert!(!m.holds(0));
+        };
+        assert!(!m.insert(0, rows(&[r"C:", r"C:"]), 0..1), "never held");
+        drop_block_0(&mut m);
+        // The same files in the same rows: nothing moved.
+        assert!(!m.insert(0, rows(&[r"C:", r"C:"]), 99..100));
+        drop_block_0(&mut m);
+        // A file came in above: the rows hold other files now.
+        assert!(m.insert(0, rows(&[r"C: ", r"C:"]), 99..100));
+        drop_block_0(&mut m);
+        // Compared with what it held last.
+        assert!(!m.insert(0, rows(&[r"C: ", r"C:"]), 99..100));
+        drop_block_0(&mut m);
+        // A new search (or a refresh) starts afresh.
+        m.adopt(Pending {
+            epoch: 2,
+            search: Arc::clone(&m.search),
+            highlight: Highlight::default(),
+            keep_place: true,
+        });
+        m.total = u64::from(BLOCK_ROWS) * 100;
+        assert!(!m.insert(0, rows(&[r"C:\z"]), 0..1));
     }
 
     #[test]

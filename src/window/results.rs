@@ -12,11 +12,21 @@
 //! selection of more than [`FETCH_MAX`] rows, a block gozd refuses, and a
 //! drag (which must start at once) act on the rows held instead, and the
 //! status bar says so for a while, so nothing is silently left out.
+//!
+//! The list's selection is by row number, and gozd answers a block with
+//! whatever is at its rows now. A block that held selected rows, was
+//! dropped and comes again holding other files there (a file was added or
+//! removed above them meanwhile) has those rows deselected
+//! ([`App::selection_moved`]): an action never takes a file nobody chose,
+//! and the status bar says what was left out. An action that waited runs
+//! only if goz-gui is still in front and, for a copy, nothing else was
+//! copied meanwhile.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{HWND, POINT};
+use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::Controls::{
     LVHITTESTINFO, LVIF_STATE, LVIS_SELECTED, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT,
@@ -111,24 +121,26 @@ pub(super) struct Fetching {
     /// The blocks not here yet.
     waiting: BTreeSet<u32>,
     then: Then,
+    /// The clipboard's sequence number when the action was asked for.
+    clipboard: u32,
+    /// Selected rows found holding other files when their block came
+    /// again, and deselected ([`App::selection_moved`]).
+    moved: usize,
 }
 
 impl Fetching {
-    /// What `then` waits for, of the `blocks` with selected rows of search
-    /// `epoch`, `held` saying which are here; `None` when all are.
-    pub(super) fn new(
-        epoch: u64,
-        blocks: Vec<u32>,
-        held: impl Fn(u32) -> bool,
-        then: Then,
-    ) -> Option<Fetching> {
-        let waiting: BTreeSet<u32> = blocks.iter().copied().filter(|&b| !held(b)).collect();
-        (!waiting.is_empty()).then_some(Fetching {
+    /// `then`, on the `blocks` with selected rows of search `epoch`,
+    /// waiting for those of them not held.
+    fn new(epoch: u64, blocks: Vec<u32>, waiting: BTreeSet<u32>, then: Then) -> Fetching {
+        Fetching {
             epoch,
             blocks,
             waiting,
             then,
-        })
+            // SAFETY: reads a counter.
+            clipboard: unsafe { GetClipboardSequenceNumber() },
+            moved: 0,
+        }
     }
 
     /// Block `block` of search `epoch` came, or will not come (gozd refused
@@ -213,6 +225,47 @@ fn partial_note(act: Act, done: usize, selected: usize) -> Option<String> {
     Some(format!("{what}; scroll to load the rest"))
 }
 
+/// Why an action that waited for its rows did not run: the user went to
+/// another program meanwhile.
+const LEFT: &str = "Not done: goz-gui was not in front when the selected items had loaded";
+
+/// Why a copy that waited for its rows did not run.
+const COPIED_MEANWHILE: &str =
+    "Not copied: something else was copied while the selected items loaded";
+
+/// Why an action that waited for its rows may not run now they are here,
+/// if so: not out of nowhere over a program the user went to meanwhile
+/// (`front`: goz-gui is still in front), as a window, a menu or a question,
+/// unless nothing shows (`quiet`: a test's dry run and the like); a copy,
+/// not over something else `copied` meanwhile.
+fn held_back(then: Then, front: bool, quiet: bool, copied: bool) -> Option<&'static str> {
+    let copies = matches!(then, Then::Copy(_) | Then::Files(_));
+    if !front && !quiet {
+        Some(LEFT)
+    } else if copies && copied {
+        Some(COPIED_MEANWHILE)
+    } else {
+        None
+    }
+}
+
+/// What the status bar says when `n` selected rows were deselected, as
+/// other files are in their rows now (the result changed); nothing for
+/// none.
+fn moved_note(n: usize) -> Option<String> {
+    (n > 0).then(|| {
+        let (items, were) = if n == 1 {
+            ("item", "was")
+        } else {
+            ("items", "were")
+        };
+        format!(
+            "The results changed: {} selected {items} moved, {were} deselected and left out",
+            format::grouped(n as u64)
+        )
+    })
+}
+
 /// The question asked before opening `n` things at once, if `n` is many.
 fn many_question(n: usize) -> Option<String> {
     (n > MANY).then(|| {
@@ -242,26 +295,20 @@ impl App {
             let at = after.unwrap_or(usize::MAX);
             usize::try_from(send(self.list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize)).ok()
         });
-        let fetching = {
-            let m = self.model.borrow();
+        let (epoch, search, waiting, missing) = {
+            let mut m = self.model.borrow_mut();
             // A search on its way replaces these rows, and its own blocks
             // are the only ones gozd is asked for now. After gozd refused a
             // block (its time budget), it is not asked for again.
             if m.pending.is_some() || m.partial_failure.is_some() {
                 return false;
             }
-            Fetching::new(m.shown, blocks, |b| m.holds(b), then)
-        };
-        let Some(fetching) = fetching else {
-            return false;
-        };
-        // It replaces an action still waiting.
-        self.cancel_fetch();
-        let (epoch, search, missing) = {
-            let mut m = self.model.borrow_mut();
-            m.set_pins(fetching.blocks.iter().copied());
-            let missing = m.request(fetching.waiting.iter().copied());
-            (m.shown, Arc::clone(&m.search), missing)
+            // Kept in place of the blocks of an action still waiting, which
+            // stay until then: none counted as held here goes first.
+            let Some((waiting, missing)) = m.pin_for(&blocks) else {
+                return false;
+            };
+            (m.shown, Arc::clone(&m.search), waiting, missing)
         };
         // The worker runs the newest job first: the first block last.
         for block in missing.into_iter().rev() {
@@ -271,7 +318,19 @@ impl App {
                 search: Arc::clone(&search),
             });
         }
+        let mut fetching = Fetching::new(epoch, blocks, waiting, then);
+        // It replaces an action still waiting (on the same selection, less
+        // the rows deselected as moved): what that one kept and this one
+        // does not need may go now, and its blocks still queued are not
+        // wanted.
+        let old = self.fetching.borrow_mut().take();
+        fetching.moved = old.as_ref().map_or(0, |o| o.moved);
         *self.fetching.borrow_mut() = Some(fetching);
+        if let Some(old) = old {
+            let on_screen = self.view_blocks();
+            self.model.borrow_mut().make_room(on_screen);
+            self.trim_requests(old.epoch);
+        }
         // Until the action runs: no timer takes it away.
         // SAFETY: a timer of this window.
         unsafe { KillTimer(self.hwnd, TIMER_NOTE) };
@@ -314,11 +373,18 @@ impl App {
         self.set_busy(Busy::Idle);
         self.clear_note();
         if self.model.borrow().shown == fetching.epoch {
-            // Out of every cell: the action may pump messages (a menu, a
-            // question), and must not fetch again.
-            self.fetch_bypass.set(true);
-            self.run_then(fetching.then);
-            self.fetch_bypass.set(false);
+            if let Err(why) = self.may_run(&fetching) {
+                self.show_note(why.into());
+            } else {
+                // Out of every cell: the action may pump messages (a menu,
+                // a question), and must not fetch again.
+                self.fetch_bypass.set(true);
+                self.run_then(fetching.then);
+                self.fetch_bypass.set(false);
+                if let Some(text) = moved_note(fetching.moved) {
+                    self.show_note(text);
+                }
+            }
         }
         // Kept no more, unless an action started meanwhile waits for them.
         let pins = self
@@ -338,6 +404,23 @@ impl App {
         m.make_room(on_screen);
     }
 
+    /// Whether an action whose rows came may still run ([`held_back`]).
+    /// `Err`: why not, for the status bar.
+    fn may_run(&self, fetching: &Fetching) -> Result<(), &'static str> {
+        // SAFETY: reads the foreground window.
+        let front = unsafe { GetForegroundWindow() } == self.hwnd;
+        // A test's dry run, silent file operations or dumped menu.
+        let quiet = match fetching.then {
+            Then::Open { .. } | Then::RunAs | Then::Properties => location::dry_run(),
+            Then::Delete { .. } => location::fileop_silent(),
+            Then::RowMenu { .. } => location::menu_dump(),
+            Then::Copy(_) | Then::Files(_) | Then::RunCount => false,
+        };
+        // SAFETY: reads a counter.
+        let copied = unsafe { GetClipboardSequenceNumber() } != fetching.clipboard;
+        held_back(fetching.then, front, quiet, copied).map_or(Ok(()), Err)
+    }
+
     fn run_then(&self, then: Then) {
         match then {
             Then::Open { reveal } => self.open_selected(reveal),
@@ -351,15 +434,53 @@ impl App {
                 at,
                 default,
                 extended,
-            } => {
-                // SAFETY: reads the foreground window.
-                let front = unsafe { GetForegroundWindow() } == self.hwnd;
-                // Not out of nowhere over a program the user went to
-                // meanwhile (a test's dump shows nothing).
-                if front || location::menu_dump() {
-                    self.show_row_menu(at, default, extended);
-                }
+            } => self.show_row_menu(at, default, extended),
+        }
+    }
+
+    /// Block `block` came again holding other files in its rows than when
+    /// it was dropped (`Model::insert`): its selected rows are deselected,
+    /// as they are not on the files chosen any more, unless every row is
+    /// selected (all of a result is all of it, wherever its files are). An
+    /// action waiting runs without them and says so after; otherwise the
+    /// status bar says so now.
+    pub(super) fn selection_moved(&self, block: u32) {
+        let total = self.model.borrow().total;
+        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
+        if selected == 0 || selected >= total {
+            return;
+        }
+        let rows = BLOCK_ROWS as usize;
+        let end = (block as usize + 1) * rows;
+        let mut moved = Vec::new();
+        // GETNEXTITEM looks after the row before the block (-1, usize::MAX:
+        // from the top).
+        let mut at = (block as usize * rows).wrapping_sub(1);
+        loop {
+            let next = send(self.list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize);
+            if next < 0 || next as usize >= end {
+                break;
             }
+            moved.push(next as usize);
+            at = next as usize;
+        }
+        if moved.is_empty() {
+            return;
+        }
+        self.quietly(|| {
+            for &i in &moved {
+                self.set_state(i, 0, LVIS_SELECTED);
+            }
+        });
+        // An action waiting says so once it has run.
+        let waiting = if let Some(f) = self.fetching.borrow_mut().as_mut() {
+            f.moved += moved.len();
+            true
+        } else {
+            false
+        };
+        if !waiting && let Some(text) = moved_note(moved.len()) {
+            self.show_note(text);
         }
     }
 
@@ -715,11 +836,9 @@ mod tests {
     #[test]
     fn an_action_waits_for_the_blocks_not_held() {
         let then = Then::Copy(Field::FullPath);
-        // All held: nothing to wait for.
-        assert!(Fetching::new(5, vec![0, 1], |_| true, then).is_none());
-        let mut f = Fetching::new(5, vec![0, 2, 3, 9], |b| b == 0 || b == 3, then).unwrap();
+        let mut f = Fetching::new(5, vec![0, 2, 3, 9], [2, 9].into(), then);
         assert_eq!(f.blocks, [0, 2, 3, 9], "all kept, held or not");
-        assert_eq!(f.waiting.iter().copied().collect::<Vec<_>>(), [2, 9]);
+        assert_eq!(f.moved, 0);
         // Blocks of another search, or not waited for, change nothing.
         assert!(!f.arrived(4, 2));
         assert!(!f.arrived(5, 3));
@@ -729,6 +848,45 @@ mod tests {
         assert!(f.arrived(5, 9));
         assert!(!f.arrived(5, 9));
         assert!(matches!(f.then, Then::Copy(Field::FullPath)));
+    }
+
+    #[test]
+    fn an_action_that_waited_runs_only_in_front_and_over_no_newer_copy() {
+        let copy = Then::Copy(Field::FullPath);
+        let cut = Then::Files(Effect::Move);
+        let props = Then::Properties;
+        // In front, nothing copied meanwhile: it runs.
+        for then in [copy, cut, props, Then::RunCount] {
+            assert_eq!(held_back(then, true, false, false), None);
+        }
+        // The user went to another program.
+        for then in [copy, cut, props, Then::Open { reveal: false }, Then::RunAs] {
+            assert_eq!(held_back(then, false, false, false), Some(LEFT));
+        }
+        // Unless nothing would show (a test's dry run).
+        assert_eq!(held_back(props, false, true, false), None);
+        // Something else was copied meanwhile: a copy or cut would replace
+        // it; other actions do not touch the clipboard.
+        assert_eq!(held_back(copy, true, false, true), Some(COPIED_MEANWHILE));
+        assert_eq!(held_back(cut, true, false, true), Some(COPIED_MEANWHILE));
+        assert_eq!(held_back(props, true, false, true), None);
+        assert_eq!(
+            held_back(Then::Delete { permanent: false }, true, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn rows_that_moved_are_reported() {
+        assert_eq!(moved_note(0), None);
+        assert_eq!(
+            moved_note(1).as_deref(),
+            Some("The results changed: 1 selected item moved, was deselected and left out")
+        );
+        assert_eq!(
+            moved_note(1500).as_deref(),
+            Some("The results changed: 1,500 selected items moved, were deselected and left out")
+        );
     }
 
     #[test]

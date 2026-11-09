@@ -1613,7 +1613,7 @@ impl App {
                 if total_size.is_some() {
                     m.total_size = total_size;
                 }
-                m.insert(block, rows, on_screen);
+                let moved = m.insert(block, rows, on_screen);
                 drop(m);
                 match adopted {
                     Some(keep) => {
@@ -1651,6 +1651,11 @@ impl App {
                             send(self.list, LVM_REDRAWITEMS, first as usize, last as isize);
                         }
                     }
+                }
+                if moved {
+                    // Before a refresh's files are selected again in it,
+                    // by path.
+                    self.selection_moved(block);
                 }
                 self.reselect_block(block);
                 if adopted.is_some() {
