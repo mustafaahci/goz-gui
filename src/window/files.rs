@@ -38,7 +38,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::{
-    App, COL_NAME, TIMER_SETTLE, WM_DRAG_DONE, WM_RENAME_AGAIN, key_down, results::Act, send,
+    App, COL_NAME, TIMER_SETTLE, WM_DRAG_DONE, WM_RENAME_AGAIN, key_down,
+    results::{Act, Then},
+    send,
 };
 use crate::dialog::Quiet;
 use crate::fileops::{self, Done, Job, Outcome};
@@ -221,6 +223,9 @@ impl App {
     /// asks as Windows does. Once they are gone the selection moves to the
     /// row after them.
     pub(super) fn delete_selected(&self, permanent: bool) {
+        if self.fetch_first(Then::Delete { permanent }) {
+            return;
+        }
         let held = self.selected_held();
         if held.is_empty() {
             return;
@@ -708,7 +713,9 @@ impl App {
     /// are dragged out as Explorer drags files (copy, move or link; a
     /// right-drag gets the target's menu). Nothing counts as a run. After
     /// a drop that did something (a move, say) the search runs again, and
-    /// the status bar says when it took only part of the selection.
+    /// the status bar says when it took only part of the selection. Its
+    /// rows are never fetched first (`results::Fetching`): the drag starts
+    /// inside LVN_BEGINDRAG, while the button is down, or not at all.
     ///
     /// A target that copied the files for a move and leaves their deletion
     /// to the source (a move it did not optimize, in the shell's protocol)

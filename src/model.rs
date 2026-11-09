@@ -58,6 +58,9 @@ pub struct Model {
     pub partial_failure: Option<String>,
     blocks: HashMap<u32, Block>,
     requested: HashSet<u32>,
+    /// Blocks of a selection an action waits for (`window::results`): never
+    /// dropped to make room while pinned, even past `MAX_BLOCKS`.
+    pinned: HashSet<u32>,
     tick: Cell<u64>,
 }
 
@@ -77,6 +80,7 @@ impl Model {
             partial_failure: None,
             blocks: HashMap::new(),
             requested: HashSet::new(),
+            pinned: HashSet::new(),
             tick: Cell::new(0),
         }
     }
@@ -88,6 +92,7 @@ impl Model {
         self.highlight = pending.highlight;
         self.blocks.clear();
         self.requested.clear();
+        self.pinned.clear();
         self.total = 0;
         self.incomplete = false;
         self.metadata_pending = false;
@@ -132,9 +137,32 @@ impl Model {
         }
         let first_block = (from / BLOCK_ROWS as usize) as u32;
         let last_block = (last / BLOCK_ROWS as usize) as u32;
-        (first_block..=last_block)
+        self.request(first_block..=last_block)
+    }
+
+    /// Of `blocks`, those neither held nor asked for yet; they are marked
+    /// as asked for.
+    pub fn request(&mut self, blocks: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        blocks
+            .into_iter()
             .filter(|b| !self.blocks.contains_key(b) && self.requested.insert(*b))
             .collect()
+    }
+
+    /// Whether `block` is held.
+    pub fn holds(&self, block: u32) -> bool {
+        self.blocks.contains_key(&block)
+    }
+
+    /// Keeps exactly `blocks` from being dropped to make room (none: the
+    /// cache shrinks back to its size as the next blocks come).
+    pub fn set_pins(&mut self, blocks: impl IntoIterator<Item = u32>) {
+        self.pinned = blocks.into_iter().collect();
+    }
+
+    /// Whether `block` is kept from being dropped.
+    pub fn pinned(&self, block: u32) -> bool {
+        self.pinned.contains(&block)
     }
 
     /// The row ranges held, as `start..end`, in order.
@@ -222,6 +250,8 @@ impl Model {
     /// longest ago. The blocks of `on_screen` are never the ones dropped: a
     /// block that arrives late (scrolled past) would otherwise push out the
     /// rows in view, which nothing repaints and so nothing marks as used.
+    /// Pinned blocks are never dropped, and do not count: while there are
+    /// some, the cache holds them and `MAX_BLOCKS` others.
     pub fn insert(&mut self, block: u32, mut rows: Vec<Row>, on_screen: Range<u32>) {
         self.requested.remove(&block);
         rows.shrink_to_fit();
@@ -234,17 +264,30 @@ impl Model {
                 used: Cell::new(tick),
             },
         );
-        while self.blocks.len() > MAX_BLOCKS {
+        self.make_room(on_screen);
+    }
+
+    /// Drops the blocks used longest ago, as [`insert`](Self::insert) says,
+    /// until the cache is back to its size.
+    pub fn make_room(&mut self, on_screen: Range<u32>) {
+        // Pinned blocks do not count: the others keep their room.
+        let pinned = self
+            .blocks
+            .keys()
+            .filter(|k| self.pinned.contains(k))
+            .count();
+        while self.blocks.len() > MAX_BLOCKS + pinned {
             let oldest = |spare_screen: bool| {
                 self.blocks
                     .iter()
+                    .filter(|(k, _)| !self.pinned.contains(k))
                     .filter(|(k, _)| !spare_screen || !on_screen.contains(k))
                     .min_by_key(|(_, b)| b.used.get())
                     .map(|(k, _)| *k)
             };
-            let victim = oldest(true)
-                .or_else(|| oldest(false))
-                .expect("more than zero blocks");
+            let Some(victim) = oldest(true).or_else(|| oldest(false)) else {
+                break;
+            };
             self.blocks.remove(&victim);
         }
     }
@@ -320,6 +363,42 @@ mod tests {
         // Once off screen, the oldest goes as before.
         m.insert(1000, vec![row(None, false)], 999..1001);
         assert!(m.peek(0).is_none());
+    }
+
+    #[test]
+    fn pinned_blocks_stay_past_the_cache_size() {
+        let mut m = model();
+        m.total = u64::from(BLOCK_ROWS) * 100;
+        let pins: Vec<u32> = (10..10 + MAX_BLOCKS as u32 * 3).collect();
+        m.set_pins(pins.iter().copied());
+        assert!(m.pinned(10) && !m.pinned(0));
+        // Asked for once: held or asked blocks are not asked again.
+        assert_eq!(m.request(pins.iter().copied()), pins);
+        assert!(m.request(pins.iter().copied()).is_empty());
+        for &b in &pins {
+            m.insert(b, vec![row(None, false)], 0..1);
+        }
+        // Blocks that are not pinned come and go round them.
+        for b in 50..60 {
+            m.insert(b, vec![row(None, false)], 0..1);
+        }
+        assert!(pins.iter().all(|&b| m.holds(b)), "every pinned block held");
+        assert_eq!(m.blocks.len(), pins.len() + MAX_BLOCKS);
+        assert!((56..60).all(|b| m.holds(b)), "the newest others");
+        // Unpinned, the cache shrinks back with the next block.
+        m.set_pins([]);
+        m.insert(70, vec![row(None, false)], 0..1);
+        assert_eq!(m.blocks.len(), MAX_BLOCKS);
+        assert!(m.holds(70));
+        // A new search forgets the pins.
+        m.set_pins([3]);
+        m.adopt(Pending {
+            epoch: 2,
+            search: Arc::clone(&m.search),
+            highlight: Highlight::default(),
+            keep_place: false,
+        });
+        assert!(!m.pinned(3));
     }
 
     #[test]

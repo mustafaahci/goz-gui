@@ -295,6 +295,12 @@ pub struct App {
     /// The data objects of cuts being pasted, one per paste queued, to be
     /// told once their files are moved.
     cuts: RefCell<Vec<shell::Cut>>,
+    /// An action on the selection waiting for its rows to be fetched.
+    fetching: RefCell<Option<results::Fetching>>,
+    /// The action that waited runs now: it fetches nothing again.
+    fetch_bypass: Cell<bool>,
+    /// The busy cursor, while goz-gui is busy for the user.
+    busy: Cell<results::Busy>,
 }
 
 /// How the program that started goz-gui asked for its window to be shown
@@ -675,6 +681,9 @@ impl App {
                 last_click: Cell::new(POINT::default()),
                 settle: Cell::new(0),
                 cuts: RefCell::new(Vec::new()),
+                fetching: RefCell::new(None),
+                fetch_bypass: Cell::new(false),
+                busy: Cell::new(results::Busy::Idle),
             })
         }
     }
@@ -1063,6 +1072,13 @@ impl App {
                     }
                     0
                 }
+                WM_SETCURSOR if u32::from(loword(l as usize)) == HTCLIENT && self.busy_cursor() => {
+                    1
+                }
+                results::WM_FETCHED => {
+                    self.fetch_done();
+                    0
+                }
                 WM_SERVICE => {
                     if w != 0 {
                         // gozd stopped or (re)started: search again, which
@@ -1276,6 +1292,11 @@ impl App {
                 // Enter and the list's other keys never reach the list's own
                 // handling (list_proc runs them), so no NM_RETURN comes.
                 LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
+                    // The user chose other rows: an action waiting for the
+                    // rows chosen before is not wanted any more.
+                    if !self.restoring.get() && results::selection_touched(l) {
+                        self.cancel_fetch();
+                    }
                     self.selection_changed();
                     self.invalidate_status();
                 }
@@ -1336,24 +1357,33 @@ impl App {
         if blocks.is_empty() {
             return;
         }
-        // The blocks asked for on the way here (a drag of the scroll box
-        // paints many) and not run yet are not wanted any more; those near
-        // the view are, and block 0, which carries the result's size.
-        let view = self.view_blocks();
-        let near = view.start.saturating_sub(1)..view.end.saturating_add(1);
-        let dropped = self.worker.trim(epoch, |b| b == 0 || near.contains(&b));
-        if !dropped.is_empty() {
-            let mut m = self.model.borrow_mut();
-            for block in dropped {
-                m.forget_request(block);
-            }
-        }
+        self.trim_requests(epoch);
         for block in blocks {
             self.worker.push(Job::Block {
                 epoch,
                 block,
                 search: Arc::clone(&search),
             });
+        }
+    }
+
+    /// The blocks of search `epoch` asked for on the way here (a drag of the
+    /// scroll box paints many) and not run yet are not wanted any more;
+    /// those near the view are, block 0, which carries the result's size,
+    /// and those an action waits for (pinned).
+    pub(super) fn trim_requests(&self, epoch: u64) {
+        let view = self.view_blocks();
+        let near = view.start.saturating_sub(1)..view.end.saturating_add(1);
+        let dropped = {
+            let m = self.model.borrow();
+            self.worker
+                .trim(epoch, |b| b == 0 || near.contains(&b) || m.pinned(b))
+        };
+        if !dropped.is_empty() {
+            let mut m = self.model.borrow_mut();
+            for block in dropped {
+                m.forget_request(block);
+            }
         }
     }
 
@@ -1376,8 +1406,9 @@ impl App {
             return;
         }
         // Nor while a row is being renamed: the refreshed rows could put
-        // another file under its box. It runs once the box is closed.
-        if keep_place && self.renaming() {
+        // another file under its box. It runs once the box is closed. Nor
+        // while an action waits for its rows, which are this search's.
+        if keep_place && (self.renaming() || self.fetch_waiting()) {
             // SAFETY: a timer of this window.
             unsafe { SetTimer(self.hwnd, TIMER_REFRESH, 1000, None) };
             return;
@@ -1398,6 +1429,7 @@ impl App {
             // of them was to select again, and a restored session's place.
             // This search is not made yet.
             self.enter_pending.set(false);
+            self.cancel_fetch();
             self.clear_note();
             self.forget_selection();
             self.drop_view();
@@ -1615,6 +1647,13 @@ impl App {
                     }
                 }
                 self.reselect_block(block);
+                if adopted.is_some() {
+                    // Other rows now: an action waiting for the old ones
+                    // cannot have them.
+                    self.cancel_fetch();
+                } else {
+                    self.fetch_arrived(epoch, block);
+                }
                 if incomplete || metadata_pending {
                     // SAFETY: a timer of this window.
                     unsafe { SetTimer(self.hwnd, TIMER_REFRESH, 1000, None) };
@@ -1643,6 +1682,8 @@ impl App {
                     m.partial_failure = Some(why.clone());
                     drop(m);
                     self.invalidate_status();
+                    // An action waiting for it acts on what is held.
+                    self.fetch_arrived(epoch, block);
                     return;
                 } else {
                     m.forget_request(block);
@@ -1664,6 +1705,10 @@ impl App {
                     self.enter_pending.set(false);
                     self.set_count(0, false);
                     self.warn_if_refused();
+                    self.cancel_fetch();
+                } else {
+                    // An action waiting for it acts on what is held.
+                    self.fetch_arrived(epoch, block);
                 }
                 if retry {
                     // SAFETY: a timer of this window.
