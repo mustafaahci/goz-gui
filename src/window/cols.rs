@@ -1,8 +1,8 @@
 //! The result list's columns as the user arranges them: shown or hidden
 //! (the header's right-click menu, a middle click to remove one, Reset
-//! Columns), dragged into another order, or resized. `crate::columns` holds
-//! the layout and its settings keys; this puts it on the list and reads
-//! the user's changes back.
+//! Columns), dragged into another order, resized, or sized to fit their
+//! text. `crate::columns` holds the layout and its settings keys; this puts
+//! it on the list and reads the user's changes back.
 //!
 //! Name is always the list's column 0 (the list view's item column), so
 //! it is never deleted; the others are deleted and inserted as they are
@@ -10,19 +10,19 @@
 //! array. `list_cols` maps a list column's index to its id for everything
 //! that gets an index from the list (custom draw, hit tests, clicks).
 
-use windows_sys::Win32::Foundation::POINT;
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::Foundation::{POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::{GetDC, InvalidateRect, ReleaseDC, SelectObject};
 use windows_sys::Win32::UI::Controls::{
     LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVM_DELETECOLUMN,
-    LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNWIDTH, LVM_INSERTCOLUMNW, LVM_SETCOLUMNORDERARRAY,
-    LVM_SETCOLUMNWIDTH,
+    LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNWIDTH, LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT,
+    LVM_GETTOPINDEX, LVM_INSERTCOLUMNW, LVM_SETCOLUMNORDERARRAY, LVM_SETCOLUMNWIDTH,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyMenu, PostMessageW};
 
 use super::{App, WM_COLUMNS, send};
 use crate::columns::{self, COL_NAME, COL_SIZE, COLS, Layout, TITLES};
-use crate::menu;
 use crate::wide::wz;
+use crate::{header, menu, paint};
 
 /// The list's columns by index: each one's id, `len` of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -198,19 +198,84 @@ impl App {
         }
     }
 
-    /// The header's right-click menu at `pt` (screen): Name (always on),
-    /// the other columns to show or hide, and Reset Columns.
-    pub fn header_menu(&self, pt: POINT) {
+    /// The width (at the window's DPI) the list's column `index` needs to
+    /// show its title and the text of every held row in view, as they are
+    /// drawn: Name with its icon, matches in bold.
+    fn fit_px(&self, index: usize) -> Option<i32> {
+        let id = self.column_id(index)?;
+        let title: Vec<u16> = TITLES[id].encode_utf16().collect();
+        let font = self.fonts.borrow().normal;
+        // SAFETY: a DC of this thread's list, measured in and given back;
+        // the old font is put back first.
+        let title_w = unsafe {
+            let hdc = GetDC(self.list);
+            let old = SelectObject(hdc, font);
+            let w = paint::width(hdc, &title);
+            SelectObject(hdc, old);
+            ReleaseDC(self.list, hdc);
+            w
+        };
+        let title_need = title_w + 2 * self.scale(header::TEXT_PAD);
+        let top = send(self.list, LVM_GETTOPINDEX, 0, 0).max(0) as usize;
+        let page = send(self.list, LVM_GETCOUNTPERPAGE, 0, 0).max(0) as usize;
+        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
+        // The rows in view, a partly shown one at the bottom included.
+        let rows = top..(top + page + 1).min(count);
+        let m = self.model.borrow();
+        let needs = rows
+            .filter_map(|i| m.peek(i))
+            .map(|row| paint::cell_text(self, &m, row, id, &RECT::default(), 0).need);
+        Some(columns::fit_width(title_need, needs))
+    }
+
+    /// Sizes the list's columns `indices` to fit their text, and keeps the
+    /// widths as the user's own.
+    fn size_to_fit(&self, indices: &[usize]) {
+        // All measured before any changes: a new width can bring a
+        // horizontal scroll bar, which changes the rows in view.
+        let widths: Vec<(usize, i32)> = indices
+            .iter()
+            .filter_map(|&i| Some((i, self.fit_px(i)?)))
+            .collect();
+        for (index, px) in widths {
+            send(self.list, LVM_SETCOLUMNWIDTH, index, px as isize);
+        }
+        self.sync_columns();
+    }
+
+    /// Size All Columns to Fit (the header menu, Ctrl+Num +).
+    pub(super) fn size_all_columns_to_fit(&self) {
+        let all: Vec<usize> = (0..self.list_cols.get().ids().len()).collect();
+        self.size_to_fit(&all);
+    }
+
+    /// The header's right-click menu at `pt` (screen), over the list's
+    /// column `on` (none from the keyboard, or right of the last column):
+    /// sizing that column or all of them to fit, removing it, Name (always
+    /// on), the other columns to show or hide, and Reset Columns.
+    pub fn header_menu(&self, pt: POINT, on: Option<usize>) {
         let layout = self.layout.get();
         let shown: [bool; COLS] = core::array::from_fn(|id| layout.is_shown(id));
-        let popup = menu::header_menu(&shown);
+        let on_id = on.and_then(|i| self.column_id(i));
+        let on = on.filter(|_| on_id.is_some());
+        let popup = menu::header_menu(&shown, on_id);
         let cmd = crate::popup::track(popup, self.hwnd, pt, "header menu", &|_| None);
         // SAFETY: the menu this function made.
         unsafe { DestroyMenu(popup) };
         let Ok(cmd) = u16::try_from(cmd) else {
             return;
         };
-        if cmd == menu::RESET_COLUMNS {
+        if cmd == menu::SIZE_COLUMN_TO_FIT {
+            if let Some(index) = on {
+                self.size_to_fit(&[index]);
+            }
+        } else if cmd == menu::SIZE_ALL_COLUMNS_TO_FIT {
+            self.size_all_columns_to_fit();
+        } else if cmd == menu::REMOVE_COLUMN {
+            if let Some(index) = on {
+                self.remove_column(index);
+            }
+        } else if cmd == menu::RESET_COLUMNS {
             self.change_columns(|l| {
                 let reset = Layout::default();
                 core::mem::replace(l, reset) != reset

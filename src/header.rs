@@ -11,7 +11,7 @@
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DrawTextW, HDC,
-    InvalidateRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    InvalidateRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDIS_SELECTED, CDRF_DODEFAULT,
@@ -30,6 +30,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::paint::fill;
 use crate::window::App;
 
+/// The space before and after an item's text, at 96 DPI.
+pub const TEXT_PAD: i32 = 6;
+
 /// The item at `pt` (the header's client coordinates).
 fn item_at(app: &App, pt: POINT) -> Option<usize> {
     let mut hit = HDHITTESTINFO {
@@ -39,6 +42,14 @@ fn item_at(app: &App, pt: POINT) -> Option<usize> {
     };
     let item = send(HDM_HITTEST, 0, (&raw mut hit) as isize, app);
     usize::try_from(item).ok()
+}
+
+/// The item at `pt` (the screen).
+pub fn item_at_screen(app: &App, pt: POINT) -> Option<usize> {
+    let mut at = pt;
+    // SAFETY: maps a point into this thread's header.
+    unsafe { ScreenToClient(app.header, &mut at) };
+    item_at(app, at)
 }
 
 fn client_point(l: LPARAM) -> POINT {
@@ -79,21 +90,23 @@ pub unsafe extern "system" fn subclass_proc(
             }
         }
         WM_CONTEXTMENU => {
+            // The point is on the screen.
             let pt = client_point(l);
             // From the keyboard (-1, -1) there is no item: the menu goes at
             // the header's corner.
-            let pt = if l == -1 {
+            let (pt, item) = if l == -1 {
                 let mut rc = RECT::default();
                 // SAFETY: reads this thread's header's place.
                 unsafe { GetWindowRect(hwnd, &mut rc) };
-                POINT {
+                let corner = POINT {
                     x: rc.left,
                     y: rc.bottom,
-                }
+                };
+                (corner, None)
             } else {
-                pt
+                (pt, item_at_screen(app, pt))
             };
-            app.header_menu(pt);
+            app.header_menu(pt, item);
             return 0;
         }
         WM_MBUTTONUP => {
@@ -221,7 +234,7 @@ fn item(app: &App, cd: &NMCUSTOMDRAW) {
         );
     }
 
-    let pad = app.scale(6);
+    let pad = app.scale(TEXT_PAD);
     let mut text_rc = RECT {
         left: rc.left + pad,
         right: rc.right - pad,

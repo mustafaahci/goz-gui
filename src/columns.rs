@@ -5,24 +5,37 @@
 //! to the window's DPI when shown.
 //!
 //! Name is always shown (Everything has no `name_column_visible`); the
-//! others can be removed and shown again.
+//! others can be removed and shown again. Extension and Type start hidden,
+//! as in Everything.
 
 /// The columns, by id. An id is also the column's place in Everything's
 /// default order.
 pub const COL_NAME: usize = 0;
 pub const COL_PATH: usize = 1;
 pub const COL_SIZE: usize = 2;
-pub const COL_DATE: usize = 3;
-pub const COLS: usize = 4;
+pub const COL_EXT: usize = 3;
+pub const COL_TYPE: usize = 4;
+pub const COL_DATE: usize = 5;
+pub const COLS: usize = 6;
 
-pub const TITLES: [&str; COLS] = ["Name", "Path", "Size", "Date Modified"];
+pub const TITLES: [&str; COLS] = ["Name", "Path", "Size", "Extension", "Type", "Date Modified"];
 
 /// The settings file's name for each column: `<key>_column_width` and so on.
 /// Date Modified is Everything's `last_write_time`.
-const KEYS: [&str; COLS] = ["name", "path", "size", "last_write_time"];
+const KEYS: [&str; COLS] = [
+    "name",
+    "path",
+    "size",
+    "extension",
+    "type",
+    "last_write_time",
+];
 
 /// Everything's default widths, at 96 DPI.
-pub const DEFAULT_WIDTHS: [i32; COLS] = [256, 256, 96, 153];
+pub const DEFAULT_WIDTHS: [i32; COLS] = [256, 256, 96, 96, 153, 153];
+
+/// Whether each column is shown when the file does not say.
+const DEFAULT_SHOWN: [bool; COLS] = [true, true, true, false, false, true];
 
 /// The widest a column is kept; wider values in the file are taken as this.
 const MAX_WIDTH: i32 = 8192;
@@ -46,12 +59,12 @@ impl PartialEq for Layout {
 }
 
 impl Default for Layout {
-    /// Everything's default: all four, in id order.
+    /// Everything's default: Name, Path, Size and Date Modified.
     fn default() -> Layout {
         Layout {
             widths: DEFAULT_WIDTHS,
-            order: [COL_NAME, COL_PATH, COL_SIZE, COL_DATE],
-            shown: COLS,
+            order: [COL_NAME, COL_PATH, COL_SIZE, COL_DATE, COL_EXT, COL_TYPE],
+            shown: 4,
         }
     }
 }
@@ -62,18 +75,25 @@ fn number(text: Option<&str>) -> Option<i32> {
 
 impl Layout {
     /// Reads the layout from the settings' keys; `get` looks one up. A key
-    /// missing or unreadable takes Everything's default.
+    /// missing or unreadable takes Everything's default (so a file written
+    /// before a column existed has it as Everything would).
     pub fn from_keys<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Layout {
         let mut layout = Layout::default();
+        let visible: [bool; COLS] = core::array::from_fn(|id| {
+            id == COL_NAME
+                || number(get(&format!("{}_column_visible", KEYS[id])))
+                    .map_or(DEFAULT_SHOWN[id], |v| v != 0)
+        });
         let mut shown: Vec<(i32, usize)> = Vec::new();
         for (id, key) in KEYS.into_iter().enumerate() {
             if let Some(w) = number(get(&format!("{key}_column_width"))) {
                 layout.widths[id] = w.clamp(0, MAX_WIDTH);
             }
-            let visible = id == COL_NAME
-                || number(get(&format!("{key}_column_visible"))).is_none_or(|v| v != 0);
-            if visible {
-                let pos = number(get(&format!("{key}_column_pos"))).unwrap_or(id as i32);
+            if visible[id] {
+                // Without one, its place among the shown columns in the
+                // default order, as Everything writes it.
+                let place = visible[..id].iter().filter(|&&v| v).count() as i32;
+                let pos = number(get(&format!("{key}_column_pos"))).unwrap_or(place);
                 shown.push((pos, id));
             }
         }
@@ -177,6 +197,13 @@ impl Layout {
     }
 }
 
+/// The width a column sized to fit gets: as wide as its title (`title`, the
+/// width it needs) and every cell measured (`cells`; an empty one needs 0),
+/// and never wider than a column is kept.
+pub fn fit_width(title: i32, cells: impl IntoIterator<Item = i32>) -> i32 {
+    cells.into_iter().fold(title, i32::max).clamp(0, MAX_WIDTH)
+}
+
 /// `width` pixels at `dpi` as a 96-DPI width, rounded to the nearest.
 pub fn unscale(width: i32, dpi: u32) -> i32 {
     let dpi = dpi.max(1) as i32;
@@ -209,8 +236,8 @@ mod tests {
 
     #[test]
     fn everythings_own_keys_are_read() {
-        // As Everything 1.5 writes them: the hidden Extension column shares
-        // position 3 with Date Modified, which does not matter here.
+        // As Everything 1.5 writes them; Extension and Type, not given, stay
+        // hidden.
         let layout = read(&[
             ("name_column_pos", "0"),
             ("name_column_width", "300"),
@@ -261,7 +288,51 @@ mod tests {
         assert_eq!(get("size_column_visible"), Some("0"));
         assert_eq!(get("size_column_pos"), Some("3"));
         assert_eq!(get("name_column_visible"), None, "Everything has none");
-        assert_eq!(keys.len(), 11);
+        assert_eq!(keys.len(), 17);
+    }
+
+    #[test]
+    fn extension_and_type_use_everythings_keys() {
+        // Everything 1.5's own defaults, as its file has them.
+        let defaults = read(&[
+            ("size_column_pos", "2"),
+            ("extension_column_visible", "0"),
+            ("extension_column_pos", "3"),
+            ("extension_column_width", "96"),
+            ("type_column_visible", "0"),
+            ("type_column_pos", "4"),
+            ("type_column_width", "153"),
+            ("last_write_time_column_visible", "1"),
+            ("last_write_time_column_pos", "3"),
+        ]);
+        assert_eq!(defaults, Layout::default());
+        // A file from before they existed leaves them hidden.
+        assert_eq!(read(&[("size_column_pos", "2")]), Layout::default());
+        // Shown with no places: in the default order.
+        let both = read(&[
+            ("extension_column_visible", "1"),
+            ("type_column_visible", "1"),
+        ]);
+        assert_eq!(
+            both.shown(),
+            [COL_NAME, COL_PATH, COL_SIZE, COL_EXT, COL_TYPE, COL_DATE]
+        );
+        // Shown, they go where Everything puts them, and read back.
+        let mut layout = Layout::default();
+        assert!(layout.show(COL_TYPE));
+        assert!(layout.show(COL_EXT));
+        layout.set_width(COL_TYPE, 200);
+        assert_eq!(
+            layout.shown(),
+            [COL_NAME, COL_PATH, COL_SIZE, COL_EXT, COL_TYPE, COL_DATE]
+        );
+        let keys = layout.to_keys();
+        let pairs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert!(pairs.contains(&("extension_column_visible", "1")));
+        assert!(pairs.contains(&("type_column_pos", "4")));
+        assert!(pairs.contains(&("type_column_width", "200")));
+        assert_eq!(read(&pairs), layout);
+        assert_eq!(read(&pairs).width(COL_TYPE), 200);
     }
 
     #[test]
@@ -286,6 +357,15 @@ mod tests {
         assert_eq!(layout.shown(), [COL_NAME, COL_PATH, COL_SIZE]);
         layout.set_order(&[COL_SIZE, COL_PATH, COL_NAME]);
         assert_eq!(layout.shown(), [COL_SIZE, COL_PATH, COL_NAME]);
+    }
+
+    #[test]
+    fn a_fitted_column_takes_its_widest_text() {
+        assert_eq!(fit_width(60, [120, 0, 90]), 120);
+        // Short cells (or none in view): the title's width.
+        assert_eq!(fit_width(60, [10, 0]), 60);
+        assert_eq!(fit_width(60, []), 60);
+        assert_eq!(fit_width(60, [100_000]), MAX_WIDTH);
     }
 
     #[test]

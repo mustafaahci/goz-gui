@@ -35,6 +35,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, DragAcceptFiles, HDROP, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use crate::celltip::{self, CellTip};
 use crate::client::{BLOCK_ROWS, Failure, Job, Reply, Search, Worker};
 use crate::columns::Layout;
 use crate::copytext::{self, Field};
@@ -51,13 +52,14 @@ use crate::settings::{OnTop, Settings};
 use crate::status::Indicator;
 use crate::store::writer::Writer;
 use crate::theme::{Palette, ThemeMode};
+use crate::typeahead::TypeAhead;
 use crate::wide::{is_wide, window_text, wz};
 use crate::{
     dialog, dropdown, format, header, hover, keys, menu, msgbox, paint, places, searchbox, shell,
     status, syntax, theme,
 };
 
-pub use crate::columns::{COL_DATE, COL_NAME, COL_PATH, COL_SIZE, COLS};
+pub use crate::columns::{COL_DATE, COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE, COLS};
 
 mod background;
 mod bookmarks;
@@ -74,6 +76,7 @@ mod results;
 mod runs;
 mod searches;
 mod session;
+mod typing;
 
 pub const WM_REPLY: u32 = WM_APP + 1;
 pub const WM_ICON: u32 = WM_APP + 2;
@@ -220,6 +223,10 @@ pub struct App {
     pub search_pressed: Cell<Option<Button>>,
     /// The search box buttons' tooltips.
     pub tooltip: Cell<HWND>,
+    /// The full text of a result cell cut off by its column.
+    pub cell_tip: CellTip,
+    /// The letters typed into the list to go to a name.
+    type_ahead: RefCell<TypeAhead>,
     /// The search history dropdown.
     pub dropdown: Dropdown,
     /// The searches made, newest first (read from the data folder).
@@ -725,6 +732,8 @@ impl App {
                 search_hot: Cell::new(None),
                 search_pressed: Cell::new(None),
                 tooltip: Cell::new(core::ptr::null_mut()),
+                cell_tip: CellTip::default(),
+                type_ahead: RefCell::new(TypeAhead::default()),
                 dropdown: Dropdown::new(),
                 search_history: RefCell::new(history),
                 searches,
@@ -805,6 +814,7 @@ impl App {
         send(self.edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
         dropdown::create(self);
         self.tooltip.set(searchbox::create_tooltip(self));
+        celltip::create(self);
         self.apply_fonts();
         theme::set_app_mode(self.theme_mode.get());
         self.apply_theme();
@@ -857,6 +867,7 @@ impl App {
         let font = self.fonts.borrow().normal;
         send(self.edit, WM_SETFONT, font as usize, 1);
         send(self.list, WM_SETFONT, font as usize, 1);
+        celltip::set_font(self);
     }
 
     /// The title bar and taskbar icons at the sizes this DPI wants, which
@@ -955,6 +966,7 @@ impl App {
         dialog::set_app_look(self.dialog_look());
         dropdown::apply_theme(self);
         searchbox::theme_tooltip(self, dark);
+        celltip::set_theme(self, dark);
         theme::flush_menus();
         // SAFETY: repaints this thread's windows.
         unsafe {
@@ -1155,7 +1167,7 @@ impl App {
                         && l != -1
                         && self.over_header(point(l))
                     {
-                        self.header_menu(point(l));
+                        self.header_menu(point(l), header::item_at_screen(self, point(l)));
                         0
                     } else if w as HWND == self.list {
                         self.list_menu(l);
@@ -1209,6 +1221,8 @@ impl App {
                         self.retry_writes();
                     } else if w == TIMER_SETTLE {
                         self.settle_tick();
+                    } else if w == celltip::TIMER {
+                        celltip::timer(self);
                     }
                     0
                 }
@@ -1448,7 +1462,8 @@ impl App {
         }
     }
 
-    /// Text for accessibility tools and the list's own type-ahead.
+    /// Text for accessibility tools (the list's own type-ahead never runs:
+    /// `list_proc` keeps the typed characters for goz-gui's).
     fn disp_info(&self, info: &mut NMLVDISPINFOW) {
         if info.item.mask & LVIF_TEXT == 0
             || info.item.pszText.is_null()
@@ -1972,7 +1987,14 @@ impl App {
             COL_NAME => SortKey::Name,
             COL_PATH => SortKey::Path,
             COL_SIZE => SortKey::Size,
-            _ => SortKey::DateModified,
+            COL_DATE => SortKey::DateModified,
+            // gozd sorts by these four only: the sort stays, and the status
+            // bar says why for a moment.
+            _ => {
+                let title = crate::columns::TITLES.get(col).copied().unwrap_or("it");
+                self.show_note(format!("goz can't sort by {title} yet"));
+                return;
+            }
         });
     }
 
@@ -2204,7 +2226,11 @@ unsafe extern "system" fn list_proc(
                 hover::moved(app, pt);
             }
             WM_MOUSELEAVE => hover::left(app),
-            WM_LBUTTONDOWN => app.last_click.set(point(l)),
+            WM_LBUTTONDOWN => {
+                celltip::hide(app);
+                app.last_click.set(point(l));
+            }
+            WM_RBUTTONDOWN | WM_MBUTTONDOWN => celltip::hide(app),
             // Rename's box, the list's child, in the list's colours.
             WM_CTLCOLOREDIT => {
                 let pal = app.pal.get();
@@ -2217,10 +2243,12 @@ unsafe extern "system" fn list_proc(
             // wanted.
             WM_SETFOCUS => {
                 let r = DefSubclassProc(hwnd, msg, w, l);
+                app.reset_type_ahead();
                 app.record_search();
                 return r;
             }
             WM_KEYDOWN => {
+                celltip::hide(app);
                 let cmd = keys::list_command(
                     w as u16,
                     key_down(VK_CONTROL),
@@ -2235,9 +2263,16 @@ unsafe extern "system" fn list_proc(
                 hover::scrolled(app);
                 return r;
             }
-            // The characters of the keys above (Enter, Esc, Ctrl+A…); the
-            // list's type-ahead wants printable ones only.
-            WM_CHAR if w < 0x20 => return 0,
+            // The characters of the keys above (Enter, Esc, Ctrl+A…, and
+            // Ctrl+Backspace's DEL) do nothing more.
+            WM_CHAR if w < 0x20 || w == 0x7f => return 0,
+            // Printable ones go to goz-gui's own type-ahead, never the
+            // list's, which would ask for rows it cannot search
+            // (LVN_ODFINDITEMW).
+            WM_CHAR => {
+                app.type_ahead(w as u16);
+                return 0;
+            }
             // Rows move under a mouse that stays put.
             WM_MOUSEWHEEL | WM_VSCROLL | WM_HSCROLL => {
                 let r = DefSubclassProc(hwnd, msg, w, l);

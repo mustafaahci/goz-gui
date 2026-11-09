@@ -25,8 +25,8 @@ use crate::format;
 use crate::highlight::Span;
 use crate::icons::{PENDING, UNSET};
 use crate::theme::Palette;
-use crate::window::{App, COL_DATE, COL_NAME, COL_PATH, COL_SIZE, Fonts};
-use crate::{searchbox, status};
+use crate::window::{App, COL_DATE, COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE, Fonts};
+use crate::{copytext, filetype, searchbox, status};
 
 /// The space inside a cell before and after its text, at 96 DPI.
 const CELL_PAD: i32 = 6;
@@ -174,6 +174,9 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                         runs(hdc, &inner, &text, &[], &fonts, true);
                     }
                 }
+                COL_EXT => runs(hdc, &inner, filetype::of_row(row), &[], &fonts, false),
+                // Looked up once per extension (`filetype`), then kept.
+                COL_TYPE => runs(hdc, &inner, &filetype::name(row), &[], &fonts, false),
                 COL_DATE => {
                     if let Some(ft) = row.mtime {
                         scratch.text.clear();
@@ -198,12 +201,89 @@ pub fn width(hdc: HDC, text: &[u16]) -> i32 {
     size.cx
 }
 
-/// Draws `text` in `rc`, bold over `spans`, ending in an ellipsis when it
-/// does not fit. `right` aligns it to the right edge when it fits.
-fn runs(hdc: HDC, rc: &RECT, text: &[u16], spans: &[Span], fonts: &Fonts, right: bool) {
-    if text.is_empty() || rc.right <= rc.left {
-        return;
+/// A cell's text in full: what it says, and where it goes in the list's
+/// client coordinates when it shows whole.
+pub struct CellText {
+    pub text: Vec<u16>,
+    /// The text's left edge and top (the row's text line), and its width.
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    /// The width the cell needs to show it all, padding (and Name's icon)
+    /// included; 0 for an empty cell.
+    pub need: i32,
+}
+
+/// Measures cell `col` of `row` (`row_rc`, in the list's client
+/// coordinates; the cell's left edge at `left`) as `row` draws it: the
+/// text with its matches in bold, inside the padding, after Name's icon.
+pub fn cell_text(
+    app: &App,
+    m: &crate::model::Model,
+    row: &crate::client::Row,
+    col: usize,
+    row_rc: &RECT,
+    left: i32,
+) -> CellText {
+    let mut text = Vec::new();
+    copytext::push(row, copytext::Field::of_column(col), &mut text);
+    let (mut folded, mut name_spans, mut parent_spans) = (Vec::new(), Vec::new(), Vec::new());
+    if col == COL_NAME || col == COL_PATH {
+        m.highlight.spans(
+            &row.path,
+            row.name_start as usize,
+            &mut folded,
+            &mut name_spans,
+            &mut parent_spans,
+        );
     }
+    let spans: &[Span] = match col {
+        COL_NAME => &name_spans,
+        COL_PATH => &parent_spans,
+        _ => &[],
+    };
+    let fonts = app.fonts.borrow();
+    // SAFETY: a DC of this thread's list, measured in and given back; the
+    // old font is put back first.
+    let w = unsafe {
+        let hdc = GetDC(app.list);
+        let old = SelectObject(hdc, fonts.normal);
+        let w = parts(&text, spans, &fonts)
+            .iter()
+            .map(|&(s, e, f)| {
+                SelectObject(hdc, f);
+                width(hdc, &text[s..e])
+            })
+            .sum::<i32>();
+        SelectObject(hdc, old);
+        ReleaseDC(app.list, hdc);
+        w
+    };
+    let pad = app.scale(CELL_PAD);
+    let lead = if col == COL_NAME {
+        let (mut cx, mut cy) = (0, 0);
+        // SAFETY: reads the size of the system image list's icons.
+        unsafe { ImageList_GetIconSize(app.icons.list, &mut cx, &mut cy) };
+        cx + app.scale(ICON_GAP)
+    } else {
+        0
+    };
+    CellText {
+        x: left + pad + lead,
+        y: row_rc.top + (row_rc.bottom - row_rc.top - fonts.height) / 2,
+        width: w,
+        need: if text.is_empty() {
+            0
+        } else {
+            2 * pad + lead + w
+        },
+        text,
+    }
+}
+
+/// `text` cut where `spans` start and end, each part with its font: bold
+/// over the spans.
+fn parts(text: &[u16], spans: &[Span], fonts: &Fonts) -> Vec<(usize, usize, HFONT)> {
     let mut parts: Vec<(usize, usize, HFONT)> = Vec::with_capacity(spans.len() * 2 + 1);
     let mut at = 0;
     for &(s, e) in spans {
@@ -219,6 +299,16 @@ fn runs(hdc: HDC, rc: &RECT, text: &[u16], spans: &[Span], fonts: &Fonts, right:
     if at < text.len() {
         parts.push((at, text.len(), fonts.normal));
     }
+    parts
+}
+
+/// Draws `text` in `rc`, bold over `spans`, ending in an ellipsis when it
+/// does not fit. `right` aligns it to the right edge when it fits.
+fn runs(hdc: HDC, rc: &RECT, text: &[u16], spans: &[Span], fonts: &Fonts, right: bool) {
+    if text.is_empty() || rc.right <= rc.left {
+        return;
+    }
+    let parts = parts(text, spans, fonts);
     let y = rc.top + (rc.bottom - rc.top - fonts.height) / 2;
     // SAFETY: draws into `hdc`, clipped to `rc`.
     unsafe {
