@@ -12,21 +12,19 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, RECT};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetWindowPlacement, PostMessageW, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SetTimer,
-    WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
-};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SetTimer};
 
 use super::{App, TIMER_SETTINGS, TIMER_STORE_RETRY, WM_STORE};
 use crate::bookmarks::one_line;
-use crate::placement::{self, Rect};
+use crate::placement;
 use crate::settings::{Settings, WindowPos};
 use crate::store::file::{self, Loaded};
 use crate::store::ini::Ini;
 use crate::store::location::{self, SETTINGS_FILE};
 use crate::store::{IniWrites, writer::Writer};
 use crate::wide::window_text;
+use crate::{places, syntax};
 
 /// How long after the last change the settings are written.
 const SAVE_DELAY_MS: u32 = 1000;
@@ -144,23 +142,6 @@ impl Prefs {
     }
 }
 
-/// `ws` in workspace coordinates (GetWindowPlacement's: relative to the
-/// work area of the monitor the window is on) as screen coordinates. The
-/// monitor is the one whose offset puts the window mostly on itself.
-fn workspace_to_screen(ws: Rect, monitors: &[placement::Monitor]) -> Rect {
-    for (i, m) in monitors.iter().enumerate() {
-        let screen = Rect {
-            x: ws.x + m.work.x - m.area.x,
-            y: ws.y + m.work.y - m.area.y,
-            ..ws
-        };
-        if placement::monitor_of(&screen, monitors) == Some(i) {
-            return screen;
-        }
-    }
-    ws
-}
-
 impl App {
     /// A setting changed: the file is written once they stop changing.
     pub(super) fn settings_changed(&self) {
@@ -171,35 +152,11 @@ impl App {
     /// The window's normal rectangle (screen pixels, with the DPI there),
     /// and whether it is maximized (or minimized from maximized).
     pub(super) fn placement_now(&self) -> (Option<WindowPos>, bool) {
-        let mut wp = WINDOWPLACEMENT {
-            length: size_of::<WINDOWPLACEMENT>() as u32,
-            // SAFETY: the rest of WINDOWPLACEMENT is plain data.
-            ..unsafe { core::mem::zeroed() }
+        let (pos, maximized) = match placement::normal_place(self.hwnd) {
+            Some((pos, maximized)) => (Some(pos), maximized),
+            None => (None, false),
         };
-        // SAFETY: reads this thread's window's placement into `wp`.
-        if unsafe { GetWindowPlacement(self.hwnd, &mut wp) } == 0 {
-            return (None, false);
-        }
-        let ws = Rect::from_win(&wp.rcNormalPosition);
-        let r = workspace_to_screen(ws, &placement::monitors());
-        let rc = RECT {
-            left: r.x,
-            top: r.y,
-            right: r.x + r.w,
-            bottom: r.y + r.h,
-        };
-        let pos = (r.w > 0 && r.h > 0).then(|| WindowPos {
-            x: r.x,
-            y: r.y,
-            width: r.w,
-            height: r.h,
-            dpi: Some(placement::dpi_at(&rc)),
-        });
-        let show = wp.showCmd as i32;
-        let maximized = show == SW_SHOWMAXIMIZED
-            || (show == SW_SHOWMINIMIZED && wp.flags & WPF_RESTORETOMAXIMIZED != 0)
-            || self.maximize_deferred.get();
-        (pos, maximized)
+        (pos, maximized || self.maximize_deferred.get())
     }
 
     /// The settings as the window has them now.
@@ -222,6 +179,10 @@ impl App {
         s.on_top = self.on_top.get();
         s.status_bar = self.status_bar_visible();
         s.columns = self.layout.get();
+        // The dialogs' places, the Search Syntax window's as it is now if
+        // it is open.
+        syntax::keep_place();
+        s.places = places::all();
         s
     }
 
@@ -343,11 +304,6 @@ pub(super) fn writer() -> Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::placement::Monitor;
-
-    fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
-        Rect { x, y, w, h }
-    }
 
     #[test]
     fn a_failed_write_is_tried_again_sooner_then_later() {
@@ -361,36 +317,5 @@ mod tests {
         assert_eq!(retry_delay(10_000, Some(ms(1600))), 20_000);
         assert_eq!(retry_delay(40_000, Some(ms(5))), 60_000);
         assert_eq!(retry_delay(60_000, Some(ms(5))), 60_000);
-    }
-
-    #[test]
-    fn workspace_coordinates_to_screen() {
-        // A taskbar on the left of the primary monitor, 60 px wide; a
-        // second monitor to the right with none.
-        let monitors = [
-            Monitor {
-                area: r(0, 0, 1920, 1080),
-                work: r(60, 0, 1860, 1080),
-                dpi: 96,
-            },
-            Monitor {
-                area: r(1920, 0, 1920, 1080),
-                work: r(1920, 0, 1920, 1080),
-                dpi: 96,
-            },
-        ];
-        assert_eq!(
-            workspace_to_screen(r(100, 50, 800, 600), &monitors),
-            r(160, 50, 800, 600)
-        );
-        assert_eq!(
-            workspace_to_screen(r(2000, 50, 800, 600), &monitors),
-            r(2000, 50, 800, 600)
-        );
-        // Nowhere: as it is.
-        assert_eq!(
-            workspace_to_screen(r(9000, 50, 800, 600), &monitors),
-            r(9000, 50, 800, 600)
-        );
     }
 }

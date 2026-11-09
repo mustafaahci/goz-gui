@@ -35,12 +35,13 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetDlgItem, IDYES, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO,
-    MessageBoxW, SendMessageW, SetWindowTextW, WM_APP,
+    SendMessageW, SetWindowTextW, WM_APP,
 };
 
 use crate::bookmarks::ops::Op;
 use crate::bookmarks::tree::{Item, TOP, Tree};
 use crate::bookmarks::{Bookmarks, FolderPath, Settings, within};
+use crate::msgbox;
 use crate::wide::wz;
 
 /// Posted to an open Find or Organize dialog when the bookmarks changed
@@ -90,8 +91,7 @@ fn set_text(hwnd: HWND, text: &str) {
 }
 
 fn message(owner: HWND, title: &str, text: &str, style: u32) -> i32 {
-    // SAFETY: NUL-terminated strings for a modal box owned by `owner`.
-    unsafe { MessageBoxW(owner, wz(text).as_ptr(), wz(title).as_ptr(), style) }
+    msgbox::show(owner, text, title, style)
 }
 
 /// Tells the user something went wrong with the bookmarks.

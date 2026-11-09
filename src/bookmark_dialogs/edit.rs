@@ -25,15 +25,20 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWi
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST,
     EN_CHANGE, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, EndDialog, GWLP_USERDATA, GetParent,
-    GetWindowRect, GetWindowTextLengthW, IDCANCEL, IDOK, SetWindowLongPtrW, WM_CHAR, WM_COMMAND,
-    WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY, WM_NCPAINT, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
+    GetWindowRect, GetWindowTextLengthW, IDCANCEL, IDOK, MINMAXINFO, SetWindowLongPtrW, WM_CHAR,
+    WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY, WM_NCPAINT,
+    WM_SIZE, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::{enable, item, send, set_text};
 use crate::bookmarks::{Fields, SORT_KEYS, one_line, sort_name};
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common, state};
+use crate::dialog::{
+    Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, anchor, apply_theme,
+    center_on_owner, common, state,
+};
 use crate::filter::Filter;
 use crate::paint::fill;
+use crate::places::{self, Which};
 use crate::theme::Palette;
 use crate::wide::{window_text, wz};
 
@@ -46,8 +51,36 @@ const ID_FILTER: u16 = 104;
 const ID_SORT: u16 = 105;
 const ID_DIR: u16 = 106;
 const ID_SEARCH_MODE: u16 = 107;
+const ID_FILTER_LABEL: u16 = 108;
+const ID_SORT_LABEL: u16 = 109;
 const OK: u16 = IDOK as u16;
 const CANCEL: u16 = IDCANCEL as u16;
+
+/// The template's size, in dialog units: the editor's smallest.
+const SIZE: (i16, i16) = (280, 172);
+/// Where the controls that follow the editor's size are in the template.
+const NAME: Units = (72, 7, 201, 14);
+const SEARCH: Units = (132, 61, 141, 40);
+const FILTER_LABEL: Units = (7, 109, 62, 8);
+const FILTER: Units = (72, 107, 201, 140);
+const SORT_LABEL: Units = (7, 127, 62, 8);
+const SORT: Units = (72, 125, 140, 100);
+const DIR: Units = (216, 125, 57, 60);
+const OK_AT: Units = (169, 151, 50, 14);
+const CANCEL_AT: Units = (223, 151, 50, 14);
+/// How they follow it: the boxes and lists wider, the search taller (the
+/// rows below it lower), the buttons at the bottom right.
+const ANCHORS: [(u16, Units, u8); 9] = [
+    (ID_NAME, NAME, GROW_X),
+    (ID_SEARCH, SEARCH, GROW_X | GROW_Y),
+    (ID_FILTER_LABEL, FILTER_LABEL, MOVE_Y),
+    (ID_FILTER, FILTER, MOVE_Y | GROW_X),
+    (ID_SORT_LABEL, SORT_LABEL, MOVE_Y),
+    (ID_SORT, SORT, MOVE_Y | GROW_X),
+    (ID_DIR, DIR, MOVE_X | MOVE_Y),
+    (OK, OK_AT, MOVE_X | MOVE_Y),
+    (CANCEL, CANCEL_AT, MOVE_X | MOVE_Y),
+];
 
 /// The match options' choices, Everything's.
 const TRI: [&str; 3] = ["(No change)", "Enabled", "Disabled"];
@@ -129,6 +162,8 @@ struct Edit {
     sorts: Vec<String>,
     look: Cell<Look>,
     result: RefCell<Option<Fields>>,
+    /// The editor's size as it opened, the smallest it can be made.
+    min: Cell<(i32, i32)>,
 }
 
 /// Shows the editor titled `title` over `owner` with `fields`; the fields
@@ -144,11 +179,12 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
         sorts,
         look: Cell::new(look),
         result: RefCell::new(None),
+        min: Cell::new((0, 0)),
     };
     let label = SS_LEFT;
     let combo = WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32;
-    let (lx, lw, fx, fw) = (7, 62, 72, 201);
-    let mut t = Template::new(title, 0, 280, 172);
+    let (lx, lw, fx) = (7, 62, 72);
+    let mut t = Template::new(title, WS_THICKFRAME, SIZE.0, SIZE.1);
     t.control(Class::Static, "&Name:", STATIC, label, 0, (lx, 9, lw, 8))
         .control(
             Class::Edit,
@@ -156,7 +192,7 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
             ID_NAME,
             WS_TABSTOP | ES_AUTOHSCROLL as u32,
             WS_EX_CLIENTEDGE,
-            (fx, 7, fw, 14),
+            NAME,
         )
         .control(
             Class::Static,
@@ -206,57 +242,29 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
             ID_SEARCH,
             WS_TABSTOP | WS_VSCROLL | (ES_MULTILINE | ES_AUTOVSCROLL) as u32,
             WS_EX_CLIENTEDGE,
-            (fx + 60, 61, fw - 60, 40),
+            SEARCH,
         )
         .control(
             Class::Static,
             "&Filter:",
-            STATIC,
+            ID_FILTER_LABEL,
             label,
             0,
-            (lx, 109, lw, 8),
+            FILTER_LABEL,
         )
-        .control(
-            Class::Named("ComboBox"),
-            "",
-            ID_FILTER,
-            combo,
-            0,
-            (fx, 107, fw, 140),
-        )
-        .control(Class::Static, "Sor&t:", STATIC, label, 0, (lx, 127, lw, 8))
-        .control(
-            Class::Named("ComboBox"),
-            "",
-            ID_SORT,
-            combo,
-            0,
-            (fx, 125, 140, 100),
-        )
-        .control(
-            Class::Named("ComboBox"),
-            "",
-            ID_DIR,
-            combo,
-            0,
-            (fx + 144, 125, fw - 144, 60),
-        )
+        .control(Class::Named("ComboBox"), "", ID_FILTER, combo, 0, FILTER)
+        .control(Class::Static, "Sor&t:", ID_SORT_LABEL, label, 0, SORT_LABEL)
+        .control(Class::Named("ComboBox"), "", ID_SORT, combo, 0, SORT)
+        .control(Class::Named("ComboBox"), "", ID_DIR, combo, 0, DIR)
         .control(
             Class::Button,
             "OK",
             OK,
             WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
             0,
-            (169, 151, 50, 14),
+            OK_AT,
         )
-        .control(
-            Class::Button,
-            "Cancel",
-            CANCEL,
-            WS_TABSTOP,
-            0,
-            (223, 151, 50, 14),
-        );
+        .control(Class::Button, "Cancel", CANCEL, WS_TABSTOP, 0, CANCEL_AT);
     t.run(owner, Some(edit_proc), (&raw const state) as LPARAM);
     state.result.into_inner()
 }
@@ -323,6 +331,17 @@ impl Edit {
         unsafe { SetWindowSubclass(item(dlg, ID_SEARCH), Some(search_proc), 1, 0) };
         apply_theme(dlg, self.look.get().dark);
         center_on_owner(dlg);
+        let mut wr = RECT::default();
+        // SAFETY: reads this thread's dialog.
+        unsafe { GetWindowRect(dlg, &mut wr) };
+        self.min.set((wr.right - wr.left, wr.bottom - wr.top));
+        places::restore(
+            dlg,
+            Which::BookmarkEdit,
+            core::ptr::null_mut(),
+            self.min.get(),
+        );
+        anchor(dlg, SIZE, &ANCHORS);
     }
 
     /// The fields as the dialog shows them.
@@ -496,6 +515,22 @@ unsafe extern "system" fn edit_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_COMMAND => {
             let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
             isize::from(s.command(dlg, id, code))
+        }
+        WM_SIZE => {
+            anchor(dlg, SIZE, &ANCHORS);
+            1
+        }
+        WM_GETMINMAXINFO => {
+            let (w, h) = s.min.get();
+            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
+            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
+            mmi.ptMinTrackSize.x = w;
+            mmi.ptMinTrackSize.y = h;
+            1
+        }
+        WM_DESTROY => {
+            places::keep(dlg, Which::BookmarkEdit, core::ptr::null_mut());
+            0
         }
         _ => 0,
     }

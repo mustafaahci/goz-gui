@@ -24,6 +24,7 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::paint::fill;
+use crate::places::{self, Which};
 use crate::theme::{self, Palette};
 use crate::wide::wz;
 use crate::window::app_icon;
@@ -158,7 +159,8 @@ pub fn show(owner: HWND, dark: bool) {
                 return;
             }
         }
-        // Centred on the main window, at its scale.
+        // Centred on the main window, at its scale; then where it was last
+        // (`places`).
         let dpi = GetDpiForWindow(owner).max(96) as i32;
         let (w, h) = (720 * dpi / 96, 600 * dpi / 96);
         let mut rc = RECT::default();
@@ -208,9 +210,27 @@ pub fn show(owner: HWND, dark: bool) {
         SetWindowTextW(edit, body.as_ptr());
         SendMessageW(edit, EM_SETSEL, 0, 0);
         apply_theme(dark);
+        places::restore(
+            hwnd,
+            Which::SearchSyntax,
+            core::ptr::null_mut(),
+            (w / 3, h / 4),
+        );
         layout(hwnd);
-        ShowWindow(hwnd, SW_SHOWNORMAL);
+        // Shown already when it opens maximized.
+        if IsWindowVisible(hwnd) == 0 {
+            ShowWindow(hwnd, SW_SHOWNORMAL);
+        }
         SetFocus(edit);
+    }
+}
+
+/// Keeps where the window is, if it is open (the settings are about to be
+/// written).
+pub fn keep_place() {
+    let hwnd = OPEN.get();
+    if !hwnd.is_null() {
+        places::keep(hwnd, Which::SearchSyntax, core::ptr::null_mut());
     }
 }
 
@@ -347,6 +367,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 0
             }
             WM_DESTROY => {
+                places::keep(hwnd, Which::SearchSyntax, core::ptr::null_mut());
                 OPEN.set(core::ptr::null_mut());
                 let font = FONT.replace(core::ptr::null_mut());
                 if !font.is_null() {

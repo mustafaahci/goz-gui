@@ -43,7 +43,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DWLP_MSGRESULT, EN_CHANGE, ES_AUTOHSCROLL, EndDialog, GWLP_USERDATA, GetClientRect,
     GetWindowRect, IDCANCEL, IDOK, MINMAXINFO, MapDialogRect, MoveWindow, SetWindowLongPtrW,
     WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SIZE,
-    WS_EX_CLIENTEDGE, WS_TABSTOP, WS_THICKFRAME,
+    WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
 };
 
 use super::pick::{folder_name, pick_folder};
@@ -59,6 +59,7 @@ use crate::dialog::{
 };
 use crate::filedlg::{self, Check};
 use crate::history_dialogs::filter_proc;
+use crate::places::{self, Which};
 use crate::store;
 use crate::wide::{window_text, wz};
 
@@ -227,7 +228,7 @@ pub fn organize(owner: HWND, host: &dyn Host, look: Look) {
         WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS;
     let tree_style =
         WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS;
-    let mut t = Template::new("Organize Bookmarks", WS_THICKFRAME, cx, cy);
+    let mut t = Template::new("Organize Bookmarks", WS_THICKFRAME | WS_MAXIMIZEBOX, cx, cy);
     // The places are set by `layout`; these are the first. Tab order, as
     // Everything's: the search box, the list, the buttons, the tree.
     t.control(Class::Static, "&Search:", STATIC, 0, 0, (93, 9, 28, 8))
@@ -330,6 +331,7 @@ impl Organize<'_> {
         // SAFETY: reads this thread's dialog.
         unsafe { GetWindowRect(dlg, &mut wr) };
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
+        places::restore(dlg, Which::BookmarkOrganize, list, self.min.get());
         self.layout(dlg);
         self.host.showing(dlg);
         self.load(dlg, Keep::At(Some(0)));
@@ -1095,6 +1097,7 @@ unsafe extern "system" fn organize_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARA
             1
         }
         WM_DESTROY => {
+            places::keep(dlg, Which::BookmarkOrganize, Organize::list_view(dlg));
             s.host.showing(core::ptr::null_mut());
             0
         }

@@ -32,9 +32,8 @@ use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, DragFinish, HDROP, RemoveWindowSubclass, SetWindowSubclass,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MB_ICONWARNING, MB_OK, MessageBoxW, PostMessageW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetTimer, SetWindowPos, SetWindowTextW, WINDOWPOS, WM_NCDESTROY,
-    WM_WINDOWPOSCHANGING,
+    MB_ICONWARNING, MB_OK, PostMessageW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetTimer, SetWindowPos, SetWindowTextW, WINDOWPOS, WM_NCDESTROY, WM_WINDOWPOSCHANGING,
 };
 
 use super::{
@@ -43,7 +42,7 @@ use super::{
 use crate::dialog::Quiet;
 use crate::fileops::{self, Done, Job, Outcome};
 use crate::wide::{nul, window_text, wz};
-use crate::{clipboard, paint, shell, theme};
+use crate::{clipboard, msgbox, paint, shell, theme};
 
 const BACKSLASH: u16 = b'\\' as u16;
 
@@ -386,19 +385,10 @@ impl App {
     }
 
     /// A warning box over the window, which does not bring goz-gui to the
-    /// front when a posted command opened it.
+    /// front when a posted command opened it. Nothing of `App` is borrowed
+    /// while it runs its loop.
     fn warn(&self, text: &str, title: &str) {
-        let _quiet = Quiet::begin();
-        // SAFETY: NUL-terminated strings for a modal box owned by this
-        // window; nothing of `App` is borrowed while it runs its loop.
-        unsafe {
-            MessageBoxW(
-                self.hwnd,
-                wz(text).as_ptr(),
-                wz(title).as_ptr(),
-                MB_OK | MB_ICONWARNING,
-            )
-        };
+        msgbox::show(self.hwnd, text, title, MB_OK | MB_ICONWARNING);
     }
 
     /// Every selected row that is held is one of `paths` (or none is

@@ -15,15 +15,14 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IDYES, KillTimer, MB_ICONQUESTION, MB_ICONWARNING, MB_YESNO, MessageBoxW, SetTimer,
+    IDYES, KillTimer, MB_ICONQUESTION, MB_ICONWARNING, MB_YESNO, SetTimer,
 };
 
 use super::{App, COL_PATH, TIMER_NOTE, key_down, send};
 use crate::actions::{self, Target};
 use crate::clipboard::{self, Effect, Files};
 use crate::copytext::{self, Field};
-use crate::format;
-use crate::wide::wz;
+use crate::{format, msgbox};
 
 /// Opening more items than this asks first, as Everything does
 /// (open_many_files_warning_threshold).
@@ -187,17 +186,8 @@ impl App {
         let Some(question) = many_question(n) else {
             return true;
         };
-        // SAFETY: NUL-terminated strings for a modal box owned by a window
-        // of this thread. Nothing of `App` is borrowed while it runs its
-        // loop.
-        unsafe {
-            MessageBoxW(
-                owner,
-                wz(&question).as_ptr(),
-                wz("goz").as_ptr(),
-                MB_YESNO | MB_ICONQUESTION,
-            ) == IDYES
-        }
+        // Nothing of `App` is borrowed while the box runs its loop.
+        msgbox::show(owner, &question, "goz", MB_YESNO | MB_ICONQUESTION) == IDYES
     }
 
     /// Opens the selection, or (`reveal`) the folders holding it with the

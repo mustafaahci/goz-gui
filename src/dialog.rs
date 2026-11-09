@@ -32,13 +32,13 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWi
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CBT_CREATEWNDW, CBTACTIVATESTRUCT, CallNextHookEx, DLGPROC, DS_MODALFRAME, DS_SETFONT,
     DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD, GW_HWNDNEXT, GW_OWNER, GWL_STYLE,
-    GWLP_USERDATA, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowThreadProcessId, HCBT_ACTIVATE, HCBT_CREATEWND, HHOOK,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SendMessageW, SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, WH_CBT,
-    WINDOWPOS, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_CTLCOLORSTATIC, WM_NCDESTROY, WM_NOTIFY, WM_SETTINGCHANGE, WM_WINDOWPOSCHANGING, WS_CAPTION,
-    WS_CHILD, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem, GetForegroundWindow, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HCBT_ACTIVATE, HCBT_CREATEWND,
+    HHOOK, MapDialogRect, MoveWindow, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetWindowPos, SetWindowsHookExW,
+    UnhookWindowsHookEx, WH_CBT, WINDOWPOS, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_NCDESTROY, WM_NOTIFY, WM_SETTINGCHANGE,
+    WM_WINDOWPOSCHANGING, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::paint::fill;
@@ -206,6 +206,27 @@ impl Look {
         let dark = theme::system_dark();
         (dark != self.dark).then_some(Look { dark, ..self })
     }
+}
+
+thread_local! {
+    /// How the window looks now, for the dialogs that are not handed a
+    /// look (message boxes).
+    static APP_LOOK: Cell<Option<Look>> = const { Cell::new(None) };
+}
+
+/// The window's look changed (or was first set): dialogs opened from now on
+/// without a look of their own take it.
+pub fn set_app_look(look: Look) {
+    APP_LOOK.set(Some(look));
+}
+
+/// The window's look, as [`set_app_look`] last set it; the system's app
+/// theme before any window set one.
+pub fn app_look() -> Look {
+    APP_LOOK.get().unwrap_or_else(|| Look {
+        dark: theme::system_dark(),
+        follow_system: true,
+    })
 }
 
 fn class_of(hwnd: HWND) -> String {
@@ -669,6 +690,64 @@ unsafe extern "system" fn quiet_show_proc(
     }
 }
 
+/// How a control follows its dialog's size ([`anchor`]): moved right or
+/// down, or grown wider or taller, by what the dialog grew.
+pub const MOVE_X: u8 = 1;
+pub const MOVE_Y: u8 = 2;
+pub const GROW_X: u8 = 4;
+pub const GROW_Y: u8 = 8;
+
+/// A rectangle `(x, y, cx, cy)` (dialog units in a template).
+pub type Units = (i16, i16, i16, i16);
+
+/// `r` moved or grown by `(dx, dy)` as `how` says.
+fn anchored(r: RECT, (dx, dy): (i32, i32), how: u8) -> RECT {
+    let by = |bit: u8, d: i32| if how & bit != 0 { d } else { 0 };
+    let (x, y) = (by(MOVE_X, dx), by(MOVE_Y, dy));
+    RECT {
+        left: r.left + x,
+        top: r.top + y,
+        right: r.right + x + by(GROW_X, dx),
+        bottom: r.bottom + y + by(GROW_Y, dy),
+    }
+}
+
+/// Places `controls` for the dialog's size: each at its template
+/// rectangle, moved or grown (`MOVE_X`, `GROW_Y`, ...) by what the client
+/// area has over the template's `size`. In dialog units, so it holds at
+/// every DPI. A combo box's height is its list's, as in the template.
+pub fn anchor(dlg: HWND, size: (i16, i16), controls: &[(u16, Units, u8)]) {
+    let px = |(x, y, cx, cy): Units| {
+        let mut r = RECT {
+            left: x.into(),
+            top: y.into(),
+            right: i32::from(x) + i32::from(cx),
+            bottom: i32::from(y) + i32::from(cy),
+        };
+        // SAFETY: converts within this thread's dialog.
+        unsafe { MapDialogRect(dlg, &mut r) };
+        r
+    };
+    let mut client = RECT::default();
+    // SAFETY: reads this thread's dialog.
+    unsafe { GetClientRect(dlg, &mut client) };
+    let base = px((0, 0, size.0, size.1));
+    let grew = (
+        (client.right - base.right).max(0),
+        (client.bottom - base.bottom).max(0),
+    );
+    for &(id, units, how) in controls {
+        let r = anchored(px(units), grew, how);
+        // SAFETY: moves a control of this thread's dialog.
+        unsafe {
+            let h = GetDlgItem(dlg, i32::from(id));
+            if !h.is_null() {
+                MoveWindow(h, r.left, r.top, r.right - r.left, r.bottom - r.top, 1);
+            }
+        }
+    }
+}
+
 /// Centres a dialog on its owner, kept inside the work area of the owner's
 /// monitor. An owner on no monitor at all (moved off the screens) leaves it
 /// centred where the owner is.
@@ -712,6 +791,39 @@ pub fn center_on_owner(dlg: HWND) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchored_controls_follow_the_dialog() {
+        let r = RECT {
+            left: 10,
+            top: 20,
+            right: 110,
+            bottom: 40,
+        };
+        let at = |l, t, rr, b| RECT {
+            left: l,
+            top: t,
+            right: rr,
+            bottom: b,
+        };
+        let eq = |a: RECT, b: RECT| {
+            (a.left, a.top, a.right, a.bottom) == (b.left, b.top, b.right, b.bottom)
+        };
+        assert!(eq(anchored(r, (30, 50), 0), r));
+        assert!(eq(anchored(r, (30, 50), GROW_X), at(10, 20, 140, 40)));
+        assert!(eq(
+            anchored(r, (30, 50), GROW_X | GROW_Y),
+            at(10, 20, 140, 90)
+        ));
+        assert!(eq(
+            anchored(r, (30, 50), MOVE_Y | GROW_X),
+            at(10, 70, 140, 90)
+        ));
+        assert!(eq(
+            anchored(r, (30, 50), MOVE_X | MOVE_Y),
+            at(40, 70, 140, 90)
+        ));
+    }
 
     #[test]
     fn template_layout() {

@@ -10,11 +10,12 @@ use windows_sys::Win32::UI::Controls::EM_SETSEL;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, EN_CHANGE, ES_AUTOHSCROLL, ES_NUMBER, EndDialog, GWLP_USERDATA, GetDlgItem,
-    IDCANCEL, IDOK, MB_ICONWARNING, MB_OK, MessageBoxW, SendMessageW, SetWindowLongPtrW,
-    SetWindowTextW, WM_COMMAND, WM_INITDIALOG, WS_EX_CLIENTEDGE, WS_TABSTOP,
+    IDCANCEL, IDOK, MB_ICONWARNING, MB_OK, SendMessageW, SetWindowLongPtrW, SetWindowTextW,
+    WM_COMMAND, WM_INITDIALOG, WS_EX_CLIENTEDGE, WS_TABSTOP,
 };
 
 use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common, state};
+use crate::msgbox;
 use crate::wide::{window_text, wz};
 
 const STATIC: u16 = 0xffff;
@@ -126,16 +127,12 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isi
             match id {
                 OK => {
                     let Some(count) = parse(&window_text(item(dlg, ID_COUNT))) else {
-                        // SAFETY: NUL-terminated strings for a modal box
-                        // owned by this dialog.
-                        unsafe {
-                            MessageBoxW(
-                                dlg,
-                                wz("Type a run count from 0 to 4294967295.").as_ptr(),
-                                wz("Set Run Count").as_ptr(),
-                                MB_OK | MB_ICONWARNING,
-                            )
-                        };
+                        msgbox::show(
+                            dlg,
+                            "Type a run count from 0 to 4294967295.",
+                            "Set Run Count",
+                            MB_OK | MB_ICONWARNING,
+                        );
                         return 1;
                     };
                     *s.result.borrow_mut() = Some(count);
