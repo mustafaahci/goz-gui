@@ -2,4 +2,86 @@
 
 # goz-gui
 
-Created in [T3 Code](https://t3.codes).
+A native Windows front end for [goz](https://github.com/mustafaahci/goz), the instant NTFS file search engine.
+
+Plain Win32 and common controls in Rust: no UI framework, no web view. The release build is a single ~500 KB exe that idles at about 5 MB of private memory, whatever the number of matches.
+
+## How it works
+
+- **Talks to gozd directly** over `\\.\pipe\goz-v1`. It uses `goz-core`'s own protocol types and framing, and checks with `goz-winfs` that the pipe really belongs to the elevated daemon before sending anything.
+- **Virtual results list.** The list view runs in owner-data mode and asks for rows by index. Rows are fetched from gozd in blocks of 1,024 and only 4 blocks stay cached, so scrolling through millions of matches costs the same memory as scrolling through ten. A refresh keeps the selection on the same files, even when the rows above them change.
+- **Searches as you type,** on a background thread. A search made stale by a new keystroke gets 200 ms to finish on its connection. After that it is dropped, so gozd never piles up abandoned work.
+- **Shows the index's state.** The status bar says when volumes are still indexing or sizes and dates are still being read, and refreshes the results until they are complete.
+- **Follows the system theme**, including a dark title bar, menu bar, header, scroll bars and popup menus, with per-monitor DPI scaling.
+
+## Using it
+
+| Key | Action |
+| --- | --- |
+| Type | Search (goz query syntax: `*.pdf`, `C:\Users\ report`, `ext:jpg dm:lastweek`, `size:>1mb`…) |
+| Enter (search box) | Select the result opened most often (the top one when none of them was opened before); Enter again opens the selection |
+| Up / Down / PgUp / PgDn (search box) | Move through the results while typing (Shift extends the selection, Ctrl moves the focus only) |
+| Tab | Move between the search box and the results |
+| Alt+Down / Alt+Up | Search history (Up/Down, Enter to use, Delete to forget, Esc) |
+| Ctrl+H / Ctrl+Shift+H | Find search history / organize search history |
+| Enter / Shift+Enter / double-click | Open (more than 32 items asks first) |
+| Ctrl+Enter, double-click in the Path column | Open the containing folder with the items selected, one window per folder |
+| Ctrl+Shift+Enter | Run as administrator |
+| Alt+Enter | Properties (one sheet for several items) |
+| Ctrl+C / Ctrl+Insert, Ctrl+X | Copy / cut the selected files, to paste in Explorer |
+| Ctrl+V / Shift+Insert | Paste the files on the clipboard into the selected folder (or the folder of the selected file); a copy pasted into its own folder is named "name - Copy", as in Explorer |
+| Delete / Shift+Delete | Delete the selection to the Recycle Bin / for good (Windows asks first) |
+| F2, or a slow second click on a name | Rename in place (Enter or a click elsewhere keeps it, Esc cancels) |
+| Ctrl+Shift+C | Copy full path |
+| Ctrl+A | Select all |
+| F4 / Shift+F4 | Move to the next / previous selected result |
+| Alt+D, Ctrl+E, Ctrl+L, Ctrl+F / Esc | Back to the search box |
+| Ctrl+1 / 2 / 3 / 6 | Sort by name / path / size / date modified (again to reverse) |
+| Ctrl+I / Ctrl+U | Match case / match path |
+| Alt+Left / Alt+Right, mouse back / forward | Previous / next search, with its options and sort |
+| Alt+Home | Home: the empty search by default (see Settings) |
+| Ctrl+D / Ctrl+B / Ctrl+Shift+B (or Ctrl+Shift+O) | Add to bookmarks / find a bookmark / organize bookmarks |
+| Ctrl+J | Run history |
+| Right-click a result, Shift+F10, Apps key | The row menu; with Shift held, Explorer's extended verbs too |
+| F5 | Refresh |
+| Ctrl+Backspace / Ctrl+Delete | Delete the previous / next word in the search box |
+| F1 / Ctrl+F1 | goz help / about goz-gui |
+| Ctrl+Shift+Q | Exit |
+
+Click a column header to sort, and click it again to reverse the sort. **Right-click a result** for its menu: Open (bold; Open Path is bold in the Path column, where a double-click opens the path), Open Path, Copy Name, Copy Full Path, Set Run Count... (while the run history is on; 0 removes the item from it), then the selection's Explorer menu (Open with, Send to, Cut, Copy, Create shortcut, Delete, Properties and every handler installed; items in several folders get one menu). **Right-click the empty space** under the results (or Shift+F10 with nothing selected) for Sort By and Refresh. **Files:** drag results out to Explorer or any program (copy, move or, with the right button, Explorer's menu); drop files or folders on the window to search for their path (a folder's contents, a shortcut's target; Shift adds it to the search; of several items the first is used, as goz has no OR yet). Delete, Paste and Rename go through Windows' own file operations on a thread of their own, with its questions, progress and undo (Ctrl+Z in Explorer brings a deleted or renamed file back); the results follow once gozd has seen the change. Rename checks the name first (no `\ / : * ? " < > |`, no trailing space or dot, no device name, no other file of that name) and opens again with what was typed; with several rows selected it renames the focused one. Opening and Properties run off the window's thread, so a slow program, a network path or thousands of selected items never freeze it, and opened files go into Windows' recent items. **File → Copy Property** copies the Name, Path, Size or Date Modified of the selection as shown, or all four as TSV. Actions take the rows the list holds; when part of a large selection is not loaded yet, the status bar says how many were taken. In the search box, **×** clears it and **▾** lists the searches made, newest first. **History** lists the searches you went through; Back, Forward and its entries bring one back. **History → Restore Previous Session** brings back the window as the last goz-gui left it (see Settings and data). **History → Find Search History** lists every search with how often and when it was last made, filtered as you type in its box and sorted by a click on a column; Open puts one in the search box, Copy copies it. **Organize Search History** also deletes searches (the selected ones, or all), imports a `Search History.csv` (Everything's or goz-gui's; it is merged in) and exports the history (all of it, or the selection only). **Bookmarks** saves a search with its options and brings it back from the menu, where folders are submenus and separators separate. The bookmark editor has the Name, the Search (*(No change)* keeps the search in the box; *Custom* takes the text beside it, where Shift+Enter starts another line and the lines are searched as one), Match Case and Match Path (each *Enabled*, *Disabled* or *(No change)*), the Filter and the Sort with its direction; *(No change)* leaves the window's own when the bookmark is opened. **Find Bookmark** lists every bookmark (named with its folders, `Music/Rock/Queen`), filtered as you type; Open opens one, Copy Search copies its search. **Organize Bookmarks** shows the folders as a tree beside what the chosen one holds, and has New..., New Folder..., Edit... (a bookmark, or a folder's name), Move Up/Down, Move To... (another folder), Delete (asks; a folder goes with everything in it), Import... (merges an Everything or goz-gui `Bookmarks.csv`) and Export... (all, or the selection with the folders it is in); its Search box lists the bookmarks of every folder whose name or search holds what you type. **Search** has Everything's result filters (Audio, Compressed, Document, Executable, Folder, Image, Video). **View → On Top** keeps the window above others, always or while searching. **Help → Search Syntax** lists what the search box accepts. **Index → Index Status** shows each volume's state and gozd's memory use. **Tools → Run History** lists every file and folder opened from goz-gui with its name, path, run count and date run (the last run first), filtered as you type and sorted by a click on a column; Open and Open Path open the selection again (and count again), Remove and Remove All (asks) forget them, Import... merges a `Run History.csv` (Everything's or goz-gui's) and Export... writes all of it or the selection. **Tools** also starts, stops or restarts the goz service (Windows asks for administrator rights).
+
+## Settings and data
+
+goz-gui keeps its files in its data folder: `%APPDATA%\goz-gui`, or the exe's own folder when a `goz-gui.ini` beside the exe holds `app_data=0` (portable use, as with Everything).
+
+- **`goz-gui.ini`** holds the settings in Everything 1.5's own INI keys (`[goz-gui]` section, `key=value`, UTF-8): the window's place and size (`window_x`, `window_y`, `window_wide`, `window_high`, `maximized`, plus goz-gui's `window_dpi`), `match_case`, `match_path`, `filter`, `sort`/`sort_ascending`, `theme` (0 User Default, 1 Standard, 2 Dark), `ontop` (0/1/2), `status_bar_visible`, the columns (`name_column_width`, `path_column_visible`, `path_column_pos`, … for Path, Size and `last_write_time`), the history and session switches, and Home. It is written about a second after a change and when goz-gui closes.
+- **`Search History.csv`** holds the searches made, in Everything 1.5's format (`Search,Search Count,Last Search Date`, the date as a FILETIME), so Everything's own file can be copied over it or imported. A search goes in when Enter is pressed, when a result is opened or copied, or when the results list takes the keyboard. Its settings are Everything's: `search_history_enabled=0` records nothing and hides ▾, Find and Organize; `search_history_keep_forever=0` keeps `search_history_days_to_keep` days; `search_history_always_suggest=1` lists the searches that contain what you type under the search box as you type (Up/Down to pick one, Esc to close).
+- **`Run History.csv`** holds the files and folders opened, in Everything 1.5's format (`Filename,Run Count,Last Run Date`, the date as a FILETIME), so Everything's own file can be copied over it or imported. Every Open counts one run of each item opened (Enter, a double-click, File → Open, the row menu, the Run History dialog), when it is handed to the shell; Open Path counts only with `run_history_increase_run_count_on_open_path=1`. The first Enter in the search box after the search changed selects the result held that was opened most often (`search_edit_enter_action`: 1 the most run, the default; 2 the last run; 3 the focused result; 4 the top; 5 the bottom; 6 select the search's text; 0 nothing), the top one when none was opened before. `run_history_enabled=0` counts nothing and hides Tools → Run History; `run_history_keep_forever=0` keeps `run_history_days_to_keep` days. With several goz-gui windows the files merge as the search history's do.
+- **`Bookmarks.csv`** holds the bookmarks in Everything 1.5's own format (its 25 columns; `Type` 0 a bookmark, 1 a folder, 2 a separator; `Folder` the folder a row is in, as `Music/Rock`; an empty match option or Filter or Sort is *(No change)*), so Everything's own file can be copied over it or imported, and every column goz-gui does not edit (icons, macros, keys, views, Everything's other match options) is kept as it was. A new bookmark takes the window's options as Everything's `bookmark_remember_case`, `_path`, `_filter`, `_sort` and `_search` say (by default the match options and the search, not the filter or the sort). Every change is written at once. With several goz-gui windows, each reads the file again before it writes and makes its own changes again on what it finds, by the bookmark's name and folder: nothing another window added is lost, a bookmark another window deleted stays deleted, and one deleted in another window but edited in this one comes back.
+- **Home** (`home_match_case`, `home_match_path`, `home_search`, `home_filter`, `home_sort`): `0` uses the last value, `1` a fixed one, which is the plain key's (`home_search=1` with `search=` empty, the default, starts every window with an empty search). `home_match_case` and `home_match_path` also take Everything's `2` (always on) and `3` (always off); the plain key then keeps the last value. History → Home (Alt+Home) sets the fixed ones and leaves the others as they are.
+- **`Session.json`** holds the session, in the shape and with the key names of Everything 1.5's own `Session.json` (so Everything's can be copied over it): the window's place, theme, On Top and status bar; the search with its options and sort; the row at the top of the list (`listview_top_index`); the selected and focused files by path (`listview_selection`, `listview_item_focus`); and Back and Forward's entries (`nav_history`, `nav_history_index`). It is written at most every `session_store_save_delay` ms (15 s) while it changes, and when goz-gui closes. **History → Restore Previous Session** restores the session that was in the file when goz-gui started: the search runs again, the list scrolls back to where it was, and the files are selected again as their rows come in, wherever they are now. A new window starts from Home unless `session_store_restore_on_first_new_window=1`; `session_store=0` turns sessions off (nothing is read or written and the menu item goes). With several goz-gui windows, each writes its own session, so the file holds the one written last: the last window closed.
+- **Back and Forward buttons** left of the search box: `toolbar_nav_bar_visible=1` (Everything's key; hidden by default).
+- **Columns:** drag a header to reorder, drag its edge to resize, middle-click a header to remove that column; right-click the header to show or hide Path, Size and Date Modified, or to reset them. All of it is kept.
+- **Nothing is lost:** every file is written to a temporary file first and then renamed over the old one, which is kept as `name.backup.ext` (only a file that was read whole becomes the backup). A file that cannot be read, or that is empty or cut short beside a good backup (left so by a power cut, a sync tool or another program), is moved aside as `name.corrupt-1.ext`, and the backup is put back in its place (for the histories, with the rows still readable in the damaged file). A write that fails (the file held open by another program) is tried again after 5 s, then less often, and at exit. Export never writes over goz-gui's own files. Several goz-gui windows can run at once: each writes only the settings it changed, over what the file holds then, and each merges its search history and run history into the file's (every search or file of either, with the higher count and the later date). A search or file deleted in one window is not written back by that window, but another goz-gui window that was already open and still holds it writes it back at its next write: close the other windows first, or delete it in each.
+
+## Testing
+
+These environment variables keep a test run away from the user's own files and desktop:
+
+| Variable | Effect |
+| --- | --- |
+| `GOZ_GUI_DATA_DIR` | The data folder to use instead of `%APPDATA%\goz-gui` (or the portable folder). Give every test run a fresh folder. |
+| `GOZ_GUI_DRY_RUN=1` | Open, Open Path, Run as administrator, Properties, the Help links and the goz service commands do nothing but append one line each to `dry-run.log` in the data folder: the verb (`open`, `open-path`, `run-as`, `properties`, `url`, `service-start`, `service-stop`, `service-restart`) and the paths, tab-separated. A dry-run open still counts in the run history. |
+| `GOZ_GUI_MENU_DUMP=1` | The context menus (row, background, header) are built exactly as for the screen, the Explorer items included, but instead of being shown they are appended to `menu-dump.log` in the data folder, as if every submenu were opened: one line per item (its label with `\t` before a shortcut, `id=`, then the state in brackets: `default`, `checked`, `radio`, `greyed`, `owner-drawn WxH` and `icon WxH` as the shell measured them; the shell's `verb=`), indented two spaces per submenu, between a `== row menu at x,y ==` line and a `== picked … ==` line. |
+| `GOZ_GUI_MENU_PICK=<label or verb>` | With `GOZ_GUI_MENU_DUMP`, the first item whose label (without `&` and the shortcut, any case) or else shell verb matches is then run, as if clicked: `Copy Full Path`, `Set Run Count...`, `properties`, `copy`. Properties and Run as administrator from the Explorer menu take goz-gui's own path (dry run included). |
+| `GOZ_GUI_FILEOP_SILENT=1` | File operations (Delete, Shift+Delete, Paste, Rename) ask nothing and show no progress or error windows (`FOF_NOCONFIRMATION`, `FOF_SILENT`, `FOF_NOERRORUI`, `FOF_NOCONFIRMMKDIR`; the Explorer menu's verbs run with `CMIC_MASK_FLAG_NO_UI`). Use it only on scratch files. |
+
+`cargo test` runs the unit tests (settings, INI, columns, placement, file store, …); they write only to temporary folders. The shell test builds the Explorer menu and the data object of system files in process and only reads them.
+
+## Build
+
+```
+cargo build --release
+```
+
+This produces `target\release\goz-gui.exe`. It needs gozd running; see the goz README for `gozd.exe install`.

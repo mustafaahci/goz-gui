@@ -1,0 +1,300 @@
+//! The result list's columns: which are shown, in what order, and how wide,
+//! kept in the settings file under Everything's own keys
+//! (`name_column_width`, `path_column_visible`, `path_column_pos`, ...), so
+//! the layout reads the same in both. Widths are kept at 96 DPI and scaled
+//! to the window's DPI when shown.
+//!
+//! Name is always shown (Everything has no `name_column_visible`); the
+//! others can be removed and shown again.
+
+/// The columns, by id. An id is also the column's place in Everything's
+/// default order.
+pub const COL_NAME: usize = 0;
+pub const COL_PATH: usize = 1;
+pub const COL_SIZE: usize = 2;
+pub const COL_DATE: usize = 3;
+pub const COLS: usize = 4;
+
+pub const TITLES: [&str; COLS] = ["Name", "Path", "Size", "Date Modified"];
+
+/// The settings file's name for each column: `<key>_column_width` and so on.
+/// Date Modified is Everything's `last_write_time`.
+const KEYS: [&str; COLS] = ["name", "path", "size", "last_write_time"];
+
+/// Everything's default widths, at 96 DPI.
+pub const DEFAULT_WIDTHS: [i32; COLS] = [256, 256, 96, 153];
+
+/// The widest a column is kept; wider values in the file are taken as this.
+const MAX_WIDTH: i32 = 8192;
+
+/// The shown columns, left to right, and every column's width.
+#[derive(Clone, Copy, Debug, Eq)]
+pub struct Layout {
+    /// Each column's width at 96 DPI, by id; kept while it is hidden.
+    widths: [i32; COLS],
+    /// The ids of the shown columns, left to right; `shown` of them.
+    order: [usize; COLS],
+    shown: usize,
+}
+
+/// Two layouts are the same when they show the same columns in the same
+/// order at the same widths; the order's unused slots do not count.
+impl PartialEq for Layout {
+    fn eq(&self, other: &Layout) -> bool {
+        self.widths == other.widths && self.shown() == other.shown()
+    }
+}
+
+impl Default for Layout {
+    /// Everything's default: all four, in id order.
+    fn default() -> Layout {
+        Layout {
+            widths: DEFAULT_WIDTHS,
+            order: [COL_NAME, COL_PATH, COL_SIZE, COL_DATE],
+            shown: COLS,
+        }
+    }
+}
+
+fn number(text: Option<&str>) -> Option<i32> {
+    text?.trim().parse().ok()
+}
+
+impl Layout {
+    /// Reads the layout from the settings' keys; `get` looks one up. A key
+    /// missing or unreadable takes Everything's default.
+    pub fn from_keys<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Layout {
+        let mut layout = Layout::default();
+        let mut shown: Vec<(i32, usize)> = Vec::new();
+        for (id, key) in KEYS.into_iter().enumerate() {
+            if let Some(w) = number(get(&format!("{key}_column_width"))) {
+                layout.widths[id] = w.clamp(0, MAX_WIDTH);
+            }
+            let visible = id == COL_NAME
+                || number(get(&format!("{key}_column_visible"))).is_none_or(|v| v != 0);
+            if visible {
+                let pos = number(get(&format!("{key}_column_pos"))).unwrap_or(id as i32);
+                shown.push((pos, id));
+            }
+        }
+        // By position; a tie (or a position Everything gave a hidden
+        // column) keeps the default order.
+        shown.sort();
+        layout.shown = shown.len();
+        for (slot, (_, id)) in layout.order.iter_mut().zip(shown) {
+            *slot = id;
+        }
+        layout
+    }
+
+    /// The layout as the settings' keys and values. The shown columns get
+    /// their places from 0; the hidden ones the places after them.
+    pub fn to_keys(self) -> Vec<(String, String)> {
+        let mut pos = [0usize; COLS];
+        let mut next = 0;
+        for &id in self.shown() {
+            pos[id] = next;
+            next += 1;
+        }
+        for id in (0..COLS).filter(|&id| !self.is_shown(id)) {
+            pos[id] = next;
+            next += 1;
+        }
+        let mut out = Vec::new();
+        for (id, key) in KEYS.into_iter().enumerate() {
+            if id != COL_NAME {
+                out.push((
+                    format!("{key}_column_visible"),
+                    u8::from(self.is_shown(id)).to_string(),
+                ));
+            }
+            out.push((format!("{key}_column_pos"), pos[id].to_string()));
+            out.push((format!("{key}_column_width"), self.widths[id].to_string()));
+        }
+        out
+    }
+
+    /// The shown columns' ids, left to right.
+    pub fn shown(&self) -> &[usize] {
+        &self.order[..self.shown]
+    }
+
+    pub fn is_shown(&self, id: usize) -> bool {
+        self.shown().contains(&id)
+    }
+
+    /// The column's width at 96 DPI.
+    pub fn width(&self, id: usize) -> i32 {
+        self.widths[id.min(COLS - 1)]
+    }
+
+    pub fn set_width(&mut self, id: usize, width: i32) {
+        if id < COLS {
+            self.widths[id] = width.clamp(0, MAX_WIDTH);
+        }
+    }
+
+    /// Puts the shown columns in `order` (ids, left to right). An order that
+    /// is not exactly the shown columns is ignored.
+    pub fn set_order(&mut self, order: &[usize]) {
+        let mut a = order.to_vec();
+        let mut b = self.shown().to_vec();
+        a.sort_unstable();
+        b.sort_unstable();
+        if a == b {
+            self.order[..order.len()].copy_from_slice(order);
+        }
+    }
+
+    /// Takes a column off the list; never Name. False when nothing changed.
+    pub fn hide(&mut self, id: usize) -> bool {
+        let Some(at) = self.shown().iter().position(|&c| c == id) else {
+            return false;
+        };
+        if id == COL_NAME {
+            return false;
+        }
+        self.order.copy_within(at + 1..self.shown, at);
+        self.shown -= 1;
+        true
+    }
+
+    /// Shows a hidden column, after the shown column that comes last before
+    /// it in the default order (or first, when none does).
+    pub fn show(&mut self, id: usize) -> bool {
+        if id >= COLS || self.is_shown(id) {
+            return false;
+        }
+        let at = self
+            .shown()
+            .iter()
+            .rposition(|&c| c < id)
+            .map_or(0, |i| i + 1);
+        self.order.copy_within(at..self.shown, at + 1);
+        self.order[at] = id;
+        self.shown += 1;
+        true
+    }
+}
+
+/// `width` pixels at `dpi` as a 96-DPI width, rounded to the nearest.
+pub fn unscale(width: i32, dpi: u32) -> i32 {
+    let dpi = dpi.max(1) as i32;
+    (width * 96 + dpi / 2).div_euclid(dpi)
+}
+
+/// A 96-DPI width at `dpi`, rounded to the nearest pixel, so that
+/// `unscale` gives the same width back at every DPI.
+pub fn scale(width: i32, dpi: u32) -> i32 {
+    (width * dpi as i32 + 48).div_euclid(96)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn read(pairs: &[(&str, &str)]) -> Layout {
+        let map: HashMap<&str, &str> = pairs.iter().copied().collect();
+        Layout::from_keys(|k| map.get(k).copied())
+    }
+
+    #[test]
+    fn nothing_in_the_file_is_everythings_default() {
+        let layout = read(&[]);
+        assert_eq!(layout, Layout::default());
+        assert_eq!(layout.shown(), [COL_NAME, COL_PATH, COL_SIZE, COL_DATE]);
+        assert_eq!(layout.width(COL_DATE), 153);
+    }
+
+    #[test]
+    fn everythings_own_keys_are_read() {
+        // As Everything 1.5 writes them: the hidden Extension column shares
+        // position 3 with Date Modified, which does not matter here.
+        let layout = read(&[
+            ("name_column_pos", "0"),
+            ("name_column_width", "300"),
+            ("path_column_visible", "1"),
+            ("path_column_pos", "2"),
+            ("path_column_width", "200"),
+            ("size_column_visible", "0"),
+            ("size_column_pos", "1"),
+            ("size_column_width", "80"),
+            ("last_write_time_column_visible", "1"),
+            ("last_write_time_column_pos", "1"),
+            ("last_write_time_column_width", "x"),
+        ]);
+        assert_eq!(layout.shown(), [COL_NAME, COL_DATE, COL_PATH]);
+        assert_eq!(layout.width(COL_NAME), 300);
+        assert_eq!(layout.width(COL_SIZE), 80, "kept while hidden");
+        assert_eq!(layout.width(COL_DATE), 153, "unreadable: the default");
+    }
+
+    #[test]
+    fn name_cannot_be_hidden_even_by_the_file() {
+        let layout = read(&[("name_column_visible", "0"), ("name_column_pos", "5")]);
+        assert_eq!(layout.shown(), [COL_PATH, COL_SIZE, COL_DATE, COL_NAME]);
+        let mut layout = Layout::default();
+        assert!(!layout.hide(COL_NAME));
+        assert!(layout.hide(COL_PATH));
+        assert!(!layout.hide(COL_PATH));
+        assert_eq!(layout.shown(), [COL_NAME, COL_SIZE, COL_DATE]);
+    }
+
+    #[test]
+    fn written_keys_read_back_the_same() {
+        let mut layout = Layout::default();
+        layout.set_order(&[COL_DATE, COL_NAME, COL_SIZE, COL_PATH]);
+        layout.hide(COL_SIZE);
+        layout.set_width(COL_PATH, 123);
+        let keys = layout.to_keys();
+        let pairs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(read(&pairs), layout);
+        let get = |k: &str| {
+            keys.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("last_write_time_column_pos"), Some("0"));
+        assert_eq!(get("name_column_pos"), Some("1"));
+        assert_eq!(get("path_column_pos"), Some("2"));
+        assert_eq!(get("size_column_visible"), Some("0"));
+        assert_eq!(get("size_column_pos"), Some("3"));
+        assert_eq!(get("name_column_visible"), None, "Everything has none");
+        assert_eq!(keys.len(), 11);
+    }
+
+    #[test]
+    fn a_shown_column_comes_back_in_its_default_place() {
+        let mut layout = Layout::default();
+        layout.hide(COL_SIZE);
+        layout.hide(COL_PATH);
+        assert!(layout.show(COL_SIZE));
+        assert_eq!(layout.shown(), [COL_NAME, COL_SIZE, COL_DATE]);
+        assert!(!layout.show(COL_SIZE));
+        // After a drag, it goes after the last column before it by id.
+        layout.set_order(&[COL_DATE, COL_SIZE, COL_NAME]);
+        assert!(layout.show(COL_PATH));
+        assert_eq!(layout.shown(), [COL_DATE, COL_SIZE, COL_NAME, COL_PATH]);
+    }
+
+    #[test]
+    fn an_order_that_is_not_the_shown_columns_is_ignored() {
+        let mut layout = Layout::default();
+        layout.hide(COL_DATE);
+        layout.set_order(&[COL_NAME, COL_DATE, COL_PATH]);
+        assert_eq!(layout.shown(), [COL_NAME, COL_PATH, COL_SIZE]);
+        layout.set_order(&[COL_SIZE, COL_PATH, COL_NAME]);
+        assert_eq!(layout.shown(), [COL_SIZE, COL_PATH, COL_NAME]);
+    }
+
+    #[test]
+    fn widths_survive_scaling_round_trips() {
+        for dpi in [96, 110, 120, 144, 168, 192, 288] {
+            for w in (0..1200).chain([4096, 8192]) {
+                assert_eq!(unscale(scale(w, dpi), dpi), w, "{w} at {dpi}");
+            }
+        }
+        assert_eq!(unscale(230, 144), 153);
+    }
+}

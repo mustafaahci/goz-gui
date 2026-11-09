@@ -1,0 +1,3 @@
+# Static CRT so goz-gui.exe runs without vcruntime140.dll, like goz.exe and gozd.exe.
+[target.'cfg(all(target_family = "windows", target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
