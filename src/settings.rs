@@ -24,6 +24,7 @@ use crate::bookmarks::{self, sort_key, sort_name};
 use crate::columns::Layout;
 use crate::filter::Filter;
 use crate::menu;
+use crate::places::Places;
 use crate::store::ini::Ini;
 use crate::theme::ThemeMode;
 
@@ -292,6 +293,9 @@ pub struct Settings {
     pub bookmark_remember: bookmarks::Remember,
     pub ini_backup: bool,
     pub csv_backup: bool,
+    /// Where the dialogs and the Search Syntax window open (see
+    /// `crate::places`).
+    pub places: Places,
 }
 
 impl Default for Settings {
@@ -321,6 +325,7 @@ impl Default for Settings {
             bookmark_remember: bookmarks::Remember::default(),
             ini_backup: true,
             csv_backup: true,
+            places: Places::default(),
         }
     }
 }
@@ -469,6 +474,7 @@ impl Settings {
             },
             ini_backup: flag(ini, "ini_backup").unwrap_or(d.ini_backup),
             csv_backup: flag(ini, "csv_backup").unwrap_or(d.csv_backup),
+            places: Places::from_keys(|k| ini.get(k)),
         }
     }
 
@@ -549,6 +555,7 @@ impl Settings {
         put("ini_backup", bit(self.ini_backup));
         put("csv_backup", bit(self.csv_backup));
         out.extend(self.columns.to_keys());
+        out.extend(self.places.to_keys());
         out
     }
 
@@ -692,6 +699,19 @@ mod tests {
             },
             ini_backup: false,
             csv_backup: false,
+            places: {
+                let mut p = Places::default();
+                p.set(
+                    crate::places::Which::BookmarkEdit,
+                    crate::places::Place {
+                        width: 600,
+                        height: 450,
+                        dpi: Some(120),
+                        ..crate::places::Place::default()
+                    },
+                );
+                p
+            },
         };
         let mut ini = Ini::default();
         for (k, v) in s.to_pairs() {
@@ -715,6 +735,9 @@ mod tests {
             "bookmark_remember_search=0",
             "run_history_increase_run_count_on_open_path=1",
             "search_edit_enter_action=5",
+            "bookmark_edit_wide=600",
+            "bookmark_edit_dpi=120",
+            "search_history_maximized=0",
         ] {
             assert!(text.contains(&format!("{line}\r\n")), "{line} in\n{text}");
         }

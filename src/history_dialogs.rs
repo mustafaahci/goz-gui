@@ -26,9 +26,9 @@ use windows_sys::Win32::UI::Controls::{
     LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVM_SETITEMSTATE,
     LVM_SETSELECTIONMARK, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN,
     LVN_ODFINDITEMW, LVN_ODSTATECHANGED, LVNI_FOCUSED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVCUSTOMDRAW,
-    NMLVDISPINFOW, NMLVKEYDOWN,
+    LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLISTVIEW,
+    NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -39,9 +39,10 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWi
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, DM_SETDEFID, DWLP_MSGRESULT, EN_CHANGE, ES_AUTOHSCROLL, EndDialog,
     GWLP_USERDATA, GetClientRect, GetDlgItem, GetWindowRect, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2,
-    MB_ICONWARNING, MB_OK, MB_YESNO, MINMAXINFO, MapDialogRect, MessageBoxW, MoveWindow,
-    SendMessageW, SetWindowLongPtrW, WM_COMMAND, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN,
-    WM_NCDESTROY, WM_NEXTDLGCTL, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_THICKFRAME,
+    MB_ICONWARNING, MB_OK, MB_YESNO, MINMAXINFO, MapDialogRect, MoveWindow, SendMessageW,
+    SetWindowLongPtrW, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN,
+    WM_NCDESTROY, WM_NEXTDLGCTL, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP,
+    WS_THICKFRAME,
 };
 
 use crate::bookmarks::one_line;
@@ -52,6 +53,8 @@ use crate::filedlg::{self, Check};
 use crate::format;
 use crate::history::Searched;
 use crate::history_file::{self, Table};
+use crate::msgbox;
+use crate::places::{self, Which};
 use crate::store;
 use crate::wide::{window_text, wz};
 
@@ -220,15 +223,7 @@ fn set_state(list: HWND, row: usize, state: u32, mask: u32) {
 
 /// Says what went wrong, over the dialog.
 fn warn(dlg: HWND, title: &str, text: &str) {
-    // SAFETY: NUL-terminated strings for a modal box owned by the dialog.
-    unsafe {
-        MessageBoxW(
-            dlg,
-            wz(text).as_ptr(),
-            wz(title).as_ptr(),
-            MB_OK | MB_ICONWARNING,
-        )
-    };
+    msgbox::show(dlg, text, title, MB_OK | MB_ICONWARNING);
 }
 
 /// A dialog's state, in its GWLP_USERDATA while it is open.
@@ -276,7 +271,7 @@ pub fn run(owner: HWND, mode: Mode, host: &dyn Host, look: Look) -> Option<Strin
     }
     let button = WS_TABSTOP;
     let default = WS_TABSTOP | BS_DEFPUSHBUTTON as u32;
-    let mut t = Template::new(title, WS_THICKFRAME, cx, cy);
+    let mut t = Template::new(title, WS_THICKFRAME | WS_MAXIMIZEBOX, cx, cy);
     // The places are set by `layout`; these are the first.
     t.control(Class::Static, "&Search:", STATIC, 0, 0, (7, 9, 28, 8))
         .control(
@@ -322,9 +317,18 @@ impl Dlg<'_> {
         item(dlg, ID_LIST)
     }
 
+    /// Where the dialog's place is kept.
+    fn which(&self) -> Which {
+        match self.mode {
+            Mode::Find => Which::SearchHistorySelect,
+            Mode::Organize => Which::SearchHistory,
+        }
+    }
+
     fn init(&self, dlg: HWND) {
         let list = Dlg::list(dlg);
-        let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
+        let ex =
+            LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_HEADERDRAGDROP;
         send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
         // SAFETY: reads this thread's dialog's DPI.
         let dpi = unsafe { GetDpiForWindow(dlg) }.max(96) as i32;
@@ -351,6 +355,7 @@ impl Dlg<'_> {
         // SAFETY: reads this thread's dialog.
         unsafe { GetWindowRect(dlg, &mut wr) };
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
+        places::restore(dlg, self.which(), list, self.min.get());
         self.layout(dlg);
         send(dlg, DM_SETDEFID, usize::from(ID_OPEN), 0);
         self.show_arrow(dlg);
@@ -629,15 +634,12 @@ impl Dlg<'_> {
                 format::grouped(n as u64)
             )
         };
-        // SAFETY: NUL-terminated strings for a modal box owned by the dialog.
-        let answer = unsafe {
-            MessageBoxW(
-                dlg,
-                wz(&question).as_ptr(),
-                wz(self.title).as_ptr(),
-                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-            )
-        };
+        let answer = msgbox::show(
+            dlg,
+            &question,
+            self.title,
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        );
         if answer == IDYES {
             self.host.forget_all();
             self.refill(dlg, None, None);
@@ -869,6 +871,10 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
         WM_COMMAND => {
             s.command(dlg, (w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
             1
+        }
+        WM_DESTROY => {
+            places::keep(dlg, s.which(), Dlg::list(dlg));
+            0
         }
         _ => 0,
     }

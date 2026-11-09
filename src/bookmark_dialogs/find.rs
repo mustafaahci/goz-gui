@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, DM_SETDEFID, DWLP_MSGRESULT, EN_CHANGE, ES_AUTOHSCROLL, EndDialog,
     GWLP_USERDATA, GetClientRect, GetWindowRect, IDCANCEL, IDOK, MINMAXINFO, MapDialogRect,
     MoveWindow, SetWindowLongPtrW, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG,
-    WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_THICKFRAME,
+    WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
 };
 
 use super::{Host, WM_REFRESH, enable, item, send};
@@ -36,6 +36,7 @@ use crate::dialog::{
     Class, Look, Template, apply_theme, center_on_owner, common, list_custom_draw, state,
 };
 use crate::history_dialogs::filter_proc;
+use crate::places::{self, Which};
 use crate::wide::{window_text, wz};
 
 /// What a bookmark opens: its search (`None`: the one in the box stays)
@@ -124,7 +125,7 @@ pub fn find(owner: HWND, host: &dyn Host, look: Look) -> Option<Chosen> {
         chosen: RefCell::new(None),
     };
     let (cx, cy) = (300, 220);
-    let mut t = Template::new("Select Bookmark", WS_THICKFRAME, cx, cy);
+    let mut t = Template::new("Select Bookmark", WS_THICKFRAME | WS_MAXIMIZEBOX, cx, cy);
     t.control(Class::Static, "&Search:", STATIC, 0, 0, (7, 9, 28, 8))
         .control(
             Class::Edit,
@@ -184,6 +185,7 @@ impl Find<'_> {
         // SAFETY: reads this thread's dialog.
         unsafe { GetWindowRect(dlg, &mut wr) };
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
+        places::restore(dlg, Which::BookmarkSelect, list, self.min.get());
         self.layout(dlg);
         send(dlg, DM_SETDEFID, usize::from(ID_OPEN), 0);
         self.host.showing(dlg);
@@ -449,6 +451,7 @@ unsafe extern "system" fn find_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             1
         }
         WM_DESTROY => {
+            places::keep(dlg, Which::BookmarkSelect, Find::list(dlg));
             s.host.showing(core::ptr::null_mut());
             0
         }

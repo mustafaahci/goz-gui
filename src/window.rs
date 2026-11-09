@@ -53,7 +53,8 @@ use crate::store::writer::Writer;
 use crate::theme::{Palette, ThemeMode};
 use crate::wide::{is_wide, window_text, wz};
 use crate::{
-    dropdown, format, header, hover, keys, menu, paint, searchbox, shell, status, syntax, theme,
+    dialog, dropdown, format, header, hover, keys, menu, msgbox, paint, places, searchbox, shell,
+    status, syntax, theme,
 };
 
 pub use crate::columns::{COL_DATE, COL_NAME, COL_PATH, COL_SIZE, COLS};
@@ -710,6 +711,10 @@ impl App {
             ex as isize,
         );
         self.apply_columns(self.layout.get());
+        // The dialogs open where they were; one that moved asks for the
+        // settings to be written.
+        let places = self.prefs.borrow().base.places.clone();
+        places::start(places, Box::new(move || self.settings_changed()));
         let cue = wz("Search");
         send(self.edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
         dropdown::create(self);
@@ -853,6 +858,7 @@ impl App {
         send(self.list, LVM_SETTEXTBKCOLOR, 0, pal.bg as isize);
         send(self.list, LVM_SETTEXTCOLOR, 0, pal.fg as isize);
         syntax::apply_theme(dark);
+        dialog::set_app_look(self.dialog_look());
         dropdown::apply_theme(self);
         searchbox::theme_tooltip(self, dark);
         theme::flush_menus();
@@ -1926,16 +1932,10 @@ impl App {
         self.layout();
     }
 
+    /// An information box over the window. Nothing of `App` is borrowed
+    /// while it runs its loop.
     fn message_box(&self, text: &str, title: &str) {
-        // SAFETY: NUL-terminated strings for a modal box owned by this window.
-        unsafe {
-            MessageBoxW(
-                self.hwnd,
-                wz(text).as_ptr(),
-                wz(title).as_ptr(),
-                MB_OK | MB_ICONINFORMATION,
-            )
-        };
+        msgbox::show(self.hwnd, text, title, MB_OK | MB_ICONINFORMATION);
     }
 
     /// The shown columns' ids and rectangles for a row at `row`, left to

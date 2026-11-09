@@ -3,12 +3,15 @@
 //! was saved at, and moved into the nearest work area when that monitor is
 //! gone or the title bar would be out of reach.
 
-use windows_sys::Win32::Foundation::{LPARAM, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
     MonitorFromRect,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetWindowPlacement, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
+};
 use windows_sys::core::BOOL;
 
 use crate::settings::WindowPos;
@@ -202,6 +205,53 @@ pub fn dpi_at(rc: &RECT) -> u32 {
     monitor(mon).map_or(96, |m| m.dpi)
 }
 
+/// `ws` in workspace coordinates (GetWindowPlacement's: relative to the
+/// work area of the monitor the window is on) as screen coordinates. The
+/// monitor is the one whose offset puts the window mostly on itself.
+pub fn workspace_to_screen(ws: Rect, monitors: &[Monitor]) -> Rect {
+    for (i, m) in monitors.iter().enumerate() {
+        let screen = Rect {
+            x: ws.x + m.work.x - m.area.x,
+            y: ws.y + m.work.y - m.area.y,
+            ..ws
+        };
+        if monitor_of(&screen, monitors) == Some(i) {
+            return screen;
+        }
+    }
+    ws
+}
+
+/// A top-level window's normal (not minimized or maximized) rectangle in
+/// screen pixels, with the DPI there, and whether it is maximized (or
+/// minimized from maximized). `None` when it has no placement or no size.
+pub fn normal_place(hwnd: HWND) -> Option<(WindowPos, bool)> {
+    let mut wp = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        // SAFETY: the rest of WINDOWPLACEMENT is plain data.
+        ..unsafe { core::mem::zeroed() }
+    };
+    // SAFETY: reads a window's placement into `wp`.
+    if unsafe { GetWindowPlacement(hwnd, &mut wp) } == 0 {
+        return None;
+    }
+    let r = workspace_to_screen(Rect::from_win(&wp.rcNormalPosition), &monitors());
+    if r.w <= 0 || r.h <= 0 {
+        return None;
+    }
+    let show = wp.showCmd as i32;
+    let maximized = show == SW_SHOWMAXIMIZED
+        || (show == SW_SHOWMINIMIZED && wp.flags & WPF_RESTORETOMAXIMIZED != 0);
+    let pos = WindowPos {
+        x: r.x,
+        y: r.y,
+        width: r.w,
+        height: r.h,
+        dpi: Some(dpi_at(&r.to_win())),
+    };
+    Some((pos, maximized))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +299,37 @@ mod tests {
             r(9000, 50, 800, 600)
         );
         assert_eq!(Rect::from_win(&r(-5, 7, 30, 40).to_win()), r(-5, 7, 30, 40));
+    }
+
+    #[test]
+    fn workspace_coordinates_to_screen() {
+        // A taskbar on the left of the primary monitor, 60 px wide; a
+        // second monitor to the right with none.
+        let monitors = [
+            Monitor {
+                area: r(0, 0, 1920, 1080),
+                work: r(60, 0, 1860, 1080),
+                dpi: 96,
+            },
+            Monitor {
+                area: r(1920, 0, 1920, 1080),
+                work: r(1920, 0, 1920, 1080),
+                dpi: 96,
+            },
+        ];
+        assert_eq!(
+            workspace_to_screen(r(100, 50, 800, 600), &monitors),
+            r(160, 50, 800, 600)
+        );
+        assert_eq!(
+            workspace_to_screen(r(2000, 50, 800, 600), &monitors),
+            r(2000, 50, 800, 600)
+        );
+        // Nowhere: as it is.
+        assert_eq!(
+            workspace_to_screen(r(9000, 50, 800, 600), &monitors),
+            r(9000, 50, 800, 600)
+        );
     }
 
     /// A 1920×1080 primary at 100 % with a taskbar at the bottom, and a
