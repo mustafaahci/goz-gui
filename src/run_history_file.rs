@@ -13,8 +13,9 @@
 //!
 //! The file is read once at startup, before the window shows. It is written
 //! by the store thread (`RunFile::write_now`), which reads it again first
-//! and merges this process's runs into it (`run_history::merge`), so two
-//! goz-gui windows never write each other's runs out.
+//! and makes on it only the changes made in this process since its last
+//! write (`history::apply`): two goz-gui windows never write each other's
+//! runs out, and a file removed in one stays removed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,8 +23,8 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::csv::{self, Field};
-use crate::history::{Keep, filetime_now};
-use crate::run_history::{self, Forgotten, Ran, fold, tidy};
+use crate::history::{self, Journal, Keep, Op, filetime_now, tidy};
+use crate::run_history::{Ran, fold};
 use crate::store::file::{self, Loaded};
 use crate::store::join_notes;
 
@@ -124,7 +125,7 @@ fn table(records: Vec<Vec<Field>>) -> Result<Table, String> {
     if !seen[0] {
         return Err("it has no Filename column".into());
     }
-    let mut entries = Vec::new();
+    let mut entries = Vec::with_capacity(records.len());
     let mut extras: HashMap<String, Vec<Field>> = HashMap::new();
     for record in records {
         let mut row = Ran {
@@ -136,7 +137,7 @@ fn table(records: Vec<Vec<Field>>) -> Result<Table, String> {
         // Values past the header's columns have no name to keep.
         for (field, slot) in record.into_iter().zip(&slots) {
             match *slot {
-                Ok(0) => row.filename = field.text,
+                Ok(0) => row.filename = history::exact(field.text),
                 Ok(1) => row.count = field.text.trim().parse().unwrap_or(1),
                 Ok(_) => row.last = field.text.trim().parse().unwrap_or(0),
                 Err(i) => values[i] = field,
@@ -160,7 +161,7 @@ fn table(records: Vec<Vec<Field>>) -> Result<Table, String> {
 /// The file's text for `entries`, in Everything's columns and then the
 /// unknown ones `columns` was read with (each file keeps its values).
 pub fn to_csv(entries: &[Ran], columns: &Table) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(history::csv_size(entries));
     let header: Vec<Field> = COLUMNS
         .iter()
         .map(|&c| Field::plain(c))
@@ -169,16 +170,14 @@ pub fn to_csv(entries: &[Ran], columns: &Table) -> String {
     csv::write_record(&header, &mut out);
     let blank = vec![Field::plain(""); columns.extra.len()];
     for e in entries {
-        let mut row = vec![
-            Field::quoted(e.filename.as_str()),
-            Field::plain(e.count.to_string()),
-            Field::plain(e.last.to_string()),
-        ];
-        if !columns.extra.is_empty() {
-            let values = columns.extras.get(&fold(&e.filename)).unwrap_or(&blank);
-            row.extend(values.iter().cloned());
-        }
-        csv::write_record(&row, &mut out);
+        let extra = (!columns.extra.is_empty()).then(|| {
+            columns
+                .extras
+                .get(&fold(&e.filename))
+                .unwrap_or(&blank)
+                .as_slice()
+        });
+        history::write_row(&mut out, &e.filename, e.count, e.last, extra);
     }
     out
 }
@@ -281,32 +280,28 @@ pub fn load(path: &Path, keep: Keep, now: u64) -> (Vec<Ran>, Option<String>) {
             Some(format!("The run history could not be read: {why}")),
         ),
     };
-    run_history::prune(&mut entries, keep, now);
+    history::prune(&mut entries, keep, now);
     (entries, note)
 }
 
-#[derive(Default)]
-struct Staged {
-    /// The history as the window has it, waiting to be written.
-    snapshot: Option<Vec<Ran>>,
-    /// What was removed here and is not yet out of the file.
-    forgotten: Forgotten,
-}
-
-/// The run history file, shared by the window (which stages its history
-/// and its removals) and the store thread (which writes them).
+/// The run history file, shared by the window (which notes each change it
+/// makes to its run history) and the store thread (which makes them on the
+/// file).
 pub struct RunFile {
     path: PathBuf,
     keep: Keep,
     backup: bool,
-    staged: Mutex<Staged>,
+    journal: Mutex<Journal<Ran>>,
 }
 
 /// What a write did.
 #[derive(Debug)]
 pub struct Written {
-    /// The history as written: this process's merged with the file's.
+    /// The run history as written: the file's, with this process's
+    /// changes made on it.
     pub entries: Vec<Ran>,
+    /// The changes numbered below this are in it (see [`RunFile::settle`]).
+    pub through: u64,
     /// The file could not be parsed, and was moved aside first.
     pub note: Option<String>,
 }
@@ -319,7 +314,7 @@ impl RunFile {
             path,
             keep,
             backup,
-            staged: Mutex::new(Staged::default()),
+            journal: Mutex::new(Journal::default()),
         }
     }
 
@@ -327,77 +322,65 @@ impl RunFile {
         &self.path
     }
 
-    fn lock(&self) -> MutexGuard<'_, Staged> {
-        self.staged.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> MutexGuard<'_, Journal<Ran>> {
+        self.journal.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The history to write next, in place of any not written yet.
-    pub fn stage(&self, entries: Vec<Ran>) {
-        self.lock().snapshot = Some(entries);
+    /// A change made to the run history here, for the next write to make on
+    /// the file.
+    pub fn log(&self, op: Op<Ran>) {
+        self.lock().log(op);
     }
 
-    /// A history staged and not written yet (a write failed): the next
-    /// save writes it even when nothing else changed.
+    /// Changes are waiting to be written (made since the last write, or
+    /// left by a write that failed).
     pub fn pending(&self) -> bool {
-        self.lock().snapshot.is_some()
+        self.lock().pending()
     }
 
-    /// `filename` was removed at `now`.
-    pub fn forget(&self, filename: &str, now: u64) {
-        self.lock().forgotten.forget(filename, now);
+    /// The window takes in `Written::entries`, written with the changes
+    /// numbered below `through`: the changes made since, to make on it.
+    pub fn settle(&self, through: u64) -> Vec<Op<Ran>> {
+        self.lock().settle(through)
     }
 
-    /// Every file was removed at `now`.
-    pub fn forget_all(&self, now: u64) {
-        self.lock().forgotten.forget_all(now);
-    }
-
-    /// The removals not yet written.
-    pub fn forgotten(&self) -> Forgotten {
-        self.lock().forgotten.clone()
-    }
-
-    /// Writes what is staged, merged into the file as it is now. Run on the
-    /// store thread. `Ok(None)`: nothing was staged. On failure the history
-    /// stays staged for the next write (unless a newer one came meanwhile).
+    /// Makes the changes not written yet on the file as it is now. Run on
+    /// the store thread. `Ok(None)`: there were none. On failure they wait
+    /// for the next write.
     pub fn write_now(&self) -> Result<Option<Written>, String> {
-        let (mine, forgotten) = {
-            let mut staged = self.lock();
-            let Some(mine) = staged.snapshot.take() else {
+        let (ops, through) = {
+            let journal = self.lock();
+            if !journal.pending() {
                 return Ok(None);
-            };
-            (mine, staged.forgotten.clone())
+            }
+            journal.unwritten()
         };
-        let result = self.merge_and_write(&mine, &forgotten);
-        let mut staged = self.lock();
-        match result {
-            Ok(written) => {
-                staged.forgotten.settle(&forgotten);
-                Ok(Some(written))
-            }
-            Err(why) => {
-                if staged.snapshot.is_none() {
-                    staged.snapshot = Some(mine);
-                }
-                Err(why)
-            }
-        }
+        let (entries, note) = self.apply_and_write(&ops)?;
+        self.lock().wrote(through);
+        Ok(Some(Written {
+            entries,
+            through,
+            note,
+        }))
     }
 
-    fn merge_and_write(&self, mine: &[Ran], forgotten: &Forgotten) -> Result<Written, String> {
+    fn apply_and_write(&self, ops: &[Op<Ran>]) -> Result<(Vec<Ran>, Option<String>), String> {
         let path = &self.path;
         // Not written over another goz-gui's write: tried again later.
         let _lock = file::Lock::for_write(path, file::WRITE_WAIT)?;
-        let theirs = read(path).map_err(|why| {
+        let mut theirs = read(path).map_err(|why| {
             format!(
                 "{} could not be read, so goz-gui does not write over it: {why}",
                 path.display()
             )
         })?;
-        let mut entries = run_history::merge(mine, &theirs.table.entries, forgotten);
-        run_history::prune(&mut entries, self.keep, filetime_now());
+        let mut entries = core::mem::take(&mut theirs.table.entries);
+        let mut changed = history::apply(&mut entries, ops);
+        let unpruned = entries.len();
+        history::prune(&mut entries, self.keep, filetime_now());
+        changed |= entries.len() != unpruned;
         let mut note = theirs.note;
-        if entries != theirs.table.entries || theirs.stale || !path.is_file() {
+        if changed || theirs.stale || !path.is_file() {
             let text = to_csv(&entries, &theirs.table);
             let previous = theirs.previous.as_deref().filter(|_| self.backup);
             let kept = file::write(path, text.as_bytes(), previous).map_err(|e| {
@@ -408,7 +391,7 @@ impl RunFile {
             })?;
             note = join_notes(note, kept);
         }
-        Ok(Written { entries, note })
+        Ok((entries, note))
     }
 }
 
@@ -554,7 +537,7 @@ mod tests {
         assert!(!f.pending());
         fs::remove_file(&path).expect("gone");
         fs::create_dir(&path).expect("a folder in its place");
-        f.stage(entries);
+        f.log(Op::Put(r(r"C:\mine", 1, 40)));
         assert!(f.write_now().is_err() && f.pending());
         fs::remove_dir(&path).expect("gone");
         assert!(f.write_now().expect("ok").is_some() && !f.pending());
@@ -565,54 +548,62 @@ mod tests {
         file::tests::scratch(name).join(FILE_NAME)
     }
 
+    fn runs_in(path: &Path) -> Vec<Ran> {
+        parse(&fs::read(path).expect("read"))
+            .expect("parses")
+            .entries
+    }
+
     #[test]
-    fn a_write_merges_with_what_another_process_wrote() {
-        let path = scratch("runs-merge");
-        let mine = RunFile::new(path.clone(), None, true);
-        // Nothing staged: nothing written.
-        assert!(mine.write_now().expect("no error").is_none());
+    fn two_processes_on_one_file_keep_each_others_changes() {
+        let path = scratch("runs-two");
+        let a = RunFile::new(path.clone(), None, true);
+        let b = RunFile::new(path.clone(), None, true);
+        // Nothing changed: nothing written.
+        assert!(a.write_now().expect("no error").is_none());
         assert!(!path.exists());
-        mine.stage(vec![r(r"C:\a", 1, 50)]);
-        let w = mine.write_now().expect("ok").expect("written");
+        a.log(Op::Put(r(r"C:\a", 1, 50)));
+        let w = a.write_now().expect("ok").expect("written");
         assert_eq!(w.entries, [r(r"C:\a", 1, 50)]);
         assert!(!file::backup_path(&path).exists(), "nothing to back up");
-        // Another window adds b and counts a more.
+        // Another window adds b and counts a more (in another case).
         fs::write(
             &path,
             "Filename,Run Count,Last Run Date\r\n\"C:\\b\",1,60\r\n\"C:\\A\",4,40\r\n",
         )
         .expect("theirs");
-        mine.stage(vec![r(r"C:\c", 1, 70), r(r"C:\a", 1, 50)]);
-        let w = mine.write_now().expect("ok").expect("written");
+        a.log(Op::Put(r(r"C:\c", 1, 70)));
+        let w = a.write_now().expect("ok").expect("written");
         assert_eq!(
             w.entries,
-            [r(r"C:\c", 1, 70), r(r"C:\b", 1, 60), r(r"C:\a", 4, 50)]
+            [r(r"C:\c", 1, 70), r(r"C:\b", 1, 60), r(r"C:\A", 4, 40)]
         );
         assert_eq!(
             fs::read_to_string(&path).expect("read"),
-            "Filename,Run Count,Last Run Date\r\n\"C:\\c\",1,70\r\n\"C:\\b\",1,60\r\n\"C:\\a\",4,50\r\n"
+            "Filename,Run Count,Last Run Date\r\n\"C:\\c\",1,70\r\n\"C:\\b\",1,60\r\n\"C:\\A\",4,40\r\n"
         );
         assert!(
             fs::read_to_string(file::backup_path(&path))
                 .expect("backup")
                 .contains("\"C:\\b\",1,60")
         );
-        // Removed here: gone from the file, though the file still had it.
-        mine.forget(r"C:\B", 80);
-        mine.stage(vec![r(r"C:\c", 1, 70), r(r"C:\a", 4, 50)]);
-        mine.write_now().expect("ok");
-        assert!(!fs::read_to_string(&path).expect("read").contains("C:\\b"));
-        assert!(mine.forgotten().is_empty(), "settled once written");
-        // Remove All here: what another window ran later stays.
-        fs::write(
-            &path,
-            "Filename,Run Count,Last Run Date\r\n\"C:\\later\",1,200\r\n\"C:\\c\",1,70\r\n",
-        )
-        .expect("theirs");
-        mine.forget_all(100);
-        mine.stage(Vec::new());
-        let w = mine.write_now().expect("ok").expect("written");
+        // Removed in B (any case): gone, and A's next write, which still
+        // had it, does not bring it back.
+        b.log(Op::Delete {
+            key: r"c:\B".into(),
+            at: 80,
+        });
+        b.write_now().expect("ok");
+        a.log(Op::Put(r(r"C:\a", 5, 90)));
+        a.write_now().expect("ok");
+        assert_eq!(runs_in(&path), [r(r"C:\a", 5, 90), r(r"C:\c", 1, 70)]);
+        // Remove All in A: what B runs later stays.
+        a.log(Op::Clear { at: 100 });
+        b.log(Op::Put(r(r"C:\later", 1, 200)));
+        b.write_now().expect("ok");
+        let w = a.write_now().expect("ok").expect("written");
         assert_eq!(w.entries, [r(r"C:\later", 1, 200)]);
+        assert_eq!(runs_in(&path), w.entries);
         let _ = fs::remove_dir_all(path.parent().expect("dir"));
     }
 
@@ -630,16 +621,18 @@ mod tests {
         let (entries, note) = load(&path, None, now);
         assert_eq!((entries.len(), note), (2, None));
         let f = RunFile::new(path.clone(), None, true);
-        f.stage(entries);
+        assert!(f.write_now().expect("ok").is_none());
+        f.log(Op::Put(entries[0].clone()));
         f.write_now().expect("ok");
         assert!(!file::backup_path(&path).exists(), "not written");
         // Kept 30 days: left out when read, and out of the file once written.
         let (entries, _) = load(&path, Some(30), now);
         assert_eq!(entries.len(), 1);
         let f = RunFile::new(path.clone(), Some(30), true);
-        f.stage(entries);
+        f.log(Op::Put(r(r"C:\today", 1, now)));
         f.write_now().expect("ok");
-        assert!(!fs::read_to_string(&path).expect("read").contains("old"));
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("old") && text.contains("today"));
         let _ = fs::remove_dir_all(path.parent().expect("dir"));
     }
 
@@ -662,9 +655,7 @@ mod tests {
             [0u8; 64]
         );
         let f = RunFile::new(path.clone(), None, true);
-        let mut mine = entries;
-        mine.insert(0, r(r"C:\mine", 1, 20));
-        f.stage(mine);
+        f.log(Op::Put(r(r"C:\mine", 1, 20)));
         f.write_now().expect("ok");
         let text = fs::read_to_string(&path).expect("read");
         assert!(text.contains("\"C:\\mine\",1,20") && text.contains("\"C:\\saved\",2,10"));
@@ -682,7 +673,7 @@ mod tests {
                 .starts_with("The run history could not be read")
         );
         let f = RunFile::new(path.clone(), None, true);
-        f.stage(vec![r(r"C:\x", 1, 1)]);
+        f.log(Op::Put(r(r"C:\x", 1, 1)));
         assert!(f.write_now().is_err());
         assert!(path.is_dir());
         fs::remove_dir(&path).expect("gone");

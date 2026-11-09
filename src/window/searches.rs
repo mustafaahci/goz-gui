@@ -9,11 +9,12 @@
 //!   `search_history_days_to_keep` days: older searches are left out when
 //!   the file is read and when it is written. `search_history_always_suggest=1`
 //!   opens the dropdown with the searches that contain what is typed.
-//! - **Writing**: a change (a search recorded, deleted or imported) is
-//!   written by the store thread about a second later, and at exit. The
-//!   write reads the file again and merges (`history::merge`), so another
-//!   goz-gui's searches are kept; what it wrote back is then merged into
-//!   this window's history too.
+//! - **Writing**: each change (a search recorded, deleted, Delete All, an
+//!   import) is noted (`HistoryFile::log`) and written by the store thread
+//!   about a second later, and at exit. The write reads the file again and
+//!   makes those changes on it (`history::apply`), so another goz-gui's
+//!   searches are kept and its deletions stick; this window then takes the
+//!   file as written for its own history.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -24,9 +25,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     KillTimer, MB_ICONWARNING, PostMessageW, SetTimer,
 };
 
+use super::runs::give_back_memory;
 use super::{App, TIMER_HISTORY, WM_HISTORY, prefs};
 use crate::dialog::Quiet;
-use crate::history::{self, Forgotten, Keep, SearchHistory, Searched, filetime_now};
+use crate::history::{self, Keep, Op, SearchHistory, Searched, filetime_now};
 use crate::history_dialogs::{self, Host, Mode};
 use crate::history_file::{self, FILE_NAME, HistoryFile, Written};
 use crate::settings::Settings;
@@ -49,8 +51,6 @@ pub(super) struct Searches {
     keep: Keep,
     /// `None` without a data folder, or with the history off.
     file: Option<Arc<HistoryFile>>,
-    /// Changed since it was last handed to the store thread.
-    dirty: Cell<bool>,
     /// Find or Organize is open.
     dialog: Cell<bool>,
     /// What to tell the user once the window is up: the file could not be
@@ -79,7 +79,6 @@ impl Searches {
             suggest: h.search_enabled && h.search_always_suggest,
             keep,
             file,
-            dirty: Cell::new(false),
             dialog: Cell::new(false),
             note: RefCell::new(note),
         };
@@ -105,46 +104,49 @@ impl App {
         self.searches.enabled
     }
 
-    /// The search history changed here: written once it stops changing.
-    pub(super) fn history_changed(&self) {
-        if self.searches.file.is_none() {
+    /// The search history changed here (`ops`, made on it already): the
+    /// file gets the changes once they stop coming.
+    fn history_changed(&self, ops: Vec<Op<Searched>>) {
+        let Some(file) = &self.searches.file else {
             return;
+        };
+        for op in ops {
+            file.log(op);
         }
-        self.searches.dirty.set(true);
         // SAFETY: a timer of this window; setting it again restarts it.
         unsafe { SetTimer(self.hwnd, TIMER_HISTORY, SAVE_DELAY_MS, None) };
     }
 
-    /// Hands the history to the store thread if it changed since the last
-    /// time.
+    /// Hands the changes made to the history to the store thread, if any
+    /// are waiting (new ones, or those of a write that failed).
     pub(super) fn save_history(&self) {
         // SAFETY: a timer of this window.
         unsafe { KillTimer(self.hwnd, TIMER_HISTORY) };
-        let dirty = self.searches.dirty.replace(false);
         let Some(file) = self.searches.file.clone() else {
             return;
         };
-        if dirty {
-            file.stage(self.search_history.borrow().entries().to_vec());
-        } else if !file.pending() {
-            // Nothing new, and no failed write waiting to go out again.
+        if !file.pending() {
             return;
         }
         let hwnd = self.hwnd as usize;
         let job = Arc::clone(&file);
         self.writer.submit(
             file.path(),
-            Box::new(move || match job.write_now() {
-                Ok(Some(written)) => post(hwnd, WM_HISTORY, written),
-                Ok(None) => {}
-                Err(why) => prefs::report(hwnd, why, true),
+            Box::new(move || {
+                match job.write_now() {
+                    Ok(Some(written)) => post(hwnd, WM_HISTORY, written),
+                    Ok(None) => {}
+                    Err(why) => prefs::report(hwnd, why, true),
+                }
+                give_back_memory();
             }),
         );
     }
 
-    /// The store thread wrote the history: the searches another goz-gui
-    /// added are taken in (not while a dialog or the dropdown shows the
-    /// history: they come with the next write).
+    /// The store thread wrote the history: this window's history becomes
+    /// the file as written (with what another goz-gui added or deleted),
+    /// and the changes made here since the write began (not while a dialog
+    /// or the dropdown shows the history: that comes with the next write).
     pub(super) fn history_written(&self, written: Written) {
         if let Some(note) = written.note {
             self.show_note(note);
@@ -152,16 +154,21 @@ impl App {
         let Some(file) = &self.searches.file else {
             return;
         };
+        let later = file.settle(written.through);
         if self.searches.dialog.get() || self.dropdown.is_open() {
             return;
         }
-        let forgotten = file.forgotten();
-        let mut h = self.search_history.borrow_mut();
-        let mut merged = history::merge(h.entries(), &written.entries, &forgotten);
-        history::prune(&mut merged, self.searches.keep, filetime_now());
-        if merged != h.entries() {
-            h.replace(merged);
+        let mut entries = written.entries;
+        history::apply(&mut entries, &later);
+        history::prune(&mut entries, self.searches.keep, filetime_now());
+        {
+            let mut h = self.search_history.borrow_mut();
+            if entries != h.entries() {
+                h.replace(entries);
+            }
         }
+        // The list it replaced, or the one written (the same), is freed.
+        give_back_memory();
     }
 
     /// Notes the search in the box as made (once per change of its text).
@@ -169,12 +176,12 @@ impl App {
         if !self.searches.enabled {
             return;
         }
-        let recorded = self
+        let made = self
             .search_history
             .borrow_mut()
             .record(text, filetime_now());
-        if recorded {
-            self.history_changed();
+        if let Some(made) = made {
+            self.history_changed(vec![Op::Put(made)]);
         }
     }
 
@@ -184,24 +191,17 @@ impl App {
         let now = filetime_now();
         // Each deletion is dated no earlier than the search it deleted, so
         // one dated in the future (a clock that was ahead) goes too.
-        let dated: Vec<(&String, u64)> = {
+        let ops = {
             let mut h = self.search_history.borrow_mut();
             searches
                 .iter()
-                .map(|s| {
-                    (
-                        s,
-                        history::deleted_at(h.remove_search(s).map(|e| e.last), now),
-                    )
+                .map(|s| Op::Delete {
+                    key: s.clone(),
+                    at: history::deleted_at(h.remove_search(s).map(|e| e.last), now),
                 })
                 .collect()
         };
-        if let Some(file) = &self.searches.file {
-            for (s, at) in dated {
-                file.forget(s, at);
-            }
-        }
-        self.history_changed();
+        self.history_changed(ops);
     }
 
     fn forget_all_searches(&self) {
@@ -212,21 +212,17 @@ impl App {
             h.replace(Vec::new());
             history::deleted_at(newest, now)
         };
-        if let Some(file) = &self.searches.file {
-            file.forget_all(at);
-        }
-        self.history_changed();
+        self.history_changed(vec![Op::Clear { at }]);
     }
 
+    /// Merges `entries` in: each search takes the higher count and the
+    /// later date. Imported on purpose: a search deleted earlier comes back.
     fn import_searches(&self, entries: Vec<Searched>) {
-        {
-            let mut h = self.search_history.borrow_mut();
-            // Imported on purpose: a search deleted earlier comes back.
-            let mut merged = history::merge(h.entries(), &entries, &Forgotten::default());
-            history::prune(&mut merged, self.searches.keep, filetime_now());
-            h.replace(merged);
-        }
-        self.history_changed();
+        let mut entries = history::tidy(entries);
+        history::prune(&mut entries, self.searches.keep, filetime_now());
+        let ops: Vec<Op<Searched>> = entries.into_iter().map(Op::Put).collect();
+        self.search_history.borrow_mut().apply(&ops);
+        self.history_changed(ops);
     }
 
     /// While a search is typed: the dropdown lists the searches containing
@@ -271,6 +267,7 @@ impl App {
         let _quiet = Quiet::begin();
         let chosen = history_dialogs::run(self.hwnd, mode, self, self.dialog_look());
         self.searches.dialog.set(false);
+        give_back_memory();
         if let Some(search) = chosen {
             self.set_search_text(&search);
         }
