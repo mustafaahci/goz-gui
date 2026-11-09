@@ -15,6 +15,8 @@
 //! `windows-sys`, whose handles are the same pointers.
 
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use windows::Win32::Foundation::{
     HGLOBAL, HWND as WHWND, LPARAM as WLPARAM, LRESULT as WLRESULT, POINT as WPOINT,
@@ -34,8 +36,9 @@ use windows::Win32::UI::Shell::{
     CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX,
     FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_RENAMEONCOLLISION,
     FOF_SILENT, FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE, GCS_VERBW, IContextMenu, IContextMenu2,
-    IContextMenu3, ILClone, ILCreateFromPathW, ILFindLastID, ILFree, ILIsParent, ILRemoveLastID,
-    IShellFolder, IShellLinkW, SHBindToParent, SHDoDragDrop, SHGetDesktopFolder, ShellLink,
+    IContextMenu3, ILClone, ILCombine, ILCreateFromPathW, ILFindLastID, ILFree, ILIsParent,
+    ILRemoveLastID, IShellFolder, IShellLinkW, SHBindToParent, SHDoDragDrop, SHGetDesktopFolder,
+    ShellLink,
 };
 use windows::Win32::UI::WindowsAndMessaging::HMENU as WHMENU;
 use windows::core::{Interface, PCSTR, PCWSTR, PSTR};
@@ -89,6 +92,123 @@ impl Drop for Pidl {
     }
 }
 
+/// The folder holding `path` (as a path the shell parses) and the name of
+/// `path` in it; `None` for a path that is a root (a drive, a share), which
+/// the shell parses whole.
+fn split_parent(path: &[u16]) -> Option<(Vec<u16>, &[u16])> {
+    const BACKSLASH: u16 = b'\\' as u16;
+    let at = path.iter().rposition(|&c| c == BACKSLASH)?;
+    let (parent, name) = (&path[..at], &path[at + 1..]);
+    if name.is_empty() || parent.iter().all(|&c| c == BACKSLASH) {
+        return None;
+    }
+    // `\\server\share` is a root, as `C:\` is.
+    if path.starts_with(&[BACKSLASH, BACKSLASH]) && parent[2..].iter().all(|&c| c != BACKSLASH) {
+        return None;
+    }
+    let mut parent = parent.to_vec();
+    // `C:` alone is the drive's current folder: its root is `C:\`.
+    if parent.last() == Some(&u16::from(b':')) {
+        parent.push(BACKSLASH);
+    }
+    Some((parent, name))
+}
+
+/// A folder some items are in: its absolute ID list and the shell's folder.
+struct Dir {
+    id: Pidl,
+    folder: IShellFolder,
+}
+
+/// The folders some items are in, each looked up once by path. A folder is
+/// parsed by its name in the folder that holds it (itself looked up the same
+/// way, down from a root), and an item by its name in its folder: each name
+/// costs one lookup in one folder. `ILCreateFromPathW` parses a whole path
+/// from the desktop for every item instead, which took about 1 ms an item in
+/// a folder some 12 levels deep (3 s for 3,000 rows); this takes some 40 µs.
+struct Dirs {
+    desktop: IShellFolder,
+    known: HashMap<Vec<u16>, Option<Rc<Dir>>>,
+}
+
+impl Dirs {
+    fn new() -> Option<Dirs> {
+        // SAFETY: COM is initialised on this thread (the UI thread's STA).
+        let desktop = unsafe { SHGetDesktopFolder() }.ok()?;
+        Some(Dirs {
+            desktop,
+            known: HashMap::new(),
+        })
+    }
+
+    /// The folder at `path`, if the shell finds it.
+    fn get(&mut self, path: &[u16]) -> Option<Rc<Dir>> {
+        if let Some(dir) = self.known.get(path) {
+            return dir.clone();
+        }
+        let dir = self.find(path).map(Rc::new);
+        self.known.insert(path.to_vec(), dir.clone());
+        dir
+    }
+
+    fn find(&mut self, path: &[u16]) -> Option<Dir> {
+        let Some((parent, name)) = split_parent(path) else {
+            let id = id_of_path(path)?;
+            // SAFETY: a valid absolute ID list; the empty one is the desktop.
+            let folder = unsafe {
+                if (*id.0).mkid.cb == 0 {
+                    self.desktop.clone()
+                } else {
+                    self.desktop.BindToObject(id.0, None).ok()?
+                }
+            };
+            return Some(Dir { id, folder });
+        };
+        let parent = self.get(&parent)?;
+        let child = parse_name(&parent.folder, name)?;
+        // SAFETY: valid ID lists: the parent's absolute one and the child's
+        // relative to it; the combined one is a copy owned by the new value.
+        unsafe {
+            let folder = parent.folder.BindToObject(child.0, None).ok()?;
+            let id = ILCombine(Some(parent.id.0), Some(child.0));
+            (!id.is_null()).then_some(Dir {
+                id: Pidl(id),
+                folder,
+            })
+        }
+    }
+}
+
+/// The ID list of `path`, parsed whole from the desktop.
+fn id_of_path(path: &[u16]) -> Option<Pidl> {
+    let path = nul(path);
+    // SAFETY: a NUL-terminated path; a null result is no item.
+    let id = unsafe { ILCreateFromPathW(PCWSTR(path.as_ptr())) };
+    (!id.is_null()).then_some(Pidl(id))
+}
+
+/// The ID list, relative to `folder`, of the item `name` in it; `None` when
+/// it is not there (gone since the search).
+fn parse_name(folder: &IShellFolder, name: &[u16]) -> Option<Pidl> {
+    let name = nul(name);
+    let mut id = core::ptr::null_mut();
+    let mut attributes = 0u32;
+    // SAFETY: a NUL-terminated name and out-pointers that outlive the call;
+    // no attributes are asked for.
+    let ok = unsafe {
+        folder.ParseDisplayName(
+            WHWND::default(),
+            None,
+            PCWSTR(name.as_ptr()),
+            None,
+            &mut id,
+            &mut attributes,
+        )
+    }
+    .is_ok();
+    (ok && !id.is_null()).then_some(Pidl(id))
+}
+
 /// Some results as the shell knows them: the folder that holds them and
 /// what it calls each. All in one folder: that folder, with each item's
 /// last ID, as Explorer does. Spread over several: the desktop, with each
@@ -96,7 +216,8 @@ impl Drop for Pidl {
 /// so the menu and the data object cover them all.
 pub struct Items {
     folder: IShellFolder,
-    /// Each item's absolute ID list; `children` point into them.
+    /// Each item's ID list (relative to `folder` when one folder holds them
+    /// all, else absolute); `children` point into them.
     _pidls: Vec<Pidl>,
     children: Vec<*const ITEMIDLIST>,
     /// The paths the items are, of those asked for (in order).
@@ -106,19 +227,76 @@ pub struct Items {
     one_parent: bool,
 }
 
+/// Where one of some items was found: by name in a folder, or (a root)
+/// whole.
+enum Found {
+    In(Rc<Dir>, Pidl),
+    Whole(Pidl),
+}
+
 impl Items {
     /// The items at `paths` (full paths). Those the shell cannot find (gone
     /// since the search) are left out; `None` when none is left.
     pub fn of_paths(paths: &[Vec<u16>]) -> Option<Items> {
-        let (pidls, taken): (Vec<Pidl>, Vec<Vec<u16>>) = paths
+        let mut dirs = Dirs::new()?;
+        let (found, taken): (Vec<Found>, Vec<Vec<u16>>) = paths
             .iter()
             .filter_map(|p| {
-                let path = nul(p);
-                // SAFETY: a NUL-terminated path; a null result is no item.
-                let id = unsafe { ILCreateFromPathW(PCWSTR(path.as_ptr())) };
-                (!id.is_null()).then(|| (Pidl(id), p.clone()))
+                let found = match split_parent(p) {
+                    Some((parent, name)) => {
+                        let dir = dirs.get(&parent)?;
+                        let child = parse_name(&dir.folder, name)?;
+                        Found::In(dir, child)
+                    }
+                    None => Found::Whole(id_of_path(p)?),
+                };
+                Some((found, p.clone()))
             })
             .unzip();
+        let first = match found.first()? {
+            Found::In(dir, _) => Some(dir),
+            Found::Whole(_) => None,
+        };
+        // All in one folder: that folder, and the names as parsed in it.
+        if let Some(dir) = first
+            && found
+                .iter()
+                .all(|f| matches!(f, Found::In(d, _) if Rc::ptr_eq(d, dir)))
+        {
+            let folder = dir.folder.clone();
+            let pidls: Vec<Pidl> = found
+                .into_iter()
+                .filter_map(|f| match f {
+                    Found::In(_, child) => Some(child),
+                    Found::Whole(_) => None,
+                })
+                .collect();
+            let children = pidls.iter().map(|p| p.0.cast_const()).collect();
+            return Some(Items {
+                folder,
+                _pidls: pidls,
+                children,
+                taken,
+                one_parent: true,
+            });
+        }
+        let pidls: Vec<Pidl> = found
+            .into_iter()
+            .map(|f| match f {
+                // SAFETY: the folder's absolute ID list and the item's
+                // relative to it; the combined copy is owned by the result.
+                Found::In(dir, child) => Pidl(unsafe { ILCombine(Some(dir.id.0), Some(child.0)) }),
+                Found::Whole(id) => id,
+            })
+            .collect();
+        if pidls.iter().any(|p| p.0.is_null()) {
+            return None;
+        }
+        Self::of_absolute(pidls, taken)
+    }
+
+    /// Items given by absolute ID lists (several folders, or a root).
+    fn of_absolute(pidls: Vec<Pidl>, taken: Vec<Vec<u16>>) -> Option<Items> {
         let first = pidls.first()?;
         // SAFETY: each PIDL is valid until `pidls` drops, which `Items`
         // keeps alive as long as the pointers into them; the parent's copy
@@ -472,6 +650,17 @@ pub fn link_target(path: &[u16]) -> Option<Vec<u16>> {
 
 /// The Explorer context menu of some items, as long as it is shown and
 /// its command run: the handlers it loaded live with it.
+///
+/// Dropping it releases the menu (its three interfaces are all the
+/// references there are then: measured) and with it every handler. What
+/// some handlers leave behind is theirs: Windows' Work Folders handler
+/// (`WorkfoldersShell.dll`, registered for `*`) creates one thread per
+/// menu in its QueryContextMenu, suspended, and never runs or ends it;
+/// Locale Emulator's leaks 4 GDI objects a menu, PowerToys' File Locksmith
+/// 1 (each measured alone, made and released through `IShellExtInit` as
+/// the menu does). Nothing goz-gui can release frees them, and
+/// `CoFreeUnusedLibrariesEx` must not be called for it: it unloads
+/// `WorkfoldersShell.dll` under its live threads.
 pub struct ContextMenu {
     menu: IContextMenu,
     /// The versions that draw their own items (icons, Open with, Send to)
@@ -612,6 +801,68 @@ mod tests {
             ReleaseStgMedium(&mut medium);
             files
         }
+    }
+
+    #[test]
+    fn a_path_splits_into_its_folder_and_name() {
+        let split = |p: &str| {
+            split_parent(&w(p)).map(|(parent, name)| {
+                (
+                    String::from_utf16_lossy(&parent),
+                    String::from_utf16_lossy(name),
+                )
+            })
+        };
+        let some = |a: &str, b: &str| Some((a.to_owned(), b.to_owned()));
+        assert_eq!(split(r"C:\dir\a.txt"), some(r"C:\dir", "a.txt"));
+        assert_eq!(split(r"C:\a.txt"), some(r"C:\", "a.txt"));
+        assert_eq!(split(r"C:\dir\sub"), some(r"C:\dir", "sub"));
+        assert_eq!(split(r"\\srv\share\a.txt"), some(r"\\srv\share", "a.txt"));
+        // Roots, which the shell parses whole.
+        for root in [r"C:\", "C:", r"\\srv\share", r"\\srv", r"\x", "name"] {
+            assert_eq!(split(root), None, "{root}");
+        }
+    }
+
+    /// A drive, a folder and files of several folders in one go: each found,
+    /// as the paths they are.
+    #[test]
+    fn roots_folders_and_files_mix() {
+        // SAFETY: COM for this test thread, which ends with the test.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let dir = windir();
+        let drive = format!("{}\\", &dir[..2]);
+        let paths: Vec<Vec<u16>> = [
+            drive.clone(),
+            format!(r"{dir}\System32"),
+            format!(r"{dir}\System32\notepad.exe"),
+            format!(r"{dir}\win.ini"),
+        ]
+        .iter()
+        .map(|p| w(p))
+        .collect();
+        let items = Items::of_paths(&paths).expect("items");
+        assert_eq!(items.paths(), &paths[..]);
+        assert!(!items.one_parent());
+        let data = items.data_object(core::ptr::null_mut()).expect("data");
+        let got: Vec<String> = hdrop_files(&data)
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        let want: Vec<String> = paths
+            .iter()
+            .map(|p| String::from_utf16_lossy(p).to_lowercase())
+            .collect();
+        assert_eq!(got, want);
+        // A drive alone: through its parent (This PC), as before.
+        let one = Items::of_paths(&[w(&drive)]).expect("drive");
+        assert!(one.one_parent());
+        let menu = one.context_menu(core::ptr::null_mut()).expect("menu");
+        // SAFETY: a popup menu of this thread, destroyed below.
+        let popup = unsafe { CreatePopupMenu() };
+        assert!(menu.fill(popup, 0, 0x7000, 0x7fff, query_flags(false, false)));
+        // SAFETY: as above.
+        unsafe { DestroyMenu(popup) };
     }
 
     #[test]

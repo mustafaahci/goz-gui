@@ -2,9 +2,10 @@
 //! Explorer menu of the selection, `crate::shell`), the menu of the list's
 //! empty space, and the messages the shell's menu needs while it is up.
 //!
-//! The shell's menu is made from the selected rows that are held: one
-//! folder's items through that folder, items spread over several through
-//! the desktop with their full ID lists (`shell::Items`). Its default item
+//! The shell's menu is made from the selected rows, fetched first when
+//! some are not held (`results::Fetching`; then the menu shows once they
+//! are here): one folder's items through that folder, items spread over
+//! several through the desktop with their full ID lists (`shell::Items`). Its default item
 //! (what a double-click in Explorer does) is the same as goz-gui's Open, so
 //! it is taken out: Open stays first and bold, and counts as a run. Of the
 //! shell's verbs, Properties and Run as administrator run goz-gui's own
@@ -17,6 +18,7 @@ use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::Controls::{
     LVHITTESTINFO, LVIR_BOUNDS, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_SUBITEMHITTEST, LVNI_FOCUSED,
     ODT_MENU,
@@ -24,12 +26,12 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DeleteMenu, DestroyMenu, GetMenuDefaultItem, GetMenuItemCount, GetMenuItemInfoW, HMENU,
-    MENUITEMINFOW, MF_BYCOMMAND, MF_BYPOSITION, MFT_SEPARATOR, MIIM_FTYPE, WM_DRAWITEM,
-    WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
+    MB_ICONWARNING, MENUITEMINFOW, MF_BYCOMMAND, MF_BYPOSITION, MFT_SEPARATOR, MIIM_FTYPE,
+    WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
 };
 
 use super::files::renamable;
-use super::results::Act;
+use super::results::{Act, Busy, Then};
 use super::{App, COL_PATH, key_down, point, send};
 use crate::dialog::Quiet;
 use crate::shell::{self, ContextMenu};
@@ -117,31 +119,55 @@ impl App {
     /// under the focused row: Open (bold; Open Path in the Path column,
     /// where a double-click opens the path), Open Path, Copy Name, Copy
     /// Full Path, Set Run Count... (with the run history on), then the
-    /// Explorer menu of the selection; Shift adds the extended verbs.
+    /// Explorer menu of the selection; Shift adds the extended verbs. When
+    /// selected rows are not held, it shows once they are fetched.
     fn row_menu(&self, mouse: Option<POINT>) {
+        let mut default = menu::OPEN;
+        if let Some(pt) = mouse {
+            let mut at = pt;
+            // SAFETY: converts a screen point to the list's.
+            unsafe { ScreenToClient(self.list, &mut at) };
+            if self
+                .hit_row(at)
+                .and_then(|(_, sub)| self.column_id(sub.max(0) as usize))
+                == Some(COL_PATH)
+            {
+                default = menu::REVEAL;
+            }
+        }
+        let extended = key_down(VK_SHIFT);
+        let then = Then::RowMenu {
+            at: mouse,
+            default,
+            extended,
+        };
+        if !self.fetch_first(then) {
+            self.show_row_menu(mouse, default, extended);
+        }
+    }
+
+    /// [`row_menu`](Self::row_menu) on the selected rows held, with
+    /// `default` bold and `extended` the extended verbs. The shell makes its
+    /// part under the wait cursor: its handlers take their time over a big
+    /// selection (see `shell::Items`).
+    pub(super) fn show_row_menu(&self, mouse: Option<POINT>, default: u16, extended: bool) {
         let (paths, selected) = self.picked_paths();
         if paths.is_empty() {
+            if selected > 0 {
+                // None of them could be had: say so, not nothing.
+                self.note_partial(Act::Command, 0, selected);
+                // SAFETY: plays a system sound.
+                unsafe { MessageBeep(MB_ICONWARNING) };
+            }
             return;
         }
-        let mut default = menu::OPEN;
-        let pt = match mouse {
-            Some(pt) => {
-                let mut at = pt;
-                // SAFETY: converts a screen point to the list's.
-                unsafe { ScreenToClient(self.list, &mut at) };
-                if self
-                    .hit_row(at)
-                    .and_then(|(_, sub)| self.column_id(sub.max(0) as usize))
-                    == Some(COL_PATH)
-                {
-                    default = menu::REVEAL;
-                }
-                pt
-            }
-            None => self.focused_row_point(),
-        };
+        let pt = mouse.unwrap_or_else(|| self.focused_row_point());
         let popup = menu::empty();
-        let (shell, took) = match self.shell_part(popup, &paths, key_down(VK_SHIFT)) {
+        let was = self.busy.get();
+        self.set_busy(Busy::Wait);
+        let shell_part = self.shell_part(popup, &paths, extended);
+        self.set_busy(was);
+        let (shell, took) = match shell_part {
             Some((cm, took)) => (Some(cm), took),
             None => (None, 0),
         };
@@ -324,7 +350,7 @@ impl App {
     /// Set Run Count... on the selection: asks for the count, starting
     /// from the first selected item's.
     pub(super) fn set_run_count(&self) {
-        if !self.run_history_enabled() {
+        if !self.run_history_enabled() || self.fetch_first(Then::RunCount) {
             return;
         }
         let (paths, _) = self.picked_paths();
