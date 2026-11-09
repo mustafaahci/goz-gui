@@ -12,8 +12,9 @@
 //!
 //! The file is read once at startup, before the window shows. It is written
 //! by the store thread (`HistoryFile::write_now`), which reads it again
-//! first and merges this process's history into it (`history::merge`), so
-//! two goz-gui windows never write each other's searches out.
+//! first and makes on it only the changes made in this process since its
+//! last write (`history::apply`): two goz-gui windows never write each
+//! other's searches out, and a search deleted in one stays deleted.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::csv::{self, Field};
-use crate::history::{self, Forgotten, Keep, Searched, filetime_now, tidy};
+use crate::history::{self, Journal, Keep, Op, Searched, filetime_now, tidy};
 use crate::store::file::{self, Loaded};
 use crate::store::join_notes;
 
@@ -124,7 +125,7 @@ fn table(records: Vec<Vec<Field>>) -> Result<Table, String> {
     if !seen[0] {
         return Err("it has no Search column".into());
     }
-    let mut entries = Vec::new();
+    let mut entries = Vec::with_capacity(records.len());
     let mut extras: HashMap<String, Vec<Field>> = HashMap::new();
     for record in records {
         let mut row = Searched {
@@ -136,7 +137,7 @@ fn table(records: Vec<Vec<Field>>) -> Result<Table, String> {
         // Values past the header's columns have no name to keep.
         for (field, slot) in record.into_iter().zip(&slots) {
             match *slot {
-                Ok(0) => row.search = field.text,
+                Ok(0) => row.search = history::exact(field.text),
                 Ok(1) => row.count = field.text.trim().parse().unwrap_or(1),
                 Ok(_) => row.last = field.text.trim().parse().unwrap_or(0),
                 Err(i) => values[i] = field,
@@ -160,7 +161,7 @@ fn table(records: Vec<Vec<Field>>) -> Result<Table, String> {
 /// The file's text for `entries`, in Everything's columns and then the
 /// unknown ones `columns` was read with (each search keeps its values).
 pub fn to_csv(entries: &[Searched], columns: &Table) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(history::csv_size(entries));
     let header: Vec<Field> = COLUMNS
         .iter()
         .map(|&c| Field::plain(c))
@@ -169,16 +170,9 @@ pub fn to_csv(entries: &[Searched], columns: &Table) -> String {
     csv::write_record(&header, &mut out);
     let blank = vec![Field::plain(""); columns.extra.len()];
     for e in entries {
-        let mut row = vec![
-            Field::quoted(e.search.as_str()),
-            Field::plain(e.count.to_string()),
-            Field::plain(e.last.to_string()),
-        ];
-        if !columns.extra.is_empty() {
-            let values = columns.extras.get(&e.search).unwrap_or(&blank);
-            row.extend(values.iter().cloned());
-        }
-        csv::write_record(&row, &mut out);
+        let extra = (!columns.extra.is_empty())
+            .then(|| columns.extras.get(&e.search).unwrap_or(&blank).as_slice());
+        history::write_row(&mut out, &e.search, e.count, e.last, extra);
     }
     out
 }
@@ -285,28 +279,24 @@ pub fn load(path: &Path, keep: Keep, now: u64) -> (Vec<Searched>, Option<String>
     (entries, note)
 }
 
-#[derive(Default)]
-struct Staged {
-    /// The history as the window has it, waiting to be written.
-    snapshot: Option<Vec<Searched>>,
-    /// What was deleted here and is not yet out of the file.
-    forgotten: Forgotten,
-}
-
-/// The search history file, shared by the window (which stages its
-/// history and its deletions) and the store thread (which writes them).
+/// The search history file, shared by the window (which notes each change
+/// it makes to its history) and the store thread (which makes them on the
+/// file).
 pub struct HistoryFile {
     path: PathBuf,
     keep: Keep,
     backup: bool,
-    staged: Mutex<Staged>,
+    journal: Mutex<Journal<Searched>>,
 }
 
 /// What a write did.
 #[derive(Debug)]
 pub struct Written {
-    /// The history as written: this process's merged with the file's.
+    /// The history as written: the file's, with this process's changes
+    /// made on it.
     pub entries: Vec<Searched>,
+    /// The changes numbered below this are in it (see [`HistoryFile::settle`]).
+    pub through: u64,
     /// The file could not be parsed, and was moved aside first.
     pub note: Option<String>,
 }
@@ -319,7 +309,7 @@ impl HistoryFile {
             path,
             keep,
             backup,
-            staged: Mutex::new(Staged::default()),
+            journal: Mutex::new(Journal::default()),
         }
     }
 
@@ -327,77 +317,68 @@ impl HistoryFile {
         &self.path
     }
 
-    fn lock(&self) -> MutexGuard<'_, Staged> {
-        self.staged.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> MutexGuard<'_, Journal<Searched>> {
+        self.journal.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The history to write next, in place of any not written yet.
-    pub fn stage(&self, entries: Vec<Searched>) {
-        self.lock().snapshot = Some(entries);
+    /// A change made to the history here, for the next write to make on
+    /// the file.
+    pub fn log(&self, op: Op<Searched>) {
+        self.lock().log(op);
     }
 
-    /// A history staged and not written yet (a write failed): the next
-    /// save writes it even when nothing else changed.
+    /// Changes are waiting to be written (made since the last write, or
+    /// left by a write that failed).
     pub fn pending(&self) -> bool {
-        self.lock().snapshot.is_some()
+        self.lock().pending()
     }
 
-    /// `search` was deleted at `now`.
-    pub fn forget(&self, search: &str, now: u64) {
-        self.lock().forgotten.forget(search, now);
+    /// The window takes in `Written::entries`, written with the changes
+    /// numbered below `through`: the changes made since, to make on it.
+    pub fn settle(&self, through: u64) -> Vec<Op<Searched>> {
+        self.lock().settle(through)
     }
 
-    /// Every search was deleted at `now`.
-    pub fn forget_all(&self, now: u64) {
-        self.lock().forgotten.forget_all(now);
-    }
-
-    /// The deletions not yet written.
-    pub fn forgotten(&self) -> Forgotten {
-        self.lock().forgotten.clone()
-    }
-
-    /// Writes what is staged, merged into the file as it is now. Run on the
-    /// store thread. `Ok(None)`: nothing was staged. On failure the history
-    /// stays staged for the next write (unless a newer one came meanwhile).
+    /// Makes the changes not written yet on the file as it is now. Run on
+    /// the store thread. `Ok(None)`: there were none. On failure they wait
+    /// for the next write.
     pub fn write_now(&self) -> Result<Option<Written>, String> {
-        let (mine, forgotten) = {
-            let mut staged = self.lock();
-            let Some(mine) = staged.snapshot.take() else {
+        let (ops, through) = {
+            let journal = self.lock();
+            if !journal.pending() {
                 return Ok(None);
-            };
-            (mine, staged.forgotten.clone())
+            }
+            journal.unwritten()
         };
-        let result = self.merge_and_write(&mine, &forgotten);
-        let mut staged = self.lock();
-        match result {
-            Ok(written) => {
-                staged.forgotten.settle(&forgotten);
-                Ok(Some(written))
-            }
-            Err(why) => {
-                if staged.snapshot.is_none() {
-                    staged.snapshot = Some(mine);
-                }
-                Err(why)
-            }
-        }
+        let (entries, note) = self.apply_and_write(&ops)?;
+        self.lock().wrote(through);
+        Ok(Some(Written {
+            entries,
+            through,
+            note,
+        }))
     }
 
-    fn merge_and_write(&self, mine: &[Searched], forgotten: &Forgotten) -> Result<Written, String> {
+    fn apply_and_write(
+        &self,
+        ops: &[Op<Searched>],
+    ) -> Result<(Vec<Searched>, Option<String>), String> {
         let path = &self.path;
         // Not written over another goz-gui's write: tried again later.
         let _lock = file::Lock::for_write(path, file::WRITE_WAIT)?;
-        let theirs = read(path).map_err(|why| {
+        let mut theirs = read(path).map_err(|why| {
             format!(
                 "{} could not be read, so goz-gui does not write over it: {why}",
                 path.display()
             )
         })?;
-        let mut entries = history::merge(mine, &theirs.table.entries, forgotten);
+        let mut entries = core::mem::take(&mut theirs.table.entries);
+        let mut changed = history::apply(&mut entries, ops);
+        let unpruned = entries.len();
         history::prune(&mut entries, self.keep, filetime_now());
+        changed |= entries.len() != unpruned;
         let mut note = theirs.note;
-        if entries != theirs.table.entries || theirs.stale || !path.is_file() {
+        if changed || theirs.stale || !path.is_file() {
             let text = to_csv(&entries, &theirs.table);
             let previous = theirs.previous.as_deref().filter(|_| self.backup);
             let kept = file::write(path, text.as_bytes(), previous).map_err(|e| {
@@ -408,7 +389,7 @@ impl HistoryFile {
             })?;
             note = join_notes(note, kept);
         }
-        Ok(Written { entries, note })
+        Ok((entries, note))
     }
 }
 
@@ -576,9 +557,7 @@ mod tests {
         assert!(note.is_some_and(|n| n.contains("it is empty")));
         let f = HistoryFile::new(path.clone(), None, true);
         for (i, now) in [(1, 40), (2, 50)] {
-            let mut mine = entries.clone();
-            mine.insert(0, s(&format!("mine {i}"), 1, now));
-            f.stage(mine);
+            f.log(Op::Put(s(&format!("mine {i}"), 1, now)));
             f.write_now().expect("ok");
         }
         let backup = parse(&fs::read(file::backup_path(&path)).expect("backup")).expect("whole");
@@ -593,12 +572,14 @@ mod tests {
         let f = HistoryFile::new(path.clone(), None, true);
         assert!(!f.pending());
         fs::create_dir(&path).expect("a folder in its place");
-        f.stage(vec![s("x", 1, 1)]);
+        f.log(Op::Put(s("x", 1, 1)));
         assert!(f.write_now().is_err());
         assert!(f.pending(), "kept for the next save");
         fs::remove_dir(&path).expect("gone");
-        assert!(f.write_now().expect("ok").is_some());
+        let w = f.write_now().expect("ok").expect("written");
+        assert_eq!((w.entries, w.through), (vec![s("x", 1, 1)], 1));
         assert!(!f.pending());
+        assert_eq!(f.settle(1), []);
         let _ = fs::remove_dir_all(path.parent().expect("dir"));
     }
 
@@ -606,41 +587,59 @@ mod tests {
         file::tests::scratch(name).join(FILE_NAME)
     }
 
+    fn searches_in(path: &Path) -> Vec<Searched> {
+        parse(&fs::read(path).expect("read"))
+            .expect("parses")
+            .entries
+    }
+
     #[test]
-    fn a_write_merges_with_what_another_process_wrote() {
-        let path = scratch("history-merge");
-        let mine = HistoryFile::new(path.clone(), None, true);
-        // Nothing staged: nothing written.
-        assert!(mine.write_now().expect("no error").is_none());
-        assert!(!path.exists());
-        mine.stage(vec![s("a", 1, 50)]);
-        let w = mine.write_now().expect("ok").expect("written");
-        assert_eq!(w.entries, [s("a", 1, 50)]);
-        // Another window adds "b" and counts "a" more.
+    fn two_processes_on_one_file_keep_each_others_changes() {
+        let path = scratch("history-two");
         fs::write(
             &path,
-            "Search,Search Count,Last Search Date\r\n\"b\",1,60\r\n\"a\",4,40\r\n",
+            "Search,Search Count,Last Search Date\r\n\"foo\",3,10\r\n\"bar\",1,5\r\n",
         )
-        .expect("theirs");
-        mine.stage(vec![s("c", 1, 70), s("a", 1, 50)]);
-        let w = mine.write_now().expect("ok").expect("written");
-        assert_eq!(w.entries, [s("c", 1, 70), s("b", 1, 60), s("a", 4, 50)]);
+        .expect("file");
+        // Two goz-gui processes, both started on that file.
+        let (start, _) = load(&path, None, 100);
+        let a = HistoryFile::new(path.clone(), None, true);
+        let b = HistoryFile::new(path.clone(), None, true);
+        // Nothing changed: nothing written.
+        assert!(a.write_now().expect("no error").is_none());
+        // A deletes foo; B, which still shows it, searches bar again and
+        // makes a new search. Both write, A first.
+        a.log(Op::Delete {
+            key: "foo".into(),
+            at: 100,
+        });
+        b.log(Op::Put(s("bar", 2, 110)));
+        b.log(Op::Put(s("new", 1, 120)));
+        assert_eq!(start.len(), 2);
+        let w = a.write_now().expect("ok").expect("written");
+        assert_eq!((w.entries, w.through), (vec![s("bar", 1, 5)], 1));
+        let w = b.write_now().expect("ok").expect("written");
+        assert_eq!(w.entries, [s("new", 1, 120), s("bar", 2, 110)]);
+        assert_eq!(w.through, 2);
+        assert_eq!(searches_in(&path), w.entries, "foo stays deleted");
         assert_eq!(
             fs::read_to_string(&path).expect("read"),
-            "Search,Search Count,Last Search Date\r\n\"c\",1,70\r\n\"b\",1,60\r\n\"a\",4,50\r\n"
+            "Search,Search Count,Last Search Date\r\n\"new\",1,120\r\n\"bar\",2,110\r\n"
         );
         // The file before the write is the backup.
         assert!(
             fs::read_to_string(file::backup_path(&path))
                 .expect("backup")
-                .contains("\"b\",1,60")
+                .contains("\"bar\",1,5")
         );
-        // Deleted here: gone from the file, though the file still had it.
-        mine.forget("b", 80);
-        mine.stage(vec![s("c", 1, 70), s("a", 4, 50)]);
-        mine.write_now().expect("ok");
-        assert!(!fs::read_to_string(&path).expect("read").contains("\"b\""));
-        assert!(mine.forgotten().is_empty(), "settled once written");
+        // B takes in what it wrote, with what it did since.
+        b.log(Op::Clear { at: 130 });
+        assert_eq!(b.settle(2), [Op::Clear { at: 130 }]);
+        // Delete All in B; A searches after it: A's search stays.
+        a.log(Op::Put(s("later", 1, 140)));
+        a.write_now().expect("ok");
+        b.write_now().expect("ok");
+        assert_eq!(searches_in(&path), [s("later", 1, 140)]);
         let _ = fs::remove_dir_all(path.parent().expect("dir"));
     }
 
@@ -655,21 +654,24 @@ mod tests {
             now - 40 * DAY
         );
         fs::write(&path, &text).expect("file");
-        // Kept forever: staging what is there already writes nothing.
+        // Kept forever: no change, no write; a change that changes
+        // nothing writes nothing either.
         let (entries, note) = load(&path, None, now);
         assert_eq!((entries.len(), note), (2, None));
         let f = HistoryFile::new(path.clone(), None, true);
-        f.stage(entries);
-        f.write_now().expect("ok");
+        assert!(f.write_now().expect("ok").is_none());
+        f.log(Op::Put(entries[0].clone()));
+        assert_eq!(f.write_now().expect("ok").expect("done").entries, entries);
         assert!(!file::backup_path(&path).exists(), "not written");
         // Kept 30 days: left out when read, and out of the file once
-        // written (merged from the file or not).
+        // written.
         let (entries, _) = load(&path, Some(30), now);
         assert_eq!(entries.len(), 1);
         let f = HistoryFile::new(path.clone(), Some(30), true);
-        f.stage(entries);
+        f.log(Op::Put(s("today", 1, now)));
         f.write_now().expect("ok");
-        assert!(!fs::read_to_string(&path).expect("read").contains("old"));
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("old") && text.contains("today"));
         let _ = fs::remove_dir_all(path.parent().expect("dir"));
     }
 
@@ -691,12 +693,10 @@ mod tests {
             fs::read(file::corrupt_path(&path, 1)).expect("kept"),
             [0u8; 64]
         );
-        // The window's history (the backup's searches and one more) is
-        // written in the moved file's place.
+        // The window's change is made on the backup's searches, written in
+        // the moved file's place.
         let f = HistoryFile::new(path.clone(), None, true);
-        let mut mine = entries;
-        mine.insert(0, s("mine", 1, 20));
-        f.stage(mine);
+        f.log(Op::Put(s("mine", 1, 20)));
         f.write_now().expect("ok");
         let text = fs::read_to_string(&path).expect("read");
         assert!(text.contains("\"mine\",1,20") && text.contains("\"saved\",2,10"));
@@ -714,10 +714,10 @@ mod tests {
                 .starts_with("The search history could not be read")
         );
         let f = HistoryFile::new(path.clone(), None, true);
-        f.stage(vec![s("x", 1, 1)]);
+        f.log(Op::Put(s("x", 1, 1)));
         assert!(f.write_now().is_err());
         assert!(path.is_dir());
-        // Still staged: written once the file can be.
+        // Still pending: written once the file can be.
         fs::remove_dir(&path).expect("gone");
         assert!(f.write_now().expect("ok").is_some());
         assert!(fs::read_to_string(&path).expect("read").contains("\"x\""));
