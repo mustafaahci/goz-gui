@@ -106,6 +106,9 @@ pub const SERVICE_START: u16 = 1700;
 pub const SERVICE_STOP: u16 = 1701;
 pub const SERVICE_RESTART: u16 = 1702;
 pub const RUN_HISTORY: u16 = 1703;
+pub const OPTIONS: u16 = 1704;
+/// The tray menu's Show Window.
+pub const TRAY_SHOW: u16 = 1705;
 
 // Help.
 pub const HELP: u16 = 1800;
@@ -292,6 +295,8 @@ pub fn menu_bar(run_history: bool) -> Bar {
         Cmd(SERVICE_START, "&Start goz Service"),
         Cmd(SERVICE_STOP, "S&top goz Service"),
         Cmd(SERVICE_RESTART, "&Restart goz Service"),
+        Sep,
+        Cmd(OPTIONS, "&Options...	Ctrl+P"),
     ] {
         append(tools, &item);
     }

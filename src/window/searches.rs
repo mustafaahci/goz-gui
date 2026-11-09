@@ -47,7 +47,7 @@ pub(super) struct Searches {
     /// `search_history_enabled`.
     enabled: bool,
     /// `search_history_always_suggest` (and enabled).
-    suggest: bool,
+    suggest: Cell<bool>,
     keep: Keep,
     /// `None` without a data folder, or with the history off.
     file: Option<Arc<HistoryFile>>,
@@ -76,7 +76,7 @@ impl Searches {
         };
         let searches = Searches {
             enabled: h.search_enabled,
-            suggest: h.search_enabled && h.search_always_suggest,
+            suggest: Cell::new(h.search_enabled && h.search_always_suggest),
             keep,
             file,
             dialog: Cell::new(false),
@@ -99,6 +99,11 @@ fn post<T>(hwnd: usize, msg: u32, value: T) {
 }
 
 impl App {
+    /// `search_history_always_suggest`, from Tools > Options.
+    pub(super) fn set_suggest(&self, on: bool) {
+        self.searches.suggest.set(self.searches.enabled && on);
+    }
+
     /// Whether searches are recorded and listed at all.
     pub fn search_history_enabled(&self) -> bool {
         self.searches.enabled
@@ -229,7 +234,7 @@ impl App {
     /// it (`search_history_always_suggest`), without taking the keyboard;
     /// it closes when none does.
     pub(super) fn suggest(&self) {
-        if !self.searches.suggest {
+        if !self.searches.suggest.get() {
             dropdown::close(self);
             return;
         }

@@ -233,6 +233,7 @@ impl App {
             menu::SERVICE_STOP => actions::service(self.hwnd, Service::Stop, WM_SERVICE),
             menu::SERVICE_RESTART => actions::service(self.hwnd, Service::Restart, WM_SERVICE),
             menu::RUN_HISTORY => self.run_history_dialog(),
+            menu::OPTIONS => self.options_dialog(),
             menu::HELP => actions::open_url(self.hwnd, actions::HELP_URL),
             menu::SEARCH_SYNTAX => syntax::show(self.hwnd, self.pal.get().dark),
             menu::WEBSITE => actions::open_url(self.hwnd, actions::WEBSITE_URL),

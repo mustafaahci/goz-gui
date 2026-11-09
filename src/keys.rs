@@ -57,6 +57,7 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     (NONE, VK_F4, menu::NEXT_SELECTED),
     (SHIFT, VK_F4, menu::PREV_SELECTED),
     (CTRL, key(b'J'), menu::RUN_HISTORY),
+    (CTRL, key(b'P'), menu::OPTIONS),
 ];
 
 pub fn accelerators() -> HACCEL {

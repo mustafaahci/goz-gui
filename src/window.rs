@@ -59,6 +59,7 @@ use crate::{
 
 pub use crate::columns::{COL_DATE, COL_NAME, COL_PATH, COL_SIZE, COLS};
 
+mod background;
 mod bookmarks;
 mod cols;
 mod commands;
@@ -66,6 +67,7 @@ mod context;
 mod edit;
 mod files;
 mod nav;
+mod opts;
 mod prefs;
 mod reselect;
 mod results;
@@ -98,6 +100,10 @@ pub const WM_FILEOP: u32 = WM_APP + 9;
 const WM_DRAG_DONE: u32 = WM_APP + 10;
 /// A name typed in Rename's box was refused: say why and open it again.
 const WM_RENAME_AGAIN: u32 = WM_APP + 11;
+/// The tray icon's clicks and menu (`crate::tray`).
+const WM_TRAY: u32 = WM_APP + 12;
+/// A command line from a second start: a `Box<Vec<String>>` in lParam.
+const WM_LAUNCH: u32 = WM_APP + 13;
 
 const ID_EDIT: usize = 100;
 const ID_LIST: usize = 101;
@@ -302,6 +308,12 @@ pub struct App {
     fetch_bypass: Cell<bool>,
     /// The busy cursor, while goz-gui is busy for the user.
     busy: Cell<results::Busy>,
+    /// Background, tray and hotkey settings, and whether the tray icon is
+    /// up.
+    background: Cell<crate::settings::Background>,
+    tray_on: Cell<bool>,
+    /// Explorer's "TaskbarCreated" message: the tray icon goes back.
+    taskbar_created: u32,
 }
 
 /// How the program that started goz-gui asked for its window to be shown
@@ -345,7 +357,62 @@ fn first_show(start: i32, maximized: bool) -> (i32, bool, bool) {
     }
 }
 
+/// The search a start's command line asks for, over the settings the
+/// window starts with.
+fn apply_launch_settings(s: &mut Settings, l: &crate::cmdline::Launch) {
+    if let Some(text) = l.search_text() {
+        s.search = text;
+    }
+    if let Some(f) = l.filter {
+        s.filter = f;
+    }
+    if let Some(c) = l.match_case {
+        s.match_case = c;
+    }
+    if let Some(p) = l.match_path {
+        s.match_path = p;
+    }
+    if let Some(key) = l.sort {
+        s.sort = SortSpec::default_for(key);
+    }
+    if let Some(dir) = l.dir {
+        s.sort.dir = dir;
+    }
+}
+
+fn prefs_background(app: &App) -> crate::settings::Background {
+    app.prefs.borrow().base.background
+}
+
 pub fn run() -> i32 {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let launch = match crate::cmdline::parse(&args) {
+        Ok(l) => l,
+        Err(why) => {
+            crate::msgbox::show(
+                core::ptr::null_mut(),
+                &format!(
+                    "{why}
+
+See Help > Search Syntax and the README for goz-gui's switches."
+                ),
+                "goz-gui",
+                MB_OK | MB_ICONWARNING,
+            );
+            return 2;
+        }
+    };
+    // One goz-gui per data folder (and -instance name): a second start
+    // hands its command line over and ends.
+    let key = crate::instance::key(launch.instance.as_deref());
+    // If the one holding the instance does not answer, start anyway.
+    if !crate::instance::claim(&key) && crate::instance::forward(&key, &args) {
+        return 0;
+    }
+    if launch.exit {
+        // Nothing running to close.
+        return 0;
+    }
     let prefs = prefs::Prefs::load();
     let (searches, history) = searches::Searches::load(&prefs.base);
     let sessions = session::Sessions::load(&prefs.base);
@@ -354,10 +421,11 @@ pub fn run() -> i32 {
     // The window starts as the settings say, or as the previous session
     // left it (`session_store_restore_on_first_new_window`).
     let restored = sessions.at_start();
-    let settings = match &restored {
+    let mut settings = match &restored {
         Some(s) => session::start_settings(&prefs.base, s),
         None => prefs.base.clone(),
     };
+    apply_launch_settings(&mut settings, &launch);
     // Popup menus follow the theme from the first one on.
     theme::set_app_mode(settings.theme);
     // Where the window was, on the monitors there are now.
@@ -418,7 +486,16 @@ pub fn run() -> i32 {
         ));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as *const App as isize);
         app.init(start.is_none());
-        let (show, deferred, min_to_max) = first_show(startup_show(), settings.maximized);
+        crate::instance::listen(&key, hwnd, WM_LAUNCH);
+        let taken = app.apply_background(prefs_background(app));
+        // -startup (signing in to Windows) starts in the background, with
+        // no window.
+        let asked = if launch.startup {
+            SW_HIDE
+        } else {
+            startup_show()
+        };
+        let (show, deferred, min_to_max) = first_show(asked, settings.maximized);
         app.maximize_deferred.set(deferred);
         if min_to_max {
             let mut wp = WINDOWPLACEMENT {
@@ -455,6 +532,12 @@ pub fn run() -> i32 {
         .collect();
         if !notes.is_empty() {
             app.show_note(notes.join("; "));
+        }
+        if !taken.is_empty() {
+            app.show_note(format!(
+                "Another program already uses the {} hotkey",
+                taken.join(" and ")
+            ));
         }
 
         let accel = keys::accelerators();
@@ -685,6 +768,9 @@ impl App {
                 fetching: RefCell::new(None),
                 fetch_bypass: Cell::new(false),
                 busy: Cell::new(results::Busy::Idle),
+                background: Cell::new(crate::settings::Background::default()),
+                tray_on: Cell::new(false),
+                taskbar_created: crate::tray::taskbar_created(),
             })
         }
     }
@@ -820,6 +906,14 @@ impl App {
     /// Whether Back and Forward show left of the search box.
     pub fn nav_bar_visible(&self) -> bool {
         self.nav_bar.get()
+    }
+
+    /// Shows or hides Back and Forward left of the search box.
+    pub fn set_nav_bar_visible(&self, visible: bool) {
+        self.nav_bar.set(visible);
+        self.layout();
+        // SAFETY: repaints this thread's window.
+        unsafe { InvalidateRect(self.hwnd, core::ptr::null(), 1) };
     }
 
     /// Shows or hides the status bar; the list takes its room.
@@ -1240,7 +1334,38 @@ impl App {
                     paint::menubar_line(self);
                     r
                 }
+                WM_CLOSE if self.background().run_in_background => {
+                    // goz-gui keeps running in the background.
+                    self.hide_to_background();
+                    0
+                }
+                WM_SYSCOMMAND
+                    if (w & 0xfff0) == SC_MINIMIZE as usize
+                        && self.background().minimize_to_tray
+                        && self.background().tray_icon() =>
+                {
+                    self.hide_to_background();
+                    0
+                }
+                WM_HOTKEY => {
+                    self.on_hotkey(w);
+                    0
+                }
+                WM_TRAY => {
+                    self.on_tray(w, l);
+                    0
+                }
+                WM_LAUNCH => {
+                    let args = Box::from_raw(l as *mut Vec<String>);
+                    self.launch(*args);
+                    0
+                }
+                m if m == self.taskbar_created && m != 0 => {
+                    self.taskbar_restarted();
+                    0
+                }
                 WM_DESTROY => {
+                    self.remove_tray();
                     // The window is still there to read its placement from.
                     self.save_and_flush();
                     self.worker.quit();

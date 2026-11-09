@@ -11,6 +11,7 @@ mod bookmark_dialogs;
 mod bookmarks;
 mod client;
 mod clipboard;
+mod cmdline;
 mod columns;
 mod copytext;
 mod csv;
@@ -27,11 +28,14 @@ mod history_dialogs;
 mod history_file;
 mod hover;
 mod icons;
+mod instance;
+mod integration;
 mod json;
 mod keys;
 mod menu;
 mod model;
 mod msgbox;
+mod options;
 mod paint;
 mod placement;
 mod places;
@@ -48,6 +52,7 @@ mod status;
 mod store;
 mod syntax;
 mod theme;
+mod tray;
 mod wide;
 mod window;
 
@@ -55,8 +60,8 @@ use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };
 use windows_sys::Win32::UI::Controls::{
-    ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, ICC_TREEVIEW_CLASSES,
-    INITCOMMONCONTROLSEX, InitCommonControlsEx,
+    ICC_BAR_CLASSES, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
+    ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
 };
 
 fn main() {
@@ -73,7 +78,8 @@ fn main() {
             dwICC: ICC_LISTVIEW_CLASSES
                 | ICC_STANDARD_CLASSES
                 | ICC_BAR_CLASSES
-                | ICC_TREEVIEW_CLASSES,
+                | ICC_TREEVIEW_CLASSES
+                | ICC_HOTKEY_CLASS,
         };
         InitCommonControlsEx(&icc);
     }

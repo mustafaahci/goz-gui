@@ -262,6 +262,15 @@ pub fn set_class(hwnd: HWND, class: Option<&str>) {
     };
 }
 
+/// Turns visual styles off for `hwnd`, so it draws in classic style with
+/// the colours its owner gives it.
+pub fn unthemed(hwnd: HWND) {
+    let empty = [0u16];
+    // SAFETY: two empty NUL-terminated strings, the documented way to turn
+    // a window's theme off.
+    unsafe { SetWindowTheme(hwnd, empty.as_ptr(), empty.as_ptr()) };
+}
+
 /// Makes menus opened from now on use the current theme.
 pub fn flush_menus() {
     if let Some(f) = uxtheme().flush_menu_themes {

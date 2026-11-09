@@ -69,3 +69,11 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Quick optimized builds for testing: thin LTO and parallel codegen build in
+# a fraction of the release profile's time. `cargo build --profile fast`.
+[profile.fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true

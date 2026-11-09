@@ -296,6 +296,37 @@ pub struct Settings {
     /// Where the dialogs and the Search Syntax window open (see
     /// `crate::places`).
     pub places: Places,
+    /// The window and the tray: Everything's keys of the same names.
+    pub background: Background,
+}
+
+/// Running in the background, the tray icon and the global hotkeys, under
+/// Everything's key names and with its defaults (all off).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Background {
+    /// `run_in_background`: closing the window hides it; goz-gui keeps
+    /// running until File > Exit.
+    pub run_in_background: bool,
+    /// `show_tray_icon`.
+    pub show_tray_icon: bool,
+    /// `minimize_to_tray`: minimizing hides the window to the tray icon.
+    pub minimize_to_tray: bool,
+    /// `single_click_tray`: one click on the tray icon shows the window
+    /// (otherwise a double-click).
+    pub single_click_tray: bool,
+    /// `toggle_window_key` and `show_window_key`: global hotkeys, as a
+    /// hotkey control holds them (virtual key in the low byte, `HOTKEYF_*`
+    /// in the high byte); 0 for none.
+    pub toggle_window_key: u16,
+    pub show_window_key: u16,
+}
+
+impl Background {
+    /// Whether the tray icon shows: asked for, or needed to reach a window
+    /// that runs in the background.
+    pub fn tray_icon(&self) -> bool {
+        self.show_tray_icon
+    }
 }
 
 impl Default for Settings {
@@ -326,6 +357,7 @@ impl Default for Settings {
             ini_backup: true,
             csv_backup: true,
             places: Places::default(),
+            background: Background::default(),
         }
     }
 }
@@ -342,6 +374,13 @@ fn flag(ini: &Ini, key: &str) -> Option<bool> {
         v if v.eq_ignore_ascii_case("false") => Some(false),
         _ => None,
     }
+}
+
+/// A hotkey key's value: a hotkey control's word, 0 (none) if unreadable.
+fn hotkey(ini: &Ini, key: &str) -> u16 {
+    number(ini, key)
+        .and_then(|n| u16::try_from(n).ok())
+        .unwrap_or(0)
 }
 
 fn bit(on: bool) -> String {
@@ -475,6 +514,17 @@ impl Settings {
             ini_backup: flag(ini, "ini_backup").unwrap_or(d.ini_backup),
             csv_backup: flag(ini, "csv_backup").unwrap_or(d.csv_backup),
             places: Places::from_keys(|k| ini.get(k)),
+            background: Background {
+                run_in_background: flag(ini, "run_in_background")
+                    .unwrap_or(d.background.run_in_background),
+                show_tray_icon: flag(ini, "show_tray_icon").unwrap_or(d.background.show_tray_icon),
+                minimize_to_tray: flag(ini, "minimize_to_tray")
+                    .unwrap_or(d.background.minimize_to_tray),
+                single_click_tray: flag(ini, "single_click_tray")
+                    .unwrap_or(d.background.single_click_tray),
+                toggle_window_key: hotkey(ini, "toggle_window_key"),
+                show_window_key: hotkey(ini, "show_window_key"),
+            },
         }
     }
 
@@ -552,6 +602,13 @@ impl Settings {
         put("bookmark_remember_sort", bit(r.sort));
         put("bookmark_remember_filter", bit(r.filter));
         put("bookmark_remember_search", bit(r.search));
+        let b = &self.background;
+        put("run_in_background", bit(b.run_in_background));
+        put("show_tray_icon", bit(b.show_tray_icon));
+        put("minimize_to_tray", bit(b.minimize_to_tray));
+        put("single_click_tray", bit(b.single_click_tray));
+        put("toggle_window_key", b.toggle_window_key.to_string());
+        put("show_window_key", b.show_window_key.to_string());
         put("ini_backup", bit(self.ini_backup));
         put("csv_backup", bit(self.csv_backup));
         out.extend(self.columns.to_keys());
@@ -711,6 +768,14 @@ mod tests {
                     },
                 );
                 p
+            },
+            background: Background {
+                run_in_background: true,
+                show_tray_icon: true,
+                minimize_to_tray: true,
+                single_click_tray: true,
+                toggle_window_key: 0x0247,
+                show_window_key: 0x0647,
             },
         };
         let mut ini = Ini::default();

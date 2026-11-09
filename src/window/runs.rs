@@ -54,7 +54,7 @@ pub(super) struct Runs {
     /// `run_history_increase_run_count_on_open_path`.
     open_path: bool,
     /// `search_edit_enter_action`.
-    enter: EnterAction,
+    enter: Cell<EnterAction>,
     keep: Keep,
     /// The runs, the last first.
     pub history: RefCell<RunHistory>,
@@ -88,7 +88,7 @@ impl Runs {
         Runs {
             enabled: h.run_enabled,
             open_path: h.run_on_open_path,
-            enter: settings.enter_action,
+            enter: Cell::new(settings.enter_action),
             keep,
             history: RefCell::new(RunHistory::from_entries(entries)),
             file,
@@ -259,7 +259,7 @@ impl App {
     /// what `search_edit_enter_action` says, the keyboard staying in the
     /// box.
     pub(super) fn enter_select(&self) {
-        let pick = match self.runs.enter {
+        let pick = match self.runs.enter.get() {
             EnterAction::None => return,
             EnterAction::SelectSearch => {
                 send(self.edit, EM_SETSEL, 0, -1);
@@ -337,6 +337,15 @@ impl App {
                 .collect()
         };
         self.runs_changed(ops);
+    }
+
+    /// `search_edit_enter_action`, from Tools > Options.
+    pub(super) fn set_enter_action(&self, action: EnterAction) {
+        self.runs.enter.set(action);
+    }
+
+    pub(super) fn enter_action(&self) -> EnterAction {
+        self.runs.enter.get()
     }
 
     /// Whether the run history is on (`run_history_enabled`).

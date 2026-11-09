@@ -30,15 +30,16 @@ use windows_sys::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CBT_CREATEWNDW, CBTACTIVATESTRUCT, CallNextHookEx, DLGPROC, DS_MODALFRAME, DS_SETFONT,
-    DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD, GW_HWNDNEXT, GW_OWNER, GWL_STYLE,
-    GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem, GetForegroundWindow, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HCBT_ACTIVATE, HCBT_CREATEWND,
-    HHOOK, MapDialogRect, MoveWindow, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetWindowPos, SetWindowsHookExW,
-    UnhookWindowsHookEx, WH_CBT, WINDOWPOS, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT,
-    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_NCDESTROY, WM_NOTIFY, WM_SETTINGCHANGE,
-    WM_WINDOWPOSCHANGING, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    BS_GROUPBOX, BS_TYPEMASK, CBT_CREATEWNDW, CBTACTIVATESTRUCT, CallNextHookEx, DLGPROC,
+    DS_MODALFRAME, DS_SETFONT, DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD, GW_HWNDNEXT,
+    GW_OWNER, GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem,
+    GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    HCBT_ACTIVATE, HCBT_CREATEWND, HHOOK, MapDialogRect, MoveWindow, NONCLIENTMETRICSW,
+    SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SendMessageW, SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, WH_CBT, WINDOWPOS,
+    WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC,
+    WM_NCDESTROY, WM_NOTIFY, WM_SETTINGCHANGE, WM_WINDOWPOSCHANGING, WS_CAPTION, WS_CHILD,
+    WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::paint::fill;
@@ -247,6 +248,16 @@ pub fn apply_theme(dlg: HWND, dark: bool) {
         while !child.is_null() {
             theme::allow(child, dark);
             match class_of(child).as_str() {
+                // A themed group box draws its caption in the theme's dark
+                // text whatever WM_CTLCOLORSTATIC says: unthemed in dark, it
+                // takes the dialog's text colour.
+                "Button"
+                    if dark
+                        && GetWindowLongPtrW(child, GWL_STYLE) as u32 & BS_TYPEMASK as u32
+                            == BS_GROUPBOX as u32 =>
+                {
+                    theme::unthemed(child);
+                }
                 "Button" => theme::set_class(child, dark.then_some("DarkMode_Explorer")),
                 // A box of several lines has a scroll bar, which the
                 // Explorer style makes dark (its edge is drawn by its
