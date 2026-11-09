@@ -108,6 +108,18 @@ impl Filter {
             .find(|filter| filter.menu_id() == id)
     }
 
+    /// Search > Next Filter (`forward`) or Previous Filter: the one after or
+    /// before in the menu, round from the last to the first.
+    pub fn cycle(self, forward: bool) -> Filter {
+        let n = Filter::ALL.len();
+        let at = self as usize;
+        Filter::ALL[if forward {
+            (at + 1) % n
+        } else {
+            (at + n - 1) % n
+        }]
+    }
+
     /// The extensions the filter keeps, `;`-separated.
     fn extensions(self) -> Option<&'static str> {
         match self {
@@ -349,6 +361,22 @@ mod tests {
             ]
         );
         assert_eq!(functions("EXT:Pdf"), [("ext".to_owned(), "Pdf".to_owned())]);
+    }
+
+    #[test]
+    fn filters_cycle_round() {
+        assert_eq!(Filter::Everything.cycle(true), Filter::Audio);
+        assert_eq!(Filter::Video.cycle(true), Filter::Everything);
+        assert_eq!(Filter::Everything.cycle(false), Filter::Video);
+        assert_eq!(Filter::Audio.cycle(false), Filter::Everything);
+        for f in Filter::ALL {
+            assert_eq!(f.cycle(true).cycle(false), f);
+        }
+        let mut f = Filter::Image;
+        for _ in 0..Filter::ALL.len() {
+            f = f.cycle(true);
+        }
+        assert_eq!(f, Filter::Image);
     }
 
     #[test]

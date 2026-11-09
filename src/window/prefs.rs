@@ -178,6 +178,9 @@ impl App {
         s.theme = self.theme_mode();
         s.on_top = self.on_top.get();
         s.status_bar = self.status_bar_visible();
+        s.filter_bar = self.filter_bar.get();
+        s.zoom = self.zoom.get();
+        s.export_type = self.export_type.get();
         s.columns = self.layout.get();
         // The dialogs' places, the Search Syntax window's as it is now if
         // it is open.

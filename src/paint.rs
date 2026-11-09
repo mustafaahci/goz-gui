@@ -110,10 +110,12 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
             pal.bg,
         );
     }
-    let m = app.model.borrow();
-    let Some(row) = m.row(index) else {
-        drop(m);
+    if app.model.borrow().row(index).is_none() {
         app.request_rows(index, index);
+    }
+    let m = app.model.borrow();
+    // A refresh's row not come yet: the one before it meanwhile.
+    let Some(row) = m.row(index).or_else(|| m.previous_row(index)) else {
         return;
     };
     let fonts = app.fonts.borrow();
@@ -331,6 +333,11 @@ pub fn window(app: &App) {
             };
             fill(mem, &inner, pal.bg);
             searchbox::paint(app, mem);
+        }
+        if let Some((rc, name, open)) = app.filter_bar()
+            && overlaps(&rc, &dirty)
+        {
+            searchbox::paint_filter_bar(app, mem, rc, name, open);
         }
         if let Some((back, forward)) = searchbox::nav_of(app)
             && overlaps(

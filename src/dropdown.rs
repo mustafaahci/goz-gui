@@ -165,7 +165,7 @@ fn text_at(app: &App, i: usize) -> Option<String> {
 }
 
 fn row_height(app: &App) -> i32 {
-    app.fonts.borrow().height + app.scale(4)
+    app.ui_fonts.borrow().height + app.scale(4)
 }
 
 fn visible(app: &App) -> usize {
@@ -531,7 +531,7 @@ fn paint(app: &App, hwnd: HWND) {
         let bmp = CreateCompatibleBitmap(hdc, w, h);
         let old_bmp = SelectObject(mem, bmp);
         fill(mem, &client, pal.popup_bg);
-        let old_font = SelectObject(mem, app.fonts.borrow().normal);
+        let old_font = SelectObject(mem, app.ui_font());
         SetBkMode(mem, TRANSPARENT as i32);
         SetTextColor(mem, pal.fg);
         let top = app.dropdown.top.get();

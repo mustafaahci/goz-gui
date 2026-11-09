@@ -90,7 +90,7 @@ fn name_of(path: &Path) -> String {
 }
 
 /// Renames `from` over `to` in one step, through to the disk.
-fn replace(from: &Path, to: &Path) -> io::Result<()> {
+pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
     let (from, to) = (wide(from), wide(to));
     // SAFETY: two NUL-terminated paths that live across the call.
     let ok = unsafe {

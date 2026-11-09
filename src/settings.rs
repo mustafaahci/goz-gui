@@ -298,6 +298,17 @@ pub struct Settings {
     pub places: Places,
     /// The window and the tray: Everything's keys of the same names.
     pub background: Background,
+    /// `filters_visible`: View > Filter Bar.
+    pub filter_bar: bool,
+    /// `zoom`: the result list's View > Zoom, in percent.
+    pub zoom: u32,
+    /// `live_update_interval_ms` (goz-gui's own): how often the results
+    /// of a window on screen are searched again; 0 for never.
+    pub live_update_ms: u32,
+    /// `utf8_bom`: an export starts with a UTF-8 byte order mark.
+    pub utf8_bom: bool,
+    /// `last_export_type`: File > Export's file type (0 EFU, 1 CSV, 2 TXT).
+    pub export_type: usize,
 }
 
 /// Running in the background, the tray icon and the global hotkeys, under
@@ -358,6 +369,11 @@ impl Default for Settings {
             csv_backup: true,
             places: Places::default(),
             background: Background::default(),
+            filter_bar: false,
+            zoom: crate::zoom::DEFAULT,
+            live_update_ms: LIVE_UPDATE_MS,
+            utf8_bom: false,
+            export_type: 0,
         }
     }
 }
@@ -393,6 +409,12 @@ pub const SESSION_SAVE_DELAY: u32 = 15_000;
 /// The shortest delay taken from the file, so a typo cannot make goz-gui
 /// write the session many times a second.
 const SESSION_SAVE_DELAY_MIN: u32 = 1000;
+
+/// How often a window on screen searches again, by default (ms).
+pub const LIVE_UPDATE_MS: u32 = 2000;
+/// The shortest interval taken from the file (0 aside, which is off), so a
+/// typo cannot make goz-gui search many times a second.
+const LIVE_UPDATE_MIN: u32 = 500;
 
 /// The keys Home can fix, each with the plain key(s) holding its value.
 const HOME_KEYS: [(&str, &[&str]); 5] = [
@@ -525,6 +547,18 @@ impl Settings {
                 toggle_window_key: hotkey(ini, "toggle_window_key"),
                 show_window_key: hotkey(ini, "show_window_key"),
             },
+            filter_bar: flag(ini, "filters_visible").unwrap_or(d.filter_bar),
+            zoom: number(ini, "zoom").map_or(d.zoom, crate::zoom::clamp),
+            live_update_ms: number(ini, "live_update_interval_ms")
+                .and_then(|n| u32::try_from(n).ok())
+                .map_or(d.live_update_ms, |n| {
+                    if n == 0 { 0 } else { n.max(LIVE_UPDATE_MIN) }
+                }),
+            utf8_bom: flag(ini, "utf8_bom").unwrap_or(d.utf8_bom),
+            export_type: number(ini, "last_export_type")
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|&n| n < 3)
+                .unwrap_or(d.export_type),
         }
     }
 
@@ -546,6 +580,8 @@ impl Settings {
         put("match_path", bit(self.match_path));
         put("match_case", bit(self.match_case));
         put("status_bar_visible", bit(self.status_bar));
+        put("filters_visible", bit(self.filter_bar));
+        put("zoom", self.zoom.to_string());
         put("theme", theme_number(self.theme).to_string());
         put("search", self.search.clone());
         put(
@@ -611,6 +647,9 @@ impl Settings {
         put("show_window_key", b.show_window_key.to_string());
         put("ini_backup", bit(self.ini_backup));
         put("csv_backup", bit(self.csv_backup));
+        put("utf8_bom", bit(self.utf8_bom));
+        put("last_export_type", self.export_type.to_string());
+        put("live_update_interval_ms", self.live_update_ms.to_string());
         out.extend(self.columns.to_keys());
         out.extend(self.places.to_keys());
         out
@@ -777,6 +816,11 @@ mod tests {
                 toggle_window_key: 0x0247,
                 show_window_key: 0x0647,
             },
+            filter_bar: true,
+            zoom: 150,
+            live_update_ms: 0,
+            utf8_bom: true,
+            export_type: 2,
         };
         let mut ini = Ini::default();
         for (k, v) in s.to_pairs() {
@@ -803,9 +847,29 @@ mod tests {
             "bookmark_edit_wide=600",
             "bookmark_edit_dpi=120",
             "search_history_maximized=0",
+            "filters_visible=1",
+            "zoom=150",
+            "live_update_interval_ms=0",
+            "utf8_bom=1",
+            "last_export_type=2",
         ] {
             assert!(text.contains(&format!("{line}\r\n")), "{line} in\n{text}");
         }
+    }
+
+    #[test]
+    fn zoom_and_live_updates_read_within_bounds() {
+        let read =
+            |text: &str| Settings::from_ini(&Ini::from_text(&format!("[goz-gui]\r\n{text}")));
+        let d = Settings::default();
+        assert_eq!((d.zoom, d.live_update_ms, d.filter_bar), (100, 2000, false));
+        assert_eq!(read("zoom=9999\r\n").zoom, 500);
+        assert_eq!(read("zoom=x\r\n").zoom, 100);
+        assert_eq!(read("live_update_interval_ms=0\r\n").live_update_ms, 0);
+        assert_eq!(read("live_update_interval_ms=10\r\n").live_update_ms, 500);
+        assert_eq!(read("live_update_interval_ms=-1\r\n").live_update_ms, 2000);
+        assert_eq!(read("last_export_type=7\r\n").export_type, 0);
+        assert!(read("filters_visible=1\r\n").filter_bar);
     }
 
     #[test]

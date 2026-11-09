@@ -38,6 +38,8 @@ pub const DELETE: u16 = 1012;
 pub const RENAME: u16 = 1013;
 /// Shift+Delete in the list; no menu item (File > Delete with Shift held).
 pub const DELETE_PERMANENT: u16 = 1014;
+/// Every result to a file; again while one runs, stops it.
+pub const EXPORT: u16 = 1015;
 
 // Edit, and keys with no menu item.
 pub const SELECT_ALL: u16 = 1100;
@@ -53,6 +55,10 @@ pub const PASTE: u16 = 1107;
 // View.
 pub const REFRESH: u16 = 1200;
 pub const STATUS_BAR: u16 = 1201;
+pub const FILTER_BAR: u16 = 1202;
+pub const ZOOM_IN: u16 = 1203;
+pub const ZOOM_OUT: u16 = 1204;
+pub const ZOOM_RESET: u16 = 1205;
 pub const SORT_NAME: u16 = 1210;
 pub const SORT_PATH: u16 = 1211;
 pub const SORT_SIZE: u16 = 1212;
@@ -73,6 +79,10 @@ pub const RESET_COLUMNS: u16 = 1259;
 // Search; the filters are FILTER_FIRST + their place in `Filter::ALL`.
 pub const MATCH_CASE: u16 = 1300;
 pub const MATCH_PATH: u16 = 1301;
+/// Ctrl+] and Ctrl+[: the next or previous filter; no menu item, as in
+/// Everything.
+pub const NEXT_FILTER: u16 = 1302;
+pub const PREV_FILTER: u16 = 1303;
 pub const FILTER_FIRST: u16 = 1310;
 
 // Index.
@@ -257,9 +267,17 @@ pub fn menu_bar(run_history: bool) -> Bar {
         Radio(ON_TOP_ALWAYS, "&Always"),
         Radio(ON_TOP_SEARCHING, "While &Searching"),
     ]);
+    let zoom = popup(&[
+        Cmd(ZOOM_IN, "Zoom &In\tCtrl+="),
+        Cmd(ZOOM_OUT, "Zoom &Out\tCtrl+-"),
+        Sep,
+        Cmd(ZOOM_RESET, "&Reset\tCtrl+0"),
+    ]);
     let view = popup(&[
+        Cmd(FILTER_BAR, "Filt&er Bar"),
         Cmd(STATUS_BAR, "Status &Bar"),
         Sep,
+        Sub("&Zoom", zoom),
         Sub("S&ort By", sort),
         Cmd(REFRESH, "&Refresh\tF5"),
         Sep,
@@ -338,10 +356,12 @@ fn sort_menu() -> HMENU {
     ])
 }
 
-/// Rebuilds the File menu: the items that act on the selection only while
-/// there is one, then Exit.
+/// Rebuilds the File menu: Export..., the items that act on the selection
+/// only while there is one, then Exit.
 pub fn fill_file(file: HMENU, selection: bool) {
     truncate(file, 0);
+    append(file, &Cmd(EXPORT, "&Export...\tCtrl+S"));
+    append(file, &Sep);
     if selection {
         let copy = popup(&[
             Cmd(COPY_NAME, "Name"),
@@ -484,6 +504,7 @@ pub struct State {
     pub sort: u16,
     pub ascending: bool,
     pub status_bar: bool,
+    pub filter_bar: bool,
     /// The `THEME_*` id of the theme mode.
     pub theme: u16,
     /// The `ON_TOP_*` id of the On Top mode.
@@ -534,6 +555,7 @@ pub fn update(menu: HMENU, s: &State) {
         if s.ascending { SORT_ASC } else { SORT_DESC },
     );
     check(menu, STATUS_BAR, s.status_bar);
+    check(menu, FILTER_BAR, s.filter_bar);
     radio(
         menu,
         &[THEME_USER_DEFAULT, THEME_STANDARD, THEME_DARK],
@@ -593,6 +615,17 @@ pub fn background_menu() -> HMENU {
     popup(&[Sub("S&ort By", sort_menu()), Cmd(REFRESH, "&Refresh\tF5")])
 }
 
+/// The filter bar's list: every filter, current checked.
+pub fn filter_menu(current: Filter) -> HMENU {
+    let menu = popup(&[]);
+    for filter in Filter::ALL {
+        append(menu, &Radio(filter.menu_id(), filter.label()));
+    }
+    let filters = Filter::ALL.map(Filter::menu_id);
+    radio(menu, &filters, current.menu_id());
+    menu
+}
+
 /// The header's right-click menu: a check item per column (Name always on
 /// and greyed, as it cannot be hidden), then Reset Columns. `shown[id]` is
 /// whether column `id` is on the list.
@@ -620,6 +653,8 @@ const _: () = {
     assert!(ON_TOP_SEARCHING < COLUMN_FIRST);
     assert!(COLUMN_FIRST + COLS as u16 <= RESET_COLUMNS);
     assert!(RESET_COLUMNS < MATCH_CASE);
+    assert!(PREV_FILTER < FILTER_FIRST);
+    assert!(ZOOM_RESET < SORT_NAME);
     assert!(FILTER_FIRST + Filter::ALL.len() as u16 <= INDEX_STATUS);
     assert!(NAV_ENTRY_FIRST + NAV_ENTRIES as u16 <= BOOKMARK_ADD);
     assert!(ABOUT < BOOKMARK_FIRST);
