@@ -2,7 +2,8 @@
 //!
 //! The list's subclass reports mouse moves here; `TrackMouseEvent` reports
 //! when the mouse leaves. Only the rows that gain or lose the highlight are
-//! redrawn.
+//! redrawn. The cell under the mouse goes on to `celltip`, which shows a
+//! cell's cut-off text.
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
@@ -15,6 +16,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SendMessageW, WindowFromPoint};
 
+use crate::celltip;
 use crate::window::App;
 
 fn send(app: &App, msg: u32, w: usize, l: isize) -> isize {
@@ -35,14 +37,18 @@ pub fn moved(app: &App, pt: POINT) {
     // while tracking is harmless, and keeps tracking alive should the list
     // cancel its own.
     unsafe { TrackMouseEvent(&mut tme) };
-    set(app, row_at(app, pt));
+    let row = row_at(app, pt);
+    set(app, row);
+    celltip::moved(app, row, pt);
 }
 
 pub fn left(app: &App) {
     set(app, None);
+    celltip::left(app);
 }
 
-/// The list scrolled under a mouse that did not move.
+/// The list scrolled under a mouse that did not move (or a key was
+/// pressed, which may have scrolled it).
 pub fn scrolled(app: &App) {
     let mut pt = POINT::default();
     // SAFETY: reads the cursor position and maps it into the list.
@@ -51,7 +57,9 @@ pub fn scrolled(app: &App) {
             && WindowFromPoint(pt) == app.list
             && ScreenToClient(app.list, &mut pt) != 0
     };
-    set(app, if over { row_at(app, pt) } else { None });
+    let row = if over { row_at(app, pt) } else { None };
+    set(app, row);
+    celltip::scrolled(app, row, over.then_some(pt));
 }
 
 /// The row at `pt`, inside the columns' width only, as the selection is.

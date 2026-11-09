@@ -8,8 +8,8 @@
 //! the list's own, handled by its subclass through [`list_command`].
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F4, VK_F5, VK_HOME, VK_INSERT, VK_LEFT, VK_RETURN,
-    VK_RIGHT,
+    VK_ADD, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F4, VK_F5, VK_HOME, VK_INSERT, VK_LEFT,
+    VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, CreateAcceleratorTableW, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL,
@@ -58,6 +58,8 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     (SHIFT, VK_F4, menu::PREV_SELECTED),
     (CTRL, key(b'J'), menu::RUN_HISTORY),
     (CTRL, key(b'P'), menu::OPTIONS),
+    // Everything's (and Explorer's) Ctrl+Num +.
+    (CTRL, VK_ADD, menu::SIZE_ALL_COLUMNS_TO_FIT),
 ];
 
 pub fn accelerators() -> HACCEL {

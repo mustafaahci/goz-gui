@@ -38,6 +38,9 @@ pub const DELETE: u16 = 1012;
 pub const RENAME: u16 = 1013;
 /// Shift+Delete in the list; no menu item (File > Delete with Shift held).
 pub const DELETE_PERMANENT: u16 = 1014;
+/// Copy Property's Extension and Type (while those columns are shown).
+pub const COPY_EXT: u16 = 1015;
+pub const COPY_TYPE: u16 = 1016;
 
 // Edit, and keys with no menu item.
 pub const SELECT_ALL: u16 = 1100;
@@ -69,6 +72,11 @@ pub const ON_TOP_SEARCHING: u16 = 1242;
 // The header's menu; each column is COLUMN_FIRST + its id.
 pub const COLUMN_FIRST: u16 = 1250;
 pub const RESET_COLUMNS: u16 = 1259;
+/// The column right-clicked, as wide as its text in view.
+pub const SIZE_COLUMN_TO_FIT: u16 = 1260;
+pub const SIZE_ALL_COLUMNS_TO_FIT: u16 = 1261;
+/// The column right-clicked, off the list (never Name).
+pub const REMOVE_COLUMN: u16 = 1262;
 
 // Search; the filters are FILTER_FIRST + their place in `Filter::ALL`.
 pub const MATCH_CASE: u16 = 1300;
@@ -238,7 +246,7 @@ const BOOKMARKS_STATIC: usize = 3;
 /// History... first, as Everything's does.
 pub fn menu_bar(run_history: bool) -> Bar {
     let file = popup(&[]);
-    fill_file(file, false);
+    fill_file(file, false, &[false; COLS]);
     let edit = popup(&[
         Cmd(CUT, "Cu&t\tCtrl+X"),
         Cmd(COPY, "&Copy\tCtrl+C"),
@@ -339,18 +347,28 @@ fn sort_menu() -> HMENU {
 }
 
 /// Rebuilds the File menu: the items that act on the selection only while
-/// there is one, then Exit.
-pub fn fill_file(file: HMENU, selection: bool) {
+/// there is one, then Exit. Copy Property has Extension and Type while
+/// `shown` (by column id) says those columns are on the list.
+pub fn fill_file(file: HMENU, selection: bool, shown: &[bool; COLS]) {
     truncate(file, 0);
     if selection {
-        let copy = popup(&[
+        let mut items = vec![
             Cmd(COPY_NAME, "Name"),
             Cmd(COPY_FOLDER, "Path"),
             Cmd(COPY_SIZE, "Size"),
+        ];
+        if shown[columns::COL_EXT] {
+            items.push(Cmd(COPY_EXT, "Extension"));
+        }
+        if shown[columns::COL_TYPE] {
+            items.push(Cmd(COPY_TYPE, "Type"));
+        }
+        items.extend([
             Cmd(COPY_DATE, "Date Modified"),
             Sep,
             Cmd(COPY_TSV, "Copy as &TSV"),
         ]);
+        let copy = popup(&items);
         for item in [
             Cmd(OPEN, "&Open\tEnter"),
             Cmd(REVEAL, "Open Path\tCtrl+Enter"),
@@ -593,11 +611,20 @@ pub fn background_menu() -> HMENU {
     popup(&[Sub("S&ort By", sort_menu()), Cmd(REFRESH, "&Refresh\tF5")])
 }
 
-/// The header's right-click menu: a check item per column (Name always on
-/// and greyed, as it cannot be hidden), then Reset Columns. `shown[id]` is
-/// whether column `id` is on the list.
-pub fn header_menu(shown: &[bool; COLS]) -> HMENU {
-    let menu = popup(&[]);
+/// The header's right-click menu, as Everything's: sizing the column
+/// right-clicked (`on`, an id; none from the keyboard or past the last
+/// column) or all of them, removing it (never Name), a check item per
+/// column (Name always on and greyed, as it cannot be hidden), then Reset
+/// Columns. `shown[id]` is whether column `id` is on the list.
+pub fn header_menu(shown: &[bool; COLS], on: Option<usize>) -> HMENU {
+    let menu = popup(&[
+        Cmd(SIZE_COLUMN_TO_FIT, "&Size Column to Fit"),
+        Cmd(SIZE_ALL_COLUMNS_TO_FIT, "Size &All Columns to Fit"),
+        Cmd(REMOVE_COLUMN, "&Remove Column"),
+        Sep,
+    ]);
+    enable(menu, SIZE_COLUMN_TO_FIT, on.is_some());
+    enable(menu, REMOVE_COLUMN, on.is_some_and(|id| id != COL_NAME));
     for (id, title) in columns::TITLES.iter().enumerate() {
         let cmd = COLUMN_FIRST + id as u16;
         append(menu, &Cmd(cmd, title));
@@ -619,7 +646,9 @@ pub fn column_of(cmd: u16) -> Option<usize> {
 const _: () = {
     assert!(ON_TOP_SEARCHING < COLUMN_FIRST);
     assert!(COLUMN_FIRST + COLS as u16 <= RESET_COLUMNS);
-    assert!(RESET_COLUMNS < MATCH_CASE);
+    assert!(RESET_COLUMNS < SIZE_COLUMN_TO_FIT);
+    assert!(REMOVE_COLUMN < MATCH_CASE);
+    assert!(DELETE_PERMANENT < COPY_EXT && COPY_TYPE < SELECT_ALL);
     assert!(FILTER_FIRST + Filter::ALL.len() as u16 <= INDEX_STATUS);
     assert!(NAV_ENTRY_FIRST + NAV_ENTRIES as u16 <= BOOKMARK_ADD);
     assert!(ABOUT < BOOKMARK_FIRST);

@@ -9,6 +9,7 @@
 mod actions;
 mod bookmark_dialogs;
 mod bookmarks;
+mod celltip;
 mod client;
 mod clipboard;
 mod cmdline;
@@ -19,6 +20,7 @@ mod dialog;
 mod dropdown;
 mod filedlg;
 mod fileops;
+mod filetype;
 mod filter;
 mod format;
 mod header;
@@ -53,6 +55,7 @@ mod store;
 mod syntax;
 mod theme;
 mod tray;
+mod typeahead;
 mod wide;
 mod window;
 

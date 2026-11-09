@@ -57,6 +57,8 @@ const ACTIONS: &[u16] = &[
     menu::COPY_FOLDER,
     menu::COPY_SIZE,
     menu::COPY_DATE,
+    menu::COPY_EXT,
+    menu::COPY_TYPE,
     menu::COPY_TSV,
     menu::COPY,
     menu::CUT,
@@ -154,7 +156,9 @@ impl App {
             menu::COPY_FOLDER => self.copy(Field::Path),
             menu::COPY_SIZE => self.copy(Field::Size),
             menu::COPY_DATE => self.copy(Field::DateModified),
-            menu::COPY_TSV => self.copy(Field::Tsv),
+            menu::COPY_EXT => self.copy(Field::Extension),
+            menu::COPY_TYPE => self.copy(Field::Type),
+            menu::COPY_TSV => self.copy(Field::Tsv(self.layout.get())),
             menu::COPY => self.copy_files(Effect::Copy),
             menu::CUT => self.copy_files(Effect::Move),
             menu::PROPERTIES => self.properties_selected(),
@@ -188,6 +192,7 @@ impl App {
             menu::NEXT_SELECTED => self.jump_selected(true),
             menu::PREV_SELECTED => self.jump_selected(false),
             menu::REFRESH => self.start_search(true),
+            menu::SIZE_ALL_COLUMNS_TO_FIT => self.size_all_columns_to_fit(),
             menu::SORT_NAME | menu::SORT_PATH | menu::SORT_SIZE | menu::SORT_DATE => {
                 self.sort_by_key(sort_key(id));
             }
@@ -293,7 +298,9 @@ impl App {
             None => selection,
         };
         if popup == self.menus.file {
-            menu::fill_file(popup, selection);
+            let layout = self.layout.get();
+            let shown = core::array::from_fn(|id| layout.is_shown(id));
+            menu::fill_file(popup, selection, &shown);
         } else if popup == self.menus.history {
             // The search on screen is listed, and stays where it is while
             // the menu is open.
