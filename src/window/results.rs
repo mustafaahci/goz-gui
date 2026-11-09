@@ -26,8 +26,8 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetForegroundWindow, IDC_APPSTARTING, IDC_WAIT, IDYES, IsChild, KillTimer,
-    LoadCursorW, MB_ICONQUESTION, MB_ICONWARNING, MB_YESNO, PostMessageW, SendMessageW,
-    SetCursor, SetTimer, WM_APP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WindowFromPoint,
+    LoadCursorW, MB_ICONQUESTION, MB_ICONWARNING, MB_YESNO, PostMessageW, SendMessageW, SetCursor,
+    SetTimer, WM_APP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WindowFromPoint,
 };
 
 use super::{App, COL_PATH, TIMER_NOTE, key_down, send};
