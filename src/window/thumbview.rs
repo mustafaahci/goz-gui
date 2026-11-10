@@ -8,13 +8,16 @@
 //! view is switched by the list's style bits (LVM_SETVIEW leaves a
 //! virtual, owner-drawn list unable to place or draw its icons).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BLENDFUNCTION, CreateCompatibleDC, DeleteDC,
-    DrawFocusRect, GetTextExtentExPointW, HDC, InvalidateRect, SelectObject, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, DrawFocusRect,
+    GdiFlush, GetTextExtentExPointW, HDC, InvalidateRect, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
@@ -379,10 +382,17 @@ impl App {
     }
 
     /// The system's big icon `icon` in `square`: the 48 px one where it
-    /// fits, else the 256 px one shrunk to the square.
+    /// fits, else the 256 px one shrunk to the square (the 48 px one, centred,
+    /// where the 256 px one is only that in a corner).
     fn draw_big_icon(&self, hdc: HDC, icon: i32, square: &RECT) {
         let side = square.right - square.left;
-        let jumbo = side >= self.scale(96);
+        // A type with no icon that big (.cfg, .md, .toml) is in Windows'
+        // jumbo list as its 48 px icon in the top left corner of an empty
+        // 256 px square: shrunk to the cell, it would be a speck in the
+        // corner until the shell's picture came. The 48 px one, centred,
+        // as that picture shows it.
+        let jumbo =
+            side >= self.scale(96) && !(icon >= 0 && jumbo_is_padded(self.big_icons(true), icon));
         let list = self.big_icons(jumbo);
         if list == 0 || icon < 0 {
             return;
@@ -536,6 +546,100 @@ fn draw_bitmap(hdc: HDC, bitmap: &Bitmap, square: &RECT) {
     }
 }
 
+/// Whether the system jumbo list's icon `icon` is a small icon in the top
+/// left corner of an otherwise empty square. Worked out once per icon (two
+/// draws into a scratch bitmap) and kept: the system list's indexes last as
+/// long as the process.
+fn jumbo_is_padded(list: HIMAGELIST, icon: i32) -> bool {
+    thread_local! {
+        static PADDED: RefCell<HashMap<i32, bool>> = RefCell::new(HashMap::new());
+    }
+    if list == 0 {
+        return false;
+    }
+    if let Some(known) = PADDED.with(|p| p.borrow().get(&icon).copied()) {
+        return known;
+    }
+    // Not borrowed while drawing: the shell's list can take messages while
+    // it loads an icon, and those can paint (and come back here).
+    let padded = drawn_extent(list, icon)
+        .is_some_and(|(right, bottom, side)| corner_only(right, bottom, side));
+    PADDED.with(|p| p.borrow_mut().insert(icon, padded));
+    padded
+}
+
+/// How far right and down icon `icon` of `list` draws anything, and the
+/// list's icon side. It is drawn twice into a scratch bitmap, on black and
+/// on white, so that no colour of its own can hide one of its pixels.
+fn drawn_extent(list: HIMAGELIST, icon: i32) -> Option<(i32, i32, i32)> {
+    let (mut cx, mut cy) = (0, 0);
+    // SAFETY: a DIB section and a memory DC made, used and deleted here.
+    // The pixels are touched only through slices made between the draws
+    // (after GdiFlush), each covering exactly the section's cx × cy 32-bit
+    // pixels.
+    unsafe {
+        ImageList_GetIconSize(list, &mut cx, &mut cy);
+        if cx <= 0 || cy <= 0 {
+            return None;
+        }
+        let mut bi: BITMAPINFO = core::mem::zeroed();
+        bi.bmiHeader = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: cx,
+            // Top-down.
+            biHeight: -cy,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..core::mem::zeroed()
+        };
+        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+        let dib = CreateDIBSection(
+            core::ptr::null_mut(),
+            &bi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            core::ptr::null_mut(),
+            0,
+        );
+        if dib.is_null() || bits.is_null() {
+            if !dib.is_null() {
+                DeleteObject(dib);
+            }
+            return None;
+        }
+        let count = (cx * cy) as usize;
+        let dc = CreateCompatibleDC(core::ptr::null_mut());
+        let old = SelectObject(dc, dib);
+        let (mut right, mut bottom) = (0, 0);
+        for back in [0u32, 0x00ff_ffff] {
+            core::slice::from_raw_parts_mut(bits.cast::<u32>(), count).fill(back);
+            ImageList_Draw(list, icon, dc, 0, 0, ILD_TRANSPARENT);
+            GdiFlush();
+            let pixels = core::slice::from_raw_parts(bits.cast::<u32>(), count);
+            for (i, p) in pixels.iter().enumerate() {
+                if p & 0x00ff_ffff != back {
+                    let (x, y) = (i as i32 % cx, i as i32 / cx);
+                    right = right.max(x + 1);
+                    bottom = bottom.max(y + 1);
+                }
+            }
+        }
+        SelectObject(dc, old);
+        DeleteDC(dc);
+        DeleteObject(dib);
+        Some((right, bottom, cx.min(cy)))
+    }
+}
+
+/// Whether what an icon draws, `right` × `bottom` from the top left of its
+/// `side` square, stays in the square's top left quarter: a small icon
+/// Windows put in the corner of a jumbo square. An icon that draws nothing
+/// is not one.
+fn corner_only(right: i32, bottom: i32, side: i32) -> bool {
+    right > 0 && bottom > 0 && right <= side / 2 && bottom <= side / 2
+}
+
 /// The spans of `spans` inside `from..to`, from `from`.
 fn spans_in(spans: &[Span], from: usize, to: usize) -> Vec<Span> {
     spans
@@ -662,6 +766,22 @@ mod tests {
         };
         assert_eq!(g.visible(&client, 100), 0..24);
         assert_eq!(g.visible(&client, 0), 0..0);
+    }
+
+    #[test]
+    fn a_small_icon_in_the_jumbo_squares_corner_is_found() {
+        // What Windows' jumbo list draws, measured: .cfg, .md and .toml
+        // (their 48 px icon, top left), then .txt, .ini and .bat (real
+        // 256 px icons, centred or filling the square).
+        assert!(corner_only(41, 46, 256));
+        assert!(!corner_only(212, 240, 256));
+        assert!(!corner_only(212, 256, 256));
+        assert!(!corner_only(256, 224, 256));
+        // A 128 px icon in the corner still is; one that draws nothing is
+        // not (it is drawn as it is).
+        assert!(corner_only(128, 128, 256));
+        assert!(!corner_only(129, 100, 256));
+        assert!(!corner_only(0, 0, 256));
     }
 
     #[test]
