@@ -1,13 +1,16 @@
 //! The system's big icons (48 and 256 px) for the thumbnail views, drawn
 //! without waiting for them to load.
 //!
-//! The shell's big image lists load an icon the first time it is drawn.
-//! For a program, a shortcut or an icon file that is its own icon, read
-//! from the file at that size: 1 to 9 ms each, so a page of Large cells
-//! over a folder of programs held the window for 100 to 180 ms. Here an
-//! icon is drawn only if it is loaded (`ILD_ASYNC`); one that is not is
-//! loaded on a thread of its own, by drawing it there, and the window is
-//! told (a posted message) so that it paints again.
+//! The shell's big image lists load an icon the first time it is drawn,
+//! reading it from its file at that size: 1 to 9 ms for a program's own
+//! icon, so a page of Large cells over a folder of programs held the window
+//! for 100 to 180 ms while the cells drew those. The cells draw their
+//! type's icon now (a program's own comes as its thumbnail, made off these
+//! lists by `bigicon.rs`), but each type's big icon is still read the first
+//! time it is drawn. Here an icon is drawn only if it is loaded
+//! (`ILD_ASYNC`); one that is not is loaded on a thread of its own, by
+//! drawing it there, and the window is told (a posted message) so that it
+//! paints again.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

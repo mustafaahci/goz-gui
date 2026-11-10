@@ -382,11 +382,11 @@ impl App {
     /// fits, else the 256 px one shrunk to the square by the list (the 48 px
     /// one, centred, where the 256 px one is only that in a corner).
     ///
-    /// Only an icon already loaded is drawn: one that is not (the first
-    /// draw of a program's own icon reads it from the file, up to 9 ms) is
-    /// loaded on a thread (`bigicons.rs`), and the list paints again when
-    /// it is. Meanwhile the 48 px one stands in for the 256 px one if it is
-    /// loaded; else the cell shows no icon for that moment.
+    /// Only an icon already loaded is drawn: one that is not (an icon's
+    /// first draw reads it from its file, up to 9 ms) is loaded on a thread
+    /// (`bigicons.rs`), and the list paints again when it is. Meanwhile the
+    /// 48 px one stands in for the 256 px one if it is loaded; else the cell
+    /// shows no icon for that moment.
     fn draw_big_icon(&self, hdc: HDC, icon: i32, square: &RECT) {
         if icon < 0 {
             return;
