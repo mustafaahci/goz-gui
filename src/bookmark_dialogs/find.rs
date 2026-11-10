@@ -12,12 +12,12 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::UI::Controls::{
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
-    LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETSELECTIONMARK,
-    LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW, LVN_ODSTATECHANGED,
-    LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA,
-    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, LVSCW_AUTOSIZE_USEHEADER, NM_CUSTOMDRAW,
-    NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN,
+    LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETSELECTIONMARK, LVN_GETDISPINFOW, LVN_ITEMCHANGED,
+    LVN_KEYDOWN, LVN_ODFINDITEMW, LVN_ODSTATECHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
+    LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLVCUSTOMDRAW, NMLVDISPINFOW,
+    NMLVKEYDOWN,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
@@ -33,7 +33,8 @@ use super::{Host, WM_REFRESH, enable, item, send};
 use crate::bookmarks::tree::{TOP, Tree};
 use crate::bookmarks::{Bookmarks, Settings, one_line};
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common, list_custom_draw, state,
+    Class, Look, Template, apply_theme, center_on_owner, common, fill_last_column,
+    list_custom_draw, state,
 };
 use crate::history_dialogs::filter_proc;
 use crate::places::{self, Which};
@@ -222,13 +223,9 @@ impl Find<'_> {
         place(ID_FILTER, m + label, my, w - 2 * m - label, edit_h);
         let by = h - my - bh;
         place(ID_LIST, m, top, w - 2 * m, by - my - top);
-        // The Search column takes what the Name column leaves.
-        send(
-            Find::list(dlg),
-            LVM_SETCOLUMNWIDTH,
-            1,
-            LVSCW_AUTOSIZE_USEHEADER as isize,
-        );
+        // The Search column takes what the Name column leaves (again in
+        // `reshow`, once the rows are in).
+        fill_last_column(Find::list(dlg));
         let mut x = w - m;
         for (id, width) in [(CANCEL, bw), (ID_COPY, wide), (ID_OPEN, bw)] {
             x -= width;
@@ -262,6 +259,9 @@ impl Find<'_> {
         // is held from here on.
         let list = Find::list(dlg);
         send(list, LVM_SETITEMCOUNT, n, 0);
+        // The rows may have brought the vertical scroll bar (or taken it
+        // away): the Search column fills what the list has now.
+        fill_last_column(list);
         let state = |row: usize, on: u32| {
             let it = LVITEMW {
                 state: on,

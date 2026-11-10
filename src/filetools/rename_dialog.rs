@@ -24,11 +24,10 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_SUBITEM, CDRF_NEWFONT, CDRF_NOTIFYSUBITEMDRAW, EM_GETSEL,
-    EM_REPLACESEL, EM_SETSEL, LVIF_TEXT, LVIS_SELECTED, LVM_GETITEMSTATE, LVM_SETCOLUMNWIDTH,
+    EM_REPLACESEL, EM_SETSEL, LVIF_TEXT, LVIS_SELECTED, LVM_GETITEMSTATE,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVN_GETDISPINFOW, LVN_ODFINDITEMW,
     LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVSCW_AUTOSIZE_USEHEADER, NM_CUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW,
-    NMLVDISPINFOW,
+    LVS_SHOWSELALWAYS, NM_CUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW, NMLVDISPINFOW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_SPACE,
@@ -49,7 +48,7 @@ use super::rename::{self, FormatError, Options, Problem, Subject};
 use super::ui::{self, checked, copy_text, enable, error_colour, item, send, set_check};
 use crate::dialog::{
     self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, apply_theme,
-    center_on_owner, common, list_custom_draw, state,
+    center_on_owner, common, fill_last_column, list_custom_draw, state,
 };
 use crate::fileops::parent;
 use crate::places::{self, Which};
@@ -323,16 +322,6 @@ fn combo_item(combo: HWND, i: usize) -> String {
     String::from_utf16_lossy(&buf[..len])
 }
 
-/// The list's last column (Path) takes the room the others leave.
-fn fill_last_column(list: HWND) {
-    send(
-        list,
-        LVM_SETCOLUMNWIDTH,
-        2,
-        LVSCW_AUTOSIZE_USEHEADER as isize,
-    );
-}
-
 /// The edit box of a drop-down combo box.
 fn combo_edit(combo: HWND) -> HWND {
     let class = wz("Edit");
@@ -519,8 +508,10 @@ impl Dlg {
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
         send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
         ui::columns(list, &[("Name", 170), ("New Name", 200), ("Path", 120)]);
-        fill_last_column(list);
         send(list, LVM_SETITEMCOUNT, self.files.len(), 0);
+        // The last column (Path) takes the room the others leave, sized
+        // once the rows are in (they may bring the vertical scroll bar).
+        fill_last_column(list);
         apply_theme(dlg, self.look.get().dark);
         center_on_owner(dlg);
         let mut wr = RECT::default();

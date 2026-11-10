@@ -16,11 +16,10 @@ use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::{
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
     LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
-    LVN_ITEMCHANGED, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
-    LVSCW_AUTOSIZE_USEHEADER, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLVCUSTOMDRAW,
-    NMLVKEYDOWN,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED, LVN_KEYDOWN,
+    LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_NOSORTHEADER,
+    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE,
+    NMLVCUSTOMDRAW, NMLVKEYDOWN,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_DELETE, VK_F2};
@@ -34,7 +33,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common, list_custom_draw, state,
+    Class, Look, Template, apply_theme, center_on_owner, common, fill_last_column,
+    list_custom_draw, state,
 };
 use crate::filedlg;
 use crate::filter::Filter;
@@ -497,13 +497,9 @@ impl Organize {
         let lw = bx - gap - m;
         let bottom = h - my - bh;
         place(ID_LIST, m, my, lw, bottom - my - note_h - my);
-        // The Search column takes what the Name column leaves.
-        send(
-            item(dlg, ID_LIST),
-            LVM_SETCOLUMNWIDTH,
-            1,
-            LVSCW_AUTOSIZE_USEHEADER as isize,
-        );
+        // The Search column takes what the Name column leaves (again in
+        // `fill`, once the rows are in).
+        fill_last_column(item(dlg, ID_LIST));
         place(ID_ABOUT, m, bottom - my - note_h + my / 2, lw, note_h);
         for (id, _, y) in BUTTONS {
             place(id, bx, px(0, y).1, bw, bh);
@@ -542,6 +538,9 @@ impl Organize {
             }
         }
         drop(list);
+        // The rows may have brought the vertical scroll bar (or taken it
+        // away): the Search column fills what the list has now.
+        fill_last_column(lv);
         if let Some(i) = select.filter(|&i| i < n) {
             let state = LVIS_SELECTED | LVIS_FOCUSED;
             let item = LVITEMW {

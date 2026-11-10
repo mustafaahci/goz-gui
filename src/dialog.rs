@@ -21,12 +21,13 @@ use windows_sys::Win32::UI::Controls::{
     CDIS_FOCUS, CDIS_HOT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT,
     CDRF_SKIPDEFAULT, CloseThemeData, DrawThemeBackground, GetThemePartSize, HDM_GETITEMCOUNT,
     HIMAGELIST, HKM_GETHOTKEY, HOTKEYF_ALT, HOTKEYF_CONTROL, HOTKEYF_EXT, HOTKEYF_SHIFT,
-    ILD_TRANSPARENT, ImageList_Draw, LVCF_FMT, LVCFMT_JUSTIFYMASK, LVCFMT_RIGHT, LVCOLUMNW,
-    LVIF_IMAGE, LVIR_BOUNDS, LVIR_ICON, LVIR_LABEL, LVIS_SELECTED, LVITEMW, LVM_GETCOLUMNW,
-    LVM_GETHEADER, LVM_GETIMAGELIST, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSTATE,
-    LVM_GETITEMTEXTW, LVM_GETITEMW, LVM_GETSUBITEMRECT, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR,
-    LVM_SETTEXTCOLOR, LVSIL_SMALL, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW,
-    OpenThemeData, RBS_CHECKEDDISABLED, RBS_CHECKEDHOT, RBS_CHECKEDNORMAL, RBS_CHECKEDPRESSED,
+    ILD_TRANSPARENT, ImageList_Draw, LVCF_FMT, LVCF_TEXT, LVCFMT_JUSTIFYMASK, LVCFMT_RIGHT,
+    LVCOLUMNW, LVIF_IMAGE, LVIR_BOUNDS, LVIR_ICON, LVIR_LABEL, LVIS_SELECTED, LVITEMW,
+    LVM_GETCOLUMNW, LVM_GETCOLUMNWIDTH, LVM_GETHEADER, LVM_GETIMAGELIST, LVM_GETITEMCOUNT,
+    LVM_GETITEMRECT, LVM_GETITEMSTATE, LVM_GETITEMTEXTW, LVM_GETITEMW, LVM_GETSTRINGWIDTHW,
+    LVM_GETSUBITEMRECT, LVM_SETBKCOLOR, LVM_SETCOLUMNWIDTH, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
+    LVSIL_SMALL, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW, OpenThemeData,
+    RBS_CHECKEDDISABLED, RBS_CHECKEDHOT, RBS_CHECKEDNORMAL, RBS_CHECKEDPRESSED,
     RBS_UNCHECKEDDISABLED, RBS_UNCHECKEDHOT, RBS_UNCHECKEDNORMAL, RBS_UNCHECKEDPRESSED, TS_DRAW,
     TVM_SETBKCOLOR, TVM_SETLINECOLOR, TVM_SETTEXTCOLOR,
 };
@@ -680,6 +681,65 @@ unsafe extern "system" fn list_proc(
     }
 }
 
+/// Sizes a dialog list's last column to take the width the columns before
+/// it leave of the list's inside, at least as wide as its header's text.
+///
+/// That room changes with the list's size *and* with its rows: rows enough
+/// to bring the vertical scroll bar (or few enough to take it away) change
+/// it, so this follows both. The width is worked out here rather than with
+/// `LVSCW_AUTOSIZE_USEHEADER`, which fills the room only while the rows are
+/// narrower: with rows in, it sizes the last column to its widest text (a
+/// built-in filter's list of extensions, a long path), and the list gets a
+/// horizontal scroll bar over its last row.
+pub fn fill_last_column(list: HWND) {
+    // SAFETY: asks this thread's list about its columns and inside, and
+    // sizes its last column; the header text's buffer lives across the
+    // calls.
+    unsafe {
+        let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
+        let columns = SendMessageW(header, HDM_GETITEMCOUNT, 0, 0);
+        if columns <= 0 {
+            return;
+        }
+        let last = (columns - 1) as usize;
+        let mut text = [0u16; 128];
+        let mut column = LVCOLUMNW {
+            mask: LVCF_TEXT,
+            pszText: text.as_mut_ptr(),
+            cchTextMax: text.len() as i32,
+            ..core::mem::zeroed()
+        };
+        SendMessageW(list, LVM_GETCOLUMNW, last, (&raw mut column) as isize);
+        let label = SendMessageW(list, LVM_GETSTRINGWIDTHW, 0, text.as_ptr() as isize) as i32;
+        let floor = label + HEADER_MARGIN * GetDpiForWindow(list).max(96) as i32 / 96;
+        // Fitting the column can take the horizontal bar away, and with it
+        // the need for the vertical one: then once more for the new room
+        // (it settles by the second time).
+        for _ in 0..3 {
+            let mut rc = RECT::default();
+            GetClientRect(list, &mut rc);
+            let others = (0..last)
+                .map(|c| SendMessageW(list, LVM_GETCOLUMNWIDTH, c, 0) as i32)
+                .sum();
+            let wide = last_column_width(rc.right - rc.left, others, floor);
+            if SendMessageW(list, LVM_GETCOLUMNWIDTH, last, 0) as i32 == wide {
+                break;
+            }
+            SendMessageW(list, LVM_SETCOLUMNWIDTH, last, wide as isize);
+        }
+    }
+}
+
+/// The room around a header's text, at 96 DPI (the header's margins).
+const HEADER_MARGIN: i32 = 12;
+
+/// The last column's width: what the other columns leave of the list's
+/// inside, but never less than `floor` (its header's text) when the others
+/// were made wider than the list.
+fn last_column_width(inside: i32, others: i32, floor: i32) -> i32 {
+    (inside - others).max(floor)
+}
+
 /// A dialog list's own `NM_CUSTOMDRAW` (which its dialog gets). Returns
 /// the answer for DWLP_MSGRESULT.
 ///
@@ -1264,6 +1324,18 @@ pub fn center_on_owner(dlg: HWND) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_last_column_takes_what_the_others_leave() {
+        // Organize Filters' list, 601 px inside; 584 with the vertical bar.
+        assert_eq!(last_column_width(601, 96, 50), 505);
+        assert_eq!(last_column_width(584, 96, 50), 488);
+        // Advanced Rename's: Name and New Name before Path.
+        assert_eq!(last_column_width(480, 170 + 200, 40), 110);
+        // The others made wider than the list: the header's text still shows.
+        assert_eq!(last_column_width(601, 590, 50), 50);
+        assert_eq!(last_column_width(601, 900, 50), 50);
+    }
 
     #[test]
     fn anchored_controls_follow_the_dialog() {

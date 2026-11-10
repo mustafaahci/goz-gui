@@ -25,14 +25,13 @@ use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::UI::Controls::{
     HTREEITEM, I_IMAGENONE, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVIS_FOCUSED,
     LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT,
-    LVM_SETITEMSTATE, LVM_SETSELECTIONMARK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN,
-    LVN_ODFINDITEMW, LVN_ODSTATECHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS,
-    LVSCW_AUTOSIZE_USEHEADER, LVSIL_SMALL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE,
-    NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN, NMTVKEYDOWN, TVM_SETEXTENDEDSTYLE,
-    TVM_SETIMAGELIST, TVN_KEYDOWN, TVN_SELCHANGEDW, TVS_EX_DOUBLEBUFFER, TVS_HASBUTTONS,
-    TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS, TVSIL_NORMAL,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE,
+    LVM_SETSELECTIONMARK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW,
+    LVN_ODSTATECHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
+    LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS, LVSIL_SMALL, NM_CUSTOMDRAW,
+    NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN, NMTVKEYDOWN,
+    TVM_SETEXTENDEDSTYLE, TVM_SETIMAGELIST, TVN_KEYDOWN, TVN_SELCHANGEDW, TVS_EX_DOUBLEBUFFER,
+    TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS, TVSIL_NORMAL,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -55,7 +54,8 @@ use crate::bookmarks::ops::{Id, Op, Target};
 use crate::bookmarks::tree::{Item, TOP, Tree};
 use crate::bookmarks::{Bookmark, Bookmarks, FolderPath, Kind, one_line, same_path, within};
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common, list_custom_draw, state,
+    Class, Look, Template, apply_theme, center_on_owner, common, fill_last_column,
+    list_custom_draw, state,
 };
 use crate::filedlg::{self, Check};
 use crate::history_dialogs::filter_proc;
@@ -385,13 +385,9 @@ impl Organize<'_> {
         place(STATIC, lx, label_y, label, label_h);
         place(ID_FILTER, lx + label, my, lw - label, edit_h);
         place(ID_LIST, lx, top, lw, h - my - top);
-        // The Search column takes what the Name column leaves.
-        send(
-            item(dlg, ID_LIST),
-            LVM_SETCOLUMNWIDTH,
-            1,
-            LVSCW_AUTOSIZE_USEHEADER as isize,
-        );
+        // The Search column takes what the Name column leaves (again in
+        // `reshow`, once the rows are in).
+        fill_last_column(item(dlg, ID_LIST));
         for (id, _, y) in BUTTONS {
             place(id, bx, px(0, y).1, bw, bh);
         }
@@ -474,6 +470,9 @@ impl Organize<'_> {
         // is held from here on.
         let list = Organize::list_view(dlg);
         send(list, LVM_SETITEMCOUNT, n, 0);
+        // The rows may have brought the vertical scroll bar (or taken it
+        // away): the Search column fills what the list has now.
+        fill_last_column(list);
         let set = |row: usize, on: u32, mask: u32| {
             let it = LVITEMW {
                 state: on,

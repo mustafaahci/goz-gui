@@ -347,6 +347,78 @@ fn put(hwnd: HWND, rc: RECT) {
     }
 }
 
+/// Sizes along the bar, in pixels at the window's DPI.
+struct Sizes {
+    /// ▴ and ▾, each square.
+    button: i32,
+    /// Between the box and ▴, between the check boxes, and before the
+    /// progress text.
+    gap: i32,
+    /// Before the first check box.
+    wide_gap: i32,
+    /// Under this the box would show a clipped bit of its cue.
+    min_box: i32,
+    /// Everything's 256 px.
+    max_box: i32,
+}
+
+/// Where the bar's parts go, from its left: each a span (left, right) or
+/// left out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Arranged {
+    frame: Option<(i32, i32)>,
+    /// The left of ▴ (▾ follows it).
+    arrows: Option<i32>,
+    checks: [Option<(i32, i32)>; 2],
+    /// Where the progress text may start (it ends at the limit).
+    rest: i32,
+}
+
+/// Lays the bar out between `left` and `limit` (the ×'s side), given each
+/// check box's width (`None`: not made yet).
+///
+/// The box comes first: it is the only thing to type into. ▴ ▾ and the
+/// check boxes only repeat Enter, F3, Shift+F3 and the bar's options, so as
+/// the bar narrows the check boxes go first (the last first), then the box
+/// shrinks from Everything's 256 px down to its minimum, then ▴ ▾ go and
+/// the box takes their room, and only under its minimum does the box go
+/// too (its text still finds with F3), with everything else but the ×.
+fn arrange(left: i32, limit: i32, z: &Sizes, checks: [Option<i32>; 2]) -> Arranged {
+    let room = limit - left;
+    let arrows_wide = z.gap + 2 * z.button;
+    let (frame, arrows) = if room >= z.min_box + arrows_wide {
+        let wide = z.max_box.min(room - arrows_wide);
+        (Some((left, left + wide)), Some(left + wide + z.gap))
+    } else if room >= z.min_box {
+        (Some((left, left + z.max_box.min(room))), None)
+    } else {
+        (None, None)
+    };
+    let mut x = match (frame, arrows) {
+        (_, Some(a)) => a + 2 * z.button + z.wide_gap,
+        (Some((_, right)), None) => right + z.wide_gap,
+        // No box: nothing else either.
+        (None, _) => limit,
+    };
+    let mut placed = [None; 2];
+    for (slot, wide) in placed.iter_mut().zip(checks) {
+        let Some(wide) = wide else { continue };
+        if x + wide <= limit {
+            *slot = Some((x, x + wide));
+            x += wide + z.gap;
+        } else {
+            // A check box that does not fit takes the ones after it along.
+            x = limit;
+        }
+    }
+    Arranged {
+        frame,
+        arrows,
+        checks: placed,
+        rest: x + z.gap,
+    }
+}
+
 impl Strip for FindBar {
     fn height(&self, app: &App) -> i32 {
         if !self.visible.get() {
@@ -376,60 +448,37 @@ impl Strip for FindBar {
         let close = square(rc.right - s(3) - button);
         let left = rc.left + s(3);
         let limit = close.left - s(8);
-        // The box takes Everything's 256 px, less when the bar is narrow;
-        // under 48 px it would show a clipped bit of its cue, so it goes
-        // (its text still finds with F3), and ▴ ▾ go too when they do not
-        // fit before the ×.
-        let room = limit - left - 2 * button - s(4);
-        let frame = if room >= s(48) {
-            RECT {
-                left,
-                top: mid(box_h),
-                right: left + s(256).min(room),
-                bottom: mid(box_h) + box_h,
-            }
-        } else {
-            RECT::default()
+        // The box first, then ▴ ▾, then the check boxes, while they fit
+        // before the × (`arrange`).
+        let checks = [self.highlight.get(), self.case.get()]
+            .map(|hwnd| (!hwnd.is_null()).then(|| FindBar::check_width(app, hwnd)));
+        let sizes = Sizes {
+            button,
+            gap: s(4),
+            wide_gap: s(6),
+            min_box: s(48),
+            max_box: s(256),
         };
-        let arrows = if empty(&frame) {
-            left
-        } else {
-            frame.right + s(4)
-        };
-        let (previous, next) = if arrows + 2 * button <= limit {
-            (square(arrows), square(arrows + button))
-        } else {
-            (RECT::default(), RECT::default())
-        };
-        // The check boxes while they fit before the ×.
-        let mut x = if empty(&next) {
-            left
-        } else {
-            next.right + s(6)
-        };
-        let mut checks = [RECT::default(); 2];
-        for (slot, hwnd) in checks
-            .iter_mut()
-            .zip([self.highlight.get(), self.case.get()])
-        {
-            if hwnd.is_null() {
-                continue;
-            }
-            let w = FindBar::check_width(app, hwnd);
-            if x + w <= limit {
-                *slot = RECT {
-                    left: x,
-                    top: mid(fh + s(2)),
-                    right: x + w,
-                    bottom: mid(fh + s(2)) + fh + s(2),
-                };
-                x += w + s(4);
-            } else {
-                x = limit;
-            }
-        }
+        let row = arrange(left, limit, &sizes, checks);
+        let frame = row.frame.map_or(RECT::default(), |(l, r)| RECT {
+            left: l,
+            top: mid(box_h),
+            right: r,
+            bottom: mid(box_h) + box_h,
+        });
+        let (previous, next) = row.arrows.map_or((RECT::default(), RECT::default()), |a| {
+            (square(a), square(a + button))
+        });
+        let checks = row.checks.map(|span| {
+            span.map_or(RECT::default(), |(l, r)| RECT {
+                left: l,
+                top: mid(fh + s(2)),
+                right: r,
+                bottom: mid(fh + s(2)) + fh + s(2),
+            })
+        });
         let status = RECT {
-            left: x + s(4),
+            left: row.rest,
             top: rc.top,
             right: limit,
             bottom: rc.bottom,
@@ -1429,6 +1478,93 @@ mod tests {
         let s = spans(&back, Some(&a));
         assert_eq!(s[0], (20_000 - 4096, Some(20_000)));
         assert_eq!(s.last().map(|c| c.0), Some(9000 - find::SLACK));
+    }
+
+    /// The sizes at 100 % with the usual 15 px font: 19 px buttons.
+    const AT_96: Sizes = Sizes {
+        button: 19,
+        gap: 4,
+        wide_gap: 6,
+        min_box: 48,
+        max_box: 256,
+    };
+
+    #[test]
+    fn a_wide_bar_holds_everything() {
+        let row = arrange(3, 1000, &AT_96, [Some(90), Some(80)]);
+        assert_eq!(row.frame, Some((3, 259)));
+        assert_eq!(row.arrows, Some(263));
+        // ▾ ends at 301; the first check box 6 px on, the next 4 px on.
+        assert_eq!(row.checks, [Some((307, 397)), Some((401, 481))]);
+        assert_eq!(row.rest, 489);
+        // Check boxes not made yet: the progress text follows the arrows.
+        let row = arrange(3, 1000, &AT_96, [None, None]);
+        assert_eq!(row.checks, [None, None]);
+        assert_eq!(row.rest, 311);
+    }
+
+    #[test]
+    fn the_check_boxes_go_first_the_last_first() {
+        // Room for the first only.
+        let row = arrange(3, 450, &AT_96, [Some(90), Some(80)]);
+        assert_eq!(row.frame, Some((3, 259)));
+        assert_eq!(row.checks, [Some((307, 397)), None]);
+        // Room for the second only: it goes with the first.
+        let row = arrange(3, 390, &AT_96, [Some(90), Some(40)]);
+        assert_eq!(row.checks, [None, None]);
+        assert!(row.rest > 390, "no room left for the progress text");
+        // Then the box shrinks, the arrows kept.
+        let row = arrange(3, 200, &AT_96, [Some(90), Some(80)]);
+        assert_eq!(row.frame, Some((3, 158)));
+        assert_eq!(row.arrows, Some(162));
+        assert_eq!(row.checks, [None, None]);
+    }
+
+    #[test]
+    fn the_arrows_give_way_before_the_box() {
+        // Exactly the box's minimum and the arrows: both.
+        let row = arrange(3, 3 + 48 + 4 + 38, &AT_96, [Some(90), Some(80)]);
+        assert_eq!(row.frame, Some((3, 51)));
+        assert_eq!(row.arrows, Some(55));
+        // A pixel less: the arrows go and the box takes their room.
+        let row = arrange(3, 3 + 48 + 4 + 37, &AT_96, [Some(90), Some(80)]);
+        assert_eq!(row.frame, Some((3, 92)));
+        assert_eq!(row.arrows, None);
+        assert_eq!(row.checks, [None, None]);
+        // A Medium window with every pane open (the bar 100 px wide): the
+        // box, 67 px, and the × (was ▴ ▾ and the × with no box).
+        let row = arrange(3, 70, &AT_96, [Some(90), Some(80)]);
+        assert_eq!(row.frame, Some((3, 70)));
+        assert_eq!(row.arrows, None);
+    }
+
+    #[test]
+    fn under_its_minimum_the_box_goes_with_everything_but_the_close() {
+        let row = arrange(3, 3 + 48, &AT_96, [Some(10), Some(10)]);
+        assert_eq!(row.frame, Some((3, 51)));
+        let row = arrange(3, 3 + 47, &AT_96, [Some(10), Some(10)]);
+        assert_eq!(row.frame, None);
+        assert_eq!(row.arrows, None);
+        assert_eq!(row.checks, [None, None]);
+        assert!(row.rest > 50, "no progress text either");
+        // No room at all.
+        let row = arrange(3, -20, &AT_96, [Some(90), Some(80)]);
+        assert_eq!((row.frame, row.arrows), (None, None));
+    }
+
+    #[test]
+    fn at_150_percent_the_same_order() {
+        let z = Sizes {
+            button: 29,
+            gap: 6,
+            wide_gap: 9,
+            min_box: 72,
+            max_box: 384,
+        };
+        let row = arrange(5, 5 + 72 + 6 + 58, &z, [Some(130), Some(120)]);
+        assert_eq!((row.frame, row.arrows), (Some((5, 77)), Some(83)));
+        let row = arrange(5, 5 + 72 + 6 + 57, &z, [Some(130), Some(120)]);
+        assert_eq!((row.frame, row.arrows), (Some((5, 140)), None));
     }
 
     #[test]
