@@ -21,6 +21,10 @@
 //!   from the row menu).
 //! - `GOZ_GUI_EXPORT_TO=<path>`: File > Export writes there without asking,
 //!   in the format its extension names (.efu, .csv, .txt).
+//! - `GOZ_GUI_PICK_FOLDER=<folder>`: Edit > Copy to Folder... and Move to
+//!   Folder... use that folder without asking (`crate::filetools`).
+//! - `GOZ_GUI_DESKTOP_DIR=<folder>`: Create Shortcut puts a shortcut it
+//!   cannot make beside its item there instead of on the Desktop.
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -40,6 +44,8 @@ pub const MENU_PICK_VAR: &str = "GOZ_GUI_MENU_PICK";
 pub const FILEOP_SILENT_VAR: &str = "GOZ_GUI_FILEOP_SILENT";
 pub const MENU_DUMP_LOG: &str = "menu-dump.log";
 pub const EXPORT_TO_VAR: &str = "GOZ_GUI_EXPORT_TO";
+pub const PICK_FOLDER_VAR: &str = "GOZ_GUI_PICK_FOLDER";
+pub const DESKTOP_DIR_VAR: &str = "GOZ_GUI_DESKTOP_DIR";
 
 /// Which rule chose the data folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +220,21 @@ pub fn fileop_silent() -> bool {
 /// Where File > Export writes without asking (`GOZ_GUI_EXPORT_TO`), if set.
 pub fn export_to() -> Option<PathBuf> {
     std::env::var_os(EXPORT_TO_VAR)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The folder Copy and Move to Folder use without asking
+/// (`GOZ_GUI_PICK_FOLDER`), if set.
+pub fn pick_folder() -> Option<PathBuf> {
+    std::env::var_os(PICK_FOLDER_VAR)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The folder that stands for the Desktop (`GOZ_GUI_DESKTOP_DIR`), if set.
+pub fn desktop_dir() -> Option<PathBuf> {
+    std::env::var_os(DESKTOP_DIR_VAR)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
 }

@@ -295,6 +295,9 @@ impl App {
             "delete" => self.command(menu::DELETE),
             "rename" => self.command(menu::RENAME),
             "paste" => self.command(menu::PASTE),
+            // Create shortcut, as File > Create Shortcut: beside the items
+            // (or on the Desktop, asked), and undoable.
+            "link" => self.command(crate::filetools::cmd::CREATE_SHORTCUT),
             _ => {
                 let mask = shell::invoke_mask(
                     key_down(VK_CONTROL),
@@ -314,9 +317,10 @@ impl App {
     }
 
     /// The menu of the list's empty space at `pt` (screen): Sort By and
-    /// Refresh.
+    /// Refresh, and New Folder (`tools.rs`).
     fn background_menu(&self, pt: POINT) {
         let popup = menu::background_menu();
+        self.add_background_items(popup);
         let id = self.track_with_shell(popup, pt, "background menu", None);
         // SAFETY: the menu this function made.
         unsafe { DestroyMenu(popup) };

@@ -50,6 +50,10 @@ pub enum Which {
     SearchSyntax,
     /// Tools > Options.
     Options,
+    /// F5: Edit > Advanced > Advanced Rename (Everything's `rename_*`).
+    Rename,
+    /// F5: Edit > Undo History.
+    UndoHistory,
 }
 
 /// What Everything keeps for a dialog, under which keys.
@@ -71,7 +75,7 @@ struct Keys {
 }
 
 impl Which {
-    pub const ALL: [Which; 8] = [
+    pub const ALL: [Which; 10] = [
         Which::SearchHistory,
         Which::SearchHistorySelect,
         Which::RunHistory,
@@ -80,6 +84,8 @@ impl Which {
         Which::BookmarkEdit,
         Which::SearchSyntax,
         Which::Options,
+        Which::Rename,
+        Which::UndoHistory,
     ];
 
     fn keys(self) -> Keys {
@@ -139,6 +145,17 @@ impl Which {
             Which::BookmarkEdit => k("bookmark_edit", false, false, "", &[], false),
             Which::SearchSyntax => k("help_search_syntax", true, true, "", &[], false),
             Which::Options => k("options", true, true, "", &[], false),
+            // Everything keeps the renamer's place and size, no columns
+            // (its lists are text boxes).
+            Which::Rename => k("rename", true, true, "", &[], false),
+            Which::UndoHistory => k(
+                "undo_history",
+                true,
+                true,
+                "undo_history_",
+                &["date", "action", "name", "path", "new_name", "new_path"],
+                true,
+            ),
         }
     }
 }
@@ -180,7 +197,7 @@ impl Place {
 
 /// Every window's place, as the settings file holds them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Places([Place; 8]);
+pub struct Places([Place; Which::ALL.len()]);
 
 impl Default for Places {
     fn default() -> Places {
@@ -688,6 +705,40 @@ mod tests {
         assert_eq!(Places::from_keys(|k| map.get(k).copied()), q);
         // An empty file: none kept.
         assert_eq!(read(&[]), Places::default());
+    }
+
+    #[test]
+    fn the_file_tools_keep_everythings_keys() {
+        // As Everything 1.5.0.1424b writes them.
+        let p = read(&[
+            ("rename_x", "1016"),
+            ("rename_y", "435"),
+            ("rename_wide", "528"),
+            ("rename_high", "498"),
+            ("undo_history_x", "485"),
+            ("undo_history_wide", "830"),
+            ("undo_history_high", "519"),
+            ("undo_history_date_wide", "112"),
+            ("undo_history_action_wide", "64"),
+            ("undo_history_new_path_order", "5"),
+        ]);
+        let r = p.get(Which::Rename);
+        assert_eq!((r.x, r.y, r.width, r.height), (1016, 435, 528, 498));
+        let u = p.get(Which::UndoHistory);
+        assert_eq!((u.x, u.width, u.height), (485, 830, 519));
+        assert_eq!(u.columns.len(), 6);
+        assert_eq!(u.columns[0].width, 112);
+        assert_eq!(u.columns[1].width, 64);
+        assert_eq!(u.columns[5].order, 5);
+        let keys: Vec<String> = p.to_keys().into_iter().map(|(k, _)| k).collect();
+        for k in [
+            "rename_maximized",
+            "undo_history_maximized",
+            "undo_history_name_wide",
+            "undo_history_new_name_order",
+        ] {
+            assert!(keys.iter().any(|have| have == k), "{k}");
+        }
     }
 
     #[test]

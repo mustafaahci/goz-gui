@@ -332,7 +332,10 @@ pub struct Settings {
     // F4 (search tools).
 
     // F5 (file tools).
-
+    /// The file tools': `max_undo`, Advanced Rename's `rename_*`, Set File
+    /// Time's `set_file_time_*`, the Undo History's sort and the folder
+    /// Copy and Move to Folder went to (`crate::filetools::settings`).
+    pub tools: crate::filetools::settings::ToolSettings,
     // F6 (integration and the Options pages).
 }
 
@@ -413,7 +416,7 @@ impl Default for Settings {
             // F4 (search tools).
 
             // F5 (file tools).
-
+            tools: crate::filetools::settings::ToolSettings::default(),
             // F6 (integration and the Options pages).
         }
     }
@@ -614,7 +617,7 @@ impl Settings {
             // F4 (search tools).
 
             // F5 (file tools).
-
+            tools: crate::filetools::settings::ToolSettings::from_keys(|k| ini.get(k)),
             // F6 (integration and the Options pages).
         }
     }
@@ -723,6 +726,7 @@ impl Settings {
         // F4 (search tools).
 
         // F5 (file tools).
+        out.extend(self.tools.to_keys());
 
         // F6 (integration and the Options pages).
 
@@ -914,6 +918,14 @@ mod tests {
                 d
             },
             options_page: "History".into(),
+            // F5 (file tools).
+            tools: crate::filetools::settings::ToolSettings {
+                max_undo: 12,
+                old_history: vec!["%1.txt".into()],
+                time_kinds: [1, 0, 4],
+                last_folder: r"D:\x".into(),
+                ..Default::default()
+            },
         };
         let mut ini = Ini::default();
         for (k, v) in s.to_pairs() {

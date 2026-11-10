@@ -47,6 +47,7 @@ impl App {
         // F4 (search tools).
 
         // F5 (file tools).
+        self.start_tools();
 
         // F6 (integration and the Options pages).
     }
@@ -71,7 +72,7 @@ impl App {
     /// A menu of the bar (or a submenu) is about to open, after the
     /// window readied its own items: the features check, grey or rebuild
     /// theirs.
-    pub(super) fn feature_menu_popup(&self, _popup: HMENU) {
+    pub(super) fn feature_menu_popup(&self, popup: HMENU) {
         // F1 (preview pane).
 
         // F2 (sidebars).
@@ -81,6 +82,7 @@ impl App {
         // F4 (search tools).
 
         // F5 (file tools).
+        self.tools_menu_popup(popup);
 
         // F6 (integration and the Options pages).
     }
@@ -102,7 +104,7 @@ impl App {
             3300..=3399 | 3800..=3999 => false,
 
             // F5: 3400..=3499.
-            3400..=3499 => false,
+            3400..=3499 => self.tools_command(id),
 
             // F6: 3500..=3599.
             3500..=3599 => false,
@@ -154,7 +156,7 @@ impl App {
             t if (F4_TIMER..F4_TIMER + TIMER_RANGE).contains(&t) => false,
 
             // F5.
-            t if (F5_TIMER..F5_TIMER + TIMER_RANGE).contains(&t) => false,
+            t if (F5_TIMER..F5_TIMER + TIMER_RANGE).contains(&t) => self.tools_timer(t),
 
             // F6.
             t if (F6_TIMER..F6_TIMER + TIMER_RANGE).contains(&t) => false,

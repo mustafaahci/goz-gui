@@ -103,6 +103,7 @@ mod typing;
 // F4 (search tools).
 
 // F5 (file tools).
+mod tools;
 
 // F6 (integration and the Options pages).
 
@@ -418,7 +419,8 @@ pub struct App {
     // F4 (search tools).
 
     // F5 (file tools).
-
+    /// The undo record, and the tools' dialogs (`tools.rs`).
+    tools: tools::Tools,
     // F6 (integration and the Options pages).
 }
 
@@ -937,7 +939,7 @@ impl App {
                 // F4 (search tools).
 
                 // F5 (file tools).
-
+                tools: tools::Tools::new(&s.tools),
                 // F6 (integration and the Options pages).
             })
         }
@@ -2633,6 +2635,17 @@ unsafe extern "system" fn list_proc(
                 hover::scrolled(app);
                 return r;
             }
+            // Alt+key in the list: Everything's Alt+Backspace (Undo). Its
+            // character is no menu's access key: no beep for it.
+            WM_SYSKEYDOWN => {
+                if let Some(cmd) =
+                    keys::list_alt_command(w as u16, key_down(VK_CONTROL), key_down(VK_SHIFT))
+                {
+                    app.command(cmd);
+                    return 0;
+                }
+            }
+            WM_SYSCHAR if w == 0x08 => return 0,
             // The characters of the keys above (Enter, Esc, Ctrl+A…, and
             // Ctrl+Backspace's DEL) do nothing more.
             WM_CHAR if w < 0x20 || w == 0x7f => return 0,

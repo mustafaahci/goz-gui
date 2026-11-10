@@ -79,6 +79,8 @@ mod zoom;
 // F4 (search tools).
 
 // F5 (file tools).
+mod filename;
+mod filetools;
 
 // F6 (integration and the Options pages).
 

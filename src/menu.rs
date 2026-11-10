@@ -505,8 +505,9 @@ fn sort_menu() -> HMENU {
 }
 
 /// Rebuilds the File menu: Export..., the items that act on the selection
-/// only while there is one, then Exit. Copy Property has Extension and
-/// Type while `shown` (by column id) says those columns are on the list.
+/// only while there is one (Create Shortcut among them), then Exit. Copy
+/// Property has Extension and Type while `shown` (by column id) says those
+/// columns are on the list.
 pub fn fill_file(file: HMENU, selection: bool, shown: &[bool; COLS]) {
     truncate(file, 0);
     append(file, &Cmd(EXPORT, "&Export...\tCtrl+S"));
@@ -536,6 +537,8 @@ pub fn fill_file(file: HMENU, selection: bool, shown: &[bool; COLS]) {
             Sub("Copy Property", copy),
             Cmd(COPY_FULL_PATH, "Copy Full Path\tCtrl+Shift+C"),
             Sep,
+            // F5 (file tools): Everything's place for it.
+            Cmd(crate::filetools::cmd::CREATE_SHORTCUT, "Create &Shortcut"),
             Cmd(DELETE, "&Delete\tDel"),
             Cmd(RENAME, "Rena&me\tF2"),
             Cmd(PROPERTIES, "P&roperties\tAlt+Enter"),

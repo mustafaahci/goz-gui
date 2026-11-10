@@ -18,6 +18,12 @@ path = "src/main.rs"
 goz-core = { git = "https://github.com/mustafaahci/goz", tag = "v0.6.0" }
 goz-winfs = { git = "https://github.com/mustafaahci/goz", tag = "v0.6.0" }
 
+# Advanced Rename (wave 1, F5): its regular expressions; and the progress
+# sink that tells the file tools where each item went (the `implement`
+# macro names windows-core).
+regex = { version = "1.12", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
+windows-core = "0.62.2"
+
 [dependencies.windows-sys]
 version = "0.61"
 features = [

@@ -6,12 +6,15 @@
 //! They run on a thread of their own, an STA made the first time one is
 //! asked for, so the window keeps painting while a large copy runs. Each
 //! result is posted back to the main window as a boxed [`Done`]. The jobs
-//! run one after another, in the order asked.
+//! run one after another, in the order asked. The thread ends after
+//! [`IDLE_MS`] without a job (the next job makes another): the shell keeps
+//! what a large operation took in the thread's own state, and an idle
+//! goz-gui gives that memory back.
 //!
 //! When goz-gui closes with a job still running, the process waits for it
 //! ([`FileOps::finish`]): a copy or move is never cut off half way.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,16 +29,19 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::{HRESULT, PCWSTR};
 use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 use windows_sys::Win32::System::Threading::GetThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW,
-    PostThreadMessageW, TranslateMessage, WM_APP,
+    DispatchMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE,
+    PM_REMOVE, PeekMessageW, PostMessageW, PostThreadMessageW, QS_ALLINPUT, TranslateMessage,
+    WM_APP, WM_QUIT,
 };
 
+use crate::filetools::{self, Change, Sink, StepResult};
 use crate::shell::{self, FileOp};
 use crate::store::location;
 use crate::wide::nul;
@@ -60,6 +66,10 @@ pub enum Job {
     },
     /// Rename the file at `path` to `name` (a name, not a path).
     Rename { path: Vec<u16>, name: Vec<u16> },
+    /// A file tool's steps (`crate::filetools`): Advanced Rename, Copy and
+    /// Move to Folder, New Folder, Create Shortcut, Set File Time, Undo and
+    /// Redo.
+    Tool(filetools::Task),
 }
 
 /// How a job ended.
@@ -79,6 +89,13 @@ pub enum Outcome {
 pub struct Done {
     pub job: Job,
     pub outcome: Outcome,
+    /// What the shell reported doing to each item given (not what is
+    /// inside a folder), for the undo record: a Delete, Paste or Rename.
+    /// Items that replaced or merged into one already there are left out:
+    /// undoing them would take what was there with them.
+    pub log: Vec<Change>,
+    /// A `Job::Tool`'s result of each step.
+    pub results: Vec<StepResult>,
 }
 
 /// The message that tells the thread there is work (or that it is to end).
@@ -89,8 +106,17 @@ struct Queue {
     jobs: Mutex<VecDeque<Job>>,
     /// The window is closing: end once the queue is empty.
     quit: AtomicBool,
+    /// The thread found no work for [`IDLE_MS`] and is ending: a job now
+    /// needs a new one. Set with `jobs` locked, so no job is pushed to a
+    /// thread that will not take it.
+    retired: AtomicBool,
     thread: u32,
 }
+
+/// How long the thread waits for work before it ends. The shell keeps what
+/// a large operation took (thousands of items: tens of MB) in the thread's
+/// own state; it goes with the thread, and an idle goz-gui gives it back.
+const IDLE_MS: u32 = 20_000;
 
 /// The file operations thread, owned by the main window.
 pub struct FileOps {
@@ -98,36 +124,51 @@ pub struct FileOps {
     owner: HWND,
     /// The message the results come as; lParam is a `Box<Done>`.
     message: u32,
-    /// The thread, once a job asked for it (`None`: it could not be made).
-    worker: OnceCell<Option<Worker>>,
+    /// The thread, while there is one (made when a job asks for it).
+    worker: RefCell<Option<Worker>>,
 }
 
 /// The queue the thread takes its jobs from, and the thread to wait for.
-type Worker = (Arc<Queue>, Cell<Option<JoinHandle<()>>>);
+type Worker = (Arc<Queue>, Option<JoinHandle<()>>);
 
 impl FileOps {
     pub fn new(owner: HWND, message: u32) -> FileOps {
         FileOps {
             owner,
             message,
-            worker: OnceCell::new(),
+            worker: RefCell::new(None),
         }
     }
 
     /// Runs `job` on the thread, after any before it; false if the thread
     /// could not be made (the job is then not run).
     pub fn run(&self, job: Job) -> bool {
-        let Some((queue, _)) = self
-            .worker
-            .get_or_init(|| spawn(self.owner as usize, self.message))
-        else {
+        let mut worker = self.worker.borrow_mut();
+        // A thread that ended for want of work is left to finish ending;
+        // a new one takes the job.
+        let retired = worker
+            .as_ref()
+            .is_some_and(|(q, _)| q.retired.load(Ordering::SeqCst));
+        if retired {
+            *worker = None;
+        }
+        if worker.is_none() {
+            *worker = spawn(self.owner as usize, self.message);
+        }
+        let Some(queue) = worker.as_ref().map(|(q, _)| Arc::clone(q)) else {
             return false;
         };
-        queue
-            .jobs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(job);
+        {
+            let mut jobs = queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            if queue.retired.load(Ordering::SeqCst) {
+                // It retired since the look above: a new thread, then.
+                drop(jobs);
+                *worker = None;
+                drop(worker);
+                return self.run(job);
+            }
+            jobs.push_back(job);
+        }
         // SAFETY: posts to a thread of this process. Before its queue
         // exists the post fails, and the thread finds the job anyway.
         unsafe { PostThreadMessageW(queue.thread, WAKE, 0, 0) };
@@ -136,13 +177,13 @@ impl FileOps {
 
     /// goz-gui is closing: waits for the jobs asked for to finish.
     pub fn finish(&self) {
-        let Some(Some((queue, handle))) = self.worker.get() else {
+        let Some((queue, handle)) = self.worker.borrow_mut().take() else {
             return;
         };
         queue.quit.store(true, Ordering::SeqCst);
         // SAFETY: as in `run`.
         unsafe { PostThreadMessageW(queue.thread, WAKE, 0, 0) };
-        if let Some(handle) = handle.take() {
+        if let Some(handle) = handle {
             let _ = handle.join();
         }
     }
@@ -164,10 +205,11 @@ fn spawn(owner: usize, message: u32) -> Option<Worker> {
     let queue = Arc::new(Queue {
         jobs: Mutex::new(VecDeque::new()),
         quit: AtomicBool::new(false),
+        retired: AtomicBool::new(false),
         thread,
     });
     tx.send(Arc::clone(&queue)).ok()?;
-    Some((queue, Cell::new(Some(handle))))
+    Some((queue, Some(handle)))
 }
 
 /// The thread: an STA with a message loop (the shell's windows run their
@@ -194,8 +236,14 @@ fn thread(queue: &Queue, owner: usize, message: u32) {
                     .unwrap_or_else(|e| e.into_inner())
                     .pop_front();
                 let Some(job) = job else { break };
-                let outcome = perform(owner as HWND, &job, location::fileop_silent());
-                let done = Box::into_raw(Box::new(Done { job, outcome }));
+                let (outcome, log, results) =
+                    perform_logged(owner as HWND, &job, location::fileop_silent());
+                let done = Box::into_raw(Box::new(Done {
+                    job,
+                    outcome,
+                    log,
+                    results,
+                }));
                 if PostMessageW(owner as HWND, message, 0, done as isize) == 0 {
                     // The window is gone: nobody will take it.
                     drop(Box::from_raw(done));
@@ -204,17 +252,68 @@ fn thread(queue: &Queue, owner: usize, message: u32) {
             if queue.quit.load(Ordering::SeqCst) {
                 break;
             }
-            if GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0) <= 0 {
-                break;
-            }
-            if msg.hwnd.is_null() && msg.message == WAKE {
+            // Waits for a message, or ends after a while without work.
+            let woke = MsgWaitForMultipleObjectsEx(
+                0,
+                core::ptr::null(),
+                IDLE_MS,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            );
+            if woke == WAIT_TIMEOUT {
+                let jobs = queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                if jobs.is_empty() {
+                    queue.retired.store(true, Ordering::SeqCst);
+                    break;
+                }
                 continue;
             }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            let mut quit = false;
+            while PeekMessageW(&mut msg, core::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if msg.message == WM_QUIT {
+                    quit = true;
+                    break;
+                }
+                if msg.hwnd.is_null() && msg.message == WAKE {
+                    continue;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if quit {
+                break;
+            }
         }
         CoUninitialize();
+        give_back_memory();
     }
+}
+
+/// Gives what the process's heaps hold free back to Windows: the shell's
+/// state of a large operation, freed as the thread ends.
+fn give_back_memory() {
+    use windows_sys::Win32::System::Memory::{HeapOptimizeResources, HeapSetInformation};
+    /// `HEAP_OPTIMIZE_RESOURCES_INFORMATION`.
+    #[repr(C)]
+    struct Optimize {
+        version: u32,
+        flags: u32,
+    }
+    let info = Optimize {
+        version: 1,
+        flags: 0,
+    };
+    // SAFETY: asks Windows to decommit what the process's heaps hold free
+    // (any thread may; each heap is locked meanwhile). `info` is the
+    // documented structure, version 1.
+    unsafe {
+        HeapSetInformation(
+            core::ptr::null_mut(),
+            HeapOptimizeResources,
+            (&raw const info).cast(),
+            size_of::<Optimize>(),
+        )
+    };
 }
 
 /// HRESULT_FROM_WIN32(ERROR_CANCELLED), and the copy engine's own
@@ -265,8 +364,14 @@ fn item(path: &[u16]) -> Option<IShellItem> {
 }
 
 /// An operation of `kind`, owned by `owner` (its questions, progress and
-/// errors; none with `silent`). COM must be initialised on this thread.
-fn operation(owner: HWND, kind: FileOp, silent: bool) -> windows::core::Result<IFileOperation> {
+/// errors; none with `silent`), telling `sink` what it does. COM must be
+/// initialised on this thread.
+fn operation(
+    owner: HWND,
+    kind: FileOp,
+    silent: bool,
+    sink: &IFileOperationProgressSink,
+) -> windows::core::Result<IFileOperation> {
     // SAFETY: plain COM calls; without COM on the thread they fail.
     unsafe {
         let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
@@ -274,8 +379,56 @@ fn operation(owner: HWND, kind: FileOp, silent: bool) -> windows::core::Result<I
             op.SetOwnerWindow(WHWND(owner))?;
         }
         op.SetOperationFlags(FILEOPERATION_FLAGS(shell::fileop_flags(kind, silent)))?;
+        // The operation is released with its sink when its job ends.
+        op.Advise(sink)?;
         Ok(op)
     }
+}
+
+/// Runs `job` as [`perform`] does, and says what it did: the shell's report
+/// on each item given (for a Delete, Paste or Rename), or each step's
+/// result (a `Job::Tool`).
+pub fn perform_logged(
+    owner: HWND,
+    job: &Job,
+    silent: bool,
+) -> (Outcome, Vec<Change>, Vec<StepResult>) {
+    if let Job::Tool(task) = job {
+        let (outcome, results) = filetools::run(owner, task, silent);
+        return (outcome, Vec::new(), results);
+    }
+    // Where a paste's items would land under their own names: an item
+    // that lands on one already there replaced or merged into it.
+    let taken: Vec<Vec<u16>> = match job {
+        Job::Paste {
+            sources, folder, ..
+        } => sources
+            .iter()
+            .map(|s| filetools::join(folder, filetools::name_of(s)))
+            .filter(|t| filetools::attributes(t).is_some())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let (sink, log) = Sink::make();
+    let outcome = perform_with(owner, job, silent, &sink);
+    let given: Vec<&[u16]> = match job {
+        Job::Delete { paths, .. } => paths.iter().map(Vec::as_slice).collect(),
+        Job::Paste { sources, .. } => sources.iter().map(Vec::as_slice).collect(),
+        Job::Rename { path, .. } => vec![path.as_slice()],
+        Job::Tool(_) => Vec::new(),
+    };
+    let changes = log
+        .borrow()
+        .iter()
+        .filter(|c| given.iter().any(|g| filetools::same_path(g, &c.from)))
+        .filter(|c| {
+            !c.to
+                .as_ref()
+                .is_some_and(|to| taken.iter().any(|t| filetools::same_path(t, to)))
+        })
+        .cloned()
+        .collect();
+    (outcome, changes, Vec::new())
 }
 
 /// Runs the `queued` items of `op`: Done, or Cancelled when any was
@@ -307,8 +460,21 @@ fn finish(op: &IFileOperation, queued: usize) -> windows::core::Result<Outcome> 
 /// a copy of it goes beside it under a name of its own ("name - Copy"),
 /// in an operation of its own (that name is the operation's choice, made
 /// for every collision in it), and a move of it is nothing to do.
+#[cfg(test)]
 pub fn perform(owner: HWND, job: &Job, silent: bool) -> Outcome {
+    perform_logged(owner, job, silent).0
+}
+
+/// [`perform`] for a Delete, Paste or Rename, each operation telling
+/// `sink` what it does.
+fn perform_with(
+    owner: HWND,
+    job: &Job,
+    silent: bool,
+    sink: &IFileOperationProgressSink,
+) -> Outcome {
     let none = None::<&IFileOperationProgressSink>;
+    let new_op = |owner: HWND, kind: FileOp, silent: bool| operation(owner, kind, silent, sink);
     let run = || -> windows::core::Result<Outcome> {
         // SAFETY: COM is initialised on this thread (an STA); every item
         // and string lives across the calls that take it, and each
@@ -321,7 +487,7 @@ pub fn perform(owner: HWND, job: &Job, silent: bool) -> Outcome {
                     let kind = FileOp::Delete {
                         permanent: *permanent,
                     };
-                    let op = operation(owner, kind, silent)?;
+                    let op = new_op(owner, kind, silent)?;
                     let items = items(paths);
                     for item in &items {
                         op.DeleteItem(item, none)?;
@@ -346,7 +512,7 @@ pub fn perform(owner: HWND, job: &Job, silent: bool) -> Outcome {
                         if items.is_empty() && !here.is_empty() {
                             return Ok(Outcome::Done);
                         }
-                        let op = operation(owner, FileOp::Transfer, silent)?;
+                        let op = new_op(owner, FileOp::Transfer, silent)?;
                         for item in &items {
                             op.MoveItem(item, &target, PCWSTR::null(), none)?;
                         }
@@ -359,7 +525,7 @@ pub fn perform(owner: HWND, job: &Job, silent: bool) -> Outcome {
                         if items.is_empty() {
                             continue;
                         }
-                        let op = operation(owner, kind, silent)?;
+                        let op = new_op(owner, kind, silent)?;
                         for item in &items {
                             op.CopyItem(item, &target, PCWSTR::null(), none)?;
                         }
@@ -373,7 +539,7 @@ pub fn perform(owner: HWND, job: &Job, silent: bool) -> Outcome {
                     outcome
                 }
                 Job::Rename { path, name } => {
-                    let op = operation(owner, FileOp::Transfer, silent)?;
+                    let op = new_op(owner, FileOp::Transfer, silent)?;
                     let items: Vec<IShellItem> = item(path).into_iter().collect();
                     let name = nul(name);
                     for item in &items {
@@ -381,6 +547,8 @@ pub fn perform(owner: HWND, job: &Job, silent: bool) -> Outcome {
                     }
                     finish(&op, items.len())
                 }
+                // `perform_logged` runs a tool's steps itself.
+                Job::Tool(_) => Ok(Outcome::Done),
             }
         }
     };

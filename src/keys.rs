@@ -8,8 +8,8 @@
 //! the list's own, handled by its subclass through [`list_command`].
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_ADD, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F4, VK_F5, VK_F6, VK_HOME, VK_INSERT, VK_LEFT,
-    VK_NUMPAD0, VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_RIGHT,
+    VK_ADD, VK_BACK, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F4, VK_F5, VK_F6, VK_HOME, VK_INSERT,
+    VK_LEFT, VK_NUMPAD0, VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, CreateAcceleratorTableW, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL,
@@ -91,7 +91,9 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     // F4 (search tools).
 
     // F5 (file tools).
-
+    // Everything's Edit > Undo History... (`edit_undo_history_keys=1370`,
+    // Global); Undo, Redo and Advanced Rename are the list's own keys.
+    (CTRL | SHIFT, key(b'Z'), crate::filetools::cmd::UNDO_HISTORY),
     // F6 (integration).
 ];
 
@@ -129,15 +131,29 @@ pub fn list_command(vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<u16> 
         (VK_F2, false, false) => menu::RENAME,
         (k, true, false) if k == key(b'A') => menu::SELECT_ALL,
         (VK_ESCAPE, false, false) => menu::FOCUS_SEARCH,
+        // Everything's result-list keys (`edit_undo_keys=8538`,
+        // `edit_redo_keys=8537`, `edit_advanced_advanced_rename_keys=9329`:
+        // 0x2000 is "in the result list"): in the search box Ctrl+Z and
+        // Ctrl+Y undo and redo its text.
+        (k, true, false) if k == key(b'Z') => crate::filetools::cmd::UNDO,
+        (k, true, false) if k == key(b'Y') => crate::filetools::cmd::REDO,
+        (VK_F2, false, true) => crate::filetools::cmd::ADVANCED_RENAME,
         _ => return None,
     })
+}
+
+/// The command an Alt+key pressed in the results list runs, if it is one of
+/// the list's own: Everything's second Undo key, Alt+Backspace
+/// (`edit_undo_keys=...,8712`).
+pub fn list_alt_command(vk: u16, ctrl: bool, shift: bool) -> Option<u16> {
+    (vk == VK_BACK && !ctrl && !shift).then_some(crate::filetools::cmd::UNDO)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        VK_BACK, VK_DOWN, VK_END, VK_NEXT, VK_PRIOR, VK_TAB, VK_UP,
+        VK_DOWN, VK_END, VK_NEXT, VK_PRIOR, VK_TAB, VK_UP,
     };
 
     /// Keys the search box needs for editing, which no shortcut may take.
@@ -308,5 +324,27 @@ mod tests {
         assert_eq!(k(key(b'V'), false, false), None, "type-ahead");
         // AltGr+C types a character on some layouts.
         assert_eq!(list_command(key(b'C'), true, false, true), None);
+    }
+
+    #[test]
+    fn file_tool_keys() {
+        use crate::filetools::cmd;
+        let k = |vk, ctrl, shift| list_command(vk, ctrl, shift, false);
+        // Everything's: 8538 (0x215a) Ctrl+Z, 8537 Ctrl+Y and 9329 (0x2471)
+        // Shift+F2 in the result list; 8712 (0x2208) Alt+Backspace there;
+        // 1370 (0x55a) Ctrl+Shift+Z anywhere.
+        assert_eq!(k(key(b'Z'), true, false), Some(cmd::UNDO));
+        assert_eq!(k(key(b'Y'), true, false), Some(cmd::REDO));
+        assert_eq!(k(VK_F2, false, true), Some(cmd::ADVANCED_RENAME));
+        assert_eq!(list_alt_command(VK_BACK, false, false), Some(cmd::UNDO));
+        assert_eq!(list_alt_command(VK_BACK, true, false), None, "AltGr");
+        assert_eq!(list_alt_command(key(b'Z'), false, false), None);
+        assert!(ACCELERATORS.contains(&(CTRL | SHIFT, 0x5a, cmd::UNDO_HISTORY)));
+        // Ctrl+Z and Ctrl+Y stay the search box's.
+        assert!(
+            !ACCELERATORS
+                .iter()
+                .any(|&(m, k, _)| m == CTRL && (k == 0x5a || k == 0x59))
+        );
     }
 }

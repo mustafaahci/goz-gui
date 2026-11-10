@@ -44,7 +44,7 @@ use super::{
 use crate::dialog::Quiet;
 use crate::fileops::{self, Done, Job, Outcome};
 use crate::wide::{nul, window_text, wz};
-use crate::{clipboard, msgbox, paint, shell, theme};
+use crate::{clipboard, filename, msgbox, paint, shell, theme};
 
 const BACKSLASH: u16 = b'\\' as u16;
 
@@ -57,41 +57,10 @@ const SETTLE_AGAIN_MS: u32 = 2000;
 /// The subclass id of Rename's box.
 const RENAME_BOX: usize = 0x524e;
 
-// What Rename says of a name it refuses: Explorer's words.
-const EMPTY: &str = "You must type a file name.";
-const BAD_CHARS: &str =
-    "A file name can't contain any of the following characters:\n\\ / : * ? \" < > |";
-const TRAILING: &str = "A file name can't end with a space or a period.";
-const RESERVED: &str = "The specified device name is invalid.";
+// What Rename says of a name taken (those Windows refuses are
+// `crate::filename`'s): Explorer's words.
 const FILE_EXISTS: &str = "There is already a file with the same name in this location.";
 const FOLDER_EXISTS: &str = "There is already a folder with the same name in this location.";
-
-/// Why `name`, typed for a rename, cannot be a file's name; `None` if it
-/// can. Empty, a character Windows refuses (or a control character), a
-/// trailing space or dot (Windows would drop it), or a device name (`CON`,
-/// `nul.txt`, `COM1`…).
-fn name_problem(name: &[u16]) -> Option<&'static str> {
-    let text = String::from_utf16_lossy(name);
-    if text.trim().is_empty() {
-        return Some(EMPTY);
-    }
-    if text
-        .chars()
-        .any(|c| "\\/:*?\"<>|".contains(c) || u32::from(c) < 0x20)
-    {
-        return Some(BAD_CHARS);
-    }
-    if text.ends_with([' ', '.']) {
-        return Some(TRAILING);
-    }
-    let base = text.split('.').next().unwrap_or("").trim_end();
-    let upper = base.to_ascii_uppercase();
-    let device = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (upper.len() == 4
-            && (upper.starts_with("COM") || upper.starts_with("LPT"))
-            && matches!(upper.as_bytes()[3], b'1'..=b'9'));
-    device.then_some(RESERVED)
-}
 
 /// How much of `name` Rename selects at first: a file's name without its
 /// extension (up to its last dot, unless the name starts with it), or all
@@ -318,9 +287,12 @@ impl App {
         Some(cuts.swap_remove(i))
     }
 
-    /// A file operation finished (`WM_FILEOP`).
+    /// A file operation finished (`WM_FILEOP`). What it did goes into the
+    /// undo record (`tools.rs`).
     pub(super) fn file_op_done(&self, done: Done) {
+        self.record_file_op(&done.job, &done.log);
         match done.job {
+            Job::Tool(task) => self.tool_done(task, done.outcome, done.results),
             Job::Delete { paths, next, .. } => {
                 // Some went: the selection, if it is still on them, moves on.
                 if paths.iter().any(|p| attributes(p).is_none())
@@ -408,7 +380,7 @@ impl App {
     }
 
     /// Selects and focuses the held row of the file at `path`, alone.
-    fn select_file(&self, path: &[u16]) {
+    pub(super) fn select_file(&self, path: &[u16]) {
         let Some(i) = self.model.borrow().find(path) else {
             return;
         };
@@ -450,8 +422,12 @@ impl App {
     }
 
     /// F2 (and File > Rename, the Explorer menu's Rename): renames the
-    /// focused row in place; with several rows selected, the focused one.
+    /// focused row in place; with several rows selected, Advanced Rename
+    /// opens instead, as in Everything (`tools.rs`).
     pub(super) fn rename_focused(&self) {
+        if self.rename_many() {
+            return;
+        }
         let held = self.selected_held();
         let focused = send(
             self.list,
@@ -657,7 +633,7 @@ impl App {
         if new == old {
             return;
         }
-        let problem = name_problem(&new).or_else(|| {
+        let problem = filename::problem(&new).or_else(|| {
             // Another file of that name (a change of case is the same file).
             let same = String::from_utf16_lossy(old).to_lowercase()
                 == String::from_utf16_lossy(&new).to_lowercase();
@@ -858,41 +834,6 @@ mod tests {
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
-    }
-
-    #[test]
-    fn names_windows_refuses() {
-        let p = |s: &str| name_problem(&w(s));
-        for good in [
-            "a.txt",
-            "report 2024.pdf",
-            " lead",
-            "CONSOLE.txt",
-            "com10",
-            "x.con",
-        ] {
-            assert_eq!(p(good), None, "{good}");
-        }
-        assert_eq!(p(""), Some(EMPTY));
-        assert_eq!(p("   "), Some(EMPTY));
-        for bad in [
-            "a/b", "a\\b", "a:b", "a*", "a?", "\"a\"", "<a>", "a|b", "a\tb",
-        ] {
-            assert_eq!(p(bad), Some(BAD_CHARS), "{bad}");
-        }
-        assert_eq!(p("name."), Some(TRAILING));
-        assert_eq!(p("name "), Some(TRAILING));
-        for device in [
-            "CON",
-            "nul",
-            "nul.txt",
-            "Aux.tar.gz",
-            "COM1",
-            "lpt9.log",
-            "con .txt",
-        ] {
-            assert_eq!(p(device), Some(RESERVED), "{device}");
-        }
     }
 
     #[test]
