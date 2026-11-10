@@ -43,7 +43,7 @@ use crate::{advsearch, clipboard, goto, placement};
 
 /// Enters fullscreen once the window has shown, as it was left
 /// (`fullscreen=1`).
-const WM_FULLSCREEN_AT_START: u32 = slots::F4_MSG + 1;
+pub(super) const WM_FULLSCREEN_AT_START: u32 = slots::F4_MSG + 1;
 
 /// The window as it was before it went fullscreen.
 struct Full {

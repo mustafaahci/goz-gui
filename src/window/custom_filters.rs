@@ -46,6 +46,8 @@ impl App {
         }
         self.invalidate_filter_bar();
         self.invalidate_status();
+        // The Filters pane (F2) lists them too.
+        self.filters_pane_follow();
     }
 
     /// Search > Organize Filters... (Ctrl+Shift+K).

@@ -48,7 +48,7 @@ use crate::wide::wz;
 /// "New folder", "New folder (2)").
 const NEW_FOLDER_NAME: &str = "New folder";
 /// The timer that looks for a new folder's row, to rename it in place.
-const TIMER_NEW_FOLDER: usize = F5_TIMER;
+pub(super) const TIMER_NEW_FOLDER: usize = F5_TIMER;
 /// How often, and how many times, it looks (about 8 s: gozd sees a new
 /// folder within a moment, later when it is busy), and every how many
 /// looks it searches again for it.

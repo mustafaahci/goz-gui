@@ -213,3 +213,321 @@ const _: () = {
     assert!(F4_TIMER == F3_TIMER + TIMER_RANGE && F5_TIMER == F4_TIMER + TIMER_RANGE);
     assert!(F6_TIMER == F5_TIMER + TIMER_RANGE);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filetools::cmd;
+    use crate::filter::Filter;
+    use crate::window::{
+        file_tools, findbar, newwin, results, sidebars, tabs as tabs_w, tools, uiopts,
+    };
+    use crate::{columns, menu, searchtools, tabs};
+
+    /// `(name, value)` of each constant, so a failure says which.
+    macro_rules! named {
+        ($($id:path),* $(,)?) => {
+            vec![$((stringify!($id), $id)),*]
+        };
+    }
+
+    /// Every command the main window runs (menu items of the bar and of
+    /// the context menus, accelerators, the panes' and strips' menus), by
+    /// name: the window's own and each wave-1 feature's.
+    fn commands() -> Vec<(&'static str, u16)> {
+        named![
+            menu::OPEN,
+            menu::REVEAL,
+            menu::COPY_FULL_PATH,
+            menu::COPY_NAME,
+            menu::COPY_FOLDER,
+            menu::PROPERTIES,
+            menu::EXIT,
+            menu::COPY_SIZE,
+            menu::COPY_DATE,
+            menu::COPY_TSV,
+            menu::RUN_AS,
+            menu::SET_RUN_COUNT,
+            menu::DELETE,
+            menu::RENAME,
+            menu::DELETE_PERMANENT,
+            menu::COPY_EXT,
+            menu::COPY_TYPE,
+            menu::EXPORT,
+            menu::SELECT_ALL,
+            menu::FOCUS_SEARCH,
+            menu::CLEAR_SEARCH,
+            menu::CUT,
+            menu::COPY,
+            menu::NEXT_SELECTED,
+            menu::PREV_SELECTED,
+            menu::PASTE,
+            menu::REFRESH,
+            menu::STATUS_BAR,
+            menu::FILTER_BAR,
+            menu::ZOOM_IN,
+            menu::ZOOM_OUT,
+            menu::ZOOM_RESET,
+            menu::SORT_NAME,
+            menu::SORT_PATH,
+            menu::SORT_SIZE,
+            menu::SORT_DATE,
+            menu::SORT_ASC,
+            menu::SORT_DESC,
+            menu::THEME_USER_DEFAULT,
+            menu::THEME_STANDARD,
+            menu::THEME_DARK,
+            menu::ON_TOP_NEVER,
+            menu::ON_TOP_ALWAYS,
+            menu::ON_TOP_SEARCHING,
+            menu::VIEW_EXTRA_LARGE,
+            menu::VIEW_LARGE,
+            menu::VIEW_MEDIUM,
+            menu::VIEW_DETAILS,
+            menu::RESET_COLUMNS,
+            menu::SIZE_COLUMN_TO_FIT,
+            menu::SIZE_ALL_COLUMNS_TO_FIT,
+            menu::REMOVE_COLUMN,
+            menu::MATCH_CASE,
+            menu::MATCH_PATH,
+            menu::NEXT_FILTER,
+            menu::PREV_FILTER,
+            menu::INDEX_STATUS,
+            menu::NAV_BACK,
+            menu::NAV_FORWARD,
+            menu::NAV_HOME,
+            menu::FIND_SEARCH_HISTORY,
+            menu::ORGANIZE_SEARCH_HISTORY,
+            menu::RESTORE_SESSION,
+            menu::BOOKMARK_ADD,
+            menu::BOOKMARK_ORGANIZE,
+            menu::BOOKMARK_FIND,
+            menu::VIEW_PANE_FOLDERS,
+            menu::VIEW_PANE_BOOKMARKS,
+            menu::VIEW_PANE_FILTERS,
+            menu::VIEW_PANE_PREVIEW,
+            menu::CLOSE_PANE,
+            menu::NEXT_FRAME,
+            menu::PREV_FRAME,
+            menu::SERVICE_START,
+            menu::SERVICE_STOP,
+            menu::SERVICE_RESTART,
+            menu::RUN_HISTORY,
+            menu::OPTIONS,
+            menu::TRAY_SHOW,
+            menu::HELP,
+            menu::SEARCH_SYNTAX,
+            menu::WEBSITE,
+            menu::ABOUT,
+            searchtools::FIND,
+            searchtools::FIND_NEXT,
+            searchtools::FIND_PREVIOUS,
+            searchtools::GO_TO,
+            searchtools::INVERT_SELECTION,
+            searchtools::ADVANCED_SEARCH,
+            searchtools::ADD_TO_FILTERS,
+            searchtools::ORGANIZE_FILTERS,
+            searchtools::FULLSCREEN,
+            searchtools::WINDOW_SMALL,
+            searchtools::WINDOW_MEDIUM,
+            searchtools::WINDOW_LARGE,
+            searchtools::WINDOW_AUTO_FIT,
+            searchtools::BOX_UNDO,
+            searchtools::BOX_CUT,
+            searchtools::BOX_COPY,
+            searchtools::BOX_PASTE,
+            searchtools::BOX_DELETE,
+            searchtools::BOX_SELECT_ALL,
+            searchtools::BOX_AND,
+            searchtools::BOX_QUOTE,
+            searchtools::BOX_CASE,
+            searchtools::BOX_PATH,
+            searchtools::BOX_FILES,
+            searchtools::BOX_FOLDERS,
+            searchtools::BOX_LOCATED_IN,
+            searchtools::BOX_DM_BEFORE,
+            searchtools::BOX_DM_AFTER,
+            searchtools::BOX_DM_TODAY,
+            searchtools::BOX_SIZE_SMALLER,
+            searchtools::BOX_SIZE_LARGER,
+            searchtools::BOX_EXT,
+            tabs::NEW_TAB,
+            tabs::CLOSE_TAB,
+            tabs::NEXT_TAB,
+            tabs::PREV_TAB,
+            tabs::REOPEN_TAB,
+            tabs::DUPLICATE_TAB,
+            tabs::CLOSE_TABS_LEFT,
+            tabs::CLOSE_TABS_RIGHT,
+            tabs::CLOSE_OTHER_TABS,
+            tabs::REOPEN_ALL_TABS,
+            tabs::NEW_WINDOW,
+            tabs::CLOSE_WINDOW,
+            cmd::UNDO,
+            cmd::REDO,
+            cmd::UNDO_HISTORY,
+            cmd::COPY_TO_FOLDER,
+            cmd::MOVE_TO_FOLDER,
+            cmd::ADVANCED_RENAME,
+            cmd::SET_FILE_TIME,
+            cmd::NEW_FOLDER,
+            cmd::CREATE_SHORTCUT,
+            sidebars::CLEAR_SELECTION,
+            sidebars::UP_ONE_FOLDER,
+            sidebars::FOLDER_EXPAND,
+            sidebars::FOLDER_OPEN,
+            sidebars::FOLDER_OPEN_PATH,
+            sidebars::FOLDER_COPY_PATH,
+            sidebars::MARK_OPEN,
+            sidebars::MARK_EDIT,
+            sidebars::MARK_DELETE,
+            sidebars::MARK_EXPAND,
+            crate::preview::TAB_OUT,
+            crate::preview::TAB_BACK_OUT,
+        ]
+    }
+
+    /// The ranges of commands made one per entry: `(name, first, count)`.
+    fn ranges() -> Vec<(&'static str, u16, usize)> {
+        vec![
+            ("columns", menu::COLUMN_FIRST, columns::COLS),
+            ("filters", menu::FILTER_FIRST, Filter::ALL.len()),
+            ("history entries", menu::NAV_ENTRY_FIRST, menu::NAV_ENTRIES),
+            ("bookmarks", menu::BOOKMARK_FIRST, menu::BOOKMARKS),
+            (
+                "custom filters",
+                menu::CUSTOM_FILTER_FIRST,
+                menu::CUSTOM_FILTERS,
+            ),
+            ("closed tabs", menu::TAB_ENTRY_FIRST, menu::TAB_ENTRIES),
+            (
+                "shell items",
+                menu::SHELL_FIRST,
+                usize::from(menu::SHELL_LAST - menu::SHELL_FIRST) + 1,
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_command_has_an_id_of_its_own() {
+        let all = commands();
+        for (i, &(a, id)) in all.iter().enumerate() {
+            assert!(id != 0, "{a} has no id");
+            for &(b, other) in &all[i + 1..] {
+                assert!(id != other, "{a} and {b} are both {id}");
+            }
+            for (range, first, n) in ranges() {
+                let inside =
+                    (usize::from(first)..usize::from(first) + n).contains(&usize::from(id));
+                assert!(!inside, "{a} ({id}) is in the {range}' ids");
+            }
+        }
+        let ranges = ranges();
+        for (i, &(a, first, n)) in ranges.iter().enumerate() {
+            for &(b, other, m) in &ranges[i + 1..] {
+                let (a0, a1) = (usize::from(first), usize::from(first) + n);
+                let (b0, b1) = (usize::from(other), usize::from(other) + m);
+                assert!(a1 <= b0 || b1 <= a0, "the {a}' and the {b}' ids meet");
+            }
+        }
+    }
+
+    #[test]
+    fn each_feature_keeps_to_its_command_range() {
+        let range = |first: u16| first..first + menu::FEATURE_RANGE;
+        for (name, id) in commands() {
+            let feature = if name.starts_with("crate::preview::") {
+                Some(menu::F1_FIRST)
+            } else if name.starts_with("sidebars::") {
+                Some(menu::F2_FIRST)
+            } else if name.starts_with("tabs::") {
+                Some(menu::F3_FIRST)
+            } else if name.starts_with("searchtools::") {
+                Some(menu::F4_FIRST)
+            } else if name.starts_with("cmd::") {
+                Some(menu::F5_FIRST)
+            } else {
+                None
+            };
+            match feature {
+                Some(first) => assert!(range(first).contains(&id), "{name} ({id})"),
+                // The window's own: below the features', or the framework's.
+                None => assert!(
+                    id < menu::F1_FIRST || range(menu::FRAMEWORK_FIRST).contains(&id),
+                    "{name} ({id})"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn the_main_windows_messages_and_timers_are_each_its_own() {
+        let messages: Vec<(&str, u32)> = named![
+            super::super::WM_REPLY,
+            super::super::WM_ICON,
+            super::super::WM_SERVICE,
+            super::super::WM_STORE,
+            super::super::WM_COLUMNS,
+            super::super::WM_HISTORY,
+            super::super::WM_BOOKMARKS,
+            super::super::WM_RUNS,
+            super::super::WM_FILEOP,
+            super::super::WM_DRAG_DONE,
+            super::super::WM_RENAME_AGAIN,
+            super::super::WM_TRAY,
+            super::super::WM_LAUNCH,
+            super::super::WM_EXPORT,
+            super::super::WM_THUMB,
+            results::WM_FETCHED,
+            super::super::WM_PANE_CLOSE,
+            crate::preview::WM_RETIRE,
+            crate::preview::WM_REPLIES,
+            newwin::WM_EXIT_WINDOW,
+            newwin::WM_NEW_WINDOW_FAILED,
+            findbar::WM_FIND,
+            tools::WM_FULLSCREEN_AT_START,
+            uiopts::WM_FOCUS_SEARCH,
+        ];
+        for (i, &(a, m)) in messages.iter().enumerate() {
+            for &(b, other) in &messages[i + 1..] {
+                assert!(m != other, "{a} and {b} are both WM_APP + {}", m - WM_APP);
+            }
+            // A feature's own sit in its range.
+            if is_feature_message(m) {
+                assert!(
+                    !a.starts_with("super::super::") && !a.starts_with("results::"),
+                    "{a} is in the features' range"
+                );
+            }
+        }
+        let timers: Vec<(&str, usize)> = named![
+            super::super::TIMER_REFRESH,
+            super::super::TIMER_RETRY,
+            super::super::TIMER_NAV,
+            super::super::TIMER_NOTE,
+            super::super::TIMER_SETTINGS,
+            super::super::TIMER_HISTORY,
+            super::super::TIMER_SESSION,
+            super::super::TIMER_RUNS,
+            super::super::TIMER_STORE_RETRY,
+            super::super::TIMER_SETTLE,
+            super::super::TIMER_LIVE,
+            crate::celltip::TIMER,
+            tabs_w::TIMER_THAW,
+            findbar::TIMER_TYPED,
+            file_tools::TIMER_NEW_FOLDER,
+            uiopts::TIMER_SEARCH_DELAY,
+        ];
+        for (i, &(a, t)) in timers.iter().enumerate() {
+            for &(b, other) in &timers[i + 1..] {
+                assert!(t != other, "{a} and {b} are both timer {t}");
+            }
+        }
+        // Each feature's own in its range.
+        assert!((F3_TIMER..F3_TIMER + TIMER_RANGE).contains(&tabs_w::TIMER_THAW));
+        assert!((F4_TIMER..F4_TIMER + TIMER_RANGE).contains(&findbar::TIMER_TYPED));
+        assert!((F5_TIMER..F5_TIMER + TIMER_RANGE).contains(&file_tools::TIMER_NEW_FOLDER));
+        assert!((F6_TIMER..F6_TIMER + TIMER_RANGE).contains(&uiopts::TIMER_SEARCH_DELAY));
+        assert!(!is_feature_timer(crate::celltip::TIMER));
+    }
+}

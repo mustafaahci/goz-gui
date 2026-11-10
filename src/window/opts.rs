@@ -19,7 +19,6 @@ mod view;
 /// The pages, in any order: the dialog puts them in Everything's
 /// (`Page::order`, `Page::parent`).
 fn pages() -> Vec<Box<dyn Page>> {
-    #[allow(unused_mut, reason = "the features push their pages below")]
     let mut pages: Vec<Box<dyn Page>> = vec![
         Box::new(general::General),
         Box::new(ui::Ui),

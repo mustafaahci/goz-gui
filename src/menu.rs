@@ -294,7 +294,6 @@ pub struct Bar {
     pub file: HMENU,
     pub edit: HMENU,
     pub view: HMENU,
-    #[allow(dead_code, reason = "for the features' menu items (FRAMEWORK.md)")]
     pub search: HMENU,
     /// Its entries after Back, Forward and Home are rebuilt as it opens.
     pub history: HMENU,
@@ -420,7 +419,6 @@ pub fn menu_bar(run_history: bool) -> Bar {
 }
 
 /// A popup menu of `items`, for a submenu a feature adds (`add_items`).
-#[allow(dead_code, reason = "for the features' menu items (FRAMEWORK.md)")]
 pub fn submenu(items: &[Item<'_>]) -> HMENU {
     popup(items)
 }
@@ -429,7 +427,6 @@ pub fn submenu(items: &[Item<'_>]) -> HMENU {
 /// `after` (at the end if none does), or at the top for `None`: how a
 /// feature adds its commands to a menu of the bar that is not rebuilt as
 /// it opens (Edit, View, Search, Tools, Help), as the window starts.
-#[allow(dead_code, reason = "for the features' menu items (FRAMEWORK.md)")]
 pub fn add_items(menu: HMENU, after: Option<u16>, items: &[Item<'_>]) {
     let at = match after {
         None => Some(0),

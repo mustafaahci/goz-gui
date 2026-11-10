@@ -100,7 +100,6 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     (CTRL | SHIFT, VK_TAB, crate::tabs::PREV_TAB),
     (CTRL, key(b'N'), crate::tabs::NEW_WINDOW),
     (CTRL | SHIFT, key(b'W'), crate::tabs::CLOSE_WINDOW),
-
     // F4 (search tools). Everything 1.5's `edit_find_keys=326` (Ctrl+F),
     // `edit_find_next_keys=114` (F3), `edit_find_previous_keys=1138`
     // (Shift+F3), `edit_go_to_keys=327` (Ctrl+G),
@@ -259,6 +258,36 @@ mod tests {
         for (i, a) in ACCELERATORS.iter().enumerate() {
             for b in &ACCELERATORS[i + 1..] {
                 assert!((a.0, a.1) != (b.0, b.1), "{a:?} twice");
+            }
+        }
+    }
+
+    /// Every key chord runs one command wherever the keyboard is: the
+    /// accelerators (all six features' and the window's own, merged) never
+    /// share a chord, and none of them takes a chord the results list
+    /// keeps for itself (its Ctrl, Shift and Alt keys).
+    #[test]
+    fn no_two_commands_share_a_key_chord() {
+        use std::collections::HashMap;
+        let mut chords: HashMap<(u8, u16), u16> = HashMap::new();
+        for &(m, vk, cmd) in ACCELERATORS {
+            if let Some(other) = chords.insert((m, vk), cmd) {
+                panic!("{m:#x}+{vk:#x} runs both {other} and {cmd}");
+            }
+        }
+        for vk in 0..=255u16 {
+            for (ctrl, shift) in [(false, false), (true, false), (false, true), (true, true)] {
+                let m = mods(ctrl, shift);
+                if let Some(cmd) = list_command(vk, ctrl, shift, false)
+                    && let Some(&global) = chords.get(&(m, vk))
+                {
+                    panic!("{m:#x}+{vk:#x}: the list's {cmd} and the window's {global}");
+                }
+                if let Some(cmd) = list_alt_command(vk, ctrl, shift)
+                    && let Some(&global) = chords.get(&(m | ALT, vk))
+                {
+                    panic!("Alt+{vk:#x}: the list's {cmd} and the window's {global}");
+                }
             }
         }
     }

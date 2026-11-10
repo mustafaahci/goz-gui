@@ -2,10 +2,12 @@
 //! filters as a list, the one in force chosen. Choosing another (a click,
 //! the arrow keys) puts it in force, as the Search menu, the filter bar or
 //! Ctrl+] would; the list follows the filter however it changes. Its menu is
-//! the filter list of the filter bar, as Everything's ends with it.
+//! Everything's: Add to Filters... and Organize Filters... (F4's), then the
+//! filter list of the filter bar.
 //!
-//! The list's entries are [`entries`]: the filters goz-gui has, each with
-//! the command that puts it in force (the Search menu's), so a filter added
+//! The list's entries are [`entries`]: the filters goz-gui has, the
+//! built-in ones and the user's own (F4's `Filters.csv`), each with the
+//! command that puts it in force (the Search menu's), so a filter added
 //! there shows here too.
 
 use std::any::Any;
@@ -36,12 +38,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::{App, point};
+use crate::dock::PaneId;
 use crate::filter::Filter;
-use crate::menu;
 use crate::paint::fill;
 use crate::pane::{PaneContent, PaneEvent};
 use crate::theme;
 use crate::wide::nul;
+use crate::{menu, searchtools};
 
 /// The list's choice is to be made to match the filter in force again.
 const WM_FOLLOW: u32 = WM_APP + 1;
@@ -51,8 +54,10 @@ const LIST_ID: usize = 1;
 /// The filters the pane lists, in the Search menu's order: each one's name
 /// and the command that puts it in force.
 fn entries() -> Vec<(String, u16)> {
-    Filter::ALL
+    Filter::all()
         .into_iter()
+        // Past the most the menus list, a filter has no command.
+        .filter(|f| f.menu_id() != 0)
         .map(|f| (f.title().to_owned(), f.menu_id()))
         .collect()
 }
@@ -292,12 +297,34 @@ impl FiltersPane {
         } else {
             point(l)
         };
+        // Everything's: the filters' own commands, then the list.
         let popup = menu::filter_menu(app.opts.get().filter);
+        menu::add_items(
+            popup,
+            None,
+            &[
+                menu::Item::Cmd(searchtools::ADD_TO_FILTERS, "Add to Filters..."),
+                menu::Item::Cmd(searchtools::ORGANIZE_FILTERS, "Organize Filters..."),
+                menu::Item::Sep,
+            ],
+        );
         let id = app.track_with_shell(popup, pt, "filters menu", None);
         // SAFETY: the menu made above.
         unsafe { DestroyMenu(popup) };
         if id > 0 {
             app.command(id as u16);
+        }
+    }
+}
+
+impl App {
+    /// The filters changed without a new search (F4's Organize Filters...
+    /// and Add to Filters...): the Filters pane, if open, lists them again.
+    pub(super) fn filters_pane_follow(&self) {
+        if let Some(content) = self.pane_content(PaneId::Filters)
+            && let Some(pane) = content.as_any().downcast_ref::<FiltersPane>()
+        {
+            pane.follow(self);
         }
     }
 }
