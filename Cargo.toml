@@ -18,9 +18,13 @@ path = "src/main.rs"
 goz-core = { git = "https://github.com/mustafaahci/goz", tag = "v0.6.0" }
 goz-winfs = { git = "https://github.com/mustafaahci/goz", tag = "v0.6.0" }
 # The windows crate's own core (already built for it): `#[implement]`, for
-# the one COM object goz-gui makes itself (the preview handlers' frame),
-# names it in the code it generates.
+# the COM objects goz-gui makes itself (the preview handlers' frame and
+# stream, F1; the file operations' progress sink, F5), names it in the code
+# it generates.
 windows-core = "0.62.2"
+
+# Advanced Rename (wave 1, F5): its regular expressions.
+regex = { version = "1.12", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 
 [dependencies.windows-sys]
 version = "0.61"

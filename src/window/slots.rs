@@ -55,6 +55,7 @@ impl App {
         self.tools_start();
 
         // F5 (file tools).
+        self.start_file_tools();
 
         // F6 (integration and the Options pages).
     }
@@ -94,6 +95,7 @@ impl App {
         self.tools_menu_popup(popup);
 
         // F5 (file tools).
+        self.file_tools_menu_popup(popup);
 
         // F6 (integration and the Options pages).
     }
@@ -117,7 +119,7 @@ impl App {
             3300..=3399 | 3800..=3999 => self.tools_command(id),
 
             // F5: 3400..=3499.
-            3400..=3499 => false,
+            3400..=3499 => self.file_tools_command(id),
 
             // F6: 3500..=3599.
             3500..=3599 => false,
@@ -177,7 +179,7 @@ impl App {
             t if (F4_TIMER..F4_TIMER + TIMER_RANGE).contains(&t) => self.tools_timer(t),
 
             // F5.
-            t if (F5_TIMER..F5_TIMER + TIMER_RANGE).contains(&t) => false,
+            t if (F5_TIMER..F5_TIMER + TIMER_RANGE).contains(&t) => self.file_tools_timer(t),
 
             // F6: the search delay (Options > Search).
             super::uiopts::TIMER_SEARCH_DELAY => {

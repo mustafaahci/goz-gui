@@ -90,6 +90,8 @@ mod goto;
 mod searchtools;
 
 // F5 (file tools).
+mod filename;
+mod filetools;
 
 // F6 (integration and the Options pages).
 mod ui_options;

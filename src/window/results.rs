@@ -92,6 +92,9 @@ pub(super) enum Then {
         default: u16,
         extended: bool,
     },
+    /// A file tool's command (`tools.rs`): Advanced Rename, Copy or Move to
+    /// Folder, Set File Time, Create Shortcut.
+    FileTool(u16),
 }
 
 /// The blocks holding the selected rows, in order. `next(after)` is the
@@ -412,7 +415,7 @@ impl App {
         // A test's dry run, silent file operations or dumped menu.
         let quiet = match fetching.then {
             Then::Open { .. } | Then::RunAs | Then::Properties => location::dry_run(),
-            Then::Delete { .. } => location::fileop_silent(),
+            Then::Delete { .. } | Then::FileTool(_) => location::fileop_silent(),
             Then::RowMenu { .. } => location::menu_dump(),
             Then::Copy(_) | Then::Files(_) | Then::RunCount => false,
         };
@@ -435,6 +438,9 @@ impl App {
                 default,
                 extended,
             } => self.show_row_menu(at, default, extended),
+            Then::FileTool(id) => {
+                self.file_tools_command(id);
+            }
         }
     }
 
@@ -570,7 +576,7 @@ impl App {
     }
 
     /// The picked rows' paths and kinds.
-    fn picked_targets(&self) -> (Vec<Target>, usize) {
+    pub(super) fn picked_targets(&self) -> (Vec<Target>, usize) {
         let (held, selected) = self.picked();
         let m = self.model.borrow();
         let targets = held

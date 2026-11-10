@@ -350,7 +350,10 @@ pub struct Settings {
     /// (`crate::searchtools`).
     pub search_tools: crate::searchtools::SearchTools,
     // F5 (file tools).
-
+    /// The file tools': `max_undo`, Advanced Rename's `rename_*`, Set File
+    /// Time's `set_file_time_*`, the Undo History's sort and the folder
+    /// Copy and Move to Folder went to (`crate::filetools::settings`).
+    pub file_tools: crate::filetools::settings::ToolSettings,
     // F6 (integration and the Options pages).
     /// What Options' UI, Search, Results and View pages set
     /// (`allow_multiple_windows`, `search_as_you_type`, `size_format`, ...;
@@ -435,7 +438,7 @@ impl Default for Settings {
             // F4 (search tools).
             search_tools: crate::searchtools::SearchTools::default(),
             // F5 (file tools).
-
+            file_tools: crate::filetools::settings::ToolSettings::default(),
             // F6 (integration and the Options pages).
             ui: UiOptions::default(),
         }
@@ -639,7 +642,7 @@ impl Settings {
             // F4 (search tools).
             search_tools: crate::searchtools::SearchTools::from_keys(|k| ini.get(k)),
             // F5 (file tools).
-
+            file_tools: crate::filetools::settings::ToolSettings::from_keys(|k| ini.get(k)),
             // F6 (integration and the Options pages).
             ui: UiOptions::from_keys(|k| ini.get(k)),
         }
@@ -754,6 +757,7 @@ impl Settings {
         out.extend(self.search_tools.to_keys());
 
         // F5 (file tools).
+        out.extend(self.file_tools.to_keys());
 
         // F6 (integration and the Options pages).
         out.extend(self.ui.to_keys());
@@ -1000,6 +1004,14 @@ mod tests {
                 findbar_visible: true,
                 fullscreen: true,
                 ..crate::searchtools::SearchTools::default()
+            },
+            // F5 (file tools).
+            file_tools: crate::filetools::settings::ToolSettings {
+                max_undo: 12,
+                old_history: vec!["%1.txt".into()],
+                time_kinds: [1, 0, 4],
+                last_folder: r"D:\x".into(),
+                ..Default::default()
             },
         };
         let mut ini = Ini::default();

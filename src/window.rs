@@ -114,6 +114,7 @@ mod findbar;
 mod tools;
 
 // F5 (file tools).
+mod file_tools;
 
 // F6 (integration and the Options pages).
 mod uiopts;
@@ -446,7 +447,8 @@ pub struct App {
     /// The find bar, the find under way, fullscreen.
     tools: tools::Tools,
     // F5 (file tools).
-
+    /// The undo record, and the file tools' dialogs (`file_tools.rs`).
+    file_tools: file_tools::Tools,
     // F6 (integration and the Options pages).
     /// Options' UI, Search, Results and View settings in force (the
     /// settings file's copy is `prefs.base.ui`; see `uiopts.rs`).
@@ -1073,7 +1075,7 @@ impl App {
                 // F4 (search tools).
                 tools: tools::Tools::new(),
                 // F5 (file tools).
-
+                file_tools: file_tools::Tools::new(&s.file_tools),
                 // F6 (integration and the Options pages).
                 ui: Cell::new(s.ui),
                 search_dirty: Cell::new(false),
@@ -2887,14 +2889,24 @@ unsafe extern "system" fn list_proc(
                 hover::scrolled(app);
                 return r;
             }
-            // Alt+Up: up one folder in the Folders pane (F2), Everything's
-            // global Up One Dir (the search box keeps it for its history).
-            WM_SYSKEYDOWN
+            // Alt+key in the list: Alt+Up goes up one folder in the Folders
+            // pane (F2), Everything's global Up One Dir (the search box keeps
+            // it for its history); Alt+Backspace is Everything's Undo (F5),
+            // and its character is no menu's access key: no beep for it.
+            WM_SYSKEYDOWN => {
                 if w == usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_UP)
-                    && app.up_one_folder() =>
-            {
-                return 0;
+                    && app.up_one_folder()
+                {
+                    return 0;
+                }
+                if let Some(cmd) =
+                    keys::list_alt_command(w as u16, key_down(VK_CONTROL), key_down(VK_SHIFT))
+                {
+                    app.command(cmd);
+                    return 0;
+                }
             }
+            WM_SYSCHAR if w == 0x08 => return 0,
             // The characters of the keys above (Enter, Esc, Ctrl+A…, and
             // Ctrl+Backspace's DEL) do nothing more.
             WM_CHAR if w < 0x20 || w == 0x7f => return 0,

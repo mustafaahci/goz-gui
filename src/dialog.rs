@@ -8,24 +8,27 @@ use std::cell::Cell;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
-    DT_VCENTER, DrawTextW, EndPaint, GetMonitorInfoW, GetTextExtentPoint32W, GetWindowDC, HBRUSH,
-    HDC, HFONT, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromRect, PAINTSTRUCT, RDW_ALLCHILDREN,
-    RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, ReleaseDC, SelectObject, SetBkColor,
-    SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DT_CALCRECT, DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_NOPREFIX,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DrawFocusRect, DrawTextW, EndPaint, GetMonitorInfoW,
+    GetTextExtentPoint32W, GetWindowDC, HBRUSH, HDC, HFONT, MONITOR_DEFAULTTONULL, MONITORINFO,
+    MonitorFromRect, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
+    RedrawWindow, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::Controls::{
-    CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
-    CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, HDM_GETITEMCOUNT, HIMAGELIST, HKM_GETHOTKEY,
-    HOTKEYF_ALT, HOTKEYF_CONTROL, HOTKEYF_EXT, HOTKEYF_SHIFT, ILD_TRANSPARENT, ImageList_Draw,
-    LVCF_FMT, LVCFMT_JUSTIFYMASK, LVCFMT_RIGHT, LVCOLUMNW, LVIF_IMAGE, LVIR_BOUNDS, LVIR_ICON,
-    LVIR_LABEL, LVIS_SELECTED, LVITEMW, LVM_GETCOLUMNW, LVM_GETHEADER, LVM_GETIMAGELIST,
-    LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSTATE, LVM_GETITEMTEXTW, LVM_GETITEMW,
-    LVM_GETSUBITEMRECT, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVSIL_SMALL,
-    NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW, TVM_SETBKCOLOR, TVM_SETLINECOLOR,
-    TVM_SETTEXTCOLOR,
+    BP_RADIOBUTTON, BST_CHECKED, CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDIS_DISABLED,
+    CDIS_FOCUS, CDIS_HOT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT,
+    CDRF_SKIPDEFAULT, CloseThemeData, DrawThemeBackground, GetThemePartSize, HDM_GETITEMCOUNT,
+    HIMAGELIST, HKM_GETHOTKEY, HOTKEYF_ALT, HOTKEYF_CONTROL, HOTKEYF_EXT, HOTKEYF_SHIFT,
+    ILD_TRANSPARENT, ImageList_Draw, LVCF_FMT, LVCFMT_JUSTIFYMASK, LVCFMT_RIGHT, LVCOLUMNW,
+    LVIF_IMAGE, LVIR_BOUNDS, LVIR_ICON, LVIR_LABEL, LVIS_SELECTED, LVITEMW, LVM_GETCOLUMNW,
+    LVM_GETHEADER, LVM_GETIMAGELIST, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSTATE,
+    LVM_GETITEMTEXTW, LVM_GETITEMW, LVM_GETSUBITEMRECT, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR,
+    LVM_SETTEXTCOLOR, LVSIL_SMALL, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW,
+    OpenThemeData, RBS_CHECKEDDISABLED, RBS_CHECKEDHOT, RBS_CHECKEDNORMAL, RBS_CHECKEDPRESSED,
+    RBS_UNCHECKEDDISABLED, RBS_UNCHECKEDHOT, RBS_UNCHECKEDNORMAL, RBS_UNCHECKEDPRESSED, TS_DRAW,
+    TVM_SETBKCOLOR, TVM_SETLINECOLOR, TVM_SETTEXTCOLOR,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::HiDpi::SystemParametersInfoForDpi;
@@ -35,18 +38,19 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_GROUPBOX, BS_TYPEMASK, CBT_CREATEWNDW, CBTACTIVATESTRUCT, CallNextHookEx,
-    CreateDialogIndirectParamW, DLGPROC, DS_CONTROL, DS_MODALFRAME, DS_SETFONT,
-    DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD, GW_HWNDNEXT, GW_OWNER, GWL_STYLE,
-    GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem, GetForegroundWindow, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HCBT_ACTIVATE, HCBT_CREATEWND,
-    HHOOK, MapDialogRect, MoveWindow, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW,
-    SetCaretPos, SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, WH_CBT, WINDOWPOS,
+    BM_GETCHECK, BS_AUTORADIOBUTTON, BS_GROUPBOX, BS_RADIOBUTTON, BS_TYPEMASK, CBT_CREATEWNDW,
+    CBTACTIVATESTRUCT, CallNextHookEx, CreateDialogIndirectParamW, DLGPROC, DS_CONTROL,
+    DS_MODALFRAME, DS_SETFONT, DWLP_MSGRESULT, DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD,
+    GW_HWNDNEXT, GW_OWNER, GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem,
+    GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    HCBT_ACTIVATE, HCBT_CREATEWND, HHOOK, MapDialogRect, MoveWindow, NONCLIENTMETRICSW,
+    SPI_GETNONCLIENTMETRICS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetCaretPos, SetWindowLongPtrW, SetWindowPos,
+    SetWindowsHookExW, UISF_HIDEACCEL, UISF_HIDEFOCUS, UnhookWindowsHookEx, WH_CBT, WINDOWPOS,
     WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC,
-    WM_ERASEBKGND, WM_GETFONT, WM_NCDESTROY, WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_SETTINGCHANGE,
-    WM_WINDOWPOSCHANGING, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_POPUP,
-    WS_SYSMENU, WS_VISIBLE,
+    WM_ERASEBKGND, WM_GETFONT, WM_NCDESTROY, WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_QUERYUISTATE,
+    WM_SETTINGCHANGE, WM_WINDOWPOSCHANGING, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::paint::fill;
@@ -862,13 +866,151 @@ pub fn ctl_color(msg: u32, hdc: HDC, dark: bool) -> Option<isize> {
     Some(brush as isize)
 }
 
+/// A radio button's `NM_CUSTOMDRAW` (which its dialog gets for every paint
+/// of it, state changes included) in the dark theme: the dark style draws
+/// a radio button's text grey, as if it were greyed, so it is drawn here:
+/// the style's own dark circle for the state, the text in the theme's
+/// colour (dim when greyed), the access key's underline and the focus
+/// rectangle as the keyboard cues say. `None` for any other notification,
+/// any other control, or the light theme (Windows draws those).
+fn radio_custom_draw(l: LPARAM, dark: bool) -> Option<isize> {
+    if !dark || l == 0 {
+        return None;
+    }
+    // SAFETY: WM_NOTIFY's lParam is an NMHDR; an NM_CUSTOMDRAW's is an
+    // NMCUSTOMDRAW.
+    let cd = unsafe { &*(l as *const NMCUSTOMDRAW) };
+    if cd.hdr.code != NM_CUSTOMDRAW || class_of(cd.hdr.hwndFrom) != "Button" {
+        return None;
+    }
+    let button = cd.hdr.hwndFrom;
+    // SAFETY: reads this thread's button's style.
+    let kind = unsafe { GetWindowLongPtrW(button, GWL_STYLE) } as u32 & BS_TYPEMASK as u32;
+    if kind != BS_RADIOBUTTON as u32 && kind != BS_AUTORADIOBUTTON as u32 {
+        return None;
+    }
+    if cd.dwDrawStage != CDDS_PREPAINT {
+        return Some(CDRF_DODEFAULT as isize);
+    }
+    paint_dark_radio(button, cd);
+    Some(CDRF_SKIPDEFAULT as isize)
+}
+
+fn paint_dark_radio(button: HWND, cd: &NMCUSTOMDRAW) {
+    let pal = Palette::new(true);
+    let hdc = cd.hdc;
+    let rc = cd.rc;
+    let state = cd.uItemState;
+    let disabled = state & CDIS_DISABLED != 0;
+    // SAFETY: draws on the DC the button gave for this paint, with the
+    // theme data of this thread's button (closed after); the font selected
+    // is put back.
+    unsafe {
+        let checked = SendMessageW(button, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+        let part_state = match (
+            checked,
+            disabled,
+            state & CDIS_SELECTED != 0,
+            state & CDIS_HOT != 0,
+        ) {
+            (false, true, ..) => RBS_UNCHECKEDDISABLED,
+            (false, _, true, _) => RBS_UNCHECKEDPRESSED,
+            (false, _, _, true) => RBS_UNCHECKEDHOT,
+            (false, ..) => RBS_UNCHECKEDNORMAL,
+            (true, true, ..) => RBS_CHECKEDDISABLED,
+            (true, _, true, _) => RBS_CHECKEDPRESSED,
+            (true, _, _, true) => RBS_CHECKEDHOT,
+            (true, ..) => RBS_CHECKEDNORMAL,
+        };
+        fill(hdc, &rc, pal.chrome);
+        let dpi = GetDpiForWindow(button).max(96) as i32;
+        let px = |v: i32| v * dpi / 96;
+        let class = crate::wide::wz("Button");
+        let theme = OpenThemeData(button, class.as_ptr());
+        let mut size = SIZE {
+            cx: px(13),
+            cy: px(13),
+        };
+        if theme != 0 {
+            GetThemePartSize(
+                theme,
+                hdc,
+                BP_RADIOBUTTON,
+                part_state,
+                core::ptr::null(),
+                TS_DRAW,
+                &mut size,
+            );
+        }
+        let top = rc.top + (rc.bottom - rc.top - size.cy) / 2;
+        let glyph = RECT {
+            left: rc.left,
+            top,
+            right: rc.left + size.cx,
+            bottom: top + size.cy,
+        };
+        if theme != 0 {
+            DrawThemeBackground(
+                theme,
+                hdc,
+                BP_RADIOBUTTON,
+                part_state,
+                &glyph,
+                core::ptr::null(),
+            );
+            CloseThemeData(theme);
+        }
+        let font = SendMessageW(button, WM_GETFONT, 0, 0) as HFONT;
+        let old = SelectObject(hdc, font);
+        let text: Vec<u16> = crate::wide::window_text(button).encode_utf16().collect();
+        let cues = SendMessageW(button, WM_QUERYUISTATE, 0, 0) as u32;
+        let mut format = DT_SINGLELINE | DT_VCENTER;
+        if cues & UISF_HIDEACCEL != 0 {
+            format |= DT_HIDEPREFIX;
+        }
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, if disabled { pal.dim } else { pal.fg });
+        let mut tr = RECT {
+            left: glyph.right + px(3),
+            ..rc
+        };
+        DrawTextW(hdc, text.as_ptr(), text.len() as i32, &mut tr, format);
+        if state & CDIS_FOCUS != 0 && cues & UISF_HIDEFOCUS == 0 {
+            // Round the text, as Windows draws it.
+            let mut measured = tr;
+            DrawTextW(
+                hdc,
+                text.as_ptr(),
+                text.len() as i32,
+                &mut measured,
+                format | DT_CALCRECT,
+            );
+            let focus = RECT {
+                left: measured.left - 1,
+                top: tr.top + (tr.bottom - tr.top - (measured.bottom - measured.top)) / 2 - 1,
+                right: measured.right + 1,
+                bottom: tr.top + (tr.bottom - tr.top + (measured.bottom - measured.top)) / 2 + 1,
+            };
+            DrawFocusRect(hdc, &focus);
+        }
+        SelectObject(hdc, old);
+    }
+}
+
 /// What every themed dialog handles alike: its colours (`WM_CTLCOLOR*`),
+/// the dark theme's radio buttons (`WM_NOTIFY`, see `radio_custom_draw`),
 /// and following the system's theme (`WM_SETTINGCHANGE`) when `look` says
 /// so. `Some` is the dialog procedure's answer.
 pub fn common(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM, look: &Cell<Look>) -> Option<isize> {
     match msg {
         WM_CTLCOLORDLG | WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN
         | WM_CTLCOLORLISTBOX => ctl_color(msg, w as HDC, look.get().dark),
+        WM_NOTIFY => {
+            let answer = radio_custom_draw(l, look.get().dark)?;
+            // SAFETY: the answer of this dialog's WM_NOTIFY.
+            unsafe { SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, answer) };
+            Some(1)
+        }
         WM_SETTINGCHANGE => {
             if let Some(new) = look.get().after_setting_change(l) {
                 look.set(new);
