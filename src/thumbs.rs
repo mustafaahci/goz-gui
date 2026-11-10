@@ -56,6 +56,23 @@ impl Bitmap {
         self.handle as HBITMAP
     }
 
+    /// A `width` by `height` bitmap whose pixels (top-down, premultiplied
+    /// BGRA) `fill` writes; `None` if it could not be made or `fill` said
+    /// it failed.
+    pub fn with_pixels(
+        width: i32,
+        height: i32,
+        fill: impl FnOnce(&mut [[u8; 4]]) -> bool,
+    ) -> Option<Bitmap> {
+        let (out, bits) = dib(width, height)?;
+        // SAFETY: the DIB section's pixels, `width * height` of them, owned
+        // by `out`, which lives across the borrow and is in no DC yet.
+        let pixels = unsafe {
+            core::slice::from_raw_parts_mut(bits.cast::<[u8; 4]>(), (width * height) as usize)
+        };
+        fill(pixels).then_some(out)
+    }
+
     fn cost(&self) -> usize {
         (self.width.max(0) as usize * self.height.max(0) as usize * 4).max(MIN_COST)
     }
@@ -361,10 +378,50 @@ fn make(path: &[u16], side: i32) -> Option<Bitmap> {
     out
 }
 
+/// A new 32-bit top-down DIB section `w` by `h`, and its pixels.
+fn dib(w: i32, h: i32) -> Option<(Bitmap, *mut core::ffi::c_void)> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    // SAFETY: a plain header for a DIB section that the returned `Bitmap`
+    // owns; its pixels stay valid until the bitmap is deleted.
+    unsafe {
+        let mut bi: BITMAPINFO = core::mem::zeroed();
+        bi.bmiHeader = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            // Top-down.
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..core::mem::zeroed()
+        };
+        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+        let made = CreateDIBSection(
+            core::ptr::null_mut(),
+            &bi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            core::ptr::null_mut(),
+            0,
+        );
+        if made.is_null() {
+            return None;
+        }
+        let out = Bitmap {
+            handle: made as usize,
+            width: w,
+            height: h,
+        };
+        (!bits.is_null()).then_some((out, bits))
+    }
+}
+
 /// A copy of `src` as a 32-bit top-down DIB with premultiplied alpha. The
 /// shell's bitmaps come with straight alpha, premultiplied alpha, or (some
 /// photos) no alpha at all, all zero: each is made right for `AlphaBlend`.
-fn premultiplied(src: HBITMAP) -> Option<Bitmap> {
+pub fn premultiplied(src: HBITMAP) -> Option<Bitmap> {
     // SAFETY: reads the bitmap's header into a plain out-struct, then copies
     // its pixels into a DIB made for them; the screen DC is released.
     unsafe {

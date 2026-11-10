@@ -324,7 +324,10 @@ pub struct Settings {
     // (FRAMEWORK.md).
 
     // F1 (preview pane).
-
+    /// The preview pane's keys (`preview_fill`, `preview_load_size`,
+    /// `show_preview_handlers_in_preview_pane`, ..., see
+    /// `crate::preview`).
+    pub preview: crate::preview::PreviewSettings,
     // F2 (sidebars).
 
     // F3 (tabs and windows).
@@ -405,7 +408,7 @@ impl Default for Settings {
             // Wave 1 (FRAMEWORK.md).
 
             // F1 (preview pane).
-
+            preview: crate::preview::PreviewSettings::default(),
             // F2 (sidebars).
 
             // F3 (tabs and windows).
@@ -606,7 +609,7 @@ impl Settings {
             // Wave 1 (FRAMEWORK.md).
 
             // F1 (preview pane).
-
+            preview: crate::preview::PreviewSettings::from_keys(|k| ini.get(k)),
             // F2 (sidebars).
 
             // F3 (tabs and windows).
@@ -715,6 +718,7 @@ impl Settings {
         // Wave 1 (FRAMEWORK.md).
 
         // F1 (preview pane).
+        out.extend(self.preview.to_keys());
 
         // F2 (sidebars).
 
@@ -914,6 +918,12 @@ mod tests {
                 d
             },
             options_page: "History".into(),
+            // F1 (preview pane).
+            preview: crate::preview::PreviewSettings {
+                fill: true,
+                load_size: 2048,
+                ..crate::preview::PreviewSettings::default()
+            },
         };
         let mut ini = Ini::default();
         for (k, v) in s.to_pairs() {

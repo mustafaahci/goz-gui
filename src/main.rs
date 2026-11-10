@@ -71,6 +71,7 @@ mod zoom;
 // their changes never meet (FRAMEWORK.md).
 
 // F1 (preview pane).
+mod preview;
 
 // F2 (sidebars).
 

@@ -57,6 +57,7 @@ dependencies = [
  "goz-core",
  "goz-winfs",
  "windows",
+ "windows-core",
  "windows-sys",
 ]
 

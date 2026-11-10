@@ -240,6 +240,10 @@ impl App {
         if l.changes_search() {
             self.apply_launch(&l);
         }
+        // F1 (preview pane): -preview / -no-preview.
+        if let Some(show) = l.preview {
+            self.show_pane(crate::dock::PaneId::Preview, show);
+        }
         if l.toggle_window {
             self.toggle_window();
         } else if !l.startup {
