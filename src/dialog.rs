@@ -39,18 +39,21 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BS_AUTORADIOBUTTON, BS_GROUPBOX, BS_RADIOBUTTON, BS_TYPEMASK, CBT_CREATEWNDW,
-    CBTACTIVATESTRUCT, CallNextHookEx, CreateDialogIndirectParamW, DLGPROC, DS_CONTROL,
+    BM_GETCHECK, BS_AUTORADIOBUTTON, BS_GROUPBOX, BS_RADIOBUTTON, BS_TYPEMASK, CB_ADDSTRING,
+    CB_DELETESTRING, CB_GETEDITSEL, CB_MSGMAX, CB_SETCURSEL, CBT_CREATEWNDW, CBTACTIVATESTRUCT,
+    CallNextHookEx, CreateDialogIndirectParamW, CreateWindowExW, DLGPROC, DS_CONTROL,
     DS_MODALFRAME, DS_SETFONT, DWLP_MSGRESULT, DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD,
     GW_HWNDNEXT, GW_OWNER, GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem,
     GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    HCBT_ACTIVATE, HCBT_CREATEWND, HHOOK, MapDialogRect, MoveWindow, NONCLIENTMETRICSW,
-    SPI_GETNONCLIENTMETRICS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetCaretPos, SetWindowLongPtrW, SetWindowPos,
-    SetWindowsHookExW, UISF_HIDEACCEL, UISF_HIDEFOCUS, UnhookWindowsHookEx, WH_CBT, WINDOWPOS,
-    WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC,
-    WM_ERASEBKGND, WM_GETFONT, WM_NCDESTROY, WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_QUERYUISTATE,
-    WM_SETTINGCHANGE, WM_WINDOWPOSCHANGING, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS,
+    HCBT_ACTIVATE, HCBT_CREATEWND, HHOOK, HMENU, KillTimer, MapDialogRect, MoveWindow,
+    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetCaretPos, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, UISF_HIDEACCEL, UISF_HIDEFOCUS,
+    USER_TIMER_MINIMUM, UnhookWindowsHookEx, WH_CBT, WINDOWPOS, WM_CHAR, WM_CTLCOLORBTN,
+    WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_ERASEBKGND,
+    WM_GETFONT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCDESTROY,
+    WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_QUERYUISTATE, WM_SETFONT, WM_SETREDRAW, WM_SETTINGCHANGE,
+    WM_SYSKEYDOWN, WM_TIMER, WM_WINDOWPOSCHANGING, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS,
     WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
@@ -290,86 +293,25 @@ fn class_of(hwnd: HWND) -> String {
 /// Makes a dialog and its controls dark or light: the title bar, buttons,
 /// text boxes and lists. Its face and text follow from [`ctl_color`].
 pub fn apply_theme(dlg: HWND, dark: bool) {
+    theme_controls(dlg, dark, false);
+}
+
+/// [`apply_theme`] for a dialog just made (from its WM_INITDIALOG): in the
+/// light theme its buttons, boxes and combo boxes are left with the visual
+/// style they were made with, which is the light one. Setting it again
+/// (`SetWindowTheme`) makes each control load its theme over and measure
+/// itself again: about half a millisecond a combo box.
+pub fn theme_new(dlg: HWND, dark: bool) {
+    theme_controls(dlg, dark, true);
+}
+
+fn theme_controls(dlg: HWND, dark: bool, fresh: bool) {
     theme::set_titlebar(dlg, dark);
-    let pal = Palette::new(dark);
-    // SAFETY: walks and sends to the children of this thread's dialog.
+    // SAFETY: walks the children of this thread's dialog, and repaints it.
     unsafe {
         let mut child = GetWindow(dlg, GW_CHILD);
         while !child.is_null() {
-            theme::allow(child, dark);
-            match class_of(child).as_str() {
-                // A themed group box draws its caption in the theme's dark
-                // text whatever WM_CTLCOLORSTATIC says, and an unthemed one
-                // a white etched frame: in the dark theme it is drawn here.
-                "Button"
-                    if GetWindowLongPtrW(child, GWL_STYLE) as u32 & BS_TYPEMASK as u32
-                        == BS_GROUPBOX as u32 =>
-                {
-                    theme::set_class(child, None);
-                    SetWindowSubclass(child, Some(group_proc), 1, usize::from(dark));
-                }
-                "Button" => theme::set_class(child, dark.then_some("DarkMode_Explorer")),
-                // A hotkey box draws white whatever its parent says: in the
-                // dark theme it is drawn here, its edge too.
-                "msctls_hotkey32" => {
-                    SetWindowSubclass(child, Some(hotkey_proc), 1, usize::from(dark));
-                    SetWindowPos(
-                        child,
-                        core::ptr::null_mut(),
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                    );
-                }
-                // A box of several lines has a scroll bar, which the
-                // Explorer style makes dark (its edge is drawn by its
-                // owner).
-                "Edit" if GetWindowLongPtrW(child, GWL_STYLE) as u32 & ES_MULTILINE as u32 != 0 => {
-                    theme::set_class(child, dark.then_some("DarkMode_Explorer"));
-                }
-                "Edit" => theme::set_class(child, dark.then_some("DarkMode_CFD")),
-                // Its list's colours come from WM_CTLCOLORLISTBOX.
-                "ComboBox" => theme::set_class(child, dark.then_some("DarkMode_CFD")),
-                "SysTreeView32" => {
-                    theme::set_class(
-                        child,
-                        Some(if dark {
-                            "DarkMode_Explorer"
-                        } else {
-                            "Explorer"
-                        }),
-                    );
-                    SendMessageW(child, TVM_SETBKCOLOR, 0, pal.bg as isize);
-                    SendMessageW(child, TVM_SETTEXTCOLOR, 0, pal.fg as isize);
-                    SendMessageW(child, TVM_SETLINECOLOR, 0, pal.dim as isize);
-                }
-                "SysListView32" => {
-                    // Dark scroll bars come with the dark Explorer style;
-                    // it shows no selection once the list loses the
-                    // keyboard, so dialogs draw that themselves (see
-                    // `list_custom_draw`).
-                    theme::set_class(
-                        child,
-                        Some(if dark {
-                            "DarkMode_Explorer"
-                        } else {
-                            "Explorer"
-                        }),
-                    );
-                    let header = SendMessageW(child, LVM_GETHEADER, 0, 0) as HWND;
-                    theme::allow(header, dark);
-                    theme::set_class(header, dark.then_some("DarkMode_ItemsView"));
-                    SendMessageW(child, LVM_SETBKCOLOR, 0, pal.bg as isize);
-                    SendMessageW(child, LVM_SETTEXTBKCOLOR, 0, pal.bg as isize);
-                    SendMessageW(child, LVM_SETTEXTCOLOR, 0, pal.fg as isize);
-                    // The subclass's data is whether the theme is dark;
-                    // setting it again only updates that.
-                    SetWindowSubclass(child, Some(list_proc), 1, usize::from(dark));
-                }
-                _ => {}
-            }
+            theme_control(child, dark, fresh);
             child = GetWindow(child, GW_HWNDNEXT);
         }
         RedrawWindow(
@@ -378,6 +320,220 @@ pub fn apply_theme(dlg: HWND, dark: bool) {
             core::ptr::null_mut(),
             RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
         );
+    }
+}
+
+/// Makes one control of a dialog dark or light, as [`apply_theme`] does
+/// each; `fresh`: just made (see [`theme_new`]). For a control a dialog
+/// makes after its others.
+pub fn theme_control(child: HWND, dark: bool, fresh: bool) {
+    let pal = Palette::new(dark);
+    let class = class_of(child);
+    // Controls still as they were made, which is light.
+    if fresh
+        && !dark
+        && matches!(
+            class.as_str(),
+            "Button" | "Edit" | "ComboBox" | "msctls_hotkey32"
+        )
+    {
+        return;
+    }
+    // SAFETY: sends to and subclasses this thread's control.
+    unsafe {
+        theme::allow(child, dark);
+        match class.as_str() {
+            // A themed group box draws its caption in the theme's dark
+            // text whatever WM_CTLCOLORSTATIC says, and an unthemed one
+            // a white etched frame: in the dark theme it is drawn here.
+            "Button"
+                if GetWindowLongPtrW(child, GWL_STYLE) as u32 & BS_TYPEMASK as u32
+                    == BS_GROUPBOX as u32 =>
+            {
+                theme::set_class(child, None);
+                SetWindowSubclass(child, Some(group_proc), 1, usize::from(dark));
+            }
+            "Button" => theme::set_class(child, dark.then_some("DarkMode_Explorer")),
+            // A hotkey box draws white whatever its parent says: in the
+            // dark theme it is drawn here, its edge too.
+            "msctls_hotkey32" => {
+                SetWindowSubclass(child, Some(hotkey_proc), 1, usize::from(dark));
+                SetWindowPos(
+                    child,
+                    core::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+            // A box of several lines has a scroll bar, which the
+            // Explorer style makes dark (its edge is drawn by its
+            // owner).
+            "Edit" if GetWindowLongPtrW(child, GWL_STYLE) as u32 & ES_MULTILINE as u32 != 0 => {
+                theme::set_class(child, dark.then_some("DarkMode_Explorer"));
+            }
+            "Edit" => theme::set_class(child, dark.then_some("DarkMode_CFD")),
+            // Its list's colours come from WM_CTLCOLORLISTBOX.
+            "ComboBox" => theme::set_class(child, dark.then_some("DarkMode_CFD")),
+            "SysTreeView32" => {
+                theme::set_class(
+                    child,
+                    Some(if dark {
+                        "DarkMode_Explorer"
+                    } else {
+                        "Explorer"
+                    }),
+                );
+                SendMessageW(child, TVM_SETBKCOLOR, 0, pal.bg as isize);
+                SendMessageW(child, TVM_SETTEXTCOLOR, 0, pal.fg as isize);
+                SendMessageW(child, TVM_SETLINECOLOR, 0, pal.dim as isize);
+            }
+            "SysListView32" => {
+                // Dark scroll bars come with the dark Explorer style;
+                // it shows no selection once the list loses the
+                // keyboard, so dialogs draw that themselves (see
+                // `list_custom_draw`).
+                theme::set_class(
+                    child,
+                    Some(if dark {
+                        "DarkMode_Explorer"
+                    } else {
+                        "Explorer"
+                    }),
+                );
+                let header = SendMessageW(child, LVM_GETHEADER, 0, 0) as HWND;
+                theme::allow(header, dark);
+                theme::set_class(header, dark.then_some("DarkMode_ItemsView"));
+                SendMessageW(child, LVM_SETBKCOLOR, 0, pal.bg as isize);
+                SendMessageW(child, LVM_SETTEXTBKCOLOR, 0, pal.bg as isize);
+                SendMessageW(child, LVM_SETTEXTCOLOR, 0, pal.fg as isize);
+                // The subclass's data is whether the theme is dark;
+                // setting it again only updates that.
+                SetWindowSubclass(child, Some(list_proc), 1, usize::from(dark));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A combo box's list still to be put in ([`fill_later`]): its items, and
+/// the one chosen.
+struct Later {
+    items: Vec<String>,
+    select: Option<usize>,
+    /// Whether the chosen item was put in ahead of the others.
+    ahead: bool,
+}
+
+/// [`fill_later`]'s subclass id, and its timer's id on the combo box.
+const LATER: usize = 0x6c61;
+
+/// Gives combo box `combo` its list `items` (`select` chosen, if any), put
+/// in only once wanted. A themed (v6) list takes about half a millisecond
+/// an item, whether or not it redraws (measured: 20 history formats, 15 ms;
+/// a WinForms v6 combo box alike), which made the dialogs that fill several
+/// as they open take 50 to 100 ms. So only the chosen item goes in now, for
+/// the box to show; the rest follow once the dialog has been drawn (a timer:
+/// timers come after every paint waiting), each box's in a message of its
+/// own, or at once when the box is used first (a key, a click, the wheel)
+/// or asked anything about its list (`CB_GETCURSEL` and every other `CB_*`
+/// message), so no caller can tell.
+pub fn fill_later(combo: HWND, items: Vec<String>, select: Option<usize>) {
+    let chosen = select.and_then(|i| items.get(i));
+    if let Some(text) = chosen {
+        let text = crate::wide::wz(text);
+        // SAFETY: messages to this thread's combo box; the text outlives
+        // them.
+        unsafe {
+            SendMessageW(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
+            SendMessageW(combo, CB_SETCURSEL, 0, 0);
+        }
+    }
+    let ahead = chosen.is_some();
+    let later = Box::into_raw(Box::new(Later {
+        items,
+        select,
+        ahead,
+    }));
+    // SAFETY: the subclass owns the box: it takes it back when it fills the
+    // list, or when the combo box goes (WM_NCDESTROY). The timer is the
+    // combo box's own.
+    unsafe {
+        if SetWindowSubclass(combo, Some(later_proc), LATER, later as usize) == 0 {
+            fill_now(combo, later);
+        } else {
+            SetTimer(combo, LATER, USER_TIMER_MINIMUM, None);
+        }
+    }
+}
+
+/// Whether `msg` is one that needs the whole list in first: one that uses
+/// the box (keys, mouse) or asks about or changes its list.
+fn wants_list(msg: u32) -> bool {
+    matches!(
+        msg,
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_KEYDOWN | WM_SYSKEYDOWN | WM_CHAR | WM_MOUSEWHEEL
+    ) || (CB_GETEDITSEL..=CB_MSGMAX).contains(&msg)
+}
+
+/// [`fill_later`]'s subclass: puts the list in when it is wanted.
+unsafe extern "system" fn later_proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    _id: usize,
+    data: usize,
+) -> LRESULT {
+    // SAFETY: `data` is the `Later` box `fill_later` made, alive until
+    // `fill_now` or WM_NCDESTROY takes it back (after which this subclass
+    // is gone); the messages are this thread's combo box's.
+    unsafe {
+        match msg {
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(later_proc), LATER);
+                KillTimer(hwnd, LATER);
+                drop(Box::from_raw(data as *mut Later));
+            }
+            WM_TIMER if w == LATER => {
+                fill_now(hwnd, data as *mut Later);
+                return 0;
+            }
+            m if wants_list(m) => fill_now(hwnd, data as *mut Later),
+            _ => {}
+        }
+        DefSubclassProc(hwnd, msg, w, l)
+    }
+}
+
+/// Puts the list of `later` in `combo` now, unseen (the box shows the same
+/// item after), and takes the subclass off.
+///
+/// # Safety
+/// `later` is the box `fill_later` made for `combo`, not yet taken back.
+unsafe fn fill_now(combo: HWND, later: *mut Later) {
+    // SAFETY: as the caller promises; messages to this thread's combo box,
+    // the texts outliving them. The subclass is removed first, so these
+    // messages do not come back to it.
+    unsafe {
+        let later = Box::from_raw(later);
+        RemoveWindowSubclass(combo, Some(later_proc), LATER);
+        KillTimer(combo, LATER);
+        SendMessageW(combo, WM_SETREDRAW, 0, 0);
+        if later.ahead {
+            // Not CB_RESETCONTENT, which also empties an editable box.
+            SendMessageW(combo, CB_DELETESTRING, 0, 0);
+        }
+        for text in &later.items {
+            let text = crate::wide::wz(text);
+            SendMessageW(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
+        }
+        if let Some(i) = later.select {
+            SendMessageW(combo, CB_SETCURSEL, i, 0);
+        }
+        SendMessageW(combo, WM_SETREDRAW, 1, 0);
     }
 }
 
@@ -1245,6 +1401,61 @@ fn anchored(r: RECT, (dx, dy): (i32, i32), how: u8) -> RECT {
     }
 }
 
+/// A control of window class `class` made in dialog `dlg` after the
+/// template's (a costly one, made once the dialog has been drawn): visible,
+/// `id`, `style` added, where `units` (dialog units) say, in the dialog's
+/// font, and next after `after` in the tab order (its label, so that the
+/// label's access key reaches it). Null if it could not be made.
+pub fn make_control(
+    dlg: HWND,
+    class: &str,
+    id: u16,
+    style: u32,
+    (x, y, cx, cy): Units,
+    after: HWND,
+) -> HWND {
+    let mut r = RECT {
+        left: x.into(),
+        top: y.into(),
+        right: i32::from(x) + i32::from(cx),
+        bottom: i32::from(y) + i32::from(cy),
+    };
+    let class = crate::wide::wz(class);
+    // SAFETY: makes a child of this thread's dialog (the class name
+    // outlives the call) and sends it the dialog's font.
+    unsafe {
+        MapDialogRect(dlg, &mut r);
+        let made = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            core::ptr::null(),
+            WS_CHILD | WS_VISIBLE | style,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            dlg,
+            usize::from(id) as HMENU,
+            GetModuleHandleW(core::ptr::null()),
+            core::ptr::null(),
+        );
+        if !made.is_null() {
+            let font = SendMessageW(dlg, WM_GETFONT, 0, 0);
+            SendMessageW(made, WM_SETFONT, font as usize, 0);
+            SetWindowPos(
+                made,
+                after,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        made
+    }
+}
+
 /// Places `controls` for the dialog's size: each at its template
 /// rectangle, moved or grown (`MOVE_X`, `GROW_Y`, ...) by what the client
 /// area has over the template's `size`. In dialog units, so it holds at
@@ -1324,6 +1535,42 @@ pub fn center_on_owner(dlg: HWND) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CB_FINDSTRINGEXACT, CB_GETCOUNT, CB_GETCURSEL, CB_GETLBTEXT, CB_SHOWDROPDOWN, WM_GETTEXT,
+        WM_MOVE, WM_SIZE,
+    };
+
+    #[test]
+    fn a_list_comes_in_before_it_is_used_or_read() {
+        // Read, changed or dropped down by anyone: the list first.
+        for msg in [
+            CB_GETCURSEL,
+            CB_SETCURSEL,
+            CB_GETCOUNT,
+            CB_GETLBTEXT,
+            CB_FINDSTRINGEXACT,
+            CB_SHOWDROPDOWN,
+            CB_ADDSTRING,
+            CB_DELETESTRING,
+        ] {
+            assert!(wants_list(msg), "{msg:#x}");
+        }
+        // Used: a click, a key, the wheel.
+        for msg in [
+            WM_LBUTTONDOWN,
+            WM_KEYDOWN,
+            WM_SYSKEYDOWN,
+            WM_CHAR,
+            WM_MOUSEWHEEL,
+        ] {
+            assert!(wants_list(msg), "{msg:#x}");
+        }
+        // Drawn, placed or its text (the chosen item, already in) read: not
+        // yet.
+        for msg in [WM_PAINT, WM_SETFONT, WM_SIZE, WM_MOVE, WM_TIMER, WM_GETTEXT] {
+            assert!(!wants_list(msg), "{msg:#x}");
+        }
+    }
 
     #[test]
     fn the_last_column_takes_what_the_others_leave() {

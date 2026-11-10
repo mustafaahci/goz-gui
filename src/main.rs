@@ -7,6 +7,7 @@
 #![windows_subsystem = "windows"]
 
 mod actions;
+mod bigicon;
 mod bookmark_dialogs;
 mod bookmarks;
 mod celltip;

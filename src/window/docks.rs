@@ -322,6 +322,8 @@ impl App {
         // SAFETY: destroys this thread's pane window and its children.
         unsafe { DestroyWindow(open.hwnd) };
         drop(open);
+        // What it held is handed back once the window rests.
+        self.memory_settles();
         if forget {
             self.layout();
             self.update_pane_menu_checks();
@@ -386,6 +388,7 @@ impl App {
     pub(super) fn panes_window_shown(&self, shown: bool) {
         if self.panes_shown.replace(shown) != shown {
             self.pane_event(PaneEvent::WindowShown(shown));
+            self.memory_window_shown(shown);
         }
     }
 

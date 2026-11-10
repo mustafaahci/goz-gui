@@ -21,15 +21,15 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
-    CBS_DROPDOWNLIST, ES_AUTOHSCROLL, ES_NUMBER, EndDialog, GWLP_USERDATA, GetDlgItem, IDCANCEL,
-    IDOK, MB_ICONWARNING, MB_OK, SendMessageW, SetWindowLongPtrW, SetWindowTextW, WM_COMMAND,
-    WM_INITDIALOG, WM_NOTIFY, WM_SETREDRAW, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
+    BM_GETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_GETCURSEL, CBS_DROPDOWNLIST, ES_AUTOHSCROLL,
+    ES_NUMBER, EndDialog, GWLP_USERDATA, GetDlgItem, IDCANCEL, IDOK, MB_ICONWARNING, MB_OK,
+    SendMessageW, SetWindowLongPtrW, SetWindowTextW, WM_COMMAND, WM_INITDIALOG, WM_NOTIFY,
+    WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
 };
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common, state};
+use crate::dialog::{Class, Look, Template, center_on_owner, common, state, theme_new};
 use crate::msgbox;
 use crate::searchtools::folder_term;
 use crate::wide::{window_text, wz};
@@ -319,6 +319,9 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
     let label = SS_LEFT;
     let edit = WS_TABSTOP | ES_AUTOHSCROLL as u32;
     let combo = WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32;
+    // Five units need no scroll bar, which costs a themed list a few
+    // milliseconds to make.
+    let units = WS_TABSTOP | CBS_DROPDOWNLIST as u32;
     let check = WS_TABSTOP | BS_AUTOCHECKBOX as u32;
     let picker = WS_TABSTOP | DTS_SHORTDATEFORMAT | DTS_SHOWNONE;
     let (lx, fx, right) = (7, 82, 293);
@@ -418,7 +421,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         Class::Named("ComboBox"),
         "",
         ID_SIZE_FROM_UNIT,
-        combo,
+        units,
         0,
         (71, 119, 44, 120),
     )
@@ -435,7 +438,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         Class::Named("ComboBox"),
         "",
         ID_SIZE_TO_UNIT,
-        combo,
+        units,
         0,
         (199, 119, 44, 120),
     )
@@ -517,16 +520,9 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
 }
 
 fn fill_combo(dlg: HWND, id: u16, items: impl IntoIterator<Item = String>, select: usize) {
-    let combo = item(dlg, id);
-    // A themed list redraws for each item added (a few ms each): it is
-    // filled unseen and drawn once, which keeps the dialog's opening short.
-    send(combo, WM_SETREDRAW, 0, 0);
-    for text in items {
-        let text = wz(&text);
-        send(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
-    }
-    send(combo, CB_SETCURSEL, select, 0);
-    send(combo, WM_SETREDRAW, 1, 0);
+    // A themed list takes half a millisecond an item: the chosen item now,
+    // the rest once the dialog shows (`dialog::fill_later`).
+    crate::dialog::fill_later(item(dlg, id), items.into_iter().collect(), Some(select));
 }
 
 fn selection(dlg: HWND, id: u16) -> usize {
@@ -574,7 +570,7 @@ impl Dlg<'_> {
         for id in [ID_DATE_FROM, ID_DATE_TO] {
             send(item(dlg, id), DTM_SETSYSTEMTIME, GDT_NONE as usize, 0);
         }
-        apply_theme(dlg, self.look.get().dark);
+        theme_new(dlg, self.look.get().dark);
         for id in [ID_DATE_FROM, ID_DATE_TO] {
             let picker = item(dlg, id);
             // SAFETY: subclasses this thread's date picker; the subclass

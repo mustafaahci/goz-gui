@@ -135,14 +135,7 @@ impl Icons {
         if row.is_dir {
             return (self.folder, None);
         }
-        let name = row.name();
-        let ext: Vec<u16> = match name.iter().rposition(|&c| c == u16::from(b'.')) {
-            Some(dot) => name[dot + 1..]
-                .iter()
-                .map(|&c| crate::highlight::fold(c))
-                .collect(),
-            None => Vec::new(),
-        };
+        let ext = extension(row.name());
         let generic = self.by_ext(&ext);
         let mut dropped = None;
         if own == UNSET && wants_own(&ext) {
@@ -160,6 +153,19 @@ impl Icons {
             }
         }
         (generic, dropped)
+    }
+
+    /// The icon of `row`'s type, never the file's own: what a thumbnail
+    /// cell shows while its picture is made (or when it has none). A type's
+    /// icon is one entry of the system image lists however many files show
+    /// it; a program's own icon is an entry each, which drawn from the
+    /// jumbo list stays there, about 50 KB a program (measured).
+    pub fn type_icon(&self, row: &Row) -> i32 {
+        if row.is_dir {
+            self.folder
+        } else {
+            self.by_ext(&extension(row.name()))
+        }
     }
 
     fn by_ext(&self, ext: &[u16]) -> i32 {
@@ -185,10 +191,23 @@ impl Icons {
     }
 }
 
-fn wants_own(ext: &[u16]) -> bool {
+/// Whether files of extension `ext` (lower case, no dot) carry their own
+/// icon.
+pub fn wants_own(ext: &[u16]) -> bool {
     OWN_ICON
         .iter()
         .any(|e| e.len() == ext.len() && e.bytes().zip(ext).all(|(a, &b)| u16::from(a) == b))
+}
+
+/// The extension of file name `name`, lower case, without its dot.
+fn extension(name: &[u16]) -> Vec<u16> {
+    match name.iter().rposition(|&c| c == u16::from(b'.')) {
+        Some(dot) => name[dot + 1..]
+            .iter()
+            .map(|&c| crate::highlight::fold(c))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 fn info() -> SHFILEINFOW {

@@ -39,7 +39,6 @@ use windows_sys::core::GUID;
 
 use super::{App, send};
 use crate::highlight::Span;
-use crate::icons::{PENDING, UNSET};
 use crate::paint::{self, RowState};
 use crate::status::ViewButton;
 use crate::thumbs::{Bitmap, ThumbReply};
@@ -357,17 +356,9 @@ impl App {
                     false
                 }
             });
-            let icon = (!drawn).then(|| {
-                let (icon, dropped) = self.icons.for_row(row, m.shown, index);
-                // As in Details: a lookup pushed out of the full queue is
-                // asked for again when its item is drawn again.
-                if let Some(other) = dropped.and_then(|i| m.peek(i))
-                    && other.icon.get() == PENDING
-                {
-                    other.icon.set(UNSET);
-                }
-                icon
-            });
+            // The type's icon, never the file's own (`Icons::type_icon`):
+            // a program's own icon comes as its thumbnail.
+            let icon = (!drawn).then(|| self.icons.type_icon(row));
             (icon, row.name().to_vec(), scratch.name_spans.clone())
         };
         if let Some(icon) = icon {

@@ -1,11 +1,22 @@
 //! Thumbnails for the thumbnail views.
 //!
-//! The shell makes them (`IShellItemImageFactory`), which can mean reading
-//! and decoding whole files, so one background thread asks for them, the
-//! items in view only, the newest request first; requests for items that
-//! scrolled away, or of a size or search no longer shown, are dropped.
-//! Each answer is posted to the window, which keeps the bitmaps in a cache
-//! bounded by their memory and redraws the item.
+//! Making one can mean reading and decoding a whole file, so one background
+//! thread makes them, the items in view only, the newest request first;
+//! requests for items that scrolled away, or of a size or search no longer
+//! shown, are dropped. Each answer is posted to the window, which keeps the
+//! bitmaps in a cache bounded by their memory and redraws the item.
+//!
+//! What a thumbnail is made from depends on the file's type ([`Source`]):
+//! the shell's image factory (`IShellItemImageFactory`) only for types with
+//! a thumbnail handler (pictures, videos, documents that have one) and for
+//! folders; a program's, shortcut's or icon file's own icon is extracted
+//! at the size by [`crate::bigicon`]; every other type shows its type's
+//! icon, which the view draws from the system image list. The factory
+//! would give those icons too, but it keeps each file's own icon in the
+//! process's jumbo image list for good (about 50 KB per program seen).
+//!
+//! The cache is let go of when the window hides and trimmed to the items in
+//! view once the view has rested ([`Thumbs::release`], [`Thumbs::trim`]).
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -21,15 +32,27 @@ use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject,
     GetDC, GetDIBits, GetObjectW, HBITMAP, ReleaseDC,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+};
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CLASSES_ROOT, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW, RegOpenKeyExW,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::Shell::{ASSOCF_NONE, ASSOCSTR_SHELLEXTENSION, AssocQueryStringW};
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use crate::wide::nul;
+use crate::wide::{nul, wz};
+
+/// The shell extension interfaces of a thumbnail handler: `IThumbnailProvider`
+/// and the older `IExtractImage`.
+const THUMBNAIL_PROVIDER: &str = "{E357FCCD-A995-4576-B01F-234630154E96}";
+const EXTRACT_IMAGE: &str = "{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}";
 
 /// The most memory the cached thumbnails take (32-bit pixels).
 pub const BUDGET: usize = 24 << 20;
@@ -157,6 +180,145 @@ impl<V> Lru<V> {
         self.map.clear();
         self.bytes = 0;
     }
+
+    /// Keeps only the values `keep` says to; the others are dropped. How
+    /// many went.
+    pub fn retain(&mut self, mut keep: impl FnMut(&V) -> bool) -> usize {
+        let before = self.map.len();
+        let mut freed = 0;
+        self.map.retain(|_, (v, cost, _)| {
+            let kept = keep(v);
+            if !kept {
+                freed += *cost;
+            }
+            kept
+        });
+        self.bytes -= freed;
+        before - self.map.len()
+    }
+}
+
+/// What a file's thumbnail is made from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    /// A picture of its contents, from the shell's image factory: types
+    /// with a thumbnail handler, and folders.
+    Shell,
+    /// Its own icon (a program's, a shortcut's, an icon file's), extracted
+    /// at the size.
+    OwnIcon,
+    /// Its type's icon, which the view draws itself: nothing to make.
+    TypeIcon,
+}
+
+/// The source of a thumbnail for a file (not a folder: those are the
+/// shell's) of extension `ext` (lower case, no dot); `handled` says whether
+/// the type has a thumbnail handler, and is asked only when that decides
+/// it.
+fn source_for(ext: &[u16], handled: impl FnOnce() -> bool) -> Source {
+    if crate::icons::wants_own(ext) {
+        // Shortcuts have a thumbnail handler (the target's picture), but
+        // are shown by their icon, as programs and icon files are.
+        Source::OwnIcon
+    } else if !ext.is_empty() && handled() {
+        Source::Shell
+    } else {
+        Source::TypeIcon
+    }
+}
+
+/// Whether files of extension `ext` (lower case, no dot) have a thumbnail
+/// handler: registered for the extension, its file type or its perceived
+/// type (`SystemFileAssociations\image` for pictures), as `IThumbnailProvider`
+/// or `IExtractImage`. Reads the registry.
+fn has_thumbnail_handler(ext: &[u16]) -> bool {
+    let mut dotted = vec![u16::from(b'.')];
+    dotted.extend_from_slice(ext);
+    let dotted_z = nul(&dotted);
+    let assoc = |iid: &str| {
+        let iid = wz(iid);
+        let mut buf = [0u16; 64];
+        let mut len = buf.len() as u32;
+        // SAFETY: NUL-terminated strings; the buffer with its length.
+        unsafe {
+            AssocQueryStringW(
+                ASSOCF_NONE,
+                ASSOCSTR_SHELLEXTENSION,
+                dotted_z.as_ptr(),
+                iid.as_ptr(),
+                buf.as_mut_ptr(),
+                &mut len,
+            ) == 0
+        }
+    };
+    if assoc(THUMBNAIL_PROVIDER) || assoc(EXTRACT_IMAGE) {
+        return true;
+    }
+    // The perceived type's own registration, which the association does not
+    // always reach (a type some program took over).
+    let Some(perceived) = perceived_type(&dotted_z) else {
+        return false;
+    };
+    [THUMBNAIL_PROVIDER, EXTRACT_IMAGE].iter().any(|iid| {
+        let mut key: Vec<u16> = "SystemFileAssociations\\".encode_utf16().collect();
+        key.extend_from_slice(&perceived);
+        key.extend("\\ShellEx\\".encode_utf16());
+        key.extend(iid.encode_utf16());
+        key_exists(&nul(&key))
+    })
+}
+
+/// The `PerceivedType` of extension key `dotted_z` (".png", NUL-terminated)
+/// under HKEY_CLASSES_ROOT.
+fn perceived_type(dotted_z: &[u16]) -> Option<Vec<u16>> {
+    let name = wz("PerceivedType");
+    let mut buf = [0u16; 64];
+    let mut bytes = (buf.len() * 2) as u32;
+    // SAFETY: NUL-terminated names; the buffer with its size in bytes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CLASSES_ROOT,
+            dotted_z.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            core::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    (len > 0).then(|| buf[..len].to_vec())
+}
+
+/// Whether key `path_z` (NUL-terminated) exists under HKEY_CLASSES_ROOT.
+fn key_exists(path_z: &[u16]) -> bool {
+    let mut key: HKEY = core::ptr::null_mut();
+    // SAFETY: a NUL-terminated path; the key opened is closed at once.
+    unsafe {
+        if RegOpenKeyExW(HKEY_CLASSES_ROOT, path_z.as_ptr(), 0, KEY_READ, &mut key) != 0 {
+            return false;
+        }
+        RegCloseKey(key);
+    }
+    true
+}
+
+/// `path`'s extension, lower case, without its dot; empty with none.
+fn extension(path: &[u16]) -> Vec<u16> {
+    let name = path
+        .iter()
+        .rposition(|&c| c == u16::from(b'\\'))
+        .map_or(path, |i| &path[i + 1..]);
+    match name.iter().rposition(|&c| c == u16::from(b'.')) {
+        Some(dot) => name[dot + 1..]
+            .iter()
+            .map(|&c| crate::highlight::fold(c))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// A thumbnail the thread made (or failed to: `None`), for the item
@@ -166,6 +328,12 @@ pub struct ThumbReply {
     pub index: usize,
     pub path: Box<[u16]>,
     bitmap: Option<Bitmap>,
+}
+
+/// A cached thumbnail, and the item it was made for (where it showed).
+struct Entry {
+    bitmap: Option<Bitmap>,
+    index: usize,
 }
 
 struct Request {
@@ -201,8 +369,9 @@ impl Drop for Shared {
 /// The window's side: the cache, and the thread's queue.
 pub struct Thumbs {
     shared: Arc<Shared>,
-    /// Thumbnails by path; `None` where the shell had no image.
-    cache: std::cell::RefCell<Lru<Option<Bitmap>>>,
+    /// Thumbnails by path; no bitmap where there is no picture to show
+    /// (the view draws the type's icon).
+    cache: std::cell::RefCell<Lru<Entry>>,
     generation: std::cell::Cell<u64>,
 }
 
@@ -257,6 +426,22 @@ impl Thumbs {
         self.cache.borrow_mut().clear();
     }
 
+    /// Lets go of every thumbnail and request, keeping the size: the
+    /// window hid, and what it shows when it comes back is made again.
+    pub fn release(&self) {
+        let side = self.queue().side;
+        self.reset(side);
+    }
+
+    /// Lets go of the thumbnails of the items not in view (the view has
+    /// rested); those come back when they are scrolled to. How many went.
+    pub fn trim(&self) -> usize {
+        let visible = self.queue().visible.clone();
+        self.cache
+            .borrow_mut()
+            .retain(|e| visible.contains(&e.index))
+    }
+
     /// The items in view now; requests for others are dropped.
     pub fn set_visible(&self, visible: Range<usize>) {
         self.queue().visible = visible;
@@ -267,7 +452,7 @@ impl Thumbs {
     /// made yet.
     pub fn with<R>(&self, path: &[u16], f: impl FnOnce(Option<Option<&Bitmap>>) -> R) -> R {
         let mut cache = self.cache.borrow_mut();
-        f(cache.get(path).map(Option::as_ref))
+        f(cache.get(path).map(|e| e.bitmap.as_ref()))
     }
 
     /// Asks for the thumbnail of item `index`, `path`, unless it is already
@@ -296,12 +481,12 @@ impl Thumbs {
         }
         self.queue().waiting.remove(&reply.path);
         let cost = reply.bitmap.as_ref().map_or(MIN_COST, Bitmap::cost);
+        let entry = Entry {
+            bitmap: reply.bitmap,
+            index: reply.index,
+        };
         // The evicted bitmaps are deleted as they drop here.
-        drop(
-            self.cache
-                .borrow_mut()
-                .insert(reply.path, reply.bitmap, cost),
-        );
+        drop(self.cache.borrow_mut().insert(reply.path, entry, cost));
         true
     }
 }
@@ -315,6 +500,8 @@ fn thumb_thread(shared: &Shared) {
             (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
         )
     };
+    // Each extension's source, worked out once (registry reads).
+    let mut sources: HashMap<Vec<u16>, Source> = HashMap::new();
     loop {
         let next = {
             let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -339,7 +526,7 @@ fn thumb_thread(shared: &Shared) {
             unsafe { WaitForSingleObject(shared.work as HANDLE, INFINITE) };
             continue;
         };
-        let bitmap = make(&request.path, side);
+        let bitmap = make(&request.path, side, &mut sources);
         let reply = Box::into_raw(Box::new(ThumbReply {
             generation,
             index: request.index,
@@ -356,19 +543,48 @@ fn thumb_thread(shared: &Shared) {
     }
 }
 
-/// The thumbnail of `path` at most `side` pixels square: the file's own
-/// picture when the shell has one, else its icon at that size.
-fn make(path: &[u16], side: i32) -> Option<Bitmap> {
-    let path = nul(path);
+/// The thumbnail of `path` at most `side` pixels square: the picture of
+/// its contents where its type has one, its own icon where it carries one;
+/// `None` for the view to draw its type's icon. `sources` keeps what each
+/// extension's thumbnails are made from.
+fn make(path: &[u16], side: i32, sources: &mut HashMap<Vec<u16>, Source>) -> Option<Bitmap> {
+    let path_z = nul(path);
+    // SAFETY: a NUL-terminated path.
+    let attrs = unsafe { GetFileAttributesW(path_z.as_ptr()) };
+    let is_dir = attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let source = if is_dir {
+        // A folder's picture shows what it holds.
+        Source::Shell
+    } else {
+        *sources
+            .entry(extension(path))
+            .or_insert_with_key(|ext| source_for(ext, || has_thumbnail_handler(ext)))
+    };
+    match source {
+        Source::TypeIcon => None,
+        Source::OwnIcon => crate::bigicon::own_icon(path, side),
+        Source::Shell => shell_thumbnail(&path_z, side, is_dir),
+    }
+}
+
+/// The shell's picture of `path_z`'s contents (NUL-terminated), at most
+/// `side` pixels square; `None` when it has none (then its type's icon
+/// shows). An empty folder's is its icon, which may be its own (a
+/// `desktop.ini`'s: Downloads, Music).
+fn shell_thumbnail(path_z: &[u16], side: i32, is_dir: bool) -> Option<Bitmap> {
     // SAFETY: a NUL-terminated path; COM is initialized on this thread.
     let factory: IShellItemImageFactory =
-        unsafe { SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None) }.ok()?;
+        unsafe { SHCreateItemFromParsingName(PCWSTR(path_z.as_ptr()), None) }.ok()?;
     let size = SIZE { cx: side, cy: side };
     // SAFETY: a live factory; the bitmap returned is ours to delete.
     let shell = unsafe {
-        factory
-            .GetImage(size, SIIGBF_THUMBNAILONLY)
-            .or_else(|_| factory.GetImage(size, SIIGBF_ICONONLY))
+        factory.GetImage(size, SIIGBF_THUMBNAILONLY).or_else(|e| {
+            if is_dir {
+                factory.GetImage(size, SIIGBF_ICONONLY)
+            } else {
+                Err(e)
+            }
+        })
     }
     .ok()?;
     let shell = shell.0 as HBITMAP;
@@ -378,8 +594,8 @@ fn make(path: &[u16], side: i32) -> Option<Bitmap> {
     out
 }
 
-/// A new 32-bit top-down DIB section `w` by `h`, and its pixels.
-fn dib(w: i32, h: i32) -> Option<(Bitmap, *mut core::ffi::c_void)> {
+/// A new 32-bit top-down DIB section `w` by `h` (all zero), and its pixels.
+pub fn dib(w: i32, h: i32) -> Option<(Bitmap, *mut core::ffi::c_void)> {
     if w <= 0 || h <= 0 {
         return None;
     }
@@ -539,6 +755,53 @@ mod tests {
         assert_eq!(lru.bytes(), 10);
         lru.clear();
         assert_eq!((lru.bytes(), lru.len()), (0, 0));
+    }
+
+    #[test]
+    fn retaining_drops_the_others_and_their_bytes() {
+        let mut lru = Lru::new(1000);
+        lru.insert(key("a"), 1, 100);
+        lru.insert(key("b"), 2, 200);
+        lru.insert(key("c"), 3, 300);
+        assert_eq!(lru.retain(|&v| v != 2), 1);
+        assert_eq!((lru.bytes(), lru.len()), (400, 2));
+        assert_eq!(lru.get(&key("b")), None);
+        assert_eq!(lru.retain(|_| false), 2);
+        assert_eq!((lru.bytes(), lru.len()), (0, 0));
+    }
+
+    #[test]
+    fn what_a_thumbnail_is_made_from() {
+        let ext = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        // Programs, shortcuts and icon files: their own icon, whatever
+        // handler their type has (a shortcut's shows its target).
+        for own in ["exe", "lnk", "ico", "url", "cpl"] {
+            assert_eq!(source_for(&ext(own), || true), Source::OwnIcon, "{own}");
+        }
+        // A type with a thumbnail handler: the shell's picture.
+        assert_eq!(source_for(&ext("jpg"), || true), Source::Shell);
+        // Without one, or with no extension: the type's icon, and the
+        // registry is not asked about a file with no extension.
+        assert_eq!(source_for(&ext("txt"), || false), Source::TypeIcon);
+        assert_eq!(
+            source_for(&[], || panic!("asked for no extension")),
+            Source::TypeIcon
+        );
+        // An own-icon type never asks.
+        assert_eq!(
+            source_for(&ext("exe"), || panic!("asked for a program")),
+            Source::OwnIcon
+        );
+    }
+
+    #[test]
+    fn extensions_are_the_names_lower_cased() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert_eq!(extension(&w(r"C:\Windows\NOTEPAD.EXE")), w("exe"));
+        assert_eq!(extension(&w(r"C:\a.b\file")), w(""));
+        assert_eq!(extension(&w(r"C:\x\archive.tar.GZ")), w("gz"));
+        assert_eq!(extension(&w(r"C:\x\.gitignore")), w("gitignore"));
+        assert_eq!(extension(&w("name.")), w(""));
     }
 
     #[test]
