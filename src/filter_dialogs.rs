@@ -1,6 +1,6 @@
 //! Search > Organize Filters... (Ctrl+Shift+K) and the filter editor (New
 //! Filter, Edit Filter, Add to Filters...), as Everything's: the filters
-//! listed with their Name, Search, Macro and Key; New..., Edit...,
+//! listed with their Name and Search; New..., Edit...,
 //! Move Up, Move Down, Delete, Import..., Export... and Reset; OK keeps
 //! the changes, Cancel none of them.
 //!
@@ -16,10 +16,11 @@ use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::{
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
     LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED, LVN_KEYDOWN,
-    LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_NOSORTHEADER,
-    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE,
-    NMLVCUSTOMDRAW, NMLVKEYDOWN,
+    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
+    LVN_ITEMCHANGED, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
+    LVSCW_AUTOSIZE_USEHEADER, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLVCUSTOMDRAW,
+    NMLVKEYDOWN,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_DELETE, VK_F2};
@@ -313,8 +314,11 @@ const BUTTONS: [(u16, &str, i32); 8] = [
     (ID_RESET, "&Reset", 145),
 ];
 
-/// The list's columns, Everything's, with their widths at 96 DPI.
-const COLUMNS: [(&str, i32); 4] = [("Name", 96), ("Search", 256), ("Macro", 96), ("Key", 96)];
+/// The list's columns, with their widths at 96 DPI: Everything's first
+/// two, Search filling the list. Not Macro and Key, which goz does not use
+/// (no `audio:` macro, no key per filter): a filter keeps them in
+/// Filters.csv, as it was given them.
+const COLUMNS: [(&str, i32); 2] = [("Name", 96), ("Search", 256)];
 
 /// The file name an export suggests.
 const EXPORT_NAME: &str = "Filters.csv";
@@ -407,36 +411,17 @@ fn row_of(list: &List, index: usize) -> Option<Row> {
 }
 
 /// The text Organize Filters shows for a row: its name (a built-in's as
-/// the menus call it), search, macro and key.
-fn row_texts(list: &List, row: Row) -> [String; 4] {
+/// the menus call it) and search.
+fn row_texts(list: &List, row: Row) -> [String; 2] {
     match row {
         Row::Builtin(i) => {
             let f = Filter::ALL[i];
-            let def = &list.builtins[i];
-            [
-                f.title().to_owned(),
-                f.search(),
-                def.macro_name().to_owned(),
-                key_text(def.key()),
-            ]
+            [f.title().to_owned(), f.search()]
         }
         Row::Custom(i) => {
             let def = &list.custom[i];
-            [
-                one_line(&def.name),
-                one_line(&def.search),
-                def.macro_name().to_owned(),
-                key_text(def.key()),
-            ]
+            [one_line(&def.name), one_line(&def.search)]
         }
-    }
-}
-
-/// Everything's Key column: a key code, 0 for none (shown as nothing).
-fn key_text(key: &str) -> String {
-    match key.trim() {
-        "" | "0" => String::new(),
-        k => k.to_owned(),
     }
 }
 
@@ -512,6 +497,13 @@ impl Organize {
         let lw = bx - gap - m;
         let bottom = h - my - bh;
         place(ID_LIST, m, my, lw, bottom - my - note_h - my);
+        // The Search column takes what the Name column leaves.
+        send(
+            item(dlg, ID_LIST),
+            LVM_SETCOLUMNWIDTH,
+            1,
+            LVSCW_AUTOSIZE_USEHEADER as isize,
+        );
         place(ID_ABOUT, m, bottom - my - note_h + my / 2, lw, note_h);
         for (id, _, y) in BUTTONS {
             place(id, bx, px(0, y).1, bw, bh);
@@ -591,7 +583,7 @@ impl Organize {
         enable(dlg, ID_DOWN, custom.is_some_and(|i| i + 1 < count));
         let about = match row {
             Some(Row::Builtin(_)) => {
-                "Everything's own filters are goz-gui's: they are not edited.".to_owned()
+                "The built-in filters are goz-gui's own: they are listed, not edited.".to_owned()
             }
             Some(Row::Custom(i)) => {
                 let list = self.list.borrow();
@@ -888,10 +880,6 @@ mod tests {
         let audio = row_texts(&list, Row::Builtin(1));
         assert_eq!(audio[0], "Audio");
         assert!(audio[1].starts_with("ext:aac;"));
-        assert_eq!(audio[2], "audio");
-        assert_eq!(audio[3], "");
-        assert_eq!(row_texts(&list, Row::Custom(0))[..2], ["Mine", "*.rs"]);
-        assert_eq!(key_text(" 0 "), "");
-        assert_eq!(key_text("1092"), "1092");
+        assert_eq!(row_texts(&list, Row::Custom(0)), ["Mine", "*.rs"]);
     }
 }

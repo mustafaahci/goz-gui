@@ -29,9 +29,9 @@ use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::Controls::{
-    LVHITTESTINFO, LVIF_STATE, LVIS_SELECTED, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT,
-    LVM_SUBITEMHITTEST, LVN_ITEMCHANGED, LVN_ODSTATECHANGED, LVNI_SELECTED, NMHDR, NMLISTVIEW,
-    NMLVODSTATECHANGE,
+    LVHITTESTINFO, LVIF_STATE, LVIS_SELECTED, LVM_GETITEMCOUNT, LVM_GETNEXTITEM,
+    LVM_GETSELECTEDCOUNT, LVM_SUBITEMHITTEST, LVN_ITEMCHANGED, LVN_ODSTATECHANGED, LVNI_SELECTED,
+    NMHDR, NMLISTVIEW, NMLVODSTATECHANGE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -548,6 +548,16 @@ impl App {
     /// held ranges, so a huge selection costs no more than the rows held.
     pub fn selected_held(&self) -> Vec<usize> {
         let ranges = self.model.borrow().loaded();
+        // Every row selected (Select All): the rows held are the answer,
+        // without asking the list about each one.
+        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize;
+        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
+        if selected > 0 && selected >= count {
+            return ranges
+                .into_iter()
+                .flat_map(|r| r.start.min(count)..r.end.min(count))
+                .collect();
+        }
         let mut out = Vec::new();
         for range in ranges {
             // The row before the range: GETNEXTITEM looks after it, and -1

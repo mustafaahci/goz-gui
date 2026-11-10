@@ -148,14 +148,16 @@ impl Which {
             Which::BookmarkEdit => k("bookmark_edit", false, false, "", &[], false),
             Which::SearchSyntax => k("help_search_syntax", true, true, "", &[], false),
             Which::Options => k("options", true, true, "", &[], false),
-            // Everything's four columns, which can be dragged.
+            // Everything's first two columns, as the bookmark lists' (not
+            // Macro and Key, which goz does not use; their keys are left as
+            // they are), the second filling the list.
             Which::FilterOrganize => k(
                 "filter_organize",
                 true,
                 true,
                 "filter_organize_",
-                &["name", "search", "macro", "key"],
-                true,
+                &["name", "search"],
+                false,
             ),
             // Everything keeps the renamer's place and size, no columns
             // (its lists are text boxes).
@@ -420,6 +422,12 @@ pub fn all() -> Places {
 
 fn get(which: Which) -> Place {
     PLACES.with_borrow(|p| p.get(which).clone())
+}
+
+/// Whether a width is kept for any of `which`'s columns (else its list
+/// shows the dialog's own).
+pub fn columns_kept(which: Which) -> bool {
+    PLACES.with_borrow(|p| p.get(which).columns.iter().any(|c| c.width > 0))
 }
 
 /// Keeps `place`; the window writes it a little later if it changed.

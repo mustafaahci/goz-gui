@@ -115,6 +115,11 @@ impl App {
         self.sidebars.ending.set(true);
     }
 
+    /// Whether the window is ending (and the process with it).
+    pub(super) fn window_ending(&self) -> bool {
+        self.sidebars.ending.get()
+    }
+
     /// F2's commands that reach the window (`slots.rs`): true when one ran.
     pub(super) fn sidebar_command(&self, id: u16) -> bool {
         match id {

@@ -352,6 +352,10 @@ pub struct App {
     worker: Worker,
     next_epoch: Cell<u64>,
     want_status: Cell<bool>,
+    /// gozd could not be reached while the window was hidden or
+    /// minimized: the search runs again once it shows, not every 2 s
+    /// meanwhile.
+    retry_when_shown: Cell<bool>,
     last_focus: Cell<HWND>,
     last_search: Cell<Option<Instant>>,
     /// The settings file: as read, and what was written since.
@@ -618,17 +622,19 @@ See Help > Search Syntax and the README for goz-gui's switches."
     }
     let prefs = prefs::Prefs::load();
     let (searches, history) = searches::Searches::load(&prefs.base);
-    let sessions = session::Sessions::load(&prefs.base);
+    let mut sessions = session::Sessions::load(&prefs.base);
     let marks = bookmarks::Marks::load(&prefs.base);
     let runs = runs::Runs::load(&prefs.base);
     // The window starts as the settings say, or as the previous session
-    // left it (`session_store_restore_on_first_new_window`; only the first
-    // window, as in Everything).
-    let restored = if launch.new_window == Some(true) {
-        None
-    } else {
-        sessions.at_start()
-    };
+    // left it (`session_store_restore_on_first_new_window`): only the
+    // first window, as in Everything; not File > New Window's, nor one
+    // that Options > UI's "Create a new window when running goz-gui"
+    // opened beside a running goz-gui. Decided once, here: what reads the
+    // session later (the Folders pane's folder) asks `sessions` again.
+    if secondary || launch.new_window == Some(true) {
+        sessions.not_first();
+    }
+    let restored = sessions.at_start();
     let mut settings = match &restored {
         Some(s) => session::start_settings(&prefs.base, s),
         // Home's match options that are always on or off apply too.
@@ -1024,6 +1030,7 @@ impl App {
                 worker: Worker::spawn(hwnd, WM_REPLY),
                 next_epoch: Cell::new(0),
                 want_status: Cell::new(false),
+                retry_when_shown: Cell::new(false),
                 last_focus: Cell::new(edit),
                 last_search: Cell::new(None),
                 prefs: RefCell::new(prefs),
@@ -1475,6 +1482,7 @@ impl App {
                     }
                     if w != SIZE_MINIMIZED as usize {
                         self.arm_live();
+                        self.retry_if_waiting();
                     }
                     self.panes_window_shown(
                         w != SIZE_MINIMIZED as usize && IsWindowVisible(self.hwnd) != 0,
@@ -1485,6 +1493,7 @@ impl App {
                 WM_SHOWWINDOW => {
                     if w != 0 {
                         self.arm_live();
+                        self.retry_if_waiting();
                     }
                     self.panes_window_shown(w != 0 && IsIconic(self.hwnd) == 0);
                     DefWindowProcW(self.hwnd, msg, w, l)
@@ -1661,7 +1670,10 @@ impl App {
                 }
                 WM_TIMER => {
                     KillTimer(self.hwnd, w);
-                    if w == TIMER_REFRESH || w == TIMER_RETRY {
+                    if w == TIMER_RETRY && !self.shown() {
+                        // Hidden since: once it shows.
+                        self.retry_when_shown.set(true);
+                    } else if w == TIMER_REFRESH || w == TIMER_RETRY {
                         self.start_search(true);
                     } else if w == TIMER_NAV {
                         self.commit_nav();
@@ -2107,6 +2119,7 @@ impl App {
             unsafe { SetTimer(self.hwnd, TIMER_REFRESH, 1000, None) };
             return;
         }
+        self.retry_when_shown.set(false);
         // SAFETY: timers of this window.
         unsafe {
             KillTimer(self.hwnd, TIMER_REFRESH);
@@ -2289,6 +2302,15 @@ impl App {
             self.beeped.set(true);
             // SAFETY: plays a system sound.
             unsafe { MessageBeep(MB_ICONWARNING) };
+        }
+    }
+
+    /// The window shows again after gozd could not be reached while it
+    /// was hidden: the search runs again (and retries every 2 s from now
+    /// on, if gozd is still not there).
+    fn retry_if_waiting(&self) {
+        if self.retry_when_shown.replace(false) {
+            self.start_search(true);
         }
     }
 
@@ -2480,8 +2502,14 @@ impl App {
                     self.fetch_arrived(epoch, block);
                 }
                 if retry {
-                    // SAFETY: a timer of this window.
-                    unsafe { SetTimer(self.hwnd, TIMER_RETRY, 2000, None) };
+                    if self.shown() {
+                        // SAFETY: a timer of this window.
+                        unsafe { SetTimer(self.hwnd, TIMER_RETRY, 2000, None) };
+                    } else {
+                        // Hidden or minimized: no busy retries meanwhile;
+                        // the search runs again as it shows.
+                        self.retry_when_shown.set(true);
+                    }
                 }
                 // SAFETY: repaints the list.
                 unsafe { InvalidateRect(self.list, core::ptr::null(), 1) };

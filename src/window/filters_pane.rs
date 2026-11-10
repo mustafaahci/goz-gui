@@ -9,6 +9,11 @@
 //! built-in ones and the user's own (F4's `Filters.csv`), each with the
 //! command that puts it in force (the Search menu's), so a filter added
 //! there shows here too.
+//!
+//! Its rows are Everything's (17 px at 100 %: the font's height and 2),
+//! not a list's own (the font's and 4): the list is owner-drawn with fixed
+//! rows, which it measures with the pane (`WM_MEASUREITEM`) whenever its
+//! size changes. The rows are painted in its custom draw as before.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -21,20 +26,22 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDIS_HOT, CDRF_DODEFAULT,
-    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM,
-    LVIF_STATE, LVIF_TEXT, LVIR_BOUNDS, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
-    LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSTATE, LVM_GETITEMW,
-    LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETBKCOLOR, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
-    LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER,
-    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLISTVIEW,
-    NMLVCUSTOMDRAW, WC_LISTVIEWW,
+    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT, LVCF_WIDTH,
+    LVCOLUMNW, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIR_BOUNDS, LVIS_FOCUSED, LVIS_SELECTED,
+    LVITEMW, LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_GETHOTITEM, LVM_GETITEMCOUNT,
+    LVM_GETITEMRECT, LVM_GETITEMSTATE, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
+    LVM_INSERTITEMW, LVM_SETBKCOLOR, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMSTATE, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVN_ITEMCHANGED, LVNI_SELECTED,
+    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_OWNERDRAWFIXED, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, MEASUREITEMSTRUCT, NM_CUSTOMDRAW, NMHDR, NMLISTVIEW,
+    NMLVCUSTOMDRAW, ODT_LISTVIEW, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_RETURN, VK_UP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyMenu, GetClientRect, HMENU, MSG, MoveWindow, PostMessageW,
-    SendMessageW, WM_APP, WM_CONTEXTMENU, WM_KEYDOWN, WM_NOTIFY, WM_SETFONT, WM_SYSKEYDOWN,
-    WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetWindowPos, WM_APP, WM_CONTEXTMENU,
+    WM_DRAWITEM, WM_KEYDOWN, WM_MEASUREITEM, WM_NOTIFY, WM_SETFONT, WM_SYSKEYDOWN, WS_CHILD,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use super::{App, point};
@@ -172,14 +179,36 @@ impl FiltersPane {
         });
     }
 
-    /// Paints entry `cd.dwItemSpec` in the window's colours, as the results
-    /// paint theirs: the one in force in the selection's colour (brighter
-    /// while the list has the keyboard), the one under the mouse lit. The
-    /// list's own look would leave the choice unseen once the list lost the
-    /// keyboard, in the dark theme.
-    fn paint_row(&self, app: &App, cd: &NMCUSTOMDRAW) {
+    /// The rows' height: Everything's 17 px at 100 % (the UI font's 15 and
+    /// 2), where a list's own would be the font's and 4.
+    fn row_height(app: &App) -> i32 {
+        app.ui_fonts.borrow().height + app.scale(2)
+    }
+
+    /// The list measures its rows again (`WM_MEASUREITEM`), which it does
+    /// as its size changes: after a change of font or DPI that left its
+    /// size alone.
+    fn remeasure(&self) {
         let list = self.list.get();
-        let index = cd.dwItemSpec;
+        let mut rc = RECT::default();
+        // SAFETY: reads this pane's list's size, then sizes it one pixel
+        // taller and back, each a WM_WINDOWPOSCHANGED to it.
+        unsafe {
+            GetClientRect(list, &mut rc);
+            let flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE;
+            let (w, h) = (rc.right, rc.bottom);
+            SetWindowPos(list, core::ptr::null_mut(), 0, 0, w, h + 1, flags);
+            SetWindowPos(list, core::ptr::null_mut(), 0, 0, w, h, flags);
+        }
+    }
+
+    /// Paints entry `index` into `hdc` (`hot`: under the mouse) in the
+    /// window's colours, as the results paint theirs: the one in force in
+    /// the selection's colour (brighter while the list has the keyboard),
+    /// the one under the mouse lit. The list's own look would leave the
+    /// choice unseen once the list lost the keyboard, in the dark theme.
+    fn paint_row(&self, app: &App, hdc: HDC, index: usize, hot: bool) {
+        let list = self.list.get();
         let mut rc = RECT {
             left: LVIR_BOUNDS as i32,
             ..RECT::default()
@@ -193,10 +222,10 @@ impl FiltersPane {
         let bg = match (selected, focused) {
             (true, true) => pal.sel,
             (true, false) => pal.sel_inactive,
-            _ if cd.uItemState & CDIS_HOT != 0 => pal.hover,
+            _ if hot => pal.hover,
             _ => pal.bg,
         };
-        fill(cd.hdc, &rc, bg);
+        fill(hdc, &rc, bg);
         let Some(name) = self.shown.borrow().get(index).map(|(name, _)| name.clone()) else {
             return;
         };
@@ -208,17 +237,17 @@ impl FiltersPane {
         };
         // SAFETY: draws into the list's paint DC; the old font is put back.
         unsafe {
-            let old = SelectObject(cd.hdc, app.ui_font());
-            SetBkMode(cd.hdc, TRANSPARENT as i32);
-            SetTextColor(cd.hdc, pal.fg);
+            let old = SelectObject(hdc, app.ui_font());
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, pal.fg);
             DrawTextW(
-                cd.hdc,
+                hdc,
                 text.as_mut_ptr(),
                 text.len() as i32,
                 &mut text_rc,
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
             );
-            SelectObject(cd.hdc, old);
+            SelectObject(hdc, old);
         }
     }
 
@@ -345,7 +374,8 @@ impl PaneContent for FiltersPane {
                     | LVS_REPORT
                     | LVS_NOCOLUMNHEADER
                     | LVS_SINGLESEL
-                    | LVS_SHOWSELALWAYS,
+                    | LVS_SHOWSELALWAYS
+                    | LVS_OWNERDRAWFIXED,
                 0,
                 0,
                 0,
@@ -367,6 +397,7 @@ impl PaneContent for FiltersPane {
         };
         self.send(LVM_INSERTCOLUMNW, 0, (&raw const column) as isize);
         self.send(WM_SETFONT, app.ui_font() as usize, 1);
+        self.remeasure();
         self.apply_theme(app);
         self.fill(app);
     }
@@ -426,7 +457,9 @@ impl PaneContent for FiltersPane {
                     return Some(match cd.nmcd.dwDrawStage {
                         CDDS_PREPAINT => (CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT) as LRESULT,
                         CDDS_ITEMPREPAINT => {
-                            self.paint_row(app, &cd.nmcd);
+                            let hot = cd.nmcd.uItemState & CDIS_HOT != 0;
+                            self.paint_row(app, cd.nmcd.hdc, cd.nmcd.dwItemSpec, hot);
+                            // Painted: no WM_DRAWITEM follows.
                             CDRF_SKIPDEFAULT as LRESULT
                         }
                         CDDS_POSTPAINT => {
@@ -460,6 +493,28 @@ impl PaneContent for FiltersPane {
                 unsafe { PostMessageW(self.pane.get(), WM_FOLLOW, 0, 0) };
                 Some(0)
             }
+            // The rows' height, asked as the list is made (before
+            // `self.list` is known) and whenever its size changes.
+            WM_MEASUREITEM => {
+                // SAFETY: this message carries a MEASUREITEMSTRUCT.
+                let mi = unsafe { &mut *(l as *mut MEASUREITEMSTRUCT) };
+                if mi.CtlType != ODT_LISTVIEW || mi.CtlID as usize != LIST_ID {
+                    return None;
+                }
+                mi.itemHeight = Self::row_height(app).max(1) as u32;
+                Some(1)
+            }
+            // An owner-drawn row the custom draw did not paint.
+            WM_DRAWITEM => {
+                // SAFETY: this message carries a DRAWITEMSTRUCT.
+                let di = unsafe { &*(l as *const DRAWITEMSTRUCT) };
+                if di.CtlType != ODT_LISTVIEW || di.hwndItem != self.list.get() {
+                    return None;
+                }
+                let hot = self.send(LVM_GETHOTITEM, 0, 0) == di.itemID as isize;
+                self.paint_row(app, di.hDC, di.itemID as usize, hot);
+                Some(1)
+            }
             WM_FOLLOW => {
                 self.follow(app);
                 Some(0)
@@ -480,6 +535,7 @@ impl PaneContent for FiltersPane {
 
     fn dpi(&self, app: &App, _dpi: u32) {
         self.send(WM_SETFONT, app.ui_font() as usize, 1);
+        self.remeasure();
     }
 
     fn event(&self, app: &App, event: PaneEvent) {

@@ -69,6 +69,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_WRITE_ATTRIBUTES, GetFileAttributesW, GetFileTime, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
     SetFileTime,
 };
+use windows_sys::Win32::UI::Shell::COPYENGINE_S_USER_IGNORED;
 
 use crate::fileops::{Outcome, parent};
 use crate::shell::{self, FileOp};
@@ -155,6 +156,11 @@ pub enum StepResult {
     Failed(String),
     /// A shortcut the folder would not take (no write access there).
     Denied,
+    /// Done, but onto an item of the same name that was there already: a
+    /// folder merged into it, or a file put in its place (Explorer's
+    /// questions answered so, or asked none). It is not undone: Undo would
+    /// take that item along, with what it held before.
+    Landed { to: Vec<u16> },
     /// Not reached: the user stopped the operation first.
     NotRun,
 }
@@ -515,6 +521,22 @@ fn group(step: &Step) -> Group {
     }
 }
 
+/// Where a copy or move into another folder lands under its own name,
+/// when something of that name is there already: the step then merges
+/// into it or replaces it (`StepResult::Landed`). Not for a copy beside
+/// itself, which gets a name of its own ("name - Copy").
+fn occupied(step: &Step) -> Option<Vec<u16>> {
+    match step {
+        Step::Move { path, folder, name } | Step::Copy { path, folder, name }
+            if group(step) == Group::Transfer =>
+        {
+            let target = join(folder, name.as_deref().unwrap_or(name_of(path)));
+            exists(&target).then_some(target)
+        }
+        _ => None,
+    }
+}
+
 /// HRESULT_FROM_WIN32(ERROR_CANCELLED), and the copy engine's own
 /// "cancelled by the user".
 const CANCELLED: [i32; 2] = [0x8007_04C7_u32 as i32, 0x8027_0000_u32 as i32];
@@ -541,6 +563,11 @@ pub fn run(owner: HWND, task: &Task, silent: bool) -> (Outcome, Vec<StepResult>)
             None => todo.push(i),
         }
     }
+    // Noted before anything is done: afterwards every target is there.
+    let occupied: Vec<(usize, Vec<u16>)> = todo
+        .iter()
+        .filter_map(|&i| occupied(&task.steps[i]).map(|t| (i, t)))
+        .collect();
     let mut cancelled = false;
     let mut failure: Option<String> = None;
     for g in [Group::Transfer, Group::Duplicate, Group::Recycle] {
@@ -580,9 +607,17 @@ pub fn run(owner: HWND, task: &Task, silent: bool) -> (Outcome, Vec<StepResult>)
             }
         }
     }
+    // A step that went onto what was there is no undoable copy or move.
+    for (i, target) in occupied {
+        if let StepResult::Done { to, .. } = &results[i]
+            && same_path(to, &target)
+        {
+            results[i] = StepResult::Landed { to: to.clone() };
+        }
+    }
     let done = results
         .iter()
-        .filter(|r| matches!(r, StepResult::Done { .. }))
+        .filter(|r| matches!(r, StepResult::Done { .. } | StepResult::Landed { .. }))
         .count();
     let outcome = if cancelled {
         Outcome::Cancelled
@@ -721,6 +756,9 @@ fn shell_steps(
                 // Sent to the Recycle Bin: done once it is gone from its
                 // place (a question answered "skip" leaves it), wherever
                 // the bin keeps it.
+                // "Skip" in Explorer's question: nothing was done to it,
+                // whatever item the operation names.
+                Some(c) if c.hr == COPYENGINE_S_USER_IGNORED => StepResult::NotRun,
                 Some(c) if c.hr >= 0 && want == Kind::Delete => {
                     if exists(step.source()) {
                         StepResult::NotRun
@@ -1070,6 +1108,61 @@ mod tests {
             true,
         );
         assert_eq!(r[0], StepResult::Skipped(NOT_EMPTY.into()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A copy or move onto an item of its name already there (a folder
+    /// merged into it, a file put in its place) is done, but is no copy or
+    /// move Undo may take back: that would take what was there along.
+    #[test]
+    fn what_lands_on_an_item_already_there_is_not_undone() {
+        // SAFETY: COM for this test thread, which ends with the test.
+        let _ = unsafe { WCoInitializeEx(None, WSTA) };
+        let dir = scratch("landed");
+        let (src, dest) = (dir.join("src"), dir.join("dest"));
+        std::fs::create_dir_all(src.join("X")).unwrap();
+        std::fs::create_dir_all(dest.join("X")).unwrap();
+        std::fs::write(src.join("X").join("new.txt"), "new").unwrap();
+        std::fs::write(dest.join("X").join("pre.txt"), "pre").unwrap();
+        std::fs::write(src.join("g.txt"), "src").unwrap();
+        std::fs::write(dest.join("g.txt"), "dest").unwrap();
+        std::fs::write(src.join("h.txt"), "h").unwrap();
+        let steps: Vec<Step> = ["X", "g.txt", "h.txt"]
+            .iter()
+            .map(|n| Step::Copy {
+                path: w(&src.join(n)),
+                folder: w(&dest),
+                name: None,
+            })
+            .collect();
+        let sources: Vec<Vec<u16>> = steps.iter().map(|s| s.source().to_vec()).collect();
+        let (outcome, r) = run(core::ptr::null_mut(), &task(steps, false), true);
+        assert_eq!(outcome, Outcome::Done, "{r:?}");
+        assert!(matches!(&r[0], StepResult::Landed { .. }), "{r:?}");
+        assert!(matches!(&r[1], StepResult::Landed { .. }), "{r:?}");
+        assert_eq!(done_to(&r[2]), dest.join("h.txt"));
+        // Merged: both files are in the folder.
+        assert!(dest.join("X").join("pre.txt").exists());
+        assert!(dest.join("X").join("new.txt").exists());
+        // Only the copy that made a new item is in the undo record.
+        let items = undo::items_of(Action::Copy, &sources, &r);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].to, w(&dest.join("h.txt")));
+        // A move the same way: the folder merged is not moved back by Undo.
+        let (_, r) = run(
+            core::ptr::null_mut(),
+            &task(
+                vec![Step::Move {
+                    path: w(&src.join("X")),
+                    folder: w(&dest),
+                    name: None,
+                }],
+                false,
+            ),
+            true,
+        );
+        assert!(matches!(&r[0], StepResult::Landed { .. }), "{r:?}");
+        assert!(undo::items_of(Action::Move, &[w(&src.join("X"))], &r).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

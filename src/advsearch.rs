@@ -24,7 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
     CBS_DROPDOWNLIST, ES_AUTOHSCROLL, ES_NUMBER, EndDialog, GWLP_USERDATA, GetDlgItem, IDCANCEL,
     IDOK, MB_ICONWARNING, MB_OK, SendMessageW, SetWindowLongPtrW, SetWindowTextW, WM_COMMAND,
-    WM_INITDIALOG, WM_NOTIFY, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
+    WM_INITDIALOG, WM_NOTIFY, WM_SETREDRAW, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
 };
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
@@ -404,13 +404,15 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         (243, 86, 50, 16),
     )
     .control(Class::Static, "&Size:", STATIC, label, 0, (lx, 108, 100, 8))
+    // The size boxes are as tall as the unit lists beside them (whose
+    // height is the font's): 12 units, the row's edges in line.
     .control(
         Class::Edit,
         "",
         ID_SIZE_FROM,
         edit | ES_NUMBER as u32,
         WS_EX_CLIENTEDGE,
-        (lx, 119, 60, 14),
+        (lx, 119, 60, 12),
     )
     .control(
         Class::Named("ComboBox"),
@@ -420,14 +422,14 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         0,
         (71, 119, 44, 120),
     )
-    .control(Class::Static, "to", STATIC, label, 0, (121, 122, 12, 8))
+    .control(Class::Static, "to", STATIC, label, 0, (121, 121, 12, 8))
     .control(
         Class::Edit,
         "",
         ID_SIZE_TO,
         edit | ES_NUMBER as u32,
         WS_EX_CLIENTEDGE,
-        (135, 119, 60, 14),
+        (135, 119, 60, 12),
     )
     .control(
         Class::Named("ComboBox"),
@@ -516,11 +518,15 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
 
 fn fill_combo(dlg: HWND, id: u16, items: impl IntoIterator<Item = String>, select: usize) {
     let combo = item(dlg, id);
+    // A themed list redraws for each item added (a few ms each): it is
+    // filled unseen and drawn once, which keeps the dialog's opening short.
+    send(combo, WM_SETREDRAW, 0, 0);
     for text in items {
         let text = wz(&text);
         send(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
     }
     send(combo, CB_SETCURSEL, select, 0);
+    send(combo, WM_SETREDRAW, 1, 0);
 }
 
 fn selection(dlg: HWND, id: u16) -> usize {

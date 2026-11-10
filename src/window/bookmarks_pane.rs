@@ -38,17 +38,20 @@ use windows_sys::Win32::UI::Controls::{
     TVM_SETEXTENDEDSTYLE, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW, TVS_EX_AUTOHSCROLL,
     TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_INFOTIP, TVS_LINESATROOT,
     TVS_NOHSCROLL, TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT, WC_TREEVIEWW,
+    WM_MOUSELEAVE,
 };
 use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F2, VK_RETURN, VK_UP,
+    GetCapture, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F2, VK_RETURN, VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyMenu, EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, GetWindowTextLengthW,
     HMENU, MSG, MoveWindow, PostMessageW, SM_CXSMICON, SendMessageW, SetWindowTextW, WM_APP,
-    WM_CHAR, WM_COMMAND, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NOTIFY,
-    WM_SETFONT, WM_SYSKEYDOWN, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
+    WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_SETFONT, WM_SYSKEYDOWN, WS_CHILD,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 use super::sidebars::{MARK_DELETE, MARK_EDIT, MARK_EXPAND, MARK_OPEN};
@@ -106,6 +109,10 @@ pub(super) struct BookmarksPane {
     filling: Cell<bool>,
     /// Where the left button last went down on the tree (its subclass).
     click: Cell<POINT>,
+    /// The mouse is over the box's ×; it went down on it (and holds the
+    /// mouse until it comes up: the × clears the box on release over it).
+    hot: Cell<bool>,
+    pressed: Cell<bool>,
 }
 
 impl BookmarksPane {
@@ -121,7 +128,47 @@ impl BookmarksPane {
             entries: RefCell::new(Vec::new()),
             filling: Cell::new(false),
             click: Cell::new(POINT::default()),
+            hot: Cell::new(false),
+            pressed: Cell::new(false),
         }
+    }
+
+    /// Whether the box holds text (its button is the ×, not the
+    /// magnifier).
+    fn has_text(&self) -> bool {
+        // SAFETY: reads the length of this pane's box.
+        unsafe { GetWindowTextLengthW(self.edit.get()) > 0 }
+    }
+
+    /// The box's button in pane window `pane`.
+    fn button_in(app: &App, pane: HWND) -> RECT {
+        Self::button(&Self::frame(app, &crate::pane::content_rect(app, pane)))
+    }
+
+    /// Lights the × (or not), repainting it when that changes.
+    fn set_hot(&self, app: &App, pane: HWND, hot: bool) {
+        if self.hot.replace(hot) != hot {
+            let rc = Self::button_in(app, pane);
+            // SAFETY: repaints part of this pane's window.
+            unsafe { InvalidateRect(pane, &rc, 0) };
+        }
+    }
+
+    /// The mouse moved to `pt` (the pane's coordinates): the × lights
+    /// while it is over it (while held, only if it went down there).
+    fn mouse_move(&self, app: &App, pane: HWND, pt: POINT) {
+        let over = inside(&Self::button_in(app, pane), pt) && self.has_text();
+        if over && !self.pressed.get() {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: pane,
+                dwHoverTime: 0,
+            };
+            // SAFETY: asks for WM_MOUSELEAVE on this pane's window.
+            unsafe { TrackMouseEvent(&mut tme) };
+        }
+        self.set_hot(app, pane, over);
     }
 
     /// The box's frame in the content `rc`: Everything's, 3 px in from the
@@ -164,14 +211,34 @@ impl BookmarksPane {
         self.entries.borrow().get(i).cloned()
     }
 
+    /// What `entry` stands for, by identity: it outlives a refill.
+    fn keep_of(&self, entry: &Entry) -> Keep {
+        match entry {
+            Entry::Folder { place, .. } => Keep::Folder(place.join("/")),
+            Entry::Mark { row } => Keep::Mark(Id::of(&self.list.borrow(), *row)),
+        }
+    }
+
     /// The chosen item's entry, kept by identity.
     fn chosen_key(&self) -> Option<Keep> {
         let entry = self.entry(treeview::selected(self.tree.get()))?;
-        let list = self.list.borrow();
-        Some(match entry {
-            Entry::Folder { place, .. } => Keep::Folder(place.join("/")),
-            Entry::Mark { row } => Keep::Mark(Id::of(&list, row)),
-        })
+        Some(self.keep_of(&entry))
+    }
+
+    /// The tree item, and its entry, that stands for `keep` now; `None`
+    /// when it is not shown any more.
+    fn find(&self, keep: &Keep) -> Option<(HTREEITEM, Entry)> {
+        let tree = self.tree.get();
+        let mut todo = treeview::children(tree, NONE);
+        while let Some(item) = todo.pop() {
+            if let Some(entry) = self.entry(item)
+                && self.keep_of(&entry) == *keep
+            {
+                return Some((item, entry));
+            }
+            todo.extend(treeview::children(tree, item));
+        }
+        None
     }
 
     /// Shows the bookmarks again if they changed since they were shown.
@@ -432,6 +499,8 @@ impl BookmarksPane {
             (treeview::hit(tree, at).0, pt)
         };
         let entry = self.entry(item);
+        // What it stands for, looked for again after the menu.
+        let keep = entry.as_ref().map(|e| self.keep_of(e));
         let mut items = Vec::new();
         let default = match &entry {
             Some(Entry::Mark { .. }) => {
@@ -476,11 +545,17 @@ impl BookmarksPane {
         }
         // SAFETY: the menu made above.
         unsafe { DestroyMenu(popup) };
-        match (id as u16, &entry) {
+        // The menu's loop may have filled the tree again (another goz-gui
+        // changed the bookmarks, read as the pane took the keyboard): the
+        // item and its row are what they stand for now, or nothing if it
+        // is gone.
+        let now = keep.as_ref().and_then(|k| self.find(k));
+        match (id as u16, now) {
             (0, _) => {}
-            (MARK_OPEN | MARK_EXPAND, Some(_)) => self.activate(app, item),
-            (MARK_EDIT, Some(e)) => self.edit_entry(app, e),
-            (MARK_DELETE, Some(e)) => self.delete_entry(app, e),
+            (MARK_OPEN | MARK_EXPAND, Some((item, _))) => self.activate(app, item),
+            (MARK_EDIT, Some((_, e))) => self.edit_entry(app, &e),
+            (MARK_DELETE, Some((_, e))) => self.delete_entry(app, &e),
+            (MARK_OPEN | MARK_EXPAND | MARK_EDIT | MARK_DELETE, None) => {}
             (id, _) => app.command(id),
         }
     }
@@ -611,6 +686,21 @@ impl BookmarksPane {
         let edit = self.edit.get();
         theme::allow(edit, pal.dark);
         theme::set_class(edit, pal.dark.then_some("DarkMode_CFD"));
+    }
+}
+
+fn inside(r: &RECT, pt: POINT) -> bool {
+    pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
+}
+
+/// The box's × glyph and face colours: lit under the mouse (as the search
+/// box's is), darker while held there, else the box's own (painted inside
+/// the frame's line).
+fn clear_colours(pal: &crate::theme::Palette, hot: bool, pressed: bool) -> (u32, u32) {
+    match (hot, pressed) {
+        (true, true) => (pal.glyph_hot, pal.header_pressed),
+        (true, false) => (pal.glyph_hot, pal.glyph_hot_bg),
+        _ => (pal.glyph, pal.bg),
     }
 }
 
@@ -807,7 +897,9 @@ impl PaneContent for BookmarksPane {
                         }
                         true
                     }
-                    VK_ESCAPE => {
+                    // Shift+Esc is Close Pane: it goes on to the window's
+                    // shortcuts.
+                    VK_ESCAPE if !key_down(VK_SHIFT) => {
                         // SAFETY: reads the length of this pane's box.
                         if unsafe { GetWindowTextLengthW(edit) } > 0 {
                             self.clear();
@@ -887,18 +979,60 @@ impl PaneContent for BookmarksPane {
             WM_LBUTTONDOWN => {
                 let pt = point(l);
                 let frame = Self::frame(app, &crate::pane::content_rect(app, pane));
-                let inside =
-                    |r: &RECT| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
-                if inside(&frame) {
-                    // The ×, or the frame round the text: the box.
-                    if inside(&Self::button(&frame)) {
-                        self.clear();
+                if inside(&frame, pt) {
+                    // The × (held until the button comes up), or the frame
+                    // round the text: the box.
+                    if inside(&Self::button(&frame), pt) && self.has_text() {
+                        self.pressed.set(true);
+                        // SAFETY: the mouse goes to this pane's window until
+                        // the button comes up.
+                        unsafe { SetCapture(pane) };
+                        // Repainted darker, whether it was lit or not.
+                        self.hot.set(false);
+                        self.set_hot(app, pane, true);
                     }
                     // SAFETY: focuses a child of this pane.
                     unsafe { SetFocus(self.edit.get()) };
                     return Some(0);
                 }
                 None
+            }
+            WM_MOUSEMOVE => {
+                self.mouse_move(app, pane, point(l));
+                Some(0)
+            }
+            WM_MOUSELEAVE => {
+                if !self.pressed.get() {
+                    self.set_hot(app, pane, false);
+                }
+                Some(0)
+            }
+            WM_LBUTTONUP if self.pressed.get() => {
+                self.pressed.set(false);
+                // SAFETY: lets go of the mouse the press took, if it is
+                // still this pane's.
+                unsafe {
+                    if GetCapture() == pane {
+                        ReleaseCapture();
+                    }
+                }
+                let pt = point(l);
+                let over = inside(&Self::button_in(app, pane), pt);
+                // Repainted either way: held, it was darker.
+                self.hot.set(!over);
+                self.set_hot(app, pane, over);
+                if over {
+                    self.clear();
+                    // Hovering on: its leaving is tracked anew.
+                    self.mouse_move(app, pane, pt);
+                }
+                Some(0)
+            }
+            WM_CAPTURECHANGED => {
+                if self.pressed.replace(false) {
+                    self.set_hot(app, pane, false);
+                }
+                Some(0)
             }
             _ => None,
         }
@@ -921,9 +1055,16 @@ impl PaneContent for BookmarksPane {
         let cx = (button.left + button.right) / 2;
         let cy = (button.top + button.bottom) / 2;
         let scale = app.dpi.get() as f32 / 96.0;
-        // SAFETY: reads the length of this pane's box.
-        if unsafe { GetWindowTextLengthW(self.edit.get()) } > 0 {
-            searchbox::paint_cross(hdc, cx, cy, 3.0, scale, pal.glyph, pal.bg);
+        if self.has_text() {
+            let (fg, bg) = clear_colours(&pal, self.hot.get(), self.pressed.get());
+            let face = RECT {
+                top: button.top + 1,
+                right: button.right - 1,
+                bottom: button.bottom - 1,
+                ..button
+            };
+            fill(hdc, &face, bg);
+            searchbox::paint_cross(hdc, cx, cy, 3.0, scale, fg, bg);
         } else {
             searchbox::paint_magnifier(hdc, cx, cy, scale, pal.glyph, pal.bg);
         }
@@ -944,5 +1085,27 @@ impl PaneContent for BookmarksPane {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::Palette;
+
+    #[test]
+    fn the_clear_button_lights_and_darkens() {
+        for dark in [true, false] {
+            let pal = Palette::new(dark);
+            let idle = clear_colours(&pal, false, false);
+            let hot = clear_colours(&pal, true, false);
+            let held = clear_colours(&pal, true, true);
+            // Idle: the box's background; lit and held: each its own.
+            assert_eq!(idle, (pal.glyph, pal.bg));
+            assert_ne!(hot.1, idle.1);
+            assert_ne!(held.1, hot.1);
+            // Held but dragged off: as idle.
+            assert_eq!(clear_colours(&pal, false, true), idle);
+        }
     }
 }

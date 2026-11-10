@@ -862,9 +862,34 @@ where
         .collect()
 }
 
+/// Puts renames (a path, and what it becomes) in an order they can be
+/// done in: what a folder holds before the folder, whose renaming would
+/// leave their paths naming nothing. A path inside another is longer than
+/// it, so the longest go first; the others keep their order. Undo, which
+/// goes backwards, then renames the folder back before what it holds.
+pub fn children_first<T>(renames: &mut [(Vec<u16>, T)]) {
+    renames.sort_by_key(|(path, _)| core::cmp::Reverse(path.len()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_a_folder_holds_is_renamed_before_it() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let mut renames = vec![
+            (w(r"C:\x\P"), 1),
+            (w(r"C:\x\P\Cdir"), 2),
+            (w(r"C:\x\P\Cdir\f.txt"), 3),
+            (w(r"C:\x\Q"), 4),
+            (w(r"C:\x\R"), 5),
+        ];
+        children_first(&mut renames);
+        let order: Vec<i32> = renames.iter().map(|r| r.1).collect();
+        // The deepest first; P, Q and R (side by side) as they were.
+        assert_eq!(order, [3, 2, 1, 4, 5]);
+    }
 
     fn subjects(names: &[&str]) -> Vec<Subject> {
         names.iter().map(|n| Subject::new(n, false)).collect()

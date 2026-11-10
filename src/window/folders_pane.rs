@@ -7,9 +7,19 @@
 //! - **Listing.** A folder's subfolders are listed when it first opens, on
 //!   a thread of its own (`crate::foldertree`), and again each time it is
 //!   opened by hand (or F5 on it), the tree keeping what is still there
-//!   (with what is open under it) and dropping what is gone. A big folder's
-//!   subfolders go in a few hundred at a time, a message each, so the
-//!   window never stalls on tens of thousands of them.
+//!   (with what is open under it) and dropping what is gone. The subfolders
+//!   go in a few hundred at a time, a message each, so the window never
+//!   stalls on many of them.
+//! - **Big folders.** At most [`foldertree::CAP`] subfolders of a folder go
+//!   in the tree (and past them the one a folder being shown lies in); an
+//!   item after them says how many more there are, and choosing it keeps
+//!   the search inside the folder, where the results list them all. A tree
+//!   view's items cost it ever more time to take out again: tens of
+//!   thousands of them took seconds to close the pane.
+//! - **Closing.** The tree is taken out of the pane before the pane goes,
+//!   hidden, so the pane closes at once: as the window ends, the process's
+//!   end frees it; otherwise it is emptied a few milliseconds at a time
+//!   ([`empty_parked`]), then destroyed.
 //! - **The keyboard.** Arrow keys choose a folder once they rest a moment
 //!   (a click at once); Enter gives the results the keyboard; Alt+Up goes up
 //!   a folder; F5 lists the chosen folder again (and refreshes the
@@ -48,7 +58,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
     HTREEITEM, NMHDR, NMTREEVIEWW, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW,
     TTM_SETMAXTIPWIDTH, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, TVC_BYMOUSE, TVE_EXPAND,
-    TVM_SETEXTENDEDSTYLE, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW, TVS_EX_AUTOHSCROLL,
+    TVM_DELETEITEM, TVM_SETEXTENDEDSTYLE, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW, TVS_EX_AUTOHSCROLL,
     TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_LINESATROOT, TVS_NOHSCROLL,
     TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT, WC_TREEVIEWW,
 };
@@ -59,9 +69,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DeleteMenu, DestroyMenu, DestroyWindow, GetMenuDefaultItem,
-    HMENU, KillTimer, MB_ICONWARNING, MF_BYCOMMAND, MSG, MoveWindow, PostMessageW, SM_CXSMICON,
-    SendMessageW, SetTimer, WM_APP, WM_CONTEXTMENU, WM_KEYDOWN, WM_NOTIFY, WM_SETFOCUS,
-    WM_SYSKEYDOWN, WM_TIMER, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    HMENU, HWND_MESSAGE, KillTimer, MB_ICONWARNING, MF_BYCOMMAND, MSG, MoveWindow, PostMessageW,
+    SM_CXSMICON, SW_HIDE, SendMessageW, SetParent, SetTimer, ShowWindow, WM_APP, WM_CONTEXTMENU,
+    WM_KEYDOWN, WM_NOTIFY, WM_SETFOCUS, WM_SYSKEYDOWN, WM_TIMER, WS_CHILD, WS_EX_TOPMOST, WS_POPUP,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 use super::sidebars::{FOLDER_COPY_PATH, FOLDER_EXPAND, FOLDER_OPEN, FOLDER_OPEN_PATH};
@@ -90,6 +101,11 @@ const CHOOSE_MS: u32 = 150;
 /// Folders a menu command may have changed are listed again.
 const TIMER_RELIST: usize = 2;
 const RELIST_MS: u32 = 1500;
+/// A closed pane's tree is emptied every `PARK_MS`, for at most
+/// `PARK_SLICE` each time.
+const PARK_TIMER: usize = 1;
+const PARK_MS: u32 = 10;
+const PARK_SLICE: Duration = Duration::from_millis(8);
 /// How long one batch of items going into the tree may hold the window's
 /// thread, and the sizes a batch starts at and keeps within.
 const BATCH_BUDGET: Duration = Duration::from_millis(25);
@@ -151,6 +167,28 @@ struct Node {
     /// The user opened it before its subfolders were in (the tree cannot
     /// show open an item with nothing under it): it opens once they come.
     open_when_listed: bool,
+    /// The listing whose answer came last (`request` while none is on its
+    /// way).
+    answered: u64,
+    /// How many of its subfolders the tree leaves out (past
+    /// [`foldertree::CAP`]), and the node of the item that counts them.
+    hidden: usize,
+    more: Option<u32>,
+    /// It is such an item: it stands for its parent's folder.
+    is_more: bool,
+    /// The name under it of the folder being shown as it was listed last,
+    /// which went in whatever its place.
+    sought: Vec<u16>,
+}
+
+/// The text of the item counting `n` subfolders the tree leaves out.
+fn more_label(n: usize) -> Vec<u16> {
+    let text = if n == 1 {
+        "1 more folder".to_owned()
+    } else {
+        format!("{} more folders", crate::format::grouped(n as u64))
+    };
+    text.encode_utf16().collect()
 }
 
 /// Subfolders still to go into the tree.
@@ -250,9 +288,14 @@ impl FoldersPane {
             .map_or(-1, |i| i.get(Source::System(sys)))
     }
 
-    /// The full path of node `n` (`None` for the top item).
+    /// The full path of node `n` (`None` for the top item); a "more
+    /// folders" item's is its folder's.
     fn path(&self, n: u32) -> Option<Vec<u16>> {
         let nodes = self.nodes.borrow();
+        let n = match nodes.get(n as usize) {
+            Some(node) if node.is_more => node.parent?,
+            _ => n,
+        };
         let mut parts = Vec::new();
         let mut at = Some(n);
         while let Some(i) = at {
@@ -329,6 +372,11 @@ impl FoldersPane {
             request: 0,
             gone: false,
             open_when_listed: false,
+            answered: 0,
+            hidden: 0,
+            more: None,
+            is_more: false,
+            sought: Vec::new(),
         });
         Some(at)
     }
@@ -342,7 +390,7 @@ impl FoldersPane {
         {
             let mut nodes = self.nodes.borrow_mut();
             let node = &mut nodes[n as usize];
-            if node.gone || node.load == Load::Inserting {
+            if node.gone || node.is_more || node.load == Load::Inserting {
                 return;
             }
             if node.load == Load::Unlisted {
@@ -382,22 +430,49 @@ impl FoldersPane {
         self.continue_reveal(app);
     }
 
+    /// The name under node `n` of the folder being shown, if it is inside
+    /// it.
+    fn reveal_name(&self, n: u32) -> Option<Vec<u16>> {
+        let target = self.reveal.borrow().clone()?;
+        let path = self.path(n)?;
+        foldertree::next_name(&target, &path).map(<[u16]>::to_vec)
+    }
+
     /// Node `node`'s subfolders came (listing `request`).
     fn folders(&self, app: &App, node: u32, request: u64, found: Result<Vec<Folder>, u32>) {
-        let (load, has_children, item) = {
-            let nodes = self.nodes.borrow();
-            let Some(n) = nodes.get(node as usize) else {
+        let (load, old_names, item) = {
+            let mut nodes = self.nodes.borrow_mut();
+            let Some(n) = nodes.get_mut(node as usize) else {
                 return;
             };
             if n.gone || n.request != request {
                 return;
             }
-            (n.load, !n.children.is_empty(), n.item)
+            n.answered = request;
+            let (load, item, children) = (n.load, n.item, n.children.clone());
+            let names: Vec<Vec<u16>> = children
+                .iter()
+                .map(|&c| nodes[c as usize].name.clone())
+                .collect();
+            (load, names, item)
         };
         if load == Load::Inserting {
             return;
         }
-        let found = found.unwrap_or_default();
+        let has_children = !old_names.is_empty();
+        // Past the cap, only what the tree must show goes in: the folders
+        // it shows already (with what is open under them) and the one on
+        // the way to the folder being shown.
+        let sought = self.reveal_name(node);
+        let mut wanted: Vec<&[u16]> = old_names.iter().map(Vec::as_slice).collect();
+        wanted.extend(sought.as_deref());
+        let (found, hidden) =
+            foldertree::capped(found.unwrap_or_default(), foldertree::CAP, &wanted);
+        {
+            let mut nodes = self.nodes.borrow_mut();
+            nodes[node as usize].hidden = hidden;
+            nodes[node as usize].sought = sought.unwrap_or_default();
+        }
         if !has_children {
             if found.is_empty() {
                 {
@@ -405,6 +480,7 @@ impl FoldersPane {
                     nodes[node as usize].load = Load::Listed;
                     nodes[node as usize].open_when_listed = false;
                 }
+                self.sync_more(node);
                 treeview::set_children(self.tree.get(), item, false);
                 self.continue_reveal(app);
                 return;
@@ -418,6 +494,7 @@ impl FoldersPane {
             return;
         }
         self.merge(node, found);
+        self.sync_more(node);
         self.nodes.borrow_mut()[node as usize].load = Load::Listed;
         // The folder chosen may have gone from under it, or come back.
         if self.leads_to_choice(app, node) {
@@ -514,9 +591,52 @@ impl FoldersPane {
             if empty {
                 treeview::set_children(self.tree.get(), item, false);
             }
+            // After the last of them: how many more there are.
+            self.sync_more(node);
             self.continue_reveal(app);
         }
         self.after_more(again);
+    }
+
+    /// The item counting node `n`'s subfolders the tree leaves out
+    /// (`Node::hidden`) comes, says the count, or goes. It is the last of
+    /// its subfolders: what goes in after it is put before it.
+    fn sync_more(&self, n: u32) {
+        let (hidden, more) = {
+            let nodes = self.nodes.borrow();
+            let node = &nodes[n as usize];
+            if node.gone {
+                return;
+            }
+            (node.hidden, node.more)
+        };
+        let tree = self.tree.get();
+        match (hidden, more) {
+            (0, None) => {}
+            (0, Some(m)) => {
+                let item = {
+                    let mut nodes = self.nodes.borrow_mut();
+                    nodes[n as usize].more = None;
+                    Self::forget(&mut nodes, m);
+                    nodes[m as usize].item
+                };
+                self.quietly(|| treeview::delete(tree, item));
+            }
+            (h, Some(m)) => {
+                let item = self.nodes.borrow()[m as usize].item;
+                treeview::set_text(tree, item, &more_label(h));
+            }
+            (h, None) => {
+                let image = self.image(None);
+                let id = self
+                    .quietly(|| self.add(Some(n), None, Vec::new(), &more_label(h), image, false));
+                if let Some(id) = id {
+                    let mut nodes = self.nodes.borrow_mut();
+                    nodes[id as usize].is_more = true;
+                    nodes[n as usize].more = Some(id);
+                }
+            }
+        }
     }
 
     /// More batches wait: the next one comes with a message of its own.
@@ -534,6 +654,7 @@ impl FoldersPane {
             let node = &mut nodes[i as usize];
             node.gone = true;
             stack.append(&mut node.children);
+            stack.extend(node.more.take());
         }
     }
 
@@ -691,6 +812,25 @@ impl FoldersPane {
                         at = c;
                     }
                     None => {
+                        // Among the subfolders the tree leaves out, maybe:
+                        // listed again (once for this name), it goes in.
+                        let (hidden, sought, waiting) = {
+                            let nodes = self.nodes.borrow();
+                            let node = &nodes[at as usize];
+                            (
+                                node.hidden,
+                                foldertree::same_name(&node.sought, name),
+                                node.request != node.answered,
+                            )
+                        };
+                        if hidden > 0 && waiting {
+                            return;
+                        }
+                        if hidden > 0 && !sought {
+                            self.nodes.borrow_mut()[at as usize].sought = name.to_vec();
+                            self.list(at);
+                            return;
+                        }
                         give_up();
                         return;
                     }
@@ -703,8 +843,14 @@ impl FoldersPane {
             }
         }
         *self.reveal.borrow_mut() = None;
-        let item = self.nodes.borrow()[at as usize].item;
-        if treeview::selected(tree) != item {
+        let (item, more) = {
+            let nodes = self.nodes.borrow();
+            let node = &nodes[at as usize];
+            (node.item, node.more.map(|m| nodes[m as usize].item))
+        };
+        let selected = treeview::selected(tree);
+        // Chosen through its "more folders" item, which stays chosen.
+        if selected != item && Some(selected) != more {
             self.quietly(|| treeview::select(tree, item));
         }
     }
@@ -804,6 +950,9 @@ impl FoldersPane {
         let Some(n) = self.node_of(item) else {
             return;
         };
+        if self.nodes.borrow()[n as usize].is_more {
+            return;
+        }
         let Some(path) = self.path(n) else {
             // The top item has nothing to act on.
             return;
@@ -1041,6 +1190,71 @@ impl FoldersPane {
     }
 }
 
+/// A closed pane's tree still to empty, and its items still in it.
+struct Parked {
+    tree: HWND,
+    items: Vec<HTREEITEM>,
+}
+
+thread_local! {
+    static PARKED: RefCell<Vec<Parked>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Takes `tree` (holding `items`) out of its pane, hidden, so the pane's
+/// window goes at once without it: destroyed, a tree view takes its items
+/// out one by one, in time that grows faster than their number (seconds
+/// for tens of thousands). As the window ends (`ending`) it stays so until
+/// the process ends, which frees it at once; otherwise it is emptied a
+/// slice at a time from a timer of its own ([`empty_parked`]).
+fn park(tree: HWND, items: Vec<HTREEITEM>, ending: bool) {
+    // SAFETY: hides this thread's tree and makes it a message-only window
+    // of this thread, no longer a child of the pane.
+    unsafe {
+        ShowWindow(tree, SW_HIDE);
+        SetParent(tree, HWND_MESSAGE);
+    }
+    if ending {
+        return;
+    }
+    PARKED.with_borrow_mut(|p| p.push(Parked { tree, items }));
+    // SAFETY: a timer of this thread's tree, which calls `empty_parked`.
+    unsafe { SetTimer(tree, PARK_TIMER, PARK_MS, Some(empty_parked)) };
+}
+
+/// A parked tree's timer: its items go, the last made first (so each is
+/// one with nothing under it), for at most [`PARK_SLICE`]; once there are
+/// none, the tree is destroyed.
+unsafe extern "system" fn empty_parked(tree: HWND, _msg: u32, id: usize, _time: u32) {
+    let started = Instant::now();
+    loop {
+        let next = PARKED.with_borrow_mut(|parked| {
+            let i = parked.iter().position(|p| p.tree == tree)?;
+            let item = parked[i].items.pop();
+            if item.is_none() {
+                parked.swap_remove(i);
+            }
+            Some(item)
+        });
+        // SAFETY: this thread's parked tree, its timer, and one of its
+        // items (none goes but here, nothing is borrowed meanwhile).
+        unsafe {
+            match next {
+                Some(Some(item)) => {
+                    SendMessageW(tree, TVM_DELETEITEM, 0, item);
+                }
+                Some(None) | None => {
+                    KillTimer(tree, id);
+                    DestroyWindow(tree);
+                    return;
+                }
+            }
+        }
+        if started.elapsed() >= PARK_SLICE {
+            return;
+        }
+    }
+}
+
 /// The tree's subclass id.
 const TREE_SUBCLASS: usize = 1;
 
@@ -1250,6 +1464,16 @@ impl crate::pane::PaneContent for FoldersPane {
         // The tree lets go of the image list before it is destroyed.
         treeview::set_images(tree, None);
         self.images.borrow_mut().take();
+        // Its items in the order they were made: a folder's subfolders
+        // after it, so the last first can be taken out one at a time.
+        let items: Vec<HTREEITEM> = self
+            .nodes
+            .borrow()
+            .iter()
+            .filter(|n| !n.gone && n.item != NONE)
+            .map(|n| n.item)
+            .collect();
+        park(tree, items, app.window_ending());
         app.folders_pane_shown(false);
     }
 

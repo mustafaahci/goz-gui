@@ -83,33 +83,58 @@ pub struct Record {
 }
 
 impl Record {
-    /// What Undo does: a step per item, the last item first.
+    /// The order Undo takes the items in: the last first. A rename's go
+    /// deepest first (by where each is now): the steps are checked and
+    /// queued before any runs, so a folder renamed back before what it
+    /// holds would leave their paths naming nothing.
+    fn undo_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.items.len()).rev().collect();
+        if self.action == Action::Rename {
+            order.sort_by_key(|&i| core::cmp::Reverse(self.items[i].to.len()));
+        }
+        order
+    }
+
+    /// The order Redo takes them in: as they were done; a rename's deepest
+    /// first (by where each was), as Advanced Rename does them.
+    fn redo_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.items.len()).collect();
+        if self.action == Action::Rename {
+            order.sort_by_key(|&i| core::cmp::Reverse(self.items[i].from.len()));
+        }
+        order
+    }
+
+    /// What Undo does: a step per item, in [`undo_order`](Self::undo_order).
     pub fn undo_steps(&self) -> Vec<Step> {
-        self.items
-            .iter()
-            .rev()
-            .map(|it| undo_step(self.action, it))
+        self.undo_order()
+            .into_iter()
+            .map(|i| undo_step(self.action, &self.items[i]))
             .collect()
     }
 
-    /// What Redo does: a step per item, in order.
+    /// What Redo does: a step per item, in [`redo_order`](Self::redo_order).
     pub fn redo_steps(&self) -> Vec<Step> {
-        self.items
-            .iter()
-            .map(|it| redo_step(self.action, it))
+        self.redo_order()
+            .into_iter()
+            .map(|i| redo_step(self.action, &self.items[i]))
             .collect()
     }
 
-    /// The items `results` (of [`undo_steps`](Self::undo_steps), the last
-    /// item first) undid, and those they did not, as two records (either
-    /// may be empty) with this one's number, date and action.
+    /// The items `results` (of [`undo_steps`](Self::undo_steps)) undid,
+    /// and those they did not, as two records (either may be empty) with
+    /// this one's number, date and action, each in this one's order.
     pub fn split_undone(self, results: &[StepResult]) -> (Record, Record) {
-        let n = self.items.len();
+        let mut undid = vec![false; self.items.len()];
+        for (k, &i) in self.undo_order().iter().enumerate() {
+            undid[i] = matches!(results.get(k), Some(StepResult::Done { .. }));
+        }
         let (mut done, mut left) = (self.empty_like(), self.empty_like());
         for (i, item) in self.items.into_iter().enumerate() {
-            match results.get(n - 1 - i) {
-                Some(StepResult::Done { .. }) => done.items.push(item),
-                _ => left.items.push(item),
+            if undid[i] {
+                done.items.push(item);
+            } else {
+                left.items.push(item);
             }
         }
         (done, left)
@@ -119,9 +144,13 @@ impl Record {
     /// as they are now (where the item went again, its times), and those
     /// they did not.
     pub fn split_redone(self, results: &[StepResult]) -> (Record, Record) {
+        let mut result: Vec<Option<&StepResult>> = vec![None; self.items.len()];
+        for (k, &i) in self.redo_order().iter().enumerate() {
+            result[i] = results.get(k);
+        }
         let (mut done, mut left) = (self.empty_like(), self.empty_like());
         for (i, mut item) in self.items.into_iter().enumerate() {
-            match results.get(i) {
+            match result[i] {
                 Some(StepResult::Done { to, before, after }) => {
                     if !to.is_empty() {
                         item.to = to.clone();
@@ -245,6 +274,73 @@ pub fn items_of(action: Action, sources: &[Vec<u16>], results: &[StepResult]) ->
             _ => None,
         })
         .collect()
+}
+
+/// A rename's items as they are once all its steps are done: what a
+/// folder holds was renamed before the folder (`rename::children_first`),
+/// so the new path the shell gave it still names the folder's old name;
+/// it takes the folder's new one here. Items side by side are left as
+/// they are.
+pub fn settle_renames(items: &mut [Item]) {
+    if items.len() < 2 {
+        return;
+    }
+    // Each item's old path, folded as Windows compares names, and its new
+    // name.
+    let renamed: std::collections::HashMap<String, Vec<u16>> = items
+        .iter()
+        .map(|it| (crate::foldertree::fold(&it.from), name_of(&it.to).to_vec()))
+        .collect();
+    // Worked out once per folder: most items share one.
+    let mut folders: std::collections::HashMap<Vec<u16>, Option<Vec<u16>>> =
+        std::collections::HashMap::new();
+    for it in items.iter_mut() {
+        let Some(folder) = parent(&it.from) else {
+            continue;
+        };
+        let now = folders
+            .entry(folder.to_vec())
+            .or_insert_with(|| renamed_folder(folder, &renamed));
+        if let Some(now) = now {
+            it.to = super::join(now, name_of(&it.to));
+        }
+    }
+}
+
+/// The path `folder` has once the folders in `renamed` (old path folded,
+/// new name) have their new names; `None` when none of it was renamed.
+fn renamed_folder(
+    folder: &[u16],
+    renamed: &std::collections::HashMap<String, Vec<u16>>,
+) -> Option<Vec<u16>> {
+    const BACKSLASH: u16 = b'\\' as u16;
+    let ends = folder
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c == BACKSLASH)
+        .map(|(k, _)| k)
+        .chain(std::iter::once(folder.len()));
+    let mut out = Vec::with_capacity(folder.len() + 16);
+    let mut start = 0;
+    let mut changed = false;
+    for end in ends {
+        if end < start {
+            continue;
+        }
+        // `folder[start..end]` is a name, `folder[..end]` its path.
+        match renamed.get(&crate::foldertree::fold(&folder[..end])) {
+            Some(name) if end > start => {
+                out.extend_from_slice(name);
+                changed = true;
+            }
+            _ => out.extend_from_slice(&folder[start..end]),
+        }
+        if end < folder.len() {
+            out.push(BACKSLASH);
+        }
+        start = end + 1;
+    }
+    changed.then_some(out)
 }
 
 /// goz-gui's undo record: what can be undone (the last done last), and
@@ -455,6 +551,86 @@ mod tests {
             before: None,
             after: None,
         }
+    }
+
+    /// A folder renamed with a subfolder and a file in it (Advanced Rename
+    /// does what they hold first): the record names where each is once all
+    /// are done, Undo and Redo take what a folder holds first, and their
+    /// results go back to the right items.
+    #[test]
+    fn a_folder_renamed_with_what_it_holds() {
+        // As the shell reported them, in the order they were done.
+        let mut items = vec![
+            item(r"C:\x\P\C\f.txt", r"C:\x\P\C\g.txt"),
+            item(r"C:\x\P\C", r"C:\x\P\D"),
+            item(r"C:\x\P", r"C:\x\Q"),
+            item(r"C:\x\other.txt", r"C:\x\other2.txt"),
+        ];
+        settle_renames(&mut items);
+        let to: Vec<String> = items
+            .iter()
+            .map(|i| String::from_utf16_lossy(&i.to))
+            .collect();
+        assert_eq!(
+            to,
+            [
+                r"C:\x\Q\D\g.txt",
+                r"C:\x\Q\D",
+                r"C:\x\Q",
+                r"C:\x\other2.txt"
+            ]
+        );
+        let rec = Record {
+            id: 1,
+            date: 0,
+            action: Action::Rename,
+            items,
+        };
+        // Undo: where each is now, the longest paths first (what a folder
+        // holds before it), the folder last.
+        let sources: Vec<String> = rec
+            .undo_steps()
+            .iter()
+            .map(|s| String::from_utf16_lossy(s.source()))
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                r"C:\x\other2.txt",
+                r"C:\x\Q\D\g.txt",
+                r"C:\x\Q\D",
+                r"C:\x\Q"
+            ]
+        );
+        // Each result goes back to its item: the first step (other2.txt)
+        // was not done.
+        let results = [StepResult::NotRun, done(""), done(""), done("")];
+        let (did, left) = rec.clone().split_undone(&results);
+        assert_eq!(did.items.len(), 3);
+        assert_eq!(left.items, [rec.items[3].clone()]);
+        // Redo: from where each was, deepest first.
+        let sources: Vec<String> = rec
+            .redo_steps()
+            .iter()
+            .map(|s| String::from_utf16_lossy(s.source()))
+            .collect();
+        assert_eq!(
+            sources,
+            [r"C:\x\P\C\f.txt", r"C:\x\other.txt", r"C:\x\P\C", r"C:\x\P"]
+        );
+        let (did, left) = rec.clone().split_redone(&[
+            done(r"C:\x\P\C\g.txt"),
+            StepResult::NotRun,
+            done(""),
+            done(""),
+        ]);
+        assert_eq!(did.items.len(), 3);
+        assert_eq!(left.items, [rec.items[3].clone()]);
+        // Side by side, nothing changes.
+        let mut flat = vec![item(r"C:\a\x", r"C:\a\y"), item(r"C:\a\z", r"C:\a\w")];
+        let was = flat.clone();
+        settle_renames(&mut flat);
+        assert_eq!(flat, was);
     }
 
     #[test]

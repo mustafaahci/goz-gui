@@ -119,6 +119,23 @@ fn text(path: &[u16]) -> String {
     String::from_utf16_lossy(path)
 }
 
+/// What the status bar says of the items that merged into, or replaced,
+/// one of their names already there: Undo leaves them.
+fn landed(results: &[StepResult]) -> Option<String> {
+    let n = results
+        .iter()
+        .filter(|r| matches!(r, StepResult::Landed { .. }))
+        .count();
+    match n {
+        0 => None,
+        1 => Some("1 item merged into or replaced one of its name: it cannot be undone".into()),
+        n => Some(format!(
+            "{} items merged into or replaced ones of their names: they cannot be undone",
+            crate::format::grouped(n as u64)
+        )),
+    }
+}
+
 /// The Desktop folder (`GOZ_GUI_DESKTOP_DIR` in a test).
 fn desktop() -> Option<Vec<u16>> {
     if let Some(dir) = location::desktop_dir() {
@@ -696,7 +713,10 @@ impl App {
         let sources: Vec<Vec<u16>> = task.steps.iter().map(|s| s.source().to_vec()).collect();
         match task.purpose {
             Purpose::Do(action) => {
-                let items = undo::items_of(action, &sources, &results);
+                let mut items = undo::items_of(action, &sources, &results);
+                if action == Action::Rename {
+                    undo::settle_renames(&mut items);
+                }
                 match action {
                     Action::Rename => self.show_renames(&task.steps, &results),
                     Action::NewFolder => {
@@ -726,7 +746,11 @@ impl App {
                     (Outcome::Failed(why), None) => {
                         self.show_note(format!("Could not {what}: {why}"))
                     }
-                    _ => {}
+                    _ => {
+                        if let Some(note) = landed(&results) {
+                            self.show_note(note);
+                        }
+                    }
                 }
             }
             Purpose::Undo(rec) => {
@@ -743,7 +767,11 @@ impl App {
                 if rec.action == Action::Rename {
                     self.show_renames(&task.steps, &results);
                 }
-                let (did, left) = rec.split_redone(&results);
+                let rename = rec.action == Action::Rename;
+                let (mut did, left) = rec.split_redone(&results);
+                if rename {
+                    undo::settle_renames(&mut did.items);
+                }
                 self.undo_note("Redid", "redo", &did, &left, &results);
                 self.file_tools.stack.borrow_mut().redone(did, left);
                 self.undo_changed();

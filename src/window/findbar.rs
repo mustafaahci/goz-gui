@@ -375,20 +375,38 @@ impl Strip for FindBar {
         };
         let close = square(rc.right - s(3) - button);
         let left = rc.left + s(3);
-        // The box takes Everything's 256 px, less when the bar is narrow.
-        let room = close.left - s(8) - left - 2 * button - s(4);
-        let box_w = s(256).min(room).max(s(48)).min(room.max(0));
-        let frame = RECT {
-            left,
-            top: mid(box_h),
-            right: left + box_w,
-            bottom: mid(box_h) + box_h,
-        };
-        let previous = square(frame.right + s(4));
-        let next = square(previous.right);
-        // The check boxes while they fit before the ×.
-        let mut x = next.right + s(6);
         let limit = close.left - s(8);
+        // The box takes Everything's 256 px, less when the bar is narrow;
+        // under 48 px it would show a clipped bit of its cue, so it goes
+        // (its text still finds with F3), and ▴ ▾ go too when they do not
+        // fit before the ×.
+        let room = limit - left - 2 * button - s(4);
+        let frame = if room >= s(48) {
+            RECT {
+                left,
+                top: mid(box_h),
+                right: left + s(256).min(room),
+                bottom: mid(box_h) + box_h,
+            }
+        } else {
+            RECT::default()
+        };
+        let arrows = if empty(&frame) {
+            left
+        } else {
+            frame.right + s(4)
+        };
+        let (previous, next) = if arrows + 2 * button <= limit {
+            (square(arrows), square(arrows + button))
+        } else {
+            (RECT::default(), RECT::default())
+        };
+        // The check boxes while they fit before the ×.
+        let mut x = if empty(&next) {
+            left
+        } else {
+            next.right + s(6)
+        };
         let mut checks = [RECT::default(); 2];
         for (slot, hwnd) in checks
             .iter_mut()
@@ -416,11 +434,15 @@ impl Strip for FindBar {
             right: limit,
             bottom: rc.bottom,
         };
-        let edit = RECT {
-            left: frame.left + s(4),
-            top: frame.top + (box_h - fh) / 2,
-            right: (frame.right - s(4)).max(frame.left + s(4)),
-            bottom: frame.top + (box_h - fh) / 2 + fh,
+        let edit = if empty(&frame) {
+            RECT::default()
+        } else {
+            RECT {
+                left: frame.left + s(4),
+                top: frame.top + (box_h - fh) / 2,
+                right: (frame.right - s(4)).max(frame.left + s(4)),
+                bottom: frame.top + (box_h - fh) / 2 + fh,
+            }
         };
         self.geo.set(Geometry {
             frame,
@@ -433,9 +455,27 @@ impl Strip for FindBar {
                 RECT::default()
             },
         });
-        put(self.edit.get(), edit);
-        put(self.highlight.get(), checks[0]);
-        put(self.case.get(), checks[1]);
+        let placed = [
+            (self.edit.get(), edit),
+            (self.highlight.get(), checks[0]),
+            (self.case.get(), checks[1]),
+        ];
+        for (hwnd, rc) in placed {
+            put(hwnd, rc);
+        }
+        // A control that went keeps no keyboard: it goes to the results
+        // (now, or when the window is active again).
+        let gone = |h: HWND| !h.is_null() && placed.iter().any(|&(c, rc)| c == h && empty(&rc));
+        // SAFETY: reads the focus of this thread; it is only moved while
+        // it is in this window (so the window is the active one).
+        unsafe {
+            if gone(GetFocus()) {
+                SetFocus(app.list);
+            }
+        }
+        if gone(app.last_focus.get()) {
+            app.last_focus.set(app.list);
+        }
     }
 
     fn paint(&self, app: &App, hdc: HDC, rc: &RECT) {
@@ -593,7 +633,8 @@ impl Strip for FindBar {
 
     fn focus(&self) -> Option<HWND> {
         let edit = self.edit.get();
-        (self.visible.get() && !edit.is_null()).then_some(edit)
+        // Not while the bar is too narrow for its box (hidden).
+        (self.visible.get() && !edit.is_null() && !empty(&self.geo.get().frame)).then_some(edit)
     }
 
     fn contains(&self, hwnd: HWND) -> bool {
@@ -804,6 +845,11 @@ impl App {
             self.relayout();
             self.set_find_visible_setting(true);
             self.update_lit();
+        }
+        // A bar too narrow for its box (hidden) leaves the keyboard where
+        // it is; F3 still finds its text.
+        if empty(&bar.geo.get().frame) {
+            return;
         }
         let edit = bar.edit.get();
         // SAFETY: moves the keyboard within this thread's window; while
@@ -1097,6 +1143,11 @@ impl App {
         }
         let index = index.min(count - 1) as usize;
         self.find_bar().set_not_found(self, false);
+        // The match is the selection now: an action still waiting for the
+        // rows of the one before (Delete, a file tool...) is not wanted
+        // any more, and must not run on the match when they come. (The
+        // selection changes quietly here, which cancels nothing itself.)
+        self.cancel_fetch();
         self.quietly(|| self.clear_selection());
         let path = path.into_vec();
         *self.reselect.borrow_mut() = Some(super::reselect::Reselect::sought_again(

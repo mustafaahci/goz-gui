@@ -6,6 +6,8 @@
 //! (diacritics, whole words, prefix, suffix, punctuation, white-space,
 //! regular expressions, columns, index) are options goz has not: not here.
 
+use std::cell::RefCell;
+
 use goz_core::types::{SortDir, SortKey, SortSpec};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
@@ -77,10 +79,11 @@ const VIEWS: [(HomeView, &str); 5] = [
     ),
 ];
 
-/// The filters, after "(Use last value)".
+/// The filters, after "(Use last value)": the built-in ones, then the
+/// user's, as the Search menu and the filter bar list them.
 fn filters() -> Vec<(Option<Filter>, &'static str)> {
     let mut out = vec![(None, LAST)];
-    out.extend(Filter::ALL.iter().map(|&f| (Some(f), f.title())));
+    out.extend(Filter::all().into_iter().map(|f| (Some(f), f.title())));
     out
 }
 
@@ -149,12 +152,13 @@ impl Shown {
         }
     }
 
-    fn put(&self, page: HWND) {
+    /// Shows these on the page, whose Filter list holds `filters`.
+    fn put(&self, page: HWND, filters: &[(Option<Filter>, &'static str)]) {
         select_combo(page, MATCH_CASE, &MATCH, self.case);
         select_combo(page, MATCH_PATH, &MATCH, self.path);
         select_combo(page, SEARCH, &SEARCHES, self.search);
         set_text(page, SEARCH_TEXT, &self.text);
-        select_combo(page, FILTER, &filters(), self.filter);
+        select_combo(page, FILTER, filters, self.filter);
         select_combo(page, SORT, &sorts(), self.sort);
         select_combo(page, SORT_DIR, &DIRS, self.dir);
         select_combo(page, VIEW, &VIEWS, self.view);
@@ -198,7 +202,20 @@ fn set_home(s: &mut Settings, shown: &Shown) {
     }
 }
 
-pub(super) struct Home;
+pub(super) struct Home {
+    /// The Filter list's filters as it was filled: what is read back by
+    /// their place in it names what it showed, even if the user's filters
+    /// change meanwhile (another goz-gui's Organize Filters).
+    filters: RefCell<Vec<(Option<Filter>, &'static str)>>,
+}
+
+impl Home {
+    pub(super) fn new() -> Home {
+        Home {
+            filters: RefCell::new(filters()),
+        }
+    }
+}
 
 /// A label `LABEL_W` wide and a drop-down list `w` wide right of it, at
 /// `x` from the row's start; the row does not move on.
@@ -254,11 +271,14 @@ impl Page for Home {
         fill_combo(page, MATCH_CASE, &MATCH, HomeOption::Last);
         fill_combo(page, MATCH_PATH, &MATCH, HomeOption::Last);
         fill_combo(page, SEARCH, &SEARCHES, false);
-        fill_combo(page, FILTER, &filters(), None);
+        let filters = filters();
+        fill_combo(page, FILTER, &filters, None);
         fill_combo(page, SORT, &sorts(), None);
         fill_combo(page, SORT_DIR, &DIRS, SortDir::Asc);
         fill_combo(page, VIEW, &VIEWS, HomeView::Last);
-        Shown::of(&app.prefs.borrow().base).put(page);
+        let shown = Shown::of(&app.prefs.borrow().base);
+        shown.put(page, &filters);
+        *self.filters.borrow_mut() = filters;
     }
 
     /// The search's text with "Custom", the direction with a sort.
@@ -286,7 +306,7 @@ impl Page for Home {
             path: combo_value(page, MATCH_PATH, &MATCH),
             search: combo_value(page, SEARCH, &SEARCHES),
             text: text(page, SEARCH_TEXT),
-            filter: combo_value(page, FILTER, &filters()),
+            filter: combo_value(page, FILTER, &self.filters.borrow()),
             sort: combo_value(page, SORT, &sorts()),
             dir: combo_value(page, SORT_DIR, &DIRS),
             view: combo_value(page, VIEW, &VIEWS),
@@ -297,7 +317,7 @@ impl Page for Home {
     /// Everything's: the empty search, the rest the last value.
     fn defaults(&self, page: HWND) {
         debug_assert_eq!(Settings::default().home, HomeFixed::default());
-        Shown::of(&Settings::default()).put(page);
+        Shown::of(&Settings::default()).put(page, &self.filters.borrow());
     }
 }
 

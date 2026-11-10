@@ -41,7 +41,7 @@ fn pages() -> Vec<Box<dyn Page>> {
     // F5 (file tools).
 
     // F6 (integration and the Options pages).
-    pages.push(Box::new(home::Home));
+    pages.push(Box::new(home::Home::new()));
     pages.push(Box::new(results::Results));
 
     pages

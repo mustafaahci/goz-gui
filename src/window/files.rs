@@ -379,11 +379,14 @@ impl App {
         })
     }
 
-    /// Selects and focuses the held row of the file at `path`, alone.
+    /// Selects and focuses the held row of the file at `path`, alone. An
+    /// action waiting for the rows of the selection before is dropped: it
+    /// must not run on this one.
     pub(super) fn select_file(&self, path: &[u16]) {
         let Some(i) = self.model.borrow().find(path) else {
             return;
         };
+        self.cancel_fetch();
         self.quietly(|| {
             self.clear_selection();
             self.set_state(

@@ -100,6 +100,9 @@ const WM_SCANNED: u32 = WM_APP + 2;
 const WM_RECOMPUTE: u32 = WM_APP + 3;
 /// Show a format's menu (Ctrl+Space in its box): wParam is the box's id.
 const WM_FORMAT_MENU: u32 = WM_APP + 4;
+/// Make the formats and the new names of many files, after the dialog
+/// opened: the window's thread is not held the whole time at once.
+const WM_REGENERATE: u32 = WM_APP + 5;
 /// The timer that makes the new names of many files a moment after the
 /// typing stops.
 const TIMER_RECOMPUTE: usize = 1;
@@ -173,6 +176,8 @@ struct Dlg {
     scan: RefCell<Option<Scan>>,
     min: Cell<(i32, i32)>,
     out: RefCell<Option<Chosen>>,
+    /// The first formats and names are still to be made (`WM_REGENERATE`).
+    regenerating: Cell<bool>,
 }
 
 /// Shows the renamer over `owner` for `files` (each path, and whether it
@@ -200,6 +205,7 @@ pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) ->
         scan: RefCell::new(None),
         min: Cell::new((0, 0)),
         out: RefCell::new(None),
+        regenerating: Cell::new(false),
     };
     let mut t = Template::new(TITLE, WS_THICKFRAME | WS_MAXIMIZEBOX, SIZE.0, SIZE.1);
     let combo = WS_TABSTOP | WS_VSCROLL | (CBS_DROPDOWN | CBS_AUTOHSCROLL) as u32;
@@ -286,8 +292,11 @@ pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) ->
     state.out.into_inner()
 }
 
-/// The names in each of `folders` (lower case), read on another thread.
-fn scan(folders: Vec<String>) -> Scan {
+/// The names in each of `folders` (lower case), read on another thread;
+/// each folder once, whatever its case.
+fn scan(mut folders: Vec<String>) -> Scan {
+    folders.sort_by_cached_key(|f| f.to_lowercase());
+    folders.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     folders
         .into_iter()
         .map(|folder| {
@@ -520,10 +529,8 @@ impl Dlg {
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
         places::restore(dlg, Which::Rename, core::ptr::null_mut(), self.min.get());
         dialog::anchor(dlg, SIZE, &PLACES);
-        // The folders' names, read off this thread.
-        let mut folders: Vec<String> = self.files.iter().map(|f| f.folder.clone()).collect();
-        folders.sort_unstable_by_key(|f| f.to_lowercase());
-        folders.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        // The folders' names, read (and sorted) off this thread.
+        let folders: Vec<String> = self.files.iter().map(|f| f.folder.clone()).collect();
         let to = dlg as usize;
         let spawned = std::thread::Builder::new()
             .name("goz-rename-scan".into())
@@ -544,7 +551,21 @@ impl Dlg {
             // SAFETY: a timer of this thread's dialog.
             unsafe { SetTimer(dlg, TIMER_SCAN, SCAN_MS, None) };
         }
-        self.regenerate(dlg);
+        if self.files.len() > MANY {
+            // Many files: the formats and names are made from a message of
+            // their own, the status line saying so meanwhile.
+            self.regenerating.set(true);
+            let z = wz("Working...");
+            // SAFETY: NUL-terminated text for this thread's static, and a
+            // post to this thread's dialog.
+            unsafe {
+                SetWindowTextW(item(dlg, ID_STATUS), z.as_ptr());
+                PostMessageW(dlg, WM_REGENERATE, 0, 0);
+            }
+            enable(dlg, OK, false);
+        } else {
+            self.regenerate(dlg);
+        }
     }
 
     /// The formats made from the files, as Everything makes them when it
@@ -639,6 +660,9 @@ impl Dlg {
     /// are made again first: the typing a moment ago may not be in them yet
     /// (many files wait for it to stop).
     fn ok(&self, dlg: HWND) -> bool {
+        if self.regenerating.get() {
+            return false;
+        }
         // SAFETY: a timer of this thread's dialog; a missing one is fine.
         unsafe { KillTimer(dlg, TIMER_RECOMPUTE) };
         self.recompute(dlg);
@@ -654,7 +678,7 @@ impl Dlg {
         {
             return false;
         }
-        let renames: Vec<(Vec<u16>, Vec<u16>)> = self
+        let mut renames: Vec<(Vec<u16>, Vec<u16>)> = self
             .files
             .iter()
             .zip(&p.new)
@@ -663,6 +687,8 @@ impl Dlg {
                 (new != f.name).then(|| (f.path.clone(), new.encode_utf16().collect()))
             })
             .collect();
+        // A folder and what it holds may both be renamed: the folder last.
+        rename::children_first(&mut renames);
         if !renames.is_empty() {
             *self.out.borrow_mut() = Some(Chosen {
                 options,
@@ -957,11 +983,22 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 Box::from_raw(l as *mut Scan)
             };
             *s.scan.borrow_mut() = Some(*scan);
-            s.recompute(dlg);
+            // The first names, still to be made, take the scan into
+            // account then.
+            if !s.regenerating.get() {
+                s.recompute(dlg);
+            }
             1
         }
         WM_RECOMPUTE => {
             s.recompute(dlg);
+            1
+        }
+        WM_REGENERATE => {
+            if s.regenerating.replace(false) {
+                s.regenerate(dlg);
+                s.focus_new(dlg);
+            }
             1
         }
         WM_FORMAT_MENU => {

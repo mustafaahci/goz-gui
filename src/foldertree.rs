@@ -373,6 +373,14 @@ pub fn roots(labels: bool, shown: Shown) -> Vec<Root> {
 /// `name` as folder names are told apart (NTFS's way: case aside, letter by
 /// letter): each letter upper-cased where that gives one letter.
 pub fn fold(name: &[u16]) -> String {
+    // Most names are ASCII: the same letters, without asking each one's
+    // upper case of the Unicode tables.
+    if name.iter().all(|&c| c < 0x80) {
+        return name
+            .iter()
+            .map(|&c| char::from((c as u8).to_ascii_uppercase()))
+            .collect();
+    }
     char::decode_utf16(name.iter().copied())
         .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
         .map(|c| {
@@ -388,6 +396,65 @@ pub fn fold(name: &[u16]) -> String {
 /// Whether two folder names name the same folder.
 pub fn same_name(a: &[u16], b: &[u16]) -> bool {
     a.len() == b.len() && fold(a) == fold(b)
+}
+
+/// The most subfolders of one folder the Folders pane puts in its tree;
+/// an item after them counts the others. A tree view takes its items out
+/// again (closing, refreshing) in time that grows faster than their
+/// number, and a folder of more than this is not browsed as a tree.
+pub const CAP: usize = 1000;
+
+/// Which of `found` (a folder's subfolders, in order) go in the tree: the
+/// first `cap`, and past them each one of the names `wanted` (the folders
+/// the tree shows under it already, the one it is to show), in their
+/// order; and how many are left out.
+pub fn capped(found: Vec<Folder>, cap: usize, wanted: &[&[u16]]) -> (Vec<Folder>, usize) {
+    if found.len() <= cap {
+        return (found, 0);
+    }
+    let first: std::collections::HashSet<String> =
+        found[..cap].iter().map(|f| fold(&f.name)).collect();
+    // The wanted names not among the first: few (usually none), each
+    // looked for in the rest by its length first.
+    let missing: Vec<(usize, String)> = wanted
+        .iter()
+        .map(|w| (w.len(), fold(w)))
+        .filter(|(_, w)| !first.contains(w))
+        .collect();
+    let total = found.len();
+    let mut out = Vec::with_capacity(cap + missing.len());
+    for (i, f) in found.into_iter().enumerate() {
+        let keep = i < cap
+            || (missing.iter().any(|(len, _)| *len == f.name.len()) && {
+                let name = fold(&f.name);
+                missing.iter().any(|(_, m)| *m == name)
+            });
+        if keep {
+            out.push(f);
+        }
+    }
+    let left_out = total - out.len();
+    (out, left_out)
+}
+
+/// The name under folder `path` on the way down to the folder `target`;
+/// `None` unless `target` is inside `path`.
+pub fn next_name<'a>(target: &'a [u16], path: &[u16]) -> Option<&'a [u16]> {
+    let k = path.len();
+    if k == 0 || target.len() <= k || !same_name(&target[..k], path) {
+        return None;
+    }
+    // A drive's root ends with its backslash already.
+    let rest = if path[k - 1] == BACKSLASH {
+        &target[k..]
+    } else if target[k] == BACKSLASH {
+        &target[k + 1..]
+    } else {
+        return None;
+    };
+    rest.split(|&c| c == BACKSLASH)
+        .next()
+        .filter(|name| !name.is_empty())
 }
 
 /// One step of turning a folder's listed subfolders into a new listing:
@@ -563,6 +630,52 @@ mod tests {
             protected: true,
         };
         assert!(!odd.shows(protected));
+    }
+
+    #[test]
+    fn folders_past_the_cap_are_counted_unless_wanted() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let found: Vec<Folder> = (0..10)
+            .map(|i| Folder {
+                name: w(&format!("f{i}")),
+                has_folders: None,
+                icon: None,
+            })
+            .collect();
+        let names = |v: &[Folder]| {
+            v.iter()
+                .map(|f| String::from_utf16_lossy(&f.name))
+                .collect::<Vec<_>>()
+        };
+        // Under the cap: all of them.
+        let (all, left) = capped(found.clone(), 10, &[]);
+        assert_eq!((all.len(), left), (10, 0));
+        // Over it: the first, and a wanted one past them (any case), in
+        // their order; one wanted among the first changes nothing.
+        let (some, left) = capped(found.clone(), 3, &[&w("F7"), &w("f1"), &w("gone")]);
+        assert_eq!(names(&some), ["f0", "f1", "f2", "f7"]);
+        assert_eq!(left, 6);
+        let (some, left) = capped(found, 3, &[]);
+        assert_eq!((some.len(), left), (3, 7));
+    }
+
+    #[test]
+    fn the_name_on_the_way_down() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let t = w(r"C:\Windows\WinSxS\amd64_x");
+        assert_eq!(next_name(&t, &w(r"C:\")), Some(&w("Windows")[..]));
+        assert_eq!(next_name(&t, &w(r"c:\windows")), Some(&w("WinSxS")[..]));
+        assert_eq!(
+            next_name(&t, &w(r"C:\Windows\WinSxS")),
+            Some(&w("amd64_x")[..])
+        );
+        assert_eq!(next_name(&t, &t), None);
+        assert_eq!(next_name(&t, &w(r"C:\Win")), None);
+        assert_eq!(next_name(&t, &w(r"D:\")), None);
+        // Folded names match whatever the case; non-ASCII too.
+        assert!(same_name(&w("WinSxS"), &w("winsxs")));
+        assert!(same_name(&w("Ärger"), &w("äRGER")));
+        assert_eq!(fold(&w("abc-Z")), "ABC-Z");
     }
 
     #[test]

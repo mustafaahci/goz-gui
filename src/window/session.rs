@@ -101,6 +101,13 @@ impl Sessions {
     pub(super) fn at_start(&self) -> Option<Session> {
         self.restore_first.then(|| self.previous.clone()).flatten()
     }
+
+    /// This window starts as the settings say, whatever
+    /// `session_store_restore_on_first_new_window` says: it is not the
+    /// first window. (Restore Previous Session still has the session.)
+    pub(super) fn not_first(&mut self) {
+        self.restore_first = false;
+    }
 }
 
 /// The settings a window starts with when it starts as `s` left it: its

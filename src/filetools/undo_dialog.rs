@@ -15,12 +15,13 @@ use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::UI::Controls::{
     HDF_SORTDOWN, HDF_SORTUP, HDI_FORMAT, HDITEMW, HDM_GETITEMW, HDM_SETITEMW, LVIF_TEXT,
     LVIS_FOCUSED, LVIS_SELECTED, LVM_GETHEADER, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVN_COLUMNCLICK, LVN_GETDISPINFOW,
-    LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW, LVN_ODSTATECHANGED, LVNI_SELECTED,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP, LVS_EX_LABELTIP,
-    LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NM_CUSTOMDRAW, NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW,
-    NMLVDISPINFOW, NMLVKEYDOWN,
+    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVN_COLUMNCLICK,
+    LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW, LVN_ODSTATECHANGED,
+    LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP,
+    LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NM_CUSTOMDRAW, NMHDR,
+    NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN,
 };
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, IsWindowEnabled, VK_CONTROL,
 };
@@ -28,9 +29,10 @@ use windows_sys::Win32::UI::Shell::SetWindowSubclass;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST,
     DM_SETDEFID, DWLP_MSGRESULT, EN_CHANGE, ES_AUTOHSCROLL, EndDialog, GWLP_USERDATA,
-    GetClientRect, GetWindowRect, IDCANCEL, IDOK, MINMAXINFO, MoveWindow, SetWindowLongPtrW,
-    SetWindowTextW, WM_APP, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_NEXTDLGCTL,
-    WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
+    GetClientRect, GetWindowRect, IDCANCEL, IDOK, MINMAXINFO, MoveWindow, SM_CXVSCROLL,
+    SetWindowLongPtrW, SetWindowTextW, WM_APP, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO,
+    WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP,
+    WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::ui::{copy_text, enable, item, send, set_state, units};
@@ -73,6 +75,19 @@ const COLUMNS: [(&str, i32); 6] = [
     ("New Name", 128),
     ("New Path", 128),
 ];
+
+/// The columns' widths when none are kept, for a list `room` pixels wide
+/// inside (at `dpi`): Date and Action as [`COLUMNS`] has them, the names
+/// and paths sharing the rest (none under 64 px at 96 DPI), so that New
+/// Path is not out of view as the dialog opens.
+pub fn fitted_widths(room: i32, dpi: i32) -> [i32; 6] {
+    let px = |v: i32| v * dpi / 96;
+    let (date, action) = (px(COLUMNS[0].1), px(COLUMNS[1].1));
+    let rest = (room - date - action).max(4 * px(64));
+    let each = rest / 4;
+    // What dividing leaves goes to the last.
+    [date, action, each, each, each, rest - 3 * each]
+}
 
 /// One row: an item of a record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,6 +235,22 @@ pub fn run(owner: HWND, host: &dyn Host, look: Look) {
     t.run(owner, Some(dialog_proc), (&raw const state) as LPARAM);
 }
 
+/// Gives `list`'s columns [`fitted_widths`] for its width now, leaving
+/// room for the vertical scroll bar that rows bring.
+fn fit_columns(list: HWND) {
+    let mut rc = RECT::default();
+    // SAFETY: reads this thread's list's size, DPI and the scroll bar's
+    // width at that DPI.
+    let (dpi, bar) = unsafe {
+        GetClientRect(list, &mut rc);
+        let dpi = GetDpiForWindow(list).max(96);
+        (dpi as i32, GetSystemMetricsForDpi(SM_CXVSCROLL, dpi))
+    };
+    for (i, w) in fitted_widths(rc.right - bar, dpi).into_iter().enumerate() {
+        send(list, LVM_SETCOLUMNWIDTH, i, w as isize);
+    }
+}
+
 impl Dlg<'_> {
     fn list(dlg: HWND) -> HWND {
         item(dlg, ID_LIST)
@@ -247,8 +278,12 @@ impl Dlg<'_> {
         // SAFETY: reads this thread's dialog.
         unsafe { GetWindowRect(dlg, &mut wr) };
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
+        let kept = places::columns_kept(Which::UndoHistory);
         places::restore(dlg, Which::UndoHistory, list, self.min.get());
         self.layout(dlg);
+        if !kept {
+            fit_columns(list);
+        }
         send(dlg, DM_SETDEFID, usize::from(ID_UNDO), 0);
         self.show_arrow(dlg);
         self.refill(dlg);
@@ -560,6 +595,22 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn the_columns_fit_the_list_as_it_opens() {
+        // The list as the dialog opens at 100 % (608 px inside), less a
+        // scroll bar: every column in view, Date and Action as given.
+        let w = fitted_widths(591, 96);
+        assert_eq!(w.iter().sum::<i32>(), 591);
+        assert_eq!((w[0], w[1]), (128, 96));
+        assert!(w[2..].iter().all(|&c| c >= 91));
+        // 150 %.
+        let w = fitted_widths(887, 144);
+        assert_eq!(w.iter().sum::<i32>(), 887);
+        assert_eq!((w[0], w[1]), (192, 144));
+        // Too narrow: the names and paths keep 64 px (at 96 DPI) each.
+        assert_eq!(fitted_widths(100, 96)[2..], [64, 64, 64, 64]);
     }
 
     #[test]

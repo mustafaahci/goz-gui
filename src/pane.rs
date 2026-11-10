@@ -10,7 +10,9 @@
 //! darker while held (it acts on release over itself). Every message the
 //! framework does not take (the content's controls' WM_COMMAND, WM_NOTIFY
 //! and WM_CTLCOLOR*, timers, the keyboard while the pane window itself has
-//! the focus, ...) goes to the content first.
+//! the focus, ...) goes to the content first; the mouse's moves and leaving
+//! (and a capture lost) go to both, so a content can light a button it
+//! paints.
 //!
 //! Re-entrancy: the content is an `Rc<dyn PaneContent>` whose methods take
 //! `&self`. The framework holds no borrow of its own state while it calls
@@ -95,9 +97,12 @@ pub trait PaneContent: Any {
     /// content: the content's controls' WM_COMMAND, WM_NOTIFY,
     /// WM_CTLCOLOR*, WM_DRAWITEM; WM_TIMER; WM_CONTEXTMENU; the keyboard and
     /// WM_SETFOCUS / WM_KILLFOCUS while the pane window itself has the
-    /// focus; the content's own WM_APP+n. `Some` is the answer; `None`
-    /// lets the framework answer (the theme's colours for WM_CTLCOLOR*,
-    /// else DefWindowProc).
+    /// focus; the left button below the title row; the content's own
+    /// WM_APP+n. `Some` is the answer; `None` lets the framework answer
+    /// (the theme's colours for WM_CTLCOLOR*, else DefWindowProc). The
+    /// framework also passes on WM_MOUSEMOVE, WM_MOUSELEAVE (it tracks
+    /// the leaving for its close button: a content asks for it too) and a
+    /// WM_CAPTURECHANGED not its own, and answers those itself.
     fn message(
         &self,
         _app: &App,
@@ -476,12 +481,21 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         let (Some(p), Some(app)) = (state(hwnd), crate::window::app_of(GetParent(hwnd))) else {
             return DefWindowProcW(hwnd, msg, w, l);
         };
+        // The content and the pane's id, owned: a content's handler may
+        // close its own pane (a choice in a menu of its own), which frees
+        // `p` (WM_NCDESTROY) and the window's hold on the content while
+        // the handler runs. This clone keeps the content alive until this
+        // returns, and `p` is not touched after a call to the content.
+        let content = Rc::clone(&p.content);
+        let id = p.id;
         match msg {
             // The content makes its windows as the pane's is made, before
             // any WM_SIZE places them.
             WM_CREATE => {
-                p.content.create(app, hwnd);
-                p.created.set(true);
+                content.create(app, hwnd);
+                if let Some(p) = state(hwnd) {
+                    p.created.set(true);
+                }
                 return 0;
             }
             WM_PAINT => {
@@ -491,7 +505,7 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             WM_ERASEBKGND => return 1,
             WM_SIZE => {
                 if p.created.get() {
-                    p.content.place(app, content_rect(app, hwnd));
+                    content.place(app, content_rect(app, hwnd));
                 }
                 // The close button keeps to the right edge.
                 let title = RECT {
@@ -501,14 +515,17 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 InvalidateRect(hwnd, &title, 0);
                 return 0;
             }
+            // The close button's, then the content's (a button it paints).
             WM_MOUSEMOVE => {
                 mouse_move(app, hwnd, p, point(l));
+                content.message(app, hwnd, msg, w, l);
                 return 0;
             }
             WM_MOUSELEAVE => {
                 if !p.pressed.get() && p.hot.replace(false) {
                     invalidate_close(app, hwnd);
                 }
+                content.message(app, hwnd, msg, w, l);
                 return 0;
             }
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
@@ -524,13 +541,13 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 // no window and does not want the click: the pane takes
                 // the keyboard.
                 if pt.y < title_height(app) {
-                    app.focus_pane(p.id);
+                    app.focus_pane(id);
                     return 0;
                 }
-                if let Some(answer) = p.content.message(app, hwnd, msg, w, l) {
+                if let Some(answer) = content.message(app, hwnd, msg, w, l) {
                     return answer;
                 }
-                app.focus_pane(p.id);
+                app.focus_pane(id);
                 return 0;
             }
             WM_LBUTTONUP if p.pressed.get() => {
@@ -552,18 +569,21 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 if p.pressed.replace(false) {
                     p.hot.set(false);
                     invalidate_close(app, hwnd);
+                } else {
+                    // The content's own press, if it took the mouse.
+                    content.message(app, hwnd, msg, w, l);
                 }
                 return 0;
             }
             WM_SETFOCUS => {
-                if let Some(target) = p.content.focus().filter(|&t| t != hwnd) {
+                if let Some(target) = content.focus().filter(|&t| t != hwnd) {
                     SetFocus(target);
                     return 0;
                 }
             }
             _ => {}
         }
-        if let Some(answer) = p.content.message(app, hwnd, msg, w, l) {
+        if let Some(answer) = content.message(app, hwnd, msg, w, l) {
             return answer;
         }
         match msg {

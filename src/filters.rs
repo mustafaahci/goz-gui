@@ -161,14 +161,11 @@ impl FilterDef {
         self.unsupported().is_empty()
     }
 
-    /// Its Macro column (Organize Filters lists it).
+    /// Its Macro column: kept and written back, not used (goz has no
+    /// search macros).
+    #[cfg(test)]
     pub fn macro_name(&self) -> &str {
         self.other("Macro").map_or("", |f| f.text.as_str())
-    }
-
-    /// Its Key column, Everything's keyboard shortcut number, as text.
-    pub fn key(&self) -> &str {
-        self.other("Key").map_or("", |f| f.text.as_str())
     }
 
     /// The terms it adds in front of the user's search: its search on one
