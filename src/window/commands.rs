@@ -183,10 +183,13 @@ impl App {
             menu::DELETE_PERMANENT => self.delete_selected(true),
             menu::RENAME => self.rename_focused(),
             menu::PASTE => self.paste(),
-            // SAFETY: destroys this thread's window.
-            menu::EXIT => unsafe {
-                DestroyWindow(self.hwnd);
-            },
+            // Every window of this goz-gui ends (File > New Window's
+            // too), as Everything's Exit ends all of its windows.
+            menu::EXIT => {
+                self.exit_other_windows();
+                // SAFETY: destroys this thread's window.
+                unsafe { DestroyWindow(self.hwnd) };
+            }
             menu::SELECT_ALL => {
                 if send(self.list, LVM_GETITEMCOUNT, 0, 0) > 0 {
                     self.set_state(usize::MAX, LVIS_SELECTED, LVIS_SELECTED);

@@ -146,7 +146,8 @@ pub const FRAMEWORK_FIRST: u16 = 3600;
 /// 3800..=3999.
 pub const CUSTOM_FILTER_FIRST: u16 = 3800;
 pub const CUSTOM_FILTERS: usize = 200;
-/// F3's tabs in the tab strip's overflow list, one each: 4000..=4255.
+/// F3's tab entries, one each: History > Recently Closed Tabs' (the strip's
+/// overflow list returns its pick and needs none): 4000..=4255.
 pub const TAB_ENTRY_FIRST: u16 = 4000;
 pub const TAB_ENTRIES: usize = 256;
 /// The size of each feature's range.

@@ -9,7 +9,7 @@
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_ADD, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F4, VK_F5, VK_F6, VK_HOME, VK_INSERT, VK_LEFT,
-    VK_NUMPAD0, VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_RIGHT,
+    VK_NUMPAD0, VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_RIGHT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, CreateAcceleratorTableW, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL,
@@ -87,7 +87,18 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     // F2 (sidebars).
 
     // F3 (tabs and windows).
-
+    // Everything's `file_new_tab_keys=340`, `file_close_tab_keys=343,371`,
+    // `history_restore_recently_closed_tab_keys=1364`,
+    // `file_new_window_keys=334` and `file_close_window_keys=1367` (0x100
+    // Ctrl, 0x400 Shift), and Ctrl+Tab / Ctrl+Shift+Tab (`ctrl_tab_action`).
+    (CTRL, key(b'T'), crate::tabs::NEW_TAB),
+    (CTRL, key(b'W'), crate::tabs::CLOSE_TAB),
+    (CTRL, VK_F4, crate::tabs::CLOSE_TAB),
+    (CTRL | SHIFT, key(b'T'), crate::tabs::REOPEN_TAB),
+    (CTRL, VK_TAB, crate::tabs::NEXT_TAB),
+    (CTRL | SHIFT, VK_TAB, crate::tabs::PREV_TAB),
+    (CTRL, key(b'N'), crate::tabs::NEW_WINDOW),
+    (CTRL | SHIFT, key(b'W'), crate::tabs::CLOSE_WINDOW),
     // F4 (search tools).
 
     // F5 (file tools).
@@ -275,6 +286,20 @@ mod tests {
                 .iter()
                 .any(|&(m, k, _)| m == NONE && k == VK_ESCAPE)
         );
+    }
+
+    #[test]
+    fn tab_and_window_keys() {
+        // Everything's INI values, less 0x100 (Ctrl) and 0x400 (Shift).
+        let has = |m: u8, vk: u16, cmd: u16| ACCELERATORS.contains(&(m, vk, cmd));
+        assert!(has(CTRL, 340 - 0x100, crate::tabs::NEW_TAB));
+        assert!(has(CTRL, 343 - 0x100, crate::tabs::CLOSE_TAB));
+        assert!(has(CTRL, 371 - 0x100, crate::tabs::CLOSE_TAB));
+        assert!(has(CTRL | SHIFT, 1364 - 0x500, crate::tabs::REOPEN_TAB));
+        assert!(has(CTRL, 334 - 0x100, crate::tabs::NEW_WINDOW));
+        assert!(has(CTRL | SHIFT, 1367 - 0x500, crate::tabs::CLOSE_WINDOW));
+        assert!(has(CTRL, VK_TAB, crate::tabs::NEXT_TAB));
+        assert!(has(CTRL | SHIFT, VK_TAB, crate::tabs::PREV_TAB));
     }
 
     #[test]

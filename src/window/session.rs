@@ -2,18 +2,21 @@
 //! looks like and shows, saved so History > Restore Previous Session can
 //! bring it back.
 //!
-//! - **Saved**: the window's place, theme, On Top and status bar; the
-//!   search with its options and sort; the row at the top of the list; the
-//!   selected and focused files by path; Back and Forward's entries. The
+//! - **Saved**: the window's place, theme, On Top and status bar; and each
+//!   tab (`tabs.rs`): the search with its options and sort, the view and
+//!   columns, the row at the top of the list, the selected and focused
+//!   files by path, Back and Forward's entries; and the tabs closed. The
 //!   store thread writes it at most every `session_store_save_delay` ms
 //!   (15 s) while it changes, and at exit. `session_store=0` turns all of
 //!   it off (nothing read or written, no menu item).
 //! - **Restored**: the session read at startup (the last one any goz-gui
-//!   wrote) on History > Restore Previous Session, or as the window starts
-//!   with `session_store_restore_on_first_new_window=1`. The search runs
-//!   again; when its first rows come the list scrolls to the saved row and
-//!   the saved files are selected again as their rows arrive (the refresh's
-//!   `Reselect`), so a file now elsewhere in the results is still found.
+//!   wrote) on History > Restore Previous Session (its tabs take the place
+//!   of the window's, which can be reopened), or as the window starts with
+//!   `session_store_restore_on_first_new_window=1`. The shown tab's search
+//!   runs again; when its first rows come the list scrolls to the saved row
+//!   and the saved files are selected again as their rows arrive (the
+//!   refresh's `Reselect`), so a file now elsewhere in the results is still
+//!   found. The other tabs do the same when they are shown.
 //! - **Several goz-gui windows**: each writes its own session, so the file
 //!   holds the window written last, which is the last one closed.
 
@@ -100,9 +103,11 @@ impl Sessions {
     }
 }
 
-/// The settings a window starts with when it starts as `s` left it.
+/// The settings a window starts with when it starts as `s` left it: its
+/// shown tab's search, view and columns.
 pub(super) fn start_settings(base: &Settings, s: &Session) -> Settings {
-    let search = &s.view.search;
+    let tab = s.view();
+    let search = &tab.search;
     Settings {
         window: s.window.or(base.window),
         maximized: s.maximized,
@@ -114,6 +119,8 @@ pub(super) fn start_settings(base: &Settings, s: &Session) -> Settings {
         match_path: search.match_path,
         filter: search.filter,
         sort: search.sort,
+        view: tab.display.unwrap_or(base.view),
+        columns: tab.columns.unwrap_or(base.columns),
         ..base.clone()
     }
 }
@@ -177,6 +184,24 @@ impl App {
     /// The window as it is now.
     fn current_session(&self) -> Session {
         let (window, maximized) = self.placement_now();
+        let (tabs, current, closed) = self.session_tabs();
+        Session {
+            window,
+            maximized,
+            on_top: self.on_top.get(),
+            theme: self.theme_mode(),
+            status_bar: self.status_bar_visible(),
+            tabs,
+            current,
+            closed,
+        }
+    }
+
+    /// The tab shown, as it is now: its search, view and columns, place
+    /// and selection, and navigation history.
+    pub(super) fn current_view(&self) -> View {
+        // The columns as the user last dragged them.
+        self.sync_columns();
         let (nav, nav_index) = {
             let nav = self.nav.borrow();
             (
@@ -185,20 +210,15 @@ impl App {
             )
         };
         let (top, focus, selection) = self.place_now();
-        Session {
-            window,
-            maximized,
-            on_top: self.on_top.get(),
-            theme: self.theme_mode(),
-            status_bar: self.status_bar_visible(),
-            view: View {
-                search: self.nav_state().to_search(),
-                top,
-                focus,
-                selection,
-                nav,
-                nav_index,
-            },
+        View {
+            search: self.nav_state().to_search(),
+            top,
+            focus,
+            selection,
+            nav,
+            nav_index,
+            display: Some(self.view()),
+            columns: Some(self.layout.get()),
         }
     }
 
@@ -272,8 +292,9 @@ impl App {
         }
     }
 
-    /// Makes the window what `s` describes: its place, look, search,
-    /// scroll position, selection and navigation history.
+    /// Makes the window what `s` describes: its place and look, and its
+    /// tabs (`tabs.rs`) with the shown one's search, scroll position,
+    /// selection and navigation history.
     fn restore_session(&self, s: &Session) {
         self.restore_placement(s.window, s.maximized);
         if self.theme_mode() != s.theme {
@@ -285,10 +306,39 @@ impl App {
         if self.status_bar_visible() != s.status_bar {
             self.set_status_bar_visible(s.status_bar);
         }
-        // Shown as Back shows an entry (no entry is made), then the saved
-        // entries take the place of this window's.
-        self.restore(&NavState::from_search(&s.view.search));
-        self.begin_view(&s.view);
+        self.restore_session_tabs(s);
+    }
+
+    /// Shows `view` as the window's: its view and columns (a tab that keeps
+    /// none, from Everything's session or an older one, the settings'),
+    /// then its search as Back shows an entry (no entry is made), its
+    /// navigation entries in place of the window's, and its place and
+    /// selection once its rows come.
+    pub(super) fn show_view(&self, view: &View) {
+        let (base_columns, base_display) = {
+            let p = self.prefs.borrow();
+            (p.base.columns, p.base.view)
+        };
+        let columns = view.columns.unwrap_or(base_columns);
+        self.sync_columns();
+        if columns != self.layout.get() {
+            self.apply_columns(columns);
+            self.settings_changed();
+        }
+        let old = self.view();
+        let display = view.display.unwrap_or(base_display);
+        if display != old {
+            self.view.set(display);
+            // Details stays Details (only the size its button goes back
+            // to changes); any thumbnails are put on the list afresh.
+            if old.thumbnails || display.thumbnails {
+                self.put_view();
+            }
+            self.settings_changed();
+            self.invalidate_status();
+        }
+        self.restore(&NavState::from_search(&view.search));
+        self.begin_view(view);
     }
 
     /// The search just started (the one in `view`) is to show as `view`
@@ -327,6 +377,10 @@ impl App {
     /// the list scrolls to the saved row, and the saved files are selected
     /// again as their rows arrive.
     pub(super) fn apply_view(&self, view: PendingView, total: u64) {
+        // A tab's rows are in: the list, frozen while they came (`tabs.rs`),
+        // takes its new size before it scrolls, and paints once this is
+        // done.
+        self.thaw_list();
         self.quietly(|| self.clear_selection());
         if total > 0 && self.view().thumbnails {
             // Rows of cells, not of the rows' height: the saved item in
@@ -352,7 +406,7 @@ impl App {
     /// maximizes it or not, never activating it: a window in the
     /// background that is to be maximized stays as it is and is saved as
     /// maximized until the user changes its state, as at startup.
-    fn restore_placement(&self, pos: Option<WindowPos>, maximized: bool) {
+    pub(super) fn restore_placement(&self, pos: Option<WindowPos>, maximized: bool) {
         let monitors = placement::monitors();
         let rect = pos.and_then(|w| placement::fit(&w, &monitors));
         // SAFETY: reads and places this thread's window; the struct lives
@@ -447,19 +501,31 @@ mod tests {
             on_top: OnTop::Always,
             theme: ThemeMode::Dark,
             status_bar: false,
-            view: View {
-                search: Search {
-                    text: "*.dll".into(),
-                    match_case: true,
-                    match_path: true,
-                    filter: Filter::Audio,
-                    sort: SortSpec {
-                        key: SortKey::Size,
-                        dir: SortDir::Asc,
+            tabs: vec![
+                View {
+                    search: Search {
+                        text: "other tab".into(),
+                        ..Search::default()
                     },
+                    display: Some(crate::view::View::thumbnails(64)),
+                    ..View::default()
                 },
-                ..View::default()
-            },
+                View {
+                    search: Search {
+                        text: "*.dll".into(),
+                        match_case: true,
+                        match_path: true,
+                        filter: Filter::Audio,
+                        sort: SortSpec {
+                            key: SortKey::Size,
+                            dir: SortDir::Asc,
+                        },
+                    },
+                    ..View::default()
+                },
+            ],
+            current: 1,
+            closed: Vec::new(),
         };
         let start = start_settings(&base, &s);
         assert_eq!(start.search, "*.dll");
@@ -472,9 +538,20 @@ mod tests {
         );
         // No rectangle in the session: the settings' one.
         assert_eq!(start.window, base.window);
-        // What a session does not hold stays the settings'.
+        // What a session does not hold stays the settings' (the shown tab
+        // keeps no view or columns here; the other tab's are not taken).
         assert_eq!(start.columns, base.columns);
+        assert_eq!(start.view, base.view);
         assert_eq!(start.home, base.home);
+        // The shown tab's view and columns when it keeps them.
+        let mut columns = crate::columns::Layout::default();
+        columns.hide(crate::columns::COL_SIZE);
+        let mut kept = s.clone();
+        kept.tabs[1].display = Some(crate::view::View::thumbnails(256));
+        kept.tabs[1].columns = Some(columns);
+        let start = start_settings(&base, &kept);
+        assert_eq!(start.view, crate::view::View::thumbnails(256));
+        assert_eq!(start.columns, columns);
         let placed = Session {
             window: Some(WindowPos {
                 x: 50,

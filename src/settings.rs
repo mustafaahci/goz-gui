@@ -328,7 +328,9 @@ pub struct Settings {
     // F2 (sidebars).
 
     // F3 (tabs and windows).
-
+    /// The tab strip, the tabs' keys and New Window's offset
+    /// (`tabs_always_show`, `tabs_min_wide`, ..., see `crate::tabs`).
+    pub tabs: crate::tabs::TabSettings,
     // F4 (search tools).
 
     // F5 (file tools).
@@ -409,7 +411,7 @@ impl Default for Settings {
             // F2 (sidebars).
 
             // F3 (tabs and windows).
-
+            tabs: crate::tabs::TabSettings::default(),
             // F4 (search tools).
 
             // F5 (file tools).
@@ -610,7 +612,7 @@ impl Settings {
             // F2 (sidebars).
 
             // F3 (tabs and windows).
-
+            tabs: crate::tabs::TabSettings::from_keys(|k| ini.get(k)),
             // F4 (search tools).
 
             // F5 (file tools).
@@ -719,6 +721,7 @@ impl Settings {
         // F2 (sidebars).
 
         // F3 (tabs and windows).
+        out.extend(self.tabs.to_keys());
 
         // F4 (search tools).
 
@@ -914,6 +917,14 @@ mod tests {
                 d
             },
             options_page: "History".into(),
+            // F3 (tabs and windows).
+            tabs: crate::tabs::TabSettings {
+                always_show: true,
+                min_wide: 90,
+                max_closed: 5,
+                offset_new_window: false,
+                ..crate::tabs::TabSettings::default()
+            },
         };
         let mut ini = Ini::default();
         for (k, v) in s.to_pairs() {
