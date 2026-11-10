@@ -386,6 +386,33 @@ fn paint(app: &App, hwnd: HWND, p: &PaneWindow) {
     }
 }
 
+/// What shows of the pane, in its colours (the title row's, the content's
+/// background) as soon as it shows: Windows asks for this (WM_ERASEBKGND)
+/// at once as the pane is shown or grows, while the paint (WM_PAINT) comes
+/// later. Left untouched, that part showed white until then: the whole
+/// pane as it opened, a band where it grew.
+fn erase(app: &App, hwnd: HWND, hdc: HDC) {
+    let pal = app.pal.get();
+    let rc = client(hwnd);
+    let title = title_height(app).min(rc.bottom);
+    fill(
+        hdc,
+        &RECT {
+            bottom: rc.top + title,
+            ..rc
+        },
+        pal.header,
+    );
+    fill(
+        hdc,
+        &RECT {
+            top: rc.top + title,
+            ..rc
+        },
+        pal.bg,
+    );
+}
+
 /// The title row `rc`: the header's background and lines, the name, and
 /// the close button.
 fn paint_title(app: &App, hwnd: HWND, p: &PaneWindow, hdc: HDC, rc: &RECT) {
@@ -502,7 +529,10 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 paint(app, hwnd, p);
                 return 0;
             }
-            WM_ERASEBKGND => return 1,
+            WM_ERASEBKGND => {
+                erase(app, hwnd, w as HDC);
+                return 1;
+            }
             WM_SIZE => {
                 if p.created.get() {
                     content.place(app, content_rect(app, hwnd));

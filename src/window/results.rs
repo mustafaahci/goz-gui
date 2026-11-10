@@ -23,6 +23,7 @@
 //! copied meanwhile.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{HWND, POINT};
@@ -153,30 +154,35 @@ impl Fetching {
     }
 }
 
-/// Whether a list notification (LVN_ITEMCHANGED, LVN_ODSTATECHANGED at
-/// `l`) changed which rows are selected, not only the focus.
+/// The rows whose selection a list notification (LVN_ITEMCHANGED,
+/// LVN_ODSTATECHANGED at `l`) changed (`None`: all of them, row -1), and
+/// whether they are selected now; nothing when it changed only the focus,
+/// not which rows are selected.
 ///
 /// # Safety
 /// `l` is the notification's lParam, for a code of the list's.
-pub(super) unsafe fn selection_touched(l: isize) -> bool {
+pub(super) unsafe fn selection_change(l: isize) -> Option<(Option<Range<usize>>, bool)> {
     // SAFETY: each structure starts with the NMHDR its code says it is.
     unsafe {
         let code = (*(l as *const NMHDR)).code;
-        let (old, new) = match code {
+        let (rows, old, new) = match code {
             LVN_ITEMCHANGED => {
                 let nm = &*(l as *const NMLISTVIEW);
                 if nm.uChanged & LVIF_STATE == 0 {
-                    return false;
+                    return None;
                 }
-                (nm.uOldState, nm.uNewState)
+                let row = usize::try_from(nm.iItem).ok();
+                (row.map(|i| i..i + 1), nm.uOldState, nm.uNewState)
             }
             LVN_ODSTATECHANGED => {
                 let nm = &*(l as *const NMLVODSTATECHANGE);
-                (nm.uOldState, nm.uNewState)
+                let from = usize::try_from(nm.iFrom).unwrap_or(0);
+                let to = usize::try_from(nm.iTo).ok()?;
+                (Some(from..to + 1), nm.uOldState, nm.uNewState)
             }
-            _ => return false,
+            _ => return None,
         };
-        (old ^ new) & LVIS_SELECTED != 0
+        ((old ^ new) & LVIS_SELECTED != 0).then_some((rows, new & LVIS_SELECTED != 0))
     }
 }
 
@@ -473,7 +479,7 @@ impl App {
         if moved.is_empty() {
             return;
         }
-        self.quietly(|| {
+        self.in_bulk(|| {
             for &i in &moved {
                 self.set_state(i, 0, LVIS_SELECTED);
             }
@@ -810,6 +816,64 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::UI::Controls::{LVIF_TEXT, LVIS_FOCUSED};
+
+    /// LVN_ITEMCHANGED for `item` (-1: all), as the list sends it.
+    fn item_changed(item: i32, changed: u32, old: u32, new: u32) -> NMLISTVIEW {
+        // SAFETY: NMLISTVIEW is plain data; all-zero is a valid value.
+        let mut nm: NMLISTVIEW = unsafe { core::mem::zeroed() };
+        nm.hdr.code = LVN_ITEMCHANGED;
+        nm.iItem = item;
+        nm.uChanged = changed;
+        nm.uOldState = old;
+        nm.uNewState = new;
+        nm
+    }
+
+    /// `selection_change` of a notification made here.
+    fn read<T>(nm: &T) -> Option<(Option<Range<usize>>, bool)> {
+        // SAFETY: `nm` is a list notification's struct, whose NMHDR's code
+        // says which one.
+        unsafe { selection_change((nm as *const T) as isize) }
+    }
+
+    #[test]
+    fn the_rows_a_notification_selects_or_deselects() {
+        let (sel, foc) = (LVIS_SELECTED, LVIS_FOCUSED);
+        // One row, selected (and focused), then deselected.
+        assert_eq!(
+            read(&item_changed(5, LVIF_STATE, 0, sel | foc)),
+            Some((Some(5..6), true))
+        );
+        assert_eq!(
+            read(&item_changed(5, LVIF_STATE, sel | foc, foc)),
+            Some((Some(5..6), false))
+        );
+        // Every row (-1), as Select All and a clear send it.
+        assert_eq!(
+            read(&item_changed(-1, LVIF_STATE, 0, sel)),
+            Some((None, true))
+        );
+        assert_eq!(
+            read(&item_changed(-1, LVIF_STATE, sel | foc, 0)),
+            Some((None, false))
+        );
+        // The focus alone, or no state at all: no selection change.
+        assert_eq!(read(&item_changed(7, LVIF_STATE, foc, 0)), None);
+        assert_eq!(read(&item_changed(7, LVIF_STATE, sel, sel | foc)), None);
+        assert_eq!(read(&item_changed(7, LVIF_TEXT, 0, sel)), None);
+        // A range (Shift+End), inclusive of its end.
+        // SAFETY: NMLVODSTATECHANGE is plain data; all-zero is valid.
+        let mut od: NMLVODSTATECHANGE = unsafe { core::mem::zeroed() };
+        od.hdr.code = LVN_ODSTATECHANGED;
+        od.iFrom = 100;
+        od.iTo = 199;
+        od.uNewState = sel;
+        assert_eq!(read(&od), Some((Some(100..200), true)));
+        od.uOldState = sel;
+        od.uNewState = 0;
+        assert_eq!(read(&od), Some((Some(100..200), false)));
+    }
 
     #[test]
     fn a_partly_held_selection_is_reported() {

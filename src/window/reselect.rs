@@ -19,12 +19,14 @@
 
 use std::collections::HashSet;
 
+use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::UI::Controls::{
     LVIS_FOCUSED, LVIS_SELECTED, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_GETSELECTIONMARK,
     LVM_SETSELECTIONMARK, LVNI_FOCUSED,
 };
 
 use super::{App, send};
+use crate::pane::PaneEvent;
 
 /// The files a refresh is to select again, by path.
 #[derive(Debug, Default)]
@@ -77,6 +79,14 @@ impl Reselect {
         self.paths.extend(older.paths);
         self.focus = self.focus.take().or(older.focus);
         self.mark = self.mark.take().or(older.mark);
+    }
+
+    /// Every row is selected again (a refresh of a result all of which was
+    /// selected, at its old size): the files need not be sought, only the
+    /// focus and the anchor. Selecting each one again would change nothing
+    /// and cost the list a message a file.
+    fn every_row_selected(&mut self) {
+        self.paths.clear();
     }
 
     /// Everything has been found.
@@ -136,6 +146,31 @@ impl App {
         self.restoring.set(was);
     }
 
+    /// Runs `f`, which changes rows' states one at a time, as goz-gui's own
+    /// change (`quietly`). In icon view the list measures an item's name
+    /// (LVN_GETDISPINFO, then DrawText) on every change of its state, to
+    /// know what to repaint: 0.1 to 0.3 ms an item, so selecting a few
+    /// thousand files again after a refresh or a tab switch held the window
+    /// for a third of a second. Meanwhile it is given no names
+    /// (`disp_info`), which makes that a few microseconds an item; the
+    /// cells it would then repaint are too small for the names drawn here,
+    /// so the whole list repaints once after, and the status bar and the
+    /// panes hear of the changes once.
+    pub(super) fn in_bulk(&self, f: impl FnOnce()) {
+        let was = self.bulk.replace(true);
+        self.quietly(f);
+        self.bulk.set(was);
+        if was {
+            return;
+        }
+        // SAFETY: repaints this thread's list.
+        unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
+        if self.bulk_changed.take() {
+            self.invalidate_status();
+            self.pane_event(PaneEvent::SelectionChanged);
+        }
+    }
+
     /// The selection changed: if the user changed it, files a refresh has
     /// not found yet are not wanted any more.
     pub(super) fn selection_changed(&self) {
@@ -191,14 +226,22 @@ impl App {
     /// row number is cleared, and the files noted in `kept` are selected
     /// again as their rows arrive (`reselect_block`).
     pub(super) fn restore_selection(&self, kept: Kept, total: u64) {
+        let Kept {
+            mut reselect,
+            all_of,
+        } = kept;
+        let all = all_of == Some(total);
         self.quietly(|| {
             self.clear_selection();
-            if kept.all_of == Some(total) {
+            if all {
                 self.set_state(usize::MAX, LVIS_SELECTED, LVIS_SELECTED);
             }
         });
-        if !kept.reselect.is_done() {
-            *self.reselect.borrow_mut() = Some(kept.reselect);
+        if all {
+            reselect.every_row_selected();
+        }
+        if !reselect.is_done() {
+            *self.reselect.borrow_mut() = Some(reselect);
         }
     }
 
@@ -220,10 +263,14 @@ impl App {
         if found.is_empty() {
             return;
         }
+        if !found.selected.is_empty() {
+            self.in_bulk(|| {
+                for &i in &found.selected {
+                    self.set_state(i, LVIS_SELECTED, LVIS_SELECTED);
+                }
+            });
+        }
         self.quietly(|| {
-            for &i in &found.selected {
-                self.set_state(i, LVIS_SELECTED, LVIS_SELECTED);
-            }
             if let Some(i) = found.focus {
                 self.set_state(i, LVIS_FOCUSED, LVIS_FOCUSED);
             }
@@ -322,6 +369,35 @@ mod tests {
         assert_eq!(r.sought(), (Vec::new(), None));
         // Nothing saved: nothing sought.
         assert!(Reselect::sought_again(Vec::new(), None).is_done());
+    }
+
+    #[test]
+    fn with_every_row_selected_again_only_the_place_is_sought() {
+        let mut r = Reselect {
+            paths: [p(r"C:\a"), p(r"C:\b"), p(r"C:\c")].into_iter().collect(),
+            focus: Some(p(r"C:\b")),
+            mark: Some(p(r"C:\a")),
+        };
+        r.every_row_selected();
+        assert!(!r.is_done(), "the focus and the anchor are still sought");
+        let found = find(&mut r, &rows(&[r"C:\a", r"C:\b", r"C:\c"]));
+        assert_eq!(
+            found,
+            Found {
+                selected: Vec::new(),
+                focus: Some(1),
+                mark: Some(0),
+            }
+        );
+        assert!(r.is_done());
+        // Nothing but files: nothing left to seek.
+        let mut r = Reselect {
+            paths: [p(r"C:\a")].into_iter().collect(),
+            focus: None,
+            mark: None,
+        };
+        r.every_row_selected();
+        assert!(r.is_done());
     }
 
     #[test]

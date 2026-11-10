@@ -329,6 +329,13 @@ pub struct App {
     reselect: RefCell<Option<reselect::Reselect>>,
     /// The list's selection is being changed by goz-gui, not the user.
     restoring: Cell<bool>,
+    /// Rows' states are being changed one by one (`in_bulk`): the list is
+    /// given no names to measure, and whether it reported a change.
+    bulk: Cell<bool>,
+    bulk_changed: Cell<bool>,
+    /// The list's selection as ranges, kept from its notifications
+    /// (`selection.rs`): Invert Selection sets the smaller side.
+    sel: RefCell<crate::selection::Selection>,
     /// The search on screen counts as made (Enter, an action, the list
     /// taking the keyboard, or the text staying put for a moment), and
     /// whether its refusal by gozd has been beeped for.
@@ -408,6 +415,8 @@ pub struct App {
     pub thumbs: Thumbs,
     /// The system's 48 px and 256 px icon lists (HIMAGELIST), once asked.
     big_icons: Cell<[usize; 2]>,
+    /// Their icons not loaded yet, loaded on a thread (`bigicons.rs`).
+    big_loads: crate::bigicons::BigIcons,
     /// The icon view's layout while the list paints (taken as it starts).
     thumb_grid: Cell<Option<thumbview::Grid>>,
     /// The status bar's view button under the mouse.
@@ -1017,6 +1026,9 @@ impl App {
                 enter_pending: Cell::new(false),
                 reselect: RefCell::new(None),
                 restoring: Cell::new(false),
+                bulk: Cell::new(false),
+                bulk_changed: Cell::new(false),
+                sel: RefCell::default(),
                 settled: Cell::new(false),
                 beeped: Cell::new(false),
                 bookmarks: marks,
@@ -1056,6 +1068,7 @@ impl App {
                 view: Cell::new(s.view),
                 thumbs: Thumbs::new(hwnd, WM_THUMB),
                 big_icons: Cell::new([0; 2]),
+                big_loads: crate::bigicons::BigIcons::new(hwnd, thumbview::WM_BIG_ICONS),
                 thumb_grid: Cell::new(None),
                 view_hot: Cell::new(None),
                 docks: RefCell::new(docks::Docks::new(s.docks)),
@@ -1797,6 +1810,10 @@ impl App {
                     self.on_thumb(*reply);
                     0
                 }
+                thumbview::WM_BIG_ICONS => {
+                    self.big_icons_loaded();
+                    0
+                }
                 WM_ACTIVATE => {
                     // Options > Search's "Focus search on activate": the
                     // keyboard goes to the search box, its text selected,
@@ -1987,9 +2004,24 @@ impl App {
                 // Enter and the list's other keys never reach the list's own
                 // handling (list_proc runs them), so no NM_RETURN comes.
                 LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
+                    // Kept as ranges, whoever changed it (`selection.rs`).
+                    let change = results::selection_change(l);
+                    if let Some((rows, on)) = change.clone() {
+                        let mut sel = self.sel.borrow_mut();
+                        match rows {
+                            Some(rows) => sel.set(rows, on),
+                            None => sel.set_all(on),
+                        }
+                    }
+                    if self.bulk.get() {
+                        // Rows changed one by one by goz-gui: reported
+                        // once, after the run (`in_bulk`).
+                        self.bulk_changed.set(true);
+                        return 0;
+                    }
                     // The user chose other rows: an action waiting for the
                     // rows chosen before is not wanted any more.
-                    if !self.restoring.get() && results::selection_touched(l) {
+                    if !self.restoring.get() && change.is_some() {
                         self.cancel_fetch();
                     }
                     self.selection_changed();
@@ -2017,7 +2049,10 @@ impl App {
     }
 
     /// Text for accessibility tools (the list's own type-ahead never runs:
-    /// `list_proc` keeps the typed characters for goz-gui's).
+    /// `list_proc` keeps the typed characters for goz-gui's), and the names
+    /// icon view measures. While rows change state one by one (`in_bulk`)
+    /// there is none: the list would only measure it to invalidate the
+    /// item, and the list repaints whole after.
     fn disp_info(&self, info: &mut NMLVDISPINFOW) {
         if info.item.mask & LVIF_TEXT == 0
             || info.item.pszText.is_null()
@@ -2027,7 +2062,12 @@ impl App {
         }
         let index = info.item.iItem.max(0) as usize;
         let mut text = Vec::new();
-        if let Some(id) = self.column_id(info.item.iSubItem.max(0) as usize) {
+        let column = if self.bulk.get() {
+            None
+        } else {
+            self.column_id(info.item.iSubItem.max(0) as usize)
+        };
+        if let Some(id) = column {
             let m = self.model.borrow();
             if let Some(row) = m.row(index) {
                 copytext::push(row, Field::of_column(id), &mut text);
@@ -2562,7 +2602,13 @@ impl App {
             0
         };
         let count = total.min(i32::MAX as u64) as usize;
+        // The list drops the selection of rows past the end without saying
+        // so, and reports any change it makes to the others: the kept
+        // ranges have the new size before those reports, and are trimmed
+        // to it after.
+        self.sel.borrow_mut().set_count(count);
         send(self.list, LVM_SETITEMCOUNT, count, flags as isize);
+        self.sel.borrow_mut().set_count(count);
     }
 
     fn set_state(&self, index: usize, state: u32, mask: u32) {
