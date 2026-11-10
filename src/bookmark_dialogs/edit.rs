@@ -169,7 +169,7 @@ struct Edit {
 /// Shows the editor titled `title` over `owner` with `fields`; the fields
 /// as the user left them on OK.
 pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fields> {
-    let filter_titles: Vec<&str> = Filter::ALL.iter().map(|f| f.title()).collect();
+    let filter_titles: Vec<&str> = Filter::all().iter().map(|f| f.title()).collect();
     let sort_names: Vec<&str> = SORT_KEYS.iter().map(|&k| sort_name(k)).collect();
     let (filters, _) = choices(&filter_titles, &fields.filter);
     let (sorts, _) = choices(&sort_names, &fields.sort);
@@ -302,7 +302,7 @@ impl Edit {
         fill_combo(dlg, ID_CASE, tri(), tri_index(f.match_case));
         fill_combo(dlg, ID_PATH, tri(), tri_index(f.match_path));
         let no_change = || std::iter::once(NO_CHANGE.to_owned());
-        let filter_titles: Vec<&str> = Filter::ALL.iter().map(|f| f.title()).collect();
+        let filter_titles: Vec<&str> = Filter::all().iter().map(|f| f.title()).collect();
         let (_, at) = choices(&filter_titles, &f.filter);
         fill_combo(
             dlg,

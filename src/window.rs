@@ -109,6 +109,9 @@ mod tabs;
 mod tabstrip;
 
 // F4 (search tools).
+mod custom_filters;
+mod findbar;
+mod tools;
 
 // F5 (file tools).
 
@@ -440,7 +443,8 @@ pub struct App {
     instance_key: RefCell<String>,
     exit_window: Cell<HWND>,
     // F4 (search tools).
-
+    /// The find bar, the find under way, fullscreen.
+    tools: tools::Tools,
     // F5 (file tools).
 
     // F6 (integration and the Options pages).
@@ -1067,7 +1071,7 @@ impl App {
                 instance_key: RefCell::new(String::new()),
                 exit_window: Cell::new(core::ptr::null_mut()),
                 // F4 (search tools).
-
+                tools: tools::Tools::new(),
                 // F5 (file tools).
 
                 // F6 (integration and the Options pages).

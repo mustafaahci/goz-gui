@@ -707,7 +707,7 @@ fn radio(menu: HMENU, ids: &[u16], on: u16) {
 pub fn update(menu: HMENU, s: &State) {
     check(menu, MATCH_CASE, s.match_case);
     check(menu, MATCH_PATH, s.match_path);
-    let filters = Filter::ALL.map(Filter::menu_id);
+    let filters: Vec<u16> = Filter::all().into_iter().map(Filter::menu_id).collect();
     radio(menu, &filters, s.filter.menu_id());
     radio(menu, &[SORT_NAME, SORT_PATH, SORT_SIZE, SORT_DATE], s.sort);
     radio(
@@ -781,15 +781,39 @@ pub fn background_menu() -> HMENU {
     popup(&[Sub("S&ort By", sort_menu()), Cmd(REFRESH, "&Refresh\tF5")])
 }
 
-/// The filter bar's list: every filter, current checked.
+/// The filter bar's list: every filter (the user's after the built-in
+/// ones), current checked.
 pub fn filter_menu(current: Filter) -> HMENU {
     let menu = popup(&[]);
-    for filter in Filter::ALL {
+    // Past the most the menus list (`CUSTOM_FILTERS`), a filter has no id.
+    let all: Vec<Filter> = Filter::all()
+        .into_iter()
+        .filter(|f| f.menu_id() != 0)
+        .collect();
+    for &filter in &all {
         append(menu, &Radio(filter.menu_id(), filter.label()));
     }
-    let filters = Filter::ALL.map(Filter::menu_id);
+    let filters: Vec<u16> = all.into_iter().map(Filter::menu_id).collect();
     radio(menu, &filters, current.menu_id());
     menu
+}
+
+/// Puts the user's own filters (`filters`, each with its menu id and
+/// label, in order) in the Search menu after the built-in ones, in place of
+/// those there before.
+pub fn set_custom_filters(search: HMENU, filters: &[(u16, &str)]) {
+    let range = CUSTOM_FILTER_FIRST..CUSTOM_FILTER_FIRST + CUSTOM_FILTERS as u16;
+    for cmd in range {
+        // SAFETY: deletes an item of this menu by command; a missing one
+        // is reported and ignored.
+        unsafe { DeleteMenu(search, u32::from(cmd), MF_BYCOMMAND) };
+    }
+    let Some(at) = position_of(search, Filter::Video.menu_id()).map(|p| p + 1) else {
+        return;
+    };
+    for (i, &(cmd, label)) in filters.iter().enumerate() {
+        insert(search, at + i as u32, &Radio(cmd, label));
+    }
 }
 
 /// The header's right-click menu, as Everything's: sizing the column

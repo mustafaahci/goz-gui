@@ -8,14 +8,15 @@
 //! the list's own, handled by its subclass through [`list_command`].
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_ADD, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F4, VK_F5, VK_F6, VK_HOME, VK_INSERT, VK_LEFT,
-    VK_NUMPAD0, VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_RIGHT, VK_TAB,
+    VK_ADD, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F11, VK_HOME,
+    VK_INSERT, VK_LEFT, VK_NUMPAD0, VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN,
+    VK_RIGHT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, CreateAcceleratorTableW, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL,
 };
 
-use crate::menu;
+use crate::{menu, searchtools};
 
 const NONE: u8 = 0;
 const CTRL: u8 = FCONTROL;
@@ -29,11 +30,10 @@ const fn key(c: u8) -> u16 {
 /// The window's shortcuts: modifiers, virtual key, command.
 const ACCELERATORS: &[(u8, u16, u16)] = &[
     (CTRL | SHIFT, key(b'Q'), menu::EXIT),
-    // Everything 1.5's three, and 1.4's Ctrl+F.
+    // Everything 1.5's three (Ctrl+F is Edit > Find..., F4's).
     (ALT, key(b'D'), menu::FOCUS_SEARCH),
     (CTRL, key(b'E'), menu::FOCUS_SEARCH),
     (CTRL, key(b'L'), menu::FOCUS_SEARCH),
-    (CTRL, key(b'F'), menu::FOCUS_SEARCH),
     (NONE, VK_F5, menu::REFRESH),
     (CTRL, key(b'1'), menu::SORT_NAME),
     (CTRL, key(b'2'), menu::SORT_PATH),
@@ -100,8 +100,23 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     (CTRL | SHIFT, VK_TAB, crate::tabs::PREV_TAB),
     (CTRL, key(b'N'), crate::tabs::NEW_WINDOW),
     (CTRL | SHIFT, key(b'W'), crate::tabs::CLOSE_WINDOW),
-    // F4 (search tools).
 
+    // F4 (search tools). Everything 1.5's `edit_find_keys=326` (Ctrl+F),
+    // `edit_find_next_keys=114` (F3), `edit_find_previous_keys=1138`
+    // (Shift+F3), `edit_go_to_keys=327` (Ctrl+G),
+    // `search_organize_filters_keys=1355` (Ctrl+Shift+K),
+    // `view_fullscreen_keys=122` (F11), `view_window_size_*_keys=561..564`
+    // (Alt+1..4).
+    (CTRL, key(b'F'), searchtools::FIND),
+    (NONE, VK_F3, searchtools::FIND_NEXT),
+    (SHIFT, VK_F3, searchtools::FIND_PREVIOUS),
+    (CTRL, key(b'G'), searchtools::GO_TO),
+    (CTRL | SHIFT, key(b'K'), searchtools::ORGANIZE_FILTERS),
+    (NONE, VK_F11, searchtools::FULLSCREEN),
+    (ALT, key(b'1'), searchtools::WINDOW_SMALL),
+    (ALT, key(b'2'), searchtools::WINDOW_MEDIUM),
+    (ALT, key(b'3'), searchtools::WINDOW_LARGE),
+    (ALT, key(b'4'), searchtools::WINDOW_AUTO_FIT),
     // F5 (file tools).
 
     // F6 (integration).
@@ -308,6 +323,29 @@ mod tests {
         // Everything's Tools > Run History... (`tools_run_history_keys=330`:
         // Ctrl+J).
         assert!(ACCELERATORS.contains(&(CTRL, key(b'J'), menu::RUN_HISTORY)));
+    }
+
+    #[test]
+    fn search_tools_keys() {
+        // Everything's: 0x100 Ctrl, 0x200 Alt, 0x400 Shift.
+        let has = |code: u16, cmd: u16| {
+            let m = (if code & 0x100 != 0 { CTRL } else { NONE })
+                | (if code & 0x200 != 0 { ALT } else { NONE })
+                | (if code & 0x400 != 0 { SHIFT } else { NONE });
+            ACCELERATORS.contains(&(m, code & 0xff, cmd))
+        };
+        assert!(has(326, searchtools::FIND));
+        assert!(has(114, searchtools::FIND_NEXT));
+        assert!(has(1138, searchtools::FIND_PREVIOUS));
+        assert!(has(327, searchtools::GO_TO));
+        assert!(has(1355, searchtools::ORGANIZE_FILTERS));
+        assert!(has(122, searchtools::FULLSCREEN));
+        assert!(has(561, searchtools::WINDOW_SMALL));
+        assert!(has(562, searchtools::WINDOW_MEDIUM));
+        assert!(has(563, searchtools::WINDOW_LARGE));
+        assert!(has(564, searchtools::WINDOW_AUTO_FIT));
+        // Ctrl+F is the find bar's now, no longer the search box's.
+        assert!(!ACCELERATORS.contains(&(CTRL, key(b'F'), menu::FOCUS_SEARCH)));
     }
 
     #[test]

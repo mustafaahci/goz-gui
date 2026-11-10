@@ -346,7 +346,9 @@ pub struct Settings {
     /// (`tabs_always_show`, `tabs_min_wide`, ..., see `crate::tabs`).
     pub tabs: crate::tabs::TabSettings,
     // F4 (search tools).
-
+    /// The find bar, fullscreen, View > Window Size, Located in...
+    /// (`crate::searchtools`).
+    pub search_tools: crate::searchtools::SearchTools,
     // F5 (file tools).
 
     // F6 (integration and the Options pages).
@@ -431,7 +433,7 @@ impl Default for Settings {
             // F3 (tabs and windows).
             tabs: crate::tabs::TabSettings::default(),
             // F4 (search tools).
-
+            search_tools: crate::searchtools::SearchTools::default(),
             // F5 (file tools).
 
             // F6 (integration and the Options pages).
@@ -635,7 +637,7 @@ impl Settings {
             // F3 (tabs and windows).
             tabs: crate::tabs::TabSettings::from_keys(|k| ini.get(k)),
             // F4 (search tools).
-
+            search_tools: crate::searchtools::SearchTools::from_keys(|k| ini.get(k)),
             // F5 (file tools).
 
             // F6 (integration and the Options pages).
@@ -749,6 +751,7 @@ impl Settings {
         out.extend(self.tabs.to_keys());
 
         // F4 (search tools).
+        out.extend(self.search_tools.to_keys());
 
         // F5 (file tools).
 
@@ -992,6 +995,12 @@ mod tests {
                 rename_stem: crate::ui_options::Tri::Off,
                 ..UiOptions::default()
             },
+            // F4 (search tools).
+            search_tools: crate::searchtools::SearchTools {
+                findbar_visible: true,
+                fullscreen: true,
+                ..crate::searchtools::SearchTools::default()
+            },
         };
         let mut ini = Ini::default();
         for (k, v) in s.to_pairs() {
@@ -1027,6 +1036,8 @@ mod tests {
             "utf8_bom=1",
             "last_export_type=2",
             "left_sidebar_wide=320",
+            "findbar_visible=1",
+            "fullscreen=1",
             "right_sidebar_wide=200",
             "preview_visible=1",
             "preview_side=1",

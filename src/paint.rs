@@ -212,6 +212,8 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                         ImageList_Draw(app.icons.list, icon, hdc, inner.left, y, ILD_TRANSPARENT);
                     }
                     inner.left += cx + app.scale(ICON_GAP);
+                    // The find bar's Highlight All, behind the text.
+                    app.paint_find_matches(hdc, &inner, row.name(), &scratch.name_spans, &fonts);
                     runs(hdc, &inner, row.name(), &scratch.name_spans, &fonts, false);
                 }
                 COL_PATH => runs(
