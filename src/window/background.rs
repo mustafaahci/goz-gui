@@ -175,10 +175,24 @@ impl App {
                 self.tray_menu(pt);
             }
             NIN_SELECT | NIN_KEYSELECT if self.background.get().single_click_tray => {
-                self.toggle_window()
+                self.tray_open(true)
             }
-            WM_LBUTTONDBLCLK if !self.background.get().single_click_tray => self.show_window(),
+            WM_LBUTTONDBLCLK if !self.background.get().single_click_tray => self.tray_open(false),
             _ => {}
+        }
+    }
+
+    /// The tray icon was clicked to open goz-gui (`toggle`: a single click,
+    /// which puts a window in front away again): another window with
+    /// Options > UI's "Create a new window from the system tray", else
+    /// this one.
+    fn tray_open(&self, toggle: bool) {
+        if self.ui().new_window_from_tray {
+            self.open_new_window(true);
+        } else if toggle {
+            self.toggle_window();
+        } else {
+            self.show_window();
         }
     }
 

@@ -7,11 +7,13 @@
 //! `-sort <name>` with `-sort-ascending`/`-sort-descending`,
 //! `-case`/`-nocase`, `-matchpath`/`-nomatchpath`, `-startup` (start in the
 //! background, no window), `-toggle-window`, `-exit` (close the running
-//! goz-gui), `-instance <name>`, `-preview`/`-no-preview` (show or hide the
-//! preview pane), `-new-window` (a window of its own: no hand-over to the
-//! running goz-gui, File > New Window's), and `-x <x>`, `-y <y>`,
-//! `-width <w>`, `-height <h>` (where the window goes, in screen pixels).
-//! Anything else is search text, as if after `-s`.
+//! goz-gui), `-instance <name>`, `-url <goz:link>` (a `goz:` link, see
+//! `crate::url`; it takes the rest of the line), `-preview`/`-no-preview`
+//! (show or hide the preview pane), `-new-window` and `-no-new-window` (a
+//! window of its own, File > New Window's, or the running one whatever
+//! Options > UI says), and `-x <x>`, `-y <y>`, `-width <w>`, `-height <h>`
+//! (where the window goes, in screen pixels). Anything else is search
+//! text, as if after `-s`.
 
 use goz_core::types::{SortDir, SortKey};
 
@@ -38,9 +40,11 @@ pub struct Launch {
     pub instance: Option<String>,
     /// `-preview` / `-no-preview`: show or hide the preview pane.
     pub preview: Option<bool>,
-    /// A window of its own (File > New Window): it starts even while a
-    /// goz-gui of the same data folder runs, and hands nothing over.
-    pub new_window: bool,
+    /// `-new-window` (`Some(true)`): a window of its own (File > New
+    /// Window), not handed to the one running; `-no-new-window`
+    /// (`Some(false)`): handed over even when Options > UI says a start
+    /// opens another window.
+    pub new_window: Option<bool>,
     /// Where the window goes: its left, top, width and height in screen
     /// pixels; each one missing stays as it is.
     pub x: Option<i32>,
@@ -160,7 +164,8 @@ pub fn parse(args: &[String]) -> Result<Launch, String> {
             "instance" => l.instance = Some(value("an instance name")?),
             "preview" => l.preview = Some(true),
             "no-preview" => l.preview = Some(false),
-            "new-window" => l.new_window = true,
+            "new-window" => l.new_window = Some(true),
+            "no-new-window" => l.new_window = Some(false),
             "x" | "y" | "width" | "height" => {
                 let v = value("a number of pixels")?;
                 let n = v
@@ -180,6 +185,23 @@ pub fn parse(args: &[String]) -> Result<Launch, String> {
                     _ => l.height = Some(n),
                 }
             }
+            // A link Windows hands over as `-url "%1"`: all that follows
+            // the switch is the link, so a link holding quotes and spaces
+            // never becomes switches of its own.
+            "url" | "uri" => {
+                if i >= args.len() {
+                    return Err(format!("{arg} needs a goz: link"));
+                }
+                let link = args[i..].join(" ");
+                i = args.len();
+                let u = crate::url::parse(&link)?;
+                l.search = Some(u.search);
+                l.match_case = u.match_case.or(l.match_case);
+                l.match_path = u.match_path.or(l.match_path);
+                l.filter = u.filter.or(l.filter);
+                l.sort = u.sort.or(l.sort);
+                l.dir = u.dir.or(l.dir);
+            }
             _ => return Err(format!("unknown switch: {arg}")),
         }
     }
@@ -191,7 +213,7 @@ pub fn parse(args: &[String]) -> Result<Launch, String> {
 
 /// A sort by Everything's name for it (`Name`, `Path`, `Size`,
 /// `Date Modified`, also written `date-modified` or `dm`), any case.
-fn sort_by_name(name: &str) -> Option<SortKey> {
+pub(crate) fn sort_by_name(name: &str) -> Option<SortKey> {
     let n = name.trim().to_ascii_lowercase().replace(['-', '_'], " ");
     match n.as_str() {
         "dm" | "date modified" | "datemodified" => Some(SortKey::DateModified),
@@ -290,11 +312,11 @@ mod tests {
             "600",
         ])
         .unwrap();
-        assert!(l.new_window && l.places_window() && !l.changes_search());
+        assert!(l.new_window == Some(true) && l.places_window() && !l.changes_search());
         assert_eq!(l.place_over(None), Some((-1900, 40, 800, 600)));
         // Some of them: over the window's own place.
         let l = p(&["-x", "10", "-HEIGHT", "300"]).unwrap();
-        assert!(!l.new_window);
+        assert_eq!(l.new_window, None);
         assert_eq!(l.place_over(None), None);
         assert_eq!(l.place_over(Some((1, 2, 3, 4))), Some((10, 2, 3, 300)));
         assert!(!Launch::default().places_window());
@@ -302,6 +324,33 @@ mod tests {
         assert!(p(&["-x", "left"]).is_err());
         assert!(p(&["-width", "0"]).is_err());
         assert!(p(&["-y"]).is_err());
+    }
+
+    #[test]
+    fn a_goz_link_sets_the_search_and_its_options() {
+        let l = p(&["-url", "goz:*.mp3%20live?case&filter=Audio&sort=size"]).unwrap();
+        assert_eq!(l.search.as_deref(), Some("*.mp3 live"));
+        assert_eq!(l.match_case, Some(true));
+        assert_eq!(l.filter, Some(Filter::Audio));
+        assert_eq!(l.sort, Some(SortKey::Size));
+        assert!(l.changes_search());
+        // Whatever follows is the link's, never a switch: a link broken up
+        // at its quotes and spaces is searched for as it was.
+        let l = p(&["-url", "goz:a", "-exit", "b"]).unwrap();
+        assert!(!l.exit);
+        assert_eq!(l.search.as_deref(), Some("a -exit b"));
+        assert_eq!(p(&["-url"]).unwrap_err(), "-url needs a goz: link");
+        assert!(p(&["-url", "goz:x?regex"]).unwrap_err().contains("regex"));
+        // Switches before it still count.
+        let l = p(&["-new-window", "/URI", "es:x"]).unwrap();
+        assert_eq!((l.new_window, l.search.as_deref()), (Some(true), Some("x")));
+    }
+
+    #[test]
+    fn new_window_switches() {
+        assert_eq!(p(&["-new-window"]).unwrap().new_window, Some(true));
+        assert_eq!(p(&["-no-new-window"]).unwrap().new_window, Some(false));
+        assert_eq!(p(&["x"]).unwrap().new_window, None);
     }
 
     #[test]

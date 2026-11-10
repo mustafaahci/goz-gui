@@ -170,7 +170,8 @@ impl App {
                 // sidebar folder.
                 folder: None,
             },
-            display: Some(self.view()),
+            // Options > Home's view when it fixes one (`home_view=1`).
+            display: Some(home.view.unwrap_or_else(|| self.view())),
             columns: Some(self.layout.get()),
             ..View::default()
         }

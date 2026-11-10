@@ -1049,8 +1049,54 @@ mod tests {
         assert_eq!(new_window_args(None, None), ["-new-window"]);
         // What the window reads back.
         let l = crate::cmdline::parse(&args).expect("parsed");
-        assert!(l.new_window);
+        assert_eq!(l.new_window, Some(true));
         assert_eq!(l.place_over(None), Some((122, -5, 1000, 640)));
         assert_eq!(l.instance.as_deref(), Some("work x"));
+    }
+
+    /// How `CommandLineToArgvW` splits `line`, as the new process will.
+    fn argv(line: &str) -> Vec<String> {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+        let w = crate::wide::wz(line);
+        let mut n = 0;
+        // SAFETY: a NUL-terminated line; the array is read for its `n`
+        // strings, then freed with LocalFree as documented.
+        unsafe {
+            let list = CommandLineToArgvW(w.as_ptr(), &mut n);
+            let out = (0..n as usize)
+                .map(|i| {
+                    let p = *list.add(i);
+                    let len = (0..).take_while(|&j| *p.add(j) != 0).count();
+                    String::from_utf16_lossy(core::slice::from_raw_parts(p, len))
+                })
+                .collect();
+            LocalFree(list.cast());
+            out
+        }
+    }
+
+    #[test]
+    fn arguments_come_back_as_they_were() {
+        let args: Vec<String> = [
+            "-new-window",
+            "plain",
+            "two words",
+            "",
+            r#"say "hi""#,
+            r"C:\Program Files\",
+            r"C:\x\\",
+            r#"a\"b"#,
+            r"\\server\share",
+            "*.mp3 dm:today",
+            "tab\there",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let exe = r"C:\Program Files\goz gui\goz-gui.exe";
+        let back = argv(&command_line(exe, &args));
+        assert_eq!(back[0], exe);
+        assert_eq!(&back[1..], &args[..]);
     }
 }

@@ -91,7 +91,8 @@ fn row_at(app: &App, pt: POINT) -> Option<usize> {
 
 fn set(app: &App, row: Option<usize>) {
     let old = app.hot_row.replace(row);
-    if old == row {
+    // Without Options > View's "Show row mouseover" nothing shows it.
+    if old == row || !app.ui().mouseover {
         return;
     }
     for i in [old, row].into_iter().flatten() {

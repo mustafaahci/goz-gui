@@ -59,18 +59,39 @@ pub struct RowState {
     pub focused: bool,
     /// Under the mouse.
     pub hot: bool,
+    /// One of every other row, shaded (Options > View's "Alternate row
+    /// color").
+    pub alternate: bool,
 }
 
 /// The background of one cell. A selection covers the whole row; otherwise
-/// the sorted column stands out, and the row under the mouse lights up.
+/// the sorted column stands out, the row under the mouse lights up, and
+/// every other row may be shaded.
 pub fn cell_colour(pal: &Palette, state: RowState, sorted: bool) -> u32 {
     match (state.selected, state.focused, state.hot, sorted) {
         (true, true, _, _) => pal.sel,
         (true, false, _, _) => pal.sel_inactive,
         (false, _, true, true) => pal.hover_sort,
         (false, _, true, false) => pal.hover,
+        (false, _, false, true) if state.alternate => pal.alt_sort_bg,
         (false, _, false, true) => pal.sort_bg,
+        (false, _, false, false) if state.alternate => pal.alt_bg,
         (false, _, false, false) => pal.bg,
+    }
+}
+
+/// The state a cell of column `col` is drawn in: the row's, but without
+/// full row select (Options > Results) only the name shows the selection
+/// and the mouse, as the list then selects by the name only.
+pub fn cell_state(state: RowState, col: usize, full_row: bool) -> RowState {
+    if full_row || col == COL_NAME {
+        state
+    } else {
+        RowState {
+            selected: false,
+            hot: false,
+            ..state
+        }
     }
 }
 
@@ -80,25 +101,32 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
     let hdc = dis.hDC;
     let rc = dis.rcItem;
     let pal = app.pal.get();
+    let ui = app.ui();
     let cols = app.column_rects(&rc);
     let state = RowState {
         selected: dis.itemState & ODS_SELECTED != 0,
         // SAFETY: reads this thread's focus.
         focused: unsafe { GetFocus() } == app.list,
-        hot: app.hot_row.get() == Some(index),
+        hot: app.row_is_hot(index),
+        alternate: ui.alternate_rows && index % 2 == 1,
     };
     let sorted = app.sorted_column();
     // The cells, then list background past the last column: a selection
-    // spans the columns only.
+    // spans the columns only (the name only without full row select).
     let mut span = RECT {
         left: rc.right,
         right: rc.left,
         ..rc
     };
+    let mut focus_rc = span;
     for &(col, cell) in cols.iter() {
-        fill(hdc, &cell, cell_colour(&pal, state, col == sorted));
+        let st = cell_state(state, col, ui.full_row_select);
+        fill(hdc, &cell, cell_colour(&pal, st, col == sorted));
         span.left = span.left.min(cell.left);
         span.right = span.right.max(cell.right);
+        if col == COL_NAME {
+            focus_rc = cell;
+        }
     }
     if span.right < rc.right {
         fill(
@@ -109,6 +137,30 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
             },
             pal.bg,
         );
+    }
+    if ui.grid_lines {
+        // A line under the row and one at each column's right edge.
+        fill(
+            hdc,
+            &RECT {
+                top: rc.bottom - 1,
+                ..span
+            },
+            pal.grid,
+        );
+        for &(_, cell) in cols.iter() {
+            fill(
+                hdc,
+                &RECT {
+                    left: cell.right - 1,
+                    ..cell
+                },
+                pal.grid,
+            );
+        }
+    }
+    if ui.full_row_select {
+        focus_rc = span;
     }
     if app.model.borrow().row(index).is_none() {
         app.request_rows(index, index);
@@ -172,7 +224,7 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                 ),
                 COL_SIZE => {
                     if let (false, Some(size)) = (row.is_dir, row.size) {
-                        let text: Vec<u16> = format::size_kb(size).encode_utf16().collect();
+                        let text: Vec<u16> = format::size_cell(size).encode_utf16().collect();
                         runs(hdc, &inner, &text, &[], &fonts, true);
                     }
                 }
@@ -189,8 +241,8 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                 _ => {}
             }
         }
-        if dis.itemState & ODS_FOCUS != 0 && state.focused {
-            DrawFocusRect(hdc, &span);
+        if dis.itemState & ODS_FOCUS != 0 && state.focused && focus_rc.right > focus_rc.left {
+            DrawFocusRect(hdc, &focus_rc);
         }
         SelectObject(hdc, old_font);
     }
@@ -640,7 +692,41 @@ mod tests {
             selected,
             focused,
             hot,
+            alternate: false,
         }
+    }
+
+    #[test]
+    fn alternate_rows_are_shaded_under_the_selection_and_the_mouse() {
+        for pal in [Palette::new(true), Palette::new(false)] {
+            let alt = RowState {
+                alternate: true,
+                ..state(false, true, false)
+            };
+            assert_eq!(cell_colour(&pal, alt, false), pal.alt_bg);
+            assert_eq!(cell_colour(&pal, alt, true), pal.alt_sort_bg);
+            assert_ne!(pal.alt_bg, pal.bg);
+            assert_ne!(pal.alt_sort_bg, pal.sort_bg);
+            // Selection and the mouse win over the shade.
+            let sel = RowState {
+                selected: true,
+                ..alt
+            };
+            assert_eq!(cell_colour(&pal, sel, false), pal.sel);
+            let hot = RowState { hot: true, ..alt };
+            assert_eq!(cell_colour(&pal, hot, true), pal.hover_sort);
+        }
+    }
+
+    #[test]
+    fn without_full_row_select_only_the_name_is_selected() {
+        let s = state(true, true, true);
+        let name = cell_state(s, COL_NAME, false);
+        assert!(name.selected && name.hot);
+        let path = cell_state(s, COL_PATH, false);
+        assert!(!path.selected && !path.hot && path.focused);
+        let path = cell_state(s, COL_PATH, true);
+        assert!(path.selected && path.hot);
     }
 
     #[test]

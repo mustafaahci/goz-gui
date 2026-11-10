@@ -9,7 +9,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::os::windows::io::AsRawHandle;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HWND};
 use windows_sys::Win32::System::Com::{
@@ -394,6 +396,7 @@ fn properties_now(hwnd: HWND, paths: &[Vec<u16>]) {
 /// Properties cannot end with its call, so it has its own thread
 /// ([`properties`]).
 pub fn in_background(f: impl FnOnce() + Send + 'static) {
+    RUNNING.fetch_add(1, Ordering::SeqCst);
     let spawned = std::thread::Builder::new()
         .name("goz-shell".into())
         .spawn(move || {
@@ -409,10 +412,27 @@ pub fn in_background(f: impl FnOnce() + Send + 'static) {
                 // SAFETY: pairs the successful CoInitializeEx above.
                 unsafe { CoUninitialize() };
             }
+            RUNNING.fetch_sub(1, Ordering::SeqCst);
         });
     // Without a thread there is nothing to run it on; the action is lost,
     // as it would be had the shell failed.
-    drop(spawned);
+    if spawned.is_err() {
+        RUNNING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The actions of [`in_background`] still running.
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
+
+/// Waits, up to `limit`, for the actions of [`in_background`] still
+/// running: the process is ending (an open was just handed to the shell
+/// when Options > Results' "Close window on execute" closed the window),
+/// and ending would cut them off.
+pub fn wait_for_launches(limit: Duration) {
+    let end = Instant::now() + limit;
+    while RUNNING.load(Ordering::SeqCst) > 0 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// One ShellExecuteEx. `verb` `None` is the default verb; `wait_ms` waits

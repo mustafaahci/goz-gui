@@ -555,7 +555,8 @@ impl App {
     /// opening. F2 and the menus ask for it (`renaming` names the file);
     /// otherwise it is the list's own slow second click, which renames only
     /// when it was on the name. The box is placed over the name, themed,
-    /// and its name selected without the extension.
+    /// and its name selected without the extension (as Options > Results
+    /// says).
     pub(super) fn begin_rename(&self, index: i32) -> bool {
         let Ok(index) = usize::try_from(index) else {
             return true;
@@ -576,7 +577,9 @@ impl App {
                 self.renaming.borrow_mut().take();
                 return true;
             }
-            None if self.click_on_name(index) => {
+            // With one-click opening (Options > Results) a click opens: a
+            // slow second click renames nothing, as in Explorer then.
+            None if !self.single_click_open() && self.click_on_name(index) => {
                 *self.renaming.borrow_mut() = Some(Renaming {
                     path: path.clone(),
                     text: None,
@@ -629,9 +632,16 @@ impl App {
                 );
             }
         }
-        // After the list selects all of it, which it does once this returns.
+        // After the list selects all of it, which it does once this returns:
+        // the name without its extension, unless Options > Results' "Do
+        // not select extension when renaming" is off.
+        let selected = if self.ui().rename_stem.on() {
+            stem_len(&name, is_dir)
+        } else {
+            name.len()
+        };
         // SAFETY: posts to the box of this thread.
-        unsafe { PostMessageW(edit, EM_SETSEL, 0, stem_len(&name, is_dir) as isize) };
+        unsafe { PostMessageW(edit, EM_SETSEL, 0, selected as isize) };
         false
     }
 

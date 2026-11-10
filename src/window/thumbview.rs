@@ -318,7 +318,8 @@ impl App {
         let state = RowState {
             selected: bits & LVIS_SELECTED != 0,
             focused: list_focused,
-            hot: self.hot_row.get() == Some(index),
+            hot: self.row_is_hot(index),
+            alternate: false,
         };
         let colour = paint::cell_colour(&pal, state, false);
         paint::fill(hdc, &geo.cell, colour);

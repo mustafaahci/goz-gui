@@ -115,6 +115,18 @@ pub(super) struct Kept {
     all_of: Option<u64>,
 }
 
+impl Kept {
+    /// The selection for another search's rows (Options > Results' "Clear
+    /// selection on search" off): its files, never all the rows because
+    /// all of the last search's were.
+    pub(super) fn for_new_search(self) -> Kept {
+        Kept {
+            all_of: None,
+            ..self
+        }
+    }
+}
+
 impl App {
     /// Runs `f`, whose changes to the list's selection are goz-gui's own,
     /// not the user's.

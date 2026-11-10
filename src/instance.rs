@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -56,16 +56,23 @@ pub fn key(instance: Option<&str>) -> String {
 }
 
 /// Takes the instance: true when this goz-gui is the first with `key`. The
-/// mutex is held until the process ends.
+/// mutex is held until the process ends; a goz-gui that is not the first
+/// lets go of it at once, so the instance ends with the first goz-gui
+/// even while another window of the folder (`-new-window`) runs on.
 pub fn claim(key: &str) -> bool {
     static HELD: OnceLock<usize> = OnceLock::new();
     let name = wz(&format!("Local\\{key}"));
-    // SAFETY: a named mutex in this session, never released or closed: the
-    // process holding it is the instance.
+    // SAFETY: a named mutex in this session, never released or closed by
+    // the first: the process holding it is the instance. Another closes
+    // the handle it was given to the existing one.
     unsafe {
         let m: HANDLE = CreateMutexW(core::ptr::null(), 0, name.as_ptr());
         let first = !m.is_null() && GetLastError() != ERROR_ALREADY_EXISTS;
-        let _ = HELD.set(m as usize);
+        if first {
+            let _ = HELD.set(m as usize);
+        } else if !m.is_null() {
+            CloseHandle(m);
+        }
         first
     }
 }

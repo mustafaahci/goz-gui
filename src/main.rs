@@ -86,6 +86,8 @@ mod tabs;
 // F5 (file tools).
 
 // F6 (integration and the Options pages).
+mod ui_options;
+mod url;
 
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,

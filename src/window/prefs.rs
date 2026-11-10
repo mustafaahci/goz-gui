@@ -195,27 +195,20 @@ impl App {
     pub(super) fn save_settings(&self) {
         self.sync_columns();
         let current = self.current_settings();
-        let pairs = current.to_pairs();
+        let pairs = fixed_from_base(current.to_pairs(), &self.prefs.borrow().base, |k| {
+            current.is_fixed(k)
+        });
         let (changes, all, writes) = {
             let mut prefs = self.prefs.borrow_mut();
             let changes: Vec<(String, String)> = pairs
                 .iter()
-                .filter(|(k, v)| !current.is_fixed(k) && prefs.written.get(k) != Some(v))
+                .filter(|(k, v)| prefs.written.get(k) != Some(v))
                 .cloned()
                 .collect();
             for (k, v) in &changes {
                 prefs.written.insert(k.clone(), v.clone());
             }
-            // Keys missing from the file get the value here; a fixed one
-            // the value read.
-            let all: Vec<(String, String)> = pairs
-                .into_iter()
-                .map(|(k, v)| match prefs.written.get(&k) {
-                    Some(read) if current.is_fixed(&k) => (k, read.clone()),
-                    _ => (k, v),
-                })
-                .collect();
-            (changes, all, prefs.writes.clone())
+            (changes, pairs, prefs.writes.clone())
         };
         let Some(writes) = writes else { return };
         // A write that failed left its changes staged: they go out now even
@@ -287,6 +280,33 @@ impl App {
     }
 }
 
+/// The window's settings `pairs`, but for the keys Home holds fixed
+/// (`fixed`), whose value is never the window's: it is Home's, which the
+/// settings read hold, and which only Options > Home changes. So a fixed
+/// key is written when Options > Home changed it, and never because the
+/// window's own search, filter, sort or view did.
+fn fixed_from_base(
+    pairs: Vec<(String, String)>,
+    base: &Settings,
+    fixed: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    if !pairs.iter().any(|(k, _)| fixed(k)) {
+        return pairs;
+    }
+    let home: BTreeMap<String, String> = base
+        .to_pairs()
+        .into_iter()
+        .filter(|(k, _)| fixed(k))
+        .collect();
+    pairs
+        .into_iter()
+        .map(|(k, v)| match home.get(&k) {
+            Some(h) => (k, h.clone()),
+            None => (k, v),
+        })
+        .collect()
+}
+
 /// The wait before the next try after a failed write: twice the last one
 /// (up to a minute) when the failure came from the last try (`since` it
 /// ran: within the time a write may wait for the file, and a little more),
@@ -309,6 +329,43 @@ pub(super) fn writer() -> Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_keys_are_written_from_home_not_the_window() {
+        use crate::store::ini::Ini;
+        // Home holds the search fixed to "base"; the window shows "typed".
+        let base = Settings::from_ini(&Ini::from_text(
+            "home_search=1\r\nsearch=base\r\nfilter=Audio\r\n",
+        ));
+        let window = Settings {
+            search: "typed".into(),
+            ..base.clone()
+        };
+        let pairs = fixed_from_base(window.to_pairs(), &base, |k| window.is_fixed(k));
+        let get = |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("search"), Some("base"));
+        // Keys Home leaves to the last value are the window's.
+        assert_eq!(get("filter"), Some("Audio"));
+        // Options > Home changed the fixed search: that is what goes out.
+        let changed = Settings {
+            search: "new home".into(),
+            ..base.clone()
+        };
+        let pairs = fixed_from_base(window.to_pairs(), &changed, |k| window.is_fixed(k));
+        assert!(pairs.contains(&("search".into(), "new home".into())));
+        // Nothing fixed: the pairs as they were.
+        let free = Settings::from_ini(&Ini::from_text("home_search=0\r\n"));
+        let pairs = free.to_pairs();
+        assert_eq!(
+            fixed_from_base(pairs.clone(), &base, |k| free.is_fixed(k)),
+            pairs
+        );
+    }
 
     #[test]
     fn a_failed_write_is_tried_again_sooner_then_later() {

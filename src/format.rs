@@ -1,6 +1,7 @@
 //! Sizes and dates as the user's locale writes them.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows_sys::Win32::Globalization::{
@@ -8,6 +9,8 @@ use windows_sys::Win32::Globalization::{
     LOCALE_STHOUSAND, TIME_NOSECONDS,
 };
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+
+use crate::ui_options::SizeFormat;
 
 /// One of the user's locale strings, such as a separator, or `default`.
 fn locale_text(kind: u32, default: &str) -> String {
@@ -45,6 +48,33 @@ pub fn grouped(n: u64) -> String {
 /// A file size in whole kilobytes, rounded up: `1,245 KB`.
 pub fn size_kb(bytes: u64) -> String {
     format!("{} KB", grouped(bytes.div_ceil(1024)))
+}
+
+/// Options > View's "Size format" for the Size column, set by the window
+/// (`SizeFormat::number`); the list's rows, its cell tips and the copy
+/// commands all read it.
+static SIZE_FORMAT: AtomicU8 = AtomicU8::new(2);
+
+pub fn set_size_format(f: SizeFormat) {
+    SIZE_FORMAT.store(f.number(), Ordering::Relaxed);
+}
+
+/// A file size as the Size column shows it, in Options > View's format.
+pub fn size_cell(bytes: u64) -> String {
+    let f =
+        SizeFormat::from_number(i64::from(SIZE_FORMAT.load(Ordering::Relaxed))).unwrap_or_default();
+    size_as(bytes, f)
+}
+
+/// A file size in format `f`: `87.2 KB` (Auto), `89,293` (bytes), `88 KB`
+/// (whole kilobytes, rounded up) or `1 MB` (whole megabytes, rounded up).
+pub fn size_as(bytes: u64, f: SizeFormat) -> String {
+    match f {
+        SizeFormat::Auto => size_auto(bytes),
+        SizeFormat::Bytes => grouped(bytes),
+        SizeFormat::Kb => size_kb(bytes),
+        SizeFormat::Mb => format!("{} MB", grouped(bytes.div_ceil(1024 * 1024))),
+    }
 }
 
 /// A byte count in the largest unit that keeps it readable: `215 MB`.
@@ -158,6 +188,27 @@ mod tests {
         assert_eq!(size_kb(1), "1 KB");
         assert_eq!(size_kb(1024), "1 KB");
         assert_eq!(size_kb(1025), "2 KB");
+    }
+
+    #[test]
+    fn sizes_in_each_format() {
+        // Grouped as the user's locale does; "," here for the test.
+        let sep = thousands();
+        let g = |s: &str| s.replace(',', sep);
+        assert_eq!(size_as(89_293, SizeFormat::Kb), g("88 KB"));
+        assert_eq!(size_as(89_293, SizeFormat::Bytes), g("89,293"));
+        assert_eq!(size_as(0, SizeFormat::Bytes), "0");
+        assert_eq!(size_as(1, SizeFormat::Mb), "1 MB");
+        assert_eq!(size_as(0, SizeFormat::Mb), "0 MB");
+        assert_eq!(size_as(5 * 1024 * 1024, SizeFormat::Mb), "5 MB");
+        assert_eq!(size_as(5 * 1024 * 1024 + 1, SizeFormat::Mb), "6 MB");
+        assert_eq!(
+            size_as(3_000_000_000_000, SizeFormat::Mb),
+            g("2,861,023 MB")
+        );
+        assert_eq!(size_as(89_344, SizeFormat::Auto), size_auto(89_344));
+        // The column's format is KB until the window says otherwise.
+        assert_eq!(SizeFormat::default(), SizeFormat::Kb);
     }
 
     #[test]

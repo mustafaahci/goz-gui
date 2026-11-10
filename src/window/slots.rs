@@ -140,7 +140,11 @@ impl App {
             // F5.
             m if (F5_MSG..F5_MSG + MSG_RANGE).contains(&m) => None,
 
-            // F6.
+            // F6: the keyboard to the search box after an activation.
+            super::uiopts::WM_FOCUS_SEARCH => {
+                self.focus_search_activated();
+                Some(0)
+            }
             m if (F6_MSG..F6_MSG + MSG_RANGE).contains(&m) => None,
 
             _ => None,
@@ -170,7 +174,11 @@ impl App {
             // F5.
             t if (F5_TIMER..F5_TIMER + TIMER_RANGE).contains(&t) => false,
 
-            // F6.
+            // F6: the search delay (Options > Search).
+            super::uiopts::TIMER_SEARCH_DELAY => {
+                self.search_delay_done();
+                true
+            }
             t if (F6_TIMER..F6_TIMER + TIMER_RANGE).contains(&t) => false,
 
             _ => false,

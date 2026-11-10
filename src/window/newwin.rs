@@ -45,9 +45,18 @@ impl App {
     }
 
     /// File > New Window (Ctrl+N): another goz-gui window at this one's
-    /// place, offset. It starts after the settings changed here are
-    /// written (on the store thread, in turn), so it starts with them.
+    /// place, offset.
     pub(super) fn new_window(&self) {
+        self.open_new_window(false);
+    }
+
+    /// Another goz-gui window at this one's place, offset. It starts after
+    /// the settings changed here are written (on the store thread, in
+    /// turn), so it starts with them. `asked`: the user asked for it from
+    /// outside this window (a click on the tray icon, with Options > UI's
+    /// "Create a new window from the system tray"), so it comes to the
+    /// front whichever window is there.
+    pub(super) fn open_new_window(&self, asked: bool) {
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(e) => {
@@ -65,10 +74,11 @@ impl App {
         let rect = pos.map(|p| (p.x + dx, p.y + dy, p.width, p.height));
         let instance = self.instance.borrow().clone();
         let args = tabs::new_window_args(rect, instance.as_deref());
-        // Brought to the front when this window is (the user's Ctrl+N);
-        // shown without taking the foreground otherwise.
+        // Brought to the front when this window is (the user's Ctrl+N) or
+        // the tray asked for it; shown without taking the foreground
+        // otherwise.
         // SAFETY: reads the foreground window.
-        let front = unsafe { GetForegroundWindow() } == self.hwnd;
+        let front = asked || unsafe { GetForegroundWindow() } == self.hwnd;
         let show = if std::env::var_os(HIDDEN_VAR).is_some_and(|v| v == "1") {
             SW_HIDE
         } else if front {

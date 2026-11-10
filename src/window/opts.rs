@@ -9,7 +9,9 @@ use crate::settings::Background;
 
 mod general;
 mod history;
+mod home;
 mod keyboard;
+mod results;
 mod search;
 mod ui;
 mod view;
@@ -40,6 +42,8 @@ fn pages() -> Vec<Box<dyn Page>> {
     // F5 (file tools).
 
     // F6 (integration and the Options pages).
+    pages.push(Box::new(home::Home));
+    pages.push(Box::new(results::Results));
 
     pages
 }
