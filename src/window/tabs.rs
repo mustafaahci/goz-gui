@@ -166,6 +166,9 @@ impl App {
                 match_path: h.match_path.unwrap_or(o.match_path),
                 filter: h.filter.unwrap_or(o.filter),
                 sort: h.sort.unwrap_or(o.sort),
+                // Home is the whole index: a new tab has no Folders
+                // sidebar folder.
+                folder: None,
             },
             display: Some(self.view()),
             columns: Some(self.layout.get()),

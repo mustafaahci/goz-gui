@@ -4,8 +4,9 @@
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    DC_BRUSH, DC_PEN, ETO_CLIPPED, ExtTextOutW, GetStockObject, HDC, PtInRect, RoundRect,
-    SelectObject, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
+    DC_BRUSH, DC_PEN, DT_CALCRECT, DT_MODIFYSTRING, DT_NOPREFIX, DT_PATH_ELLIPSIS, DT_SINGLELINE,
+    DrawTextW, ETO_CLIPPED, ExtTextOutW, GetStockObject, HDC, PtInRect, RoundRect, SelectObject,
+    SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::LVM_GETSELECTEDCOUNT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -165,6 +166,41 @@ pub enum Indicator {
     Case,
     Path,
     Filter,
+    /// The Folders pane's folder, which keeps the search inside it.
+    Folder,
+}
+
+/// `text` (a path) cut to `max` px wide in `hdc`'s font with an ellipsis in
+/// its middle, as Explorer shortens paths (`C:\Users\…\Projects`); as it
+/// is when it fits.
+fn elide_path(hdc: HDC, text: &[u16], max: i32) -> Vec<u16> {
+    if width(hdc, text) <= max {
+        return text.to_vec();
+    }
+    // DT_MODIFYSTRING writes the shortened text back, with room for the
+    // ellipsis and its NUL.
+    let mut buf = text.to_vec();
+    buf.extend_from_slice(&[0; 5]);
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: max.max(1),
+        bottom: 1,
+    };
+    // SAFETY: the buffer holds the text and five more units, as
+    // DT_MODIFYSTRING needs.
+    unsafe {
+        DrawTextW(
+            hdc,
+            buf.as_mut_ptr(),
+            text.len() as i32,
+            &mut rc,
+            DT_SINGLELINE | DT_NOPREFIX | DT_PATH_ELLIPSIS | DT_MODIFYSTRING | DT_CALCRECT,
+        );
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    buf.truncate(end);
+    buf
 }
 
 /// What is selected, as the left side describes it.
@@ -276,6 +312,15 @@ pub fn paint(app: &App, hdc: HDC) {
                 indicator: None,
             });
         }
+        // The Folders pane's folder (F2), left of the options: Everything
+        // shows its selection there.
+        if let Some(folder) = app.folder_indicator() {
+            right.push(Part {
+                text: folder,
+                colour: pal.fg,
+                indicator: Some(Indicator::Folder),
+            });
+        }
         for (indicator, text) in app.indicators_on() {
             right.push(Part {
                 text: text.into(),
@@ -369,7 +414,11 @@ pub fn paint(app: &App, hdc: HDC) {
             x_right = buttons[0].1.left - pad;
         }
         for part in right.iter().rev() {
-            let t: Vec<u16> = part.text.encode_utf16().collect();
+            let mut t: Vec<u16> = part.text.encode_utf16().collect();
+            if part.indicator == Some(Indicator::Folder) {
+                // A long folder takes at most a third of the bar.
+                t = elide_path(hdc, &t, (rc.right - rc.left) / 3);
+            }
             let w = width(hdc, &t);
             x_right -= w;
             draw(x_right, &rc, &t, part.colour);

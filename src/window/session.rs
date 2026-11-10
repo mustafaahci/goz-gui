@@ -520,6 +520,7 @@ mod tests {
                             key: SortKey::Size,
                             dir: SortDir::Asc,
                         },
+                        folder: None,
                     },
                     ..View::default()
                 },

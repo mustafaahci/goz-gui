@@ -43,6 +43,7 @@ impl App {
         crate::preview::register(self, preview);
 
         // F2 (sidebars).
+        self.start_sidebars();
 
         // F3 (tabs and windows).
         self.set_strip(
@@ -65,6 +66,7 @@ impl App {
         crate::preview::exit(self);
 
         // F2 (sidebars).
+        self.exit_sidebars();
 
         // F3 (tabs and windows).
 
@@ -101,7 +103,7 @@ impl App {
             3000..=3099 => self.preview_command(id),
 
             // F2: 3100..=3199.
-            3100..=3199 => false,
+            3100..=3199 => self.sidebar_command(id),
 
             // F3: 3200..=3299, and its tab entries 4000..=4255.
             3200..=3299 | 4000..=4255 => self.tab_command(id),

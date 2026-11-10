@@ -416,6 +416,12 @@ pub fn paint_cross(hdc: HDC, cx: i32, cy: i32, arm: f32, scale: f32, fg: u32, bg
     draw(hdc, cx, cy, &strokes, fg, bg);
 }
 
+/// The search box's magnifier, dimmed as it draws it, centred on the pixel
+/// (`cx`, `cy`) over `bg`: the Bookmarks pane's filter box.
+pub fn paint_magnifier(hdc: HDC, cx: i32, cy: i32, scale: f32, fg: u32, bg: u32) {
+    draw(hdc, cx, cy, &magnifier(scale), blend(bg, fg, 0.5), bg);
+}
+
 /// Back's ← (Forward's → when not `back`): a shaft 9 px long at 100 % and
 /// a head 4 px back along each side.
 fn arrow(scale: f32, back: bool) -> Vec<Stroke> {

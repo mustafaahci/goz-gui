@@ -329,7 +329,9 @@ pub struct Settings {
     /// `crate::preview`).
     pub preview: crate::preview::PreviewSettings,
     // F2 (sidebars).
-
+    /// The sidebars' own keys (`folders_sidebar_labels`,
+    /// `bookmarks_sidebar_expanded`, ..., see `crate::sidebars`).
+    pub sidebars: crate::sidebars::Settings,
     // F3 (tabs and windows).
     /// The tab strip, the tabs' keys and New Window's offset
     /// (`tabs_always_show`, `tabs_min_wide`, ..., see `crate::tabs`).
@@ -412,7 +414,7 @@ impl Default for Settings {
             // F1 (preview pane).
             preview: crate::preview::PreviewSettings::default(),
             // F2 (sidebars).
-
+            sidebars: crate::sidebars::Settings::default(),
             // F3 (tabs and windows).
             tabs: crate::tabs::TabSettings::default(),
             // F4 (search tools).
@@ -613,7 +615,7 @@ impl Settings {
             // F1 (preview pane).
             preview: crate::preview::PreviewSettings::from_keys(|k| ini.get(k)),
             // F2 (sidebars).
-
+            sidebars: crate::sidebars::Settings::from_keys(|k| ini.get(k)),
             // F3 (tabs and windows).
             tabs: crate::tabs::TabSettings::from_keys(|k| ini.get(k)),
             // F4 (search tools).
@@ -723,6 +725,7 @@ impl Settings {
         out.extend(self.preview.to_keys());
 
         // F2 (sidebars).
+        out.extend(self.sidebars.to_keys());
 
         // F3 (tabs and windows).
         out.extend(self.tabs.to_keys());
@@ -934,6 +937,13 @@ mod tests {
                 max_closed: 5,
                 offset_new_window: false,
                 ..crate::tabs::TabSettings::default()
+            },
+            // F2 (sidebars).
+            sidebars: crate::sidebars::Settings {
+                clear_on_close: true,
+                match_only_when_shown: false,
+                labels: false,
+                bookmarks_expanded: vec!["Music".into(), "Music/Rock".into()],
             },
         };
         let mut ini = Ini::default();

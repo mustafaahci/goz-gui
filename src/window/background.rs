@@ -282,6 +282,12 @@ impl App {
         let text = l
             .search_text()
             .unwrap_or_else(|| crate::wide::window_text(self.edit));
-        self.navigate(&text, o);
+        if l.path.is_some() {
+            // A folder of its own (Explorer's "Search goz..."): the Folders
+            // pane's goes, or the search would be inside both (F2).
+            self.navigate_to(&text, o, None);
+        } else {
+            self.navigate(&text, o);
+        }
     }
 }

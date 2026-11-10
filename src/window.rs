@@ -98,6 +98,10 @@ mod typing;
 mod preview;
 
 // F2 (sidebars).
+mod bookmarks_pane;
+mod filters_pane;
+mod folders_pane;
+mod sidebars;
 
 // F3 (tabs and windows).
 mod newwin;
@@ -416,7 +420,8 @@ pub struct App {
     // F1 (preview pane).
 
     // F2 (sidebars).
-
+    /// The Folders pane's folder and the search it scopes (`sidebars.rs`).
+    sidebars: sidebars::Sidebars,
     // F3 (tabs and windows).
     /// The window's tabs (`tabs.rs`): the shown one's state is the
     /// window's own; the others are kept as views, and so are the tabs
@@ -993,7 +998,7 @@ impl App {
                 // F1 (preview pane).
 
                 // F2 (sidebars).
-
+                sidebars: sidebars::Sidebars::new(),
                 // F3 (tabs and windows).
                 tabs: RefCell::new(crate::tabs::TabList::new(
                     crate::session::View::default(),
@@ -1540,6 +1545,9 @@ impl App {
                     } else if w as HWND == self.list {
                         self.list_menu(l);
                         0
+                    } else if w as HWND == self.hwnd && self.status_menu(l) {
+                        // The status bar's menu (F2).
+                        0
                     } else {
                         DefWindowProcW(self.hwnd, msg, w, l)
                     }
@@ -2011,7 +2019,8 @@ impl App {
         let text = window_text(self.edit);
         let o = self.opts.get();
         let search = Arc::new(Search {
-            query: filter::query(o.filter, o.match_path, &text),
+            // The Folders pane's folder goes in front of the text (F2).
+            query: filter::query(o.filter, o.match_path, &self.scoped_search(&text)),
             sort: o.sort,
             match_case: o.match_case,
         });
@@ -2493,6 +2502,8 @@ impl App {
             Indicator::Case => o.match_case = false,
             Indicator::Path => o.match_path = false,
             Indicator::Filter => o.filter = Filter::Everything,
+            // The Folders pane's folder (F2), no search option.
+            Indicator::Folder => return self.clear_folder(),
         }
         self.opts.set(o);
         self.start_search(false);
@@ -2710,6 +2721,14 @@ unsafe extern "system" fn list_proc(
                 let r = DefSubclassProc(hwnd, msg, w, l);
                 hover::scrolled(app);
                 return r;
+            }
+            // Alt+Up: up one folder in the Folders pane (F2), Everything's
+            // global Up One Dir (the search box keeps it for its history).
+            WM_SYSKEYDOWN
+                if w == usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_UP)
+                    && app.up_one_folder() =>
+            {
+                return 0;
             }
             // The characters of the keys above (Enter, Esc, Ctrl+A…, and
             // Ctrl+Backspace's DEL) do nothing more.
