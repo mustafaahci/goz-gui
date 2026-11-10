@@ -76,6 +76,7 @@ mod preview;
 // F2 (sidebars).
 
 // F3 (tabs and windows).
+mod tabs;
 
 // F4 (search tools).
 

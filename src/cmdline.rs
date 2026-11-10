@@ -8,7 +8,10 @@
 //! `-case`/`-nocase`, `-matchpath`/`-nomatchpath`, `-startup` (start in the
 //! background, no window), `-toggle-window`, `-exit` (close the running
 //! goz-gui), `-instance <name>`, `-preview`/`-no-preview` (show or hide the
-//! preview pane). Anything else is search text, as if after `-s`.
+//! preview pane), `-new-window` (a window of its own: no hand-over to the
+//! running goz-gui, File > New Window's), and `-x <x>`, `-y <y>`,
+//! `-width <w>`, `-height <h>` (where the window goes, in screen pixels).
+//! Anything else is search text, as if after `-s`.
 
 use goz_core::types::{SortDir, SortKey};
 
@@ -35,6 +38,15 @@ pub struct Launch {
     pub instance: Option<String>,
     /// `-preview` / `-no-preview`: show or hide the preview pane.
     pub preview: Option<bool>,
+    /// A window of its own (File > New Window): it starts even while a
+    /// goz-gui of the same data folder runs, and hands nothing over.
+    pub new_window: bool,
+    /// Where the window goes: its left, top, width and height in screen
+    /// pixels; each one missing stays as it is.
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
 }
 
 impl Launch {
@@ -47,6 +59,27 @@ impl Launch {
             || self.dir.is_some()
             || self.match_case.is_some()
             || self.match_path.is_some()
+    }
+
+    /// Whether it says where the window goes.
+    pub fn places_window(&self) -> bool {
+        self.x.is_some() || self.y.is_some() || self.width.is_some() || self.height.is_some()
+    }
+
+    /// The window's place (left, top, width, height) with what it asks for
+    /// put over `now`; `None` without a place to start from and not all
+    /// four asked for.
+    pub fn place_over(&self, now: Option<(i32, i32, i32, i32)>) -> Option<(i32, i32, i32, i32)> {
+        if let (Some(x), Some(y), Some(w), Some(h)) = (self.x, self.y, self.width, self.height) {
+            return Some((x, y, w, h));
+        }
+        let (x, y, w, h) = now?;
+        Some((
+            self.x.unwrap_or(x),
+            self.y.unwrap_or(y),
+            self.width.unwrap_or(w),
+            self.height.unwrap_or(h),
+        ))
     }
 
     /// The search text to put in the box: the folder as a quoted path term
@@ -127,6 +160,26 @@ pub fn parse(args: &[String]) -> Result<Launch, String> {
             "instance" => l.instance = Some(value("an instance name")?),
             "preview" => l.preview = Some(true),
             "no-preview" => l.preview = Some(false),
+            "new-window" => l.new_window = true,
+            "x" | "y" | "width" | "height" => {
+                let v = value("a number of pixels")?;
+                let n = v
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|n| n.abs() <= 100_000)
+                    .ok_or_else(|| format!("{arg} needs a number of pixels, not {v}"))?;
+                let size = matches!(name.as_str(), "width" | "height");
+                if size && n <= 0 {
+                    return Err(format!("{arg} needs a size above 0, not {v}"));
+                }
+                match name.as_str() {
+                    "x" => l.x = Some(n),
+                    "y" => l.y = Some(n),
+                    "width" => l.width = Some(n),
+                    _ => l.height = Some(n),
+                }
+            }
             _ => return Err(format!("unknown switch: {arg}")),
         }
     }
@@ -221,6 +274,34 @@ mod tests {
         assert_eq!(p(&["-bogus"]).unwrap_err(), "unknown switch: -bogus");
         assert!(p(&["-sort", "bogus"]).is_err());
         assert!(p(&["-filter", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn a_new_window_and_its_place() {
+        let l = p(&[
+            "-new-window",
+            "-x",
+            "-1900",
+            "-y",
+            "40",
+            "-width",
+            "800",
+            "-height",
+            "600",
+        ])
+        .unwrap();
+        assert!(l.new_window && l.places_window() && !l.changes_search());
+        assert_eq!(l.place_over(None), Some((-1900, 40, 800, 600)));
+        // Some of them: over the window's own place.
+        let l = p(&["-x", "10", "-HEIGHT", "300"]).unwrap();
+        assert!(!l.new_window);
+        assert_eq!(l.place_over(None), None);
+        assert_eq!(l.place_over(Some((1, 2, 3, 4))), Some((10, 2, 3, 300)));
+        assert!(!Launch::default().places_window());
+        // Not a number, or no size.
+        assert!(p(&["-x", "left"]).is_err());
+        assert!(p(&["-width", "0"]).is_err());
+        assert!(p(&["-y"]).is_err());
     }
 
     #[test]

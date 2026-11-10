@@ -4,30 +4,36 @@
 //! The file has the shape of Everything 1.5's own `Session.json` (an array
 //! of windows, each with its tabs) and uses its key names, so a session can
 //! be carried between the two: goz-gui reads the first open window of
-//! Everything's file and its current tab (`tab_cursel`). goz-gui has one
-//! window and one "tab" and writes only what it keeps:
+//! Everything's file with its tabs. Each goz-gui window is a process of its
+//! own, so goz-gui writes one window, with its tabs, and only what it keeps:
 //!
 //! - the window: `window_x`, `window_y`, `window_wide`, `window_high`
 //!   (screen pixels, as the INI's) with goz-gui's `window_dpi`,
-//!   `maximized`, `ontop`, `theme`, `status_bar_visible`;
-//! - the tab: `search`, `match_case`, `match_path`, `filter`, `sort`,
-//!   `sort_ascending`, `listview_item_focus` and `listview_selection` (full
-//!   paths, as Everything's), and goz-gui's own `listview_top_index` (the
-//!   row at the top of the list), `nav_history` (Back and Forward's entries,
-//!   oldest first, each with the search keys above) and `nav_history_index`
-//!   (the current one).
+//!   `maximized`, `ontop`, `theme`, `status_bar_visible`, and `tab_cursel`
+//!   (the tab shown);
+//! - each tab: `search`, `match_case`, `match_path`, `filter`, `sort`,
+//!   `sort_ascending`, `view` (0 Details, 1 thumbnails) and
+//!   `thumbnail_size`, `listview_item_focus` and `listview_selection` (full
+//!   paths, as Everything's), `columns` (the shown columns left to right,
+//!   each `{"name":…,"width":…}` at 96 DPI), and goz-gui's own
+//!   `listview_top_index` (the row at the top of the list), `nav_history`
+//!   (Back and Forward's entries, oldest first, each with the search keys
+//!   above) and `nav_history_index` (the current one). The open tabs come
+//!   first, left to right; the tabs closed (Reopen Closed Tab's, oldest
+//!   first) follow with `"is_closed":1`, as Everything keeps its own.
 //!
 //! Unknown keys are ignored. The file is replaced as a whole: the session
 //! written last wins. `SessionFile` writes it on the store thread, like
 //! every other file goz-gui keeps (`crate::store`).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use goz_core::types::{SortDir, SortSpec};
 
 use crate::bookmarks::{sort_key, sort_name};
+use crate::columns::{self, Layout};
 use crate::filter::Filter;
 use crate::history::NavHistory;
 use crate::json::{self, Json};
@@ -54,8 +60,8 @@ pub struct Search {
     pub sort: SortSpec,
 }
 
-/// The results as they were: the search, where the list was scrolled to,
-/// what was selected, and the navigation history.
+/// A tab's results as they were: the search, the view and columns, where
+/// the list was scrolled to, what was selected, and the navigation history.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct View {
     pub search: Search,
@@ -69,6 +75,12 @@ pub struct View {
     pub nav: Vec<Search>,
     /// The current entry of `nav`.
     pub nav_index: usize,
+    /// Details or thumbnails and their size; `None` (a session written
+    /// before tabs, or Everything's without the keys) keeps the window's.
+    pub display: Option<crate::view::View>,
+    /// The columns shown, their order and widths; `None` keeps the
+    /// window's.
+    pub columns: Option<Layout>,
 }
 
 /// A window as it was.
@@ -80,7 +92,11 @@ pub struct Session {
     pub on_top: OnTop,
     pub theme: ThemeMode,
     pub status_bar: bool,
-    pub view: View,
+    /// The tabs, left to right (at least one), and the one shown.
+    pub tabs: Vec<View>,
+    pub current: usize,
+    /// The tabs closed, oldest first, for Reopen Closed Tab.
+    pub closed: Vec<View>,
 }
 
 impl Default for Session {
@@ -91,10 +107,15 @@ impl Default for Session {
             on_top: OnTop::Never,
             theme: ThemeMode::UserDefault,
             status_bar: true,
-            view: View::default(),
+            tabs: vec![View::default()],
+            current: 0,
+            closed: Vec::new(),
         }
     }
 }
+
+/// What a session without a tab shows.
+static NO_VIEW: LazyLock<View> = LazyLock::new(View::default);
 
 fn int(o: &Json, key: &str) -> Option<i64> {
     o.get(key).and_then(Json::as_int)
@@ -179,6 +200,43 @@ fn is_open(o: &Json) -> bool {
     flag(o, "is_closed") != Some(true)
 }
 
+/// A tab's `view` (0 Details, 1 thumbnails) and `thumbnail_size`; `None`
+/// without `view`.
+fn read_display(tab: &Json) -> Option<crate::view::View> {
+    let view = int(tab, "view")?;
+    let size = int(tab, "thumbnail_size")
+        .and_then(|s| u32::try_from(s).ok())
+        .unwrap_or(crate::view::LARGE);
+    let thumbnails = crate::view::View::thumbnails(size);
+    Some(if view == 1 {
+        thumbnails
+    } else {
+        thumbnails.details()
+    })
+}
+
+/// A tab's `columns`: the shown ones, left to right, by Everything's
+/// names; those goz-gui has not got are left out. `None` without one it
+/// has.
+fn read_columns(tab: &Json) -> Option<Layout> {
+    let shown: Vec<(usize, i32)> = tab
+        .get("columns")
+        .and_then(Json::as_array)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Json::as_text)?;
+            let id = columns::TITLES
+                .iter()
+                .position(|t| t.eq_ignore_ascii_case(name.trim()))?;
+            let width =
+                int(c, "width").map_or(columns::DEFAULT_WIDTHS[id], |w| w.clamp(0, 8192) as i32);
+            Some((id, width))
+        })
+        .collect();
+    (!shown.is_empty()).then(|| Layout::from_shown(Layout::default(), &shown))
+}
+
 fn read_view(tab: &Json) -> View {
     let mut nav: Vec<Search> = tab
         .get("nav_history")
@@ -216,13 +274,83 @@ fn read_view(tab: &Json) -> View {
             .collect(),
         nav,
         nav_index,
+        display: read_display(tab),
+        columns: read_columns(tab),
     }
 }
 
+/// The keys of one tab, as Everything orders them.
+fn tab_members(v: &View, closed: bool) -> Vec<(String, Json)> {
+    let mut tab: Vec<(String, Json)> = vec![("is_closed".into(), Json::bit(closed))];
+    tab.extend(search_members(&v.search));
+    if let Some(d) = v.display {
+        tab.push(("view".into(), Json::bit(d.thumbnails)));
+        tab.push(("thumbnail_size".into(), Json::int(d.size.into())));
+    }
+    tab.push((
+        "listview_top_index".into(),
+        Json::int(i64::try_from(v.top).unwrap_or(i64::MAX)),
+    ));
+    tab.push((
+        "listview_item_focus".into(),
+        Json::Str(v.focus.clone().unwrap_or_default()),
+    ));
+    tab.push((
+        "listview_selection".into(),
+        Json::Array(
+            v.selection
+                .iter()
+                .take(MAX_SELECTION)
+                .map(|p| Json::Str(p.clone()))
+                .collect(),
+        ),
+    ));
+    tab.push((
+        "nav_history_index".into(),
+        Json::int(i64::try_from(v.nav_index).unwrap_or(0)),
+    ));
+    tab.push((
+        "nav_history".into(),
+        Json::Array(
+            v.nav
+                .iter()
+                .map(|s| Json::Object(search_members(s)))
+                .collect(),
+        ),
+    ));
+    if let Some(layout) = v.columns {
+        tab.push((
+            "columns".into(),
+            Json::Array(
+                layout
+                    .shown_widths()
+                    .into_iter()
+                    .map(|(id, width)| {
+                        Json::Object(vec![
+                            ("name".into(), Json::str(columns::TITLES[id])),
+                            ("width".into(), Json::int(width.into())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ));
+    }
+    tab
+}
+
 impl Session {
+    /// The tab shown.
+    pub fn view(&self) -> &View {
+        self.tabs
+            .get(self.current)
+            .or_else(|| self.tabs.last())
+            .unwrap_or(&NO_VIEW)
+    }
+
     /// The session in a parsed `Session.json`: its first open window (the
-    /// first window if all are closed), and that window's current tab.
-    /// `None` when it holds no window; `Err` when it is not a session.
+    /// first window if all are closed), with that window's tabs (the first
+    /// one if all are closed). `None` when it holds no window; `Err` when it
+    /// is not a session.
     pub fn from_json(doc: &Json) -> Result<Option<Session>, String> {
         let windows: &[Json] = match doc {
             Json::Array(items) => items,
@@ -239,14 +367,28 @@ impl Session {
         if !matches!(win, Json::Object(_)) {
             return Err("it is not a session (a window is not an object)".into());
         }
-        let tabs = win.get("tabs").and_then(Json::as_array).unwrap_or_default();
-        let current = int(win, "tab_cursel")
-            .and_then(|i| usize::try_from(i).ok())
-            .and_then(|i| tabs.get(i))
-            .filter(|t| is_open(t));
-        let tab = current
-            .or_else(|| tabs.iter().find(|t| is_open(t)))
-            .or_else(|| tabs.first());
+        let all = win.get("tabs").and_then(Json::as_array).unwrap_or_default();
+        let cursel = int(win, "tab_cursel").and_then(|i| usize::try_from(i).ok());
+        let (mut tabs, mut closed, mut current) = (Vec::new(), Vec::new(), None);
+        for (i, t) in all.iter().enumerate() {
+            if is_open(t) {
+                if cursel == Some(i) {
+                    current = Some(tabs.len());
+                }
+                tabs.push(read_view(t));
+            } else {
+                closed.push(read_view(t));
+            }
+        }
+        if tabs.is_empty() {
+            // Every tab closed: the first, as a window shows one; none at
+            // all: an empty one.
+            tabs.push(if closed.is_empty() {
+                View::default()
+            } else {
+                closed.remove(0)
+            });
+        }
         let d = Session::default();
         Ok(Some(Session {
             window: read_window(win),
@@ -258,11 +400,14 @@ impl Session {
                 .and_then(settings::theme_from)
                 .unwrap_or(d.theme),
             status_bar: flag(win, "status_bar_visible").unwrap_or(d.status_bar),
-            view: tab.map(read_view).unwrap_or_default(),
+            tabs,
+            current: current.unwrap_or(0),
+            closed,
         }))
     }
 
-    /// The session as `Session.json` holds it: one window with one tab.
+    /// The session as `Session.json` holds it: one window with its tabs,
+    /// the closed ones after the open ones.
     pub fn to_json(&self) -> Json {
         let mut win: Vec<(String, Json)> = vec![("is_closed".into(), Json::int(0))];
         if let Some(w) = self.window {
@@ -281,42 +426,26 @@ impl Session {
             Json::int(settings::theme_number(self.theme).into()),
         ));
         win.push(("status_bar_visible".into(), Json::bit(self.status_bar)));
-        win.push(("tab_cursel".into(), Json::int(0)));
-        let v = &self.view;
-        let mut tab: Vec<(String, Json)> = vec![("is_closed".into(), Json::int(0))];
-        tab.extend(search_members(&v.search));
-        tab.push((
-            "listview_top_index".into(),
-            Json::int(i64::try_from(v.top).unwrap_or(i64::MAX)),
+        let open: &[View] = if self.tabs.is_empty() {
+            core::slice::from_ref(&*NO_VIEW)
+        } else {
+            &self.tabs
+        };
+        let current = self.current.min(open.len() - 1);
+        win.push((
+            "tab_cursel".into(),
+            Json::int(i64::try_from(current).unwrap_or(0)),
         ));
-        tab.push((
-            "listview_item_focus".into(),
-            Json::Str(v.focus.clone().unwrap_or_default()),
-        ));
-        tab.push((
-            "listview_selection".into(),
-            Json::Array(
-                v.selection
+        let tabs = open
+            .iter()
+            .map(|v| Json::Object(tab_members(v, false)))
+            .chain(
+                self.closed
                     .iter()
-                    .take(MAX_SELECTION)
-                    .map(|p| Json::Str(p.clone()))
-                    .collect(),
-            ),
-        ));
-        tab.push((
-            "nav_history_index".into(),
-            Json::int(i64::try_from(v.nav_index).unwrap_or(0)),
-        ));
-        tab.push((
-            "nav_history".into(),
-            Json::Array(
-                v.nav
-                    .iter()
-                    .map(|s| Json::Object(search_members(s)))
-                    .collect(),
-            ),
-        ));
-        win.push(("tabs".into(), Json::Array(vec![Json::Object(tab)])));
+                    .map(|v| Json::Object(tab_members(v, true))),
+            )
+            .collect();
+        win.push(("tabs".into(), Json::Array(tabs)));
         Json::Array(vec![Json::Object(win)])
     }
 
@@ -485,7 +614,7 @@ mod tests {
             on_top: OnTop::WhileSearching,
             theme: ThemeMode::Dark,
             status_bar: false,
-            view: View {
+            tabs: vec![View {
                 search: Search {
                     text: r#"c:\windows\system32\*.dll "a b""#.into(),
                     match_case: true,
@@ -511,7 +640,11 @@ mod tests {
                     search("é😀"),
                 ],
                 nav_index: 1,
-            },
+                display: None,
+                columns: None,
+            }],
+            current: 0,
+            closed: Vec::new(),
         }
     }
 
@@ -520,6 +653,8 @@ mod tests {
         let s = sample();
         let text = s.to_text();
         assert_eq!(parse(text.as_bytes()), Ok(Some(s.clone())));
+        // Written before tabs had views and columns: none.
+        assert!(!text.contains("\"view\"") && !text.contains("\"columns\""));
         // Everything's layout and keys.
         for line in [
             "[\r\n\t{\r\n\t\t\"is_closed\":0,\r\n\t\t\"window_x\":-1900,\r\n",
@@ -537,16 +672,108 @@ mod tests {
         // Without a window rectangle or a focus.
         let bare = Session {
             window: None,
-            view: View {
+            tabs: vec![View {
                 focus: None,
                 ..View::default()
-            },
+            }],
             ..Session::default()
         };
         let text = bare.to_text();
         assert!(!text.contains("window_x"));
         assert!(text.contains("\"listview_item_focus\":\"\","));
         assert_eq!(parse(text.as_bytes()), Ok(Some(bare)));
+    }
+
+    #[test]
+    fn every_tab_and_the_closed_ones_read_back() {
+        let mut columns = Layout::default();
+        columns.show(columns::COL_EXT);
+        columns.set_width(columns::COL_NAME, 300);
+        let first = View {
+            display: Some(crate::view::View::thumbnails(256)),
+            columns: Some(columns),
+            ..sample().tabs[0].clone()
+        };
+        let second = View {
+            search: search("*.mp3"),
+            display: Some(crate::view::View::thumbnails(64).details()),
+            columns: Some(Layout::default()),
+            top: 7,
+            ..View::default()
+        };
+        let gone = View {
+            search: search("closed"),
+            ..View::default()
+        };
+        let s = Session {
+            tabs: vec![first, second],
+            current: 1,
+            closed: vec![gone.clone(), search_view("older")],
+            ..sample()
+        };
+        let text = s.to_text();
+        assert_eq!(parse(text.as_bytes()), Ok(Some(s.clone())));
+        assert_eq!(parse(text.as_bytes()).unwrap().unwrap().view().top, 7);
+        for line in [
+            "\t\t\"tab_cursel\":1,\r\n",
+            "\t\t\t\t\"sort_ascending\":1,\r\n\t\t\t\t\"view\":1,\r\n\t\t\t\t\"thumbnail_size\":256,\r\n",
+            "\t\t\t\t\"view\":0,\r\n\t\t\t\t\"thumbnail_size\":64,\r\n",
+            "{\"name\":\"Name\",\"width\":300},",
+            "{\"name\":\"Extension\",\"width\":96},",
+            "\t\t\t\t\"is_closed\":1,\r\n\t\t\t\t\"search\":\"closed\",\r\n",
+        ] {
+            assert!(text.contains(line), "{line:?} in\n{text}");
+        }
+        // The closed tabs after the open ones, oldest first.
+        assert!(text.find("\"closed\"") < text.find("\"older\""));
+        assert!(text.find("\"*.mp3\"") < text.find("\"closed\""));
+        // No tab at all: an empty one is written.
+        let none = Session {
+            tabs: Vec::new(),
+            current: 3,
+            ..Session::default()
+        };
+        assert_eq!(none.view(), &View::default());
+        let back = parse(none.to_text().as_bytes()).unwrap().unwrap();
+        assert_eq!((back.tabs.len(), back.current), (1, 0));
+    }
+
+    fn search_view(text: &str) -> View {
+        View {
+            search: search(text),
+            ..View::default()
+        }
+    }
+
+    #[test]
+    fn everythings_columns_and_views_are_read() {
+        let doc = "[{\"tab_cursel\":0,\"tabs\":[{\"search\":\"x\",\"view\":1,\"thumbnail_size\":999,\
+                   \"columns\":[{\"name\":\"Path\",\"width\":120},{\"name\":\"Date Created\",\"width\":80},\
+                   {\"name\":\"name\",\"width\":-4},{\"name\":\"Size\"}]},\
+                   {\"search\":\"y\",\"view\":0,\"columns\":[{\"name\":\"Attributes\"}]}]}]";
+        let s = parse(doc.as_bytes()).expect("valid").expect("window");
+        let v = s.view();
+        assert_eq!(v.display, Some(crate::view::View::thumbnails(256)));
+        let l = v.columns.expect("columns");
+        assert_eq!(
+            l.shown(),
+            [columns::COL_PATH, columns::COL_NAME, columns::COL_SIZE]
+        );
+        assert_eq!(
+            (l.width(columns::COL_PATH), l.width(columns::COL_NAME)),
+            (120, 0)
+        );
+        assert_eq!(
+            l.width(columns::COL_SIZE),
+            columns::DEFAULT_WIDTHS[columns::COL_SIZE]
+        );
+        // Details at the default size; no column goz-gui has: the window's.
+        let y = &s.tabs[1];
+        assert_eq!(
+            y.display,
+            Some(crate::view::View::thumbnails(crate::view::LARGE).details())
+        );
+        assert_eq!(y.columns, None);
     }
 
     /// Everything 1.5.0.1424b's own `Session.json`, cut down: two tabs, the
@@ -586,7 +813,14 @@ mod tests {
         );
         assert!(!s.maximized && s.status_bar);
         assert_eq!((s.on_top, s.theme), (OnTop::Never, ThemeMode::UserDefault));
-        let v = &s.view;
+        // Both tabs, the second shown; the first with its columns.
+        assert_eq!((s.tabs.len(), s.current), (2, 1));
+        assert_eq!(s.tabs[0].search.text, "*.png|*.jpg");
+        assert_eq!(
+            s.tabs[0].columns.map(|l| l.shown_widths()),
+            Some(vec![(columns::COL_NAME, 256), (columns::COL_PATH, 256)])
+        );
+        let v = s.view();
         assert_eq!(v.search.text, r"c:\windows\system32\*.exe");
         assert_eq!(v.search.sort, SortSpec::default());
         let agent = w(r"C:\Windows\System32\agentactivationruntimestarter.exe");
@@ -596,9 +830,9 @@ mod tests {
         // The first tab when tab_cursel is out of range.
         let first = EVERYTHING.replace("\"tab_cursel\":1", "\"tab_cursel\":9");
         let s = parse(first.as_bytes()).expect("valid").expect("a window");
-        assert_eq!(s.view.search.text, "*.png|*.jpg");
+        assert_eq!(s.view().search.text, "*.png|*.jpg");
         assert_eq!(
-            s.view.search.sort,
+            s.view().search.sort,
             SortSpec {
                 key: SortKey::DateModified,
                 dir: SortDir::Desc
@@ -612,16 +846,26 @@ mod tests {
                    {\"is_closed\":0,\"tab_cursel\":0,\"tabs\":[{\"is_closed\":1,\"search\":\"closed tab\"},\
                    {\"search\":\"open\"}]}]";
         let s = parse(doc.as_bytes()).expect("valid").expect("a window");
-        assert_eq!(s.view.search.text, "open");
+        assert_eq!(s.view().search.text, "open");
+        // The closed tab is kept to reopen.
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!(s.closed.len(), 1);
+        assert_eq!(s.closed[0].search.text, "closed tab");
         // Every window closed: the first one.
         let doc = "[{\"is_closed\":1,\"tabs\":[{\"search\":\"a\"}]},{\"is_closed\":1}]";
         let s = parse(doc.as_bytes()).expect("valid").expect("a window");
-        assert_eq!(s.view.search.text, "a");
+        assert_eq!(s.view().search.text, "a");
+        // Every tab closed: the first one shows, the others stay closed.
+        let doc =
+            "[{\"tabs\":[{\"is_closed\":1,\"search\":\"p\"},{\"is_closed\":1,\"search\":\"q\"}]}]";
+        let s = parse(doc.as_bytes()).expect("valid").expect("a window");
+        assert_eq!(s.view().search.text, "p");
+        assert_eq!(s.closed.len(), 1);
         // No window: no session; no tab: the default view.
         assert_eq!(parse(b"[]"), Ok(None));
         let s = parse(b"[{\"theme\":2}]").expect("valid").expect("a window");
         assert_eq!(
-            (s.theme, s.view.clone()),
+            (s.theme, s.view().clone()),
             (ThemeMode::Dark, View::default())
         );
     }
@@ -642,7 +886,7 @@ mod tests {
             (s.on_top, s.theme, s.maximized),
             (OnTop::Never, ThemeMode::UserDefault, false)
         );
-        let v = &s.view;
+        let v = s.view();
         assert_eq!(
             (v.search.sort, v.search.filter),
             (SortSpec::default(), Filter::Everything)
@@ -654,7 +898,7 @@ mod tests {
         let s = parse(b"[{\"tabs\":[{\"sort\":\"size\"}]}]")
             .expect("valid")
             .expect("window");
-        assert_eq!(s.view.search.sort, SortSpec::default_for(SortKey::Size));
+        assert_eq!(s.view().search.sort, SortSpec::default_for(SortKey::Size));
         for bad in [
             &b"\0\0\0"[..],
             b"{\"tabs\":",
@@ -672,27 +916,25 @@ mod tests {
         let max = NavHistory::<Search>::MAX;
         let nav: Vec<Search> = (0..max + 10).map(|i| search(&i.to_string())).collect();
         let s = Session {
-            view: View {
+            tabs: vec![View {
                 nav,
                 nav_index: max + 5,
                 selection: (0..MAX_SELECTION + 7)
                     .map(|i| w(&format!("C:\\{i}")))
                     .collect(),
                 ..View::default()
-            },
+            }],
             ..Session::default()
         };
         let back = parse(s.to_text().as_bytes())
             .expect("valid")
             .expect("window");
-        assert_eq!(back.view.nav.len(), max);
-        assert_eq!(back.view.nav[0].text, "10");
-        assert_eq!(back.view.nav_index, max - 5);
-        assert_eq!(
-            back.view.nav[back.view.nav_index].text,
-            (max + 5).to_string()
-        );
-        assert_eq!(back.view.selection.len(), MAX_SELECTION);
+        let v = back.view();
+        assert_eq!(v.nav.len(), max);
+        assert_eq!(v.nav[0].text, "10");
+        assert_eq!(v.nav_index, max - 5);
+        assert_eq!(v.nav[v.nav_index].text, (max + 5).to_string());
+        assert_eq!(v.selection.len(), MAX_SELECTION);
     }
 
     #[test]

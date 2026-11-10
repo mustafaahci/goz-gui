@@ -179,6 +179,49 @@ impl Layout {
         true
     }
 
+    /// The layout a tab of Everything's session keeps (its `columns`): the
+    /// shown columns left to right, each with its width at 96 DPI. A column
+    /// listed twice counts once; Name shows first when it is not listed (it
+    /// is always shown); the columns not listed are hidden, with `base`'s
+    /// widths.
+    pub fn from_shown(base: Layout, shown: &[(usize, i32)]) -> Layout {
+        let mut layout = Layout {
+            widths: base.widths,
+            order: [0; COLS],
+            shown: 0,
+        };
+        if !shown.iter().any(|&(id, _)| id == COL_NAME) {
+            layout.order[0] = COL_NAME;
+            layout.shown = 1;
+        }
+        for &(id, width) in shown {
+            if id >= COLS || layout.shown().contains(&id) {
+                continue;
+            }
+            layout.widths[id] = width.clamp(0, MAX_WIDTH);
+            layout.order[layout.shown] = id;
+            layout.shown += 1;
+        }
+        // The hidden ones fill the order's unused slots.
+        let mut at = layout.shown;
+        for id in 0..COLS {
+            if !layout.shown().contains(&id) {
+                layout.order[at] = id;
+                at += 1;
+            }
+        }
+        layout
+    }
+
+    /// The shown columns, left to right, each with its width at 96 DPI: what
+    /// a tab of a session keeps.
+    pub fn shown_widths(&self) -> Vec<(usize, i32)> {
+        self.shown()
+            .iter()
+            .map(|&id| (id, self.width(id)))
+            .collect()
+    }
+
     /// Shows a hidden column, after the shown column that comes last before
     /// it in the default order (or first, when none does).
     pub fn show(&mut self, id: usize) -> bool {
@@ -224,6 +267,38 @@ mod tests {
     fn read(pairs: &[(&str, &str)]) -> Layout {
         let map: HashMap<&str, &str> = pairs.iter().copied().collect();
         Layout::from_keys(|k| map.get(k).copied())
+    }
+
+    #[test]
+    fn a_sessions_columns_read_back_as_kept() {
+        let mut layout = Layout::default();
+        layout.show(COL_EXT);
+        layout.set_width(COL_PATH, 300);
+        layout.set_order(&[COL_PATH, COL_NAME, COL_EXT, COL_SIZE, COL_DATE]);
+        let kept = layout.shown_widths();
+        assert_eq!(
+            kept,
+            [
+                (COL_PATH, 300),
+                (COL_NAME, 256),
+                (COL_EXT, 96),
+                (COL_SIZE, 96),
+                (COL_DATE, 153)
+            ]
+        );
+        assert_eq!(Layout::from_shown(Layout::default(), &kept), layout);
+        // Name always shows (first when not listed); twice or unknown
+        // counts once or not at all; the hidden keep the base's widths.
+        let mut base = Layout::default();
+        base.set_width(COL_TYPE, 77);
+        let l = Layout::from_shown(base, &[(COL_SIZE, 50), (COL_SIZE, 60), (99, 10)]);
+        assert_eq!(l.shown(), [COL_NAME, COL_SIZE]);
+        assert_eq!((l.width(COL_SIZE), l.width(COL_TYPE)), (50, 77));
+        assert!(!l.is_shown(COL_TYPE));
+        // Every id is still in the order once, so showing one works.
+        let mut l = l;
+        assert!(l.show(COL_TYPE));
+        assert_eq!(l.shown(), [COL_NAME, COL_SIZE, COL_TYPE]);
     }
 
     #[test]

@@ -58,6 +58,11 @@ impl App {
     /// that another program holds already, by name, for the user.
     pub(super) fn apply_background(&self, b: Background) -> Vec<&'static str> {
         self.background.set(b);
+        // A window File > New Window started leaves the tray icon and the
+        // hotkeys to the first window.
+        if self.is_new_window() {
+            return Vec::new();
+        }
         if b.tray_icon() {
             if !self.tray_on.get() {
                 let icon = self.window_icons.get()[0];
@@ -233,6 +238,8 @@ impl App {
             }
         };
         if l.exit {
+            // Every window of this goz-gui (File > New Window's) closes.
+            self.exit_other_windows();
             // SAFETY: closes this thread's window for good.
             unsafe { DestroyWindow(self.hwnd) };
             return;
@@ -243,6 +250,9 @@ impl App {
         // F1 (preview pane): -preview / -no-preview.
         if let Some(show) = l.preview {
             self.show_pane(crate::dock::PaneId::Preview, show);
+        }
+        if l.places_window() {
+            self.place_window(&l);
         }
         if l.toggle_window {
             self.toggle_window();

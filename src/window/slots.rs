@@ -45,6 +45,10 @@ impl App {
         // F2 (sidebars).
 
         // F3 (tabs and windows).
+        self.set_strip(
+            crate::strip::StripSlot::Tabs,
+            Some(std::rc::Rc::new(super::tabstrip::TabStrip::new())),
+        );
 
         // F4 (search tools).
 
@@ -74,12 +78,13 @@ impl App {
     /// A menu of the bar (or a submenu) is about to open, after the
     /// window readied its own items: the features check, grey or rebuild
     /// theirs.
-    pub(super) fn feature_menu_popup(&self, _popup: HMENU) {
+    pub(super) fn feature_menu_popup(&self, popup: HMENU) {
         // F1 (preview pane).
 
         // F2 (sidebars).
 
         // F3 (tabs and windows).
+        self.tab_menu_popup(popup);
 
         // F4 (search tools).
 
@@ -99,7 +104,7 @@ impl App {
             3100..=3199 => false,
 
             // F3: 3200..=3299, and its tab entries 4000..=4255.
-            3200..=3299 | 4000..=4255 => false,
+            3200..=3299 | 4000..=4255 => self.tab_command(id),
 
             // F4: 3300..=3399, and its custom filters 3800..=3999.
             3300..=3399 | 3800..=3999 => false,
@@ -125,7 +130,7 @@ impl App {
             m if (F2_MSG..F2_MSG + MSG_RANGE).contains(&m) => None,
 
             // F3.
-            m if (F3_MSG..F3_MSG + MSG_RANGE).contains(&m) => None,
+            m if (F3_MSG..F3_MSG + MSG_RANGE).contains(&m) => self.window_message(m, l),
 
             // F4.
             m if (F4_MSG..F4_MSG + MSG_RANGE).contains(&m) => None,
@@ -151,6 +156,10 @@ impl App {
             t if (F2_TIMER..F2_TIMER + TIMER_RANGE).contains(&t) => false,
 
             // F3.
+            super::tabs::TIMER_THAW => {
+                self.thaw_list();
+                true
+            }
             t if (F3_TIMER..F3_TIMER + TIMER_RANGE).contains(&t) => false,
 
             // F4.

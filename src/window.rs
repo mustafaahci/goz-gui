@@ -100,6 +100,9 @@ mod preview;
 // F2 (sidebars).
 
 // F3 (tabs and windows).
+mod newwin;
+mod tabs;
+mod tabstrip;
 
 // F4 (search tools).
 
@@ -415,7 +418,21 @@ pub struct App {
     // F2 (sidebars).
 
     // F3 (tabs and windows).
-
+    /// The window's tabs (`tabs.rs`): the shown one's state is the
+    /// window's own; the others are kept as views, and so are the tabs
+    /// closed.
+    tabs: RefCell<crate::tabs::TabList<crate::session::View>>,
+    /// The list is not painting while a tab's rows come.
+    list_frozen: Cell<bool>,
+    /// Started by File > New Window (`-new-window`): no tray icon,
+    /// hotkeys or hand-over; closing it ends it (`newwin.rs`).
+    new_window: Cell<bool>,
+    /// The `-instance` name and the instance's key, for the windows File >
+    /// New Window starts and for Exit to reach them all; and this window's
+    /// message-only window for Exit.
+    instance: RefCell<Option<String>>,
+    instance_key: RefCell<String>,
+    exit_window: Cell<HWND>,
     // F4 (search tools).
 
     // F5 (file tools).
@@ -497,6 +514,21 @@ fn apply_launch_settings(s: &mut Settings, l: &crate::cmdline::Launch) {
             },
         );
     }
+    // `-x`, `-y`, `-width`, `-height` (File > New Window's): a normal
+    // window there, kept on a monitor as a saved place is.
+    if l.places_window() {
+        let now = s.window.map(|w| (w.x, w.y, w.width, w.height));
+        if let Some((x, y, width, height)) = l.place_over(now) {
+            s.window = Some(crate::settings::WindowPos {
+                x,
+                y,
+                width,
+                height,
+                dpi: None,
+            });
+            s.maximized = false;
+        }
+    }
 }
 
 fn prefs_background(app: &App) -> crate::settings::Background {
@@ -522,14 +554,18 @@ See Help > Search Syntax and the README for goz-gui's switches."
         }
     };
     // One goz-gui per data folder (and -instance name): a second start
-    // hands its command line over and ends.
+    // hands its command line over and ends. File > New Window's
+    // (`-new-window`) is a window of its own.
     let key = crate::instance::key(launch.instance.as_deref());
     // If the one holding the instance does not answer, start anyway.
-    if !crate::instance::claim(&key) && crate::instance::forward(&key, &args) {
+    if !launch.new_window && !crate::instance::claim(&key) && crate::instance::forward(&key, &args)
+    {
         return 0;
     }
     if launch.exit {
-        // Nothing running to close.
+        // No first window to hand it to: the windows File > New Window
+        // opened (if any) close.
+        crate::instance::exit_others(&key, core::ptr::null_mut());
         return 0;
     }
     let prefs = prefs::Prefs::load();
@@ -538,8 +574,13 @@ See Help > Search Syntax and the README for goz-gui's switches."
     let marks = bookmarks::Marks::load(&prefs.base);
     let runs = runs::Runs::load(&prefs.base);
     // The window starts as the settings say, or as the previous session
-    // left it (`session_store_restore_on_first_new_window`).
-    let restored = sessions.at_start();
+    // left it (`session_store_restore_on_first_new_window`; only the first
+    // window, as in Everything).
+    let restored = if launch.new_window {
+        None
+    } else {
+        sessions.at_start()
+    };
     let mut settings = match &restored {
         Some(s) => session::start_settings(&prefs.base, s),
         None => prefs.base.clone(),
@@ -605,8 +646,16 @@ See Help > Search Syntax and the README for goz-gui's switches."
         ));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as *const App as isize);
         APP.set(Some(app));
+        // F3: which window of the instance this is (before the tray and
+        // hotkeys, which only the first has).
+        app.new_window.set(launch.new_window);
+        *app.instance.borrow_mut() = launch.instance.clone();
+        *app.instance_key.borrow_mut() = key.clone();
         app.init(start.is_none());
-        crate::instance::listen(&key, hwnd, WM_LAUNCH);
+        if !launch.new_window {
+            crate::instance::listen(&key, hwnd, WM_LAUNCH);
+        }
+        app.listen_for_exit();
         let taken = app.apply_background(prefs_background(app));
         // -startup (signing in to Windows) starts in the background, with
         // no window.
@@ -631,9 +680,9 @@ See Help > Search Syntax and the README for goz-gui's switches."
         }
         app.start_search(false);
         if let Some(s) = &restored {
-            // Its navigation entries, and its place in the results once
-            // they come.
-            app.begin_view(&s.view);
+            // Its tabs, the shown one's navigation entries, and its place
+            // in the results once they come.
+            app.start_tabs(s);
         }
         // The search the window starts with is the first navigation entry,
         // as in Everything.
@@ -946,7 +995,15 @@ impl App {
                 // F2 (sidebars).
 
                 // F3 (tabs and windows).
-
+                tabs: RefCell::new(crate::tabs::TabList::new(
+                    crate::session::View::default(),
+                    s.tabs.max_closed,
+                )),
+                list_frozen: Cell::new(false),
+                new_window: Cell::new(false),
+                instance: RefCell::new(None),
+                instance_key: RefCell::new(String::new()),
+                exit_window: Cell::new(core::ptr::null_mut()),
                 // F4 (search tools).
 
                 // F5 (file tools).
@@ -1188,7 +1245,12 @@ impl App {
         let mut rc = RECT::default();
         // SAFETY: reads this thread's window's size.
         unsafe { GetClientRect(self.hwnd, &mut rc) };
-        let (side, above, below) = (self.scale(3), self.scale(5), self.scale(3));
+        let (tabs_h, find_h) = self.strip_heights();
+        // Under the tab strip, Everything's 3 px above the frame: the 2 px
+        // more under the menu bar make up for Everything's taller one, which
+        // the strip does when it is there (`tabstrip.rs`).
+        let above = self.scale(if tabs_h > 0 { 3 } else { 5 });
+        let (side, below) = (self.scale(3), self.scale(3));
         let fh = self.ui_fonts.borrow().height;
         let search_h = fh + self.scale(8);
         // The status bar is the result list's: it zooms with it.
@@ -1197,7 +1259,6 @@ impl App {
         } else {
             0
         };
-        let (tabs_h, find_h) = self.strip_heights();
         let (left, right) = self.dock_widths();
         let (min_dock, min_center) = self.dock_limits();
         let r = crate::layout::regions(&crate::layout::Inputs {
@@ -1693,15 +1754,17 @@ impl App {
                     paint::menubar_line(self);
                     r
                 }
-                WM_CLOSE if self.background().run_in_background => {
+                // A window File > New Window started ends when closed.
+                WM_CLOSE if self.background().run_in_background && !self.is_new_window() => {
                     // goz-gui keeps running in the background.
                     self.hide_to_background();
                     0
                 }
+                // Only with the tray icon up (a New Window's has none).
                 WM_SYSCOMMAND
                     if (w & 0xfff0) == SC_MINIMIZE as usize
                         && self.background().minimize_to_tray
-                        && self.background().tray_icon() =>
+                        && self.tray_on.get() =>
                 {
                     self.hide_to_background();
                     0
@@ -1998,6 +2061,8 @@ impl App {
             searchbox::invalidate_nav(self);
             self.invalidate_filter_bar();
             self.pane_event(PaneEvent::SearchChanged);
+            // The shown tab's title is its search.
+            self.tabs_search_changed();
         }
     }
 
