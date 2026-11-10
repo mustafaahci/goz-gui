@@ -83,7 +83,8 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     // their lines never meet (FRAMEWORK.md).
 
     // F1 (preview pane).
-
+    // Everything's View | Preview (`view_preview_keys=592`, Alt+P).
+    (ALT, key(b'P'), menu::VIEW_PANE_PREVIEW),
     // F2 (sidebars).
 
     // F3 (tabs and windows).

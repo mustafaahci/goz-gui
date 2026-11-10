@@ -7,8 +7,8 @@
 //! `-sort <name>` with `-sort-ascending`/`-sort-descending`,
 //! `-case`/`-nocase`, `-matchpath`/`-nomatchpath`, `-startup` (start in the
 //! background, no window), `-toggle-window`, `-exit` (close the running
-//! goz-gui), `-instance <name>`. Anything else is search text, as if after
-//! `-s`.
+//! goz-gui), `-instance <name>`, `-preview`/`-no-preview` (show or hide the
+//! preview pane). Anything else is search text, as if after `-s`.
 
 use goz_core::types::{SortDir, SortKey};
 
@@ -33,6 +33,8 @@ pub struct Launch {
     pub exit: bool,
     /// A named instance: its own single-instance key.
     pub instance: Option<String>,
+    /// `-preview` / `-no-preview`: show or hide the preview pane.
+    pub preview: Option<bool>,
 }
 
 impl Launch {
@@ -123,6 +125,8 @@ pub fn parse(args: &[String]) -> Result<Launch, String> {
             "toggle-window" => l.toggle_window = true,
             "exit" | "quit" => l.exit = true,
             "instance" => l.instance = Some(value("an instance name")?),
+            "preview" => l.preview = Some(true),
+            "no-preview" => l.preview = Some(false),
             _ => return Err(format!("unknown switch: {arg}")),
         }
     }
@@ -204,6 +208,11 @@ mod tests {
         assert_eq!(l.instance.as_deref(), Some("work"));
         assert!(p(&["-exit"]).unwrap().exit);
         assert!(p(&["-toggle-window"]).unwrap().toggle_window);
+        // Everything's pane switches.
+        assert_eq!(p(&["-preview"]).unwrap().preview, Some(true));
+        assert_eq!(p(&["/No-Preview"]).unwrap().preview, Some(false));
+        assert!(!p(&["-preview"]).unwrap().changes_search());
+        assert_eq!(p(&[]).unwrap().preview, None);
     }
 
     #[test]

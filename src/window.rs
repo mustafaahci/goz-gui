@@ -95,6 +95,7 @@ mod typing;
 // below, so their changes never meet (FRAMEWORK.md).
 
 // F1 (preview pane).
+mod preview;
 
 // F2 (sidebars).
 
@@ -483,6 +484,18 @@ fn apply_launch_settings(s: &mut Settings, l: &crate::cmdline::Launch) {
     }
     if let Some(dir) = l.dir {
         s.sort.dir = dir;
+    }
+    // F1 (preview pane): -preview / -no-preview.
+    if let Some(show) = l.preview {
+        let id = crate::dock::PaneId::Preview;
+        let layout = s.docks.pane(id);
+        s.docks.set_pane(
+            id,
+            crate::dock::PaneLayout {
+                visible: show,
+                ..layout
+            },
+        );
     }
 }
 

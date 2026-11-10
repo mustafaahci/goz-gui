@@ -17,6 +17,10 @@ path = "src/main.rs"
 # speaks exactly what gozd speaks and never re-implements the framing.
 goz-core = { git = "https://github.com/mustafaahci/goz", tag = "v0.6.0" }
 goz-winfs = { git = "https://github.com/mustafaahci/goz", tag = "v0.6.0" }
+# The windows crate's own core (already built for it): `#[implement]`, for
+# the one COM object goz-gui makes itself (the preview handlers' frame),
+# names it in the code it generates.
+windows-core = "0.62.2"
 
 [dependencies.windows-sys]
 version = "0.61"
@@ -56,11 +60,17 @@ features = [
     "Win32_Foundation",
     # STGMEDIUM, which reading a data object's contents (GetData) takes.
     "Win32_Graphics_Gdi",
+    # The preview pane: WIC decodes images, preview handlers are
+    # initialized through the property system's IInitializeWith*, and
+    # WIC's metadata (an image's orientation) comes as a PROPVARIANT.
+    "Win32_Graphics_Imaging",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
+    "Win32_System_Variant",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ]
 

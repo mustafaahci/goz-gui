@@ -39,6 +39,8 @@ impl App {
     /// (`menu::add_items`).
     pub(super) fn start_features(&self) {
         // F1 (preview pane).
+        let preview = self.prefs.borrow().base.preview;
+        crate::preview::register(self, preview);
 
         // F2 (sidebars).
 
@@ -56,6 +58,7 @@ impl App {
     /// hold.
     pub(super) fn exit_features(&self) {
         // F1 (preview pane).
+        crate::preview::exit(self);
 
         // F2 (sidebars).
 
@@ -90,7 +93,7 @@ impl App {
     pub(super) fn feature_command(&self, id: u16) -> bool {
         match id {
             // F1: 3000..=3099.
-            3000..=3099 => false,
+            3000..=3099 => self.preview_command(id),
 
             // F2: 3100..=3199.
             3100..=3199 => false,
@@ -113,10 +116,10 @@ impl App {
 
     /// A feature's WM_APP message (its range above): the answer, or `None`
     /// for DefWindowProc.
-    pub(super) fn feature_message(&self, msg: u32, _w: WPARAM, _l: LPARAM) -> Option<LRESULT> {
+    pub(super) fn feature_message(&self, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         match msg {
             // F1.
-            m if (F1_MSG..F1_MSG + MSG_RANGE).contains(&m) => None,
+            m if (F1_MSG..F1_MSG + MSG_RANGE).contains(&m) => self.preview_message(m, w, l),
 
             // F2.
             m if (F2_MSG..F2_MSG + MSG_RANGE).contains(&m) => None,
