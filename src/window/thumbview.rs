@@ -113,6 +113,7 @@ impl App {
         // nor are the big icons of the old size still to load.
         self.reset_thumbs();
         self.big_loads.forget_queued();
+        self.big_loads.forget_shrunk();
         if v.thumbnails {
             // The shell's big icon lists, asked for here rather than in
             // the middle of a paint.
@@ -384,8 +385,9 @@ impl App {
     }
 
     /// The system's big icon `icon` in `square`: the 48 px one where it
-    /// fits, else the 256 px one shrunk to the square by the list (the 48 px
-    /// one, centred, where the 256 px one is only that in a corner).
+    /// fits, else the 256 px one shrunk to the square with a filter (by the
+    /// list while that is made; the 48 px one, centred, where the 256 px
+    /// one is only that in a corner).
     ///
     /// Only an icon already loaded is drawn: one that is not (an icon's
     /// first draw reads it from its file, up to 9 ms) is loaded on a thread
@@ -435,10 +437,20 @@ impl App {
             let y = square.top + (side - cy) / 2;
             (x, y, 0, 0, ILD_TRANSPARENT)
         } else {
+            // Shrunk with a filter on the big icons' thread, once per icon
+            // and size (`bigicons.rs`): the list's own shrink, below, drops
+            // lines finer than its step (a text file's page at Large was
+            // blank), so it stands in only while that is made.
+            if wanted
+                && self
+                    .big_loads
+                    .draw_shrunk(list, icon, side, |b| draw_bitmap(hdc, b, square))
+            {
+                return;
+            }
             // Shrunk by the list itself: an icon made of it and drawn
             // shrunk (ImageList_GetIcon, DrawIconEx) cost 0.7 ms a cell,
-            // 45 ms for a window of Large cells; this is 20 times less,
-            // and looks the same.
+            // 45 ms for a window of Large cells; this is 20 times less.
             (
                 square.left,
                 square.top,

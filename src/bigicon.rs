@@ -448,7 +448,7 @@ fn render(icon: windows_sys::Win32::UI::WindowsAndMessaging::HICON, side: i32) -
 /// premultiplied BGRA pixel: what the white shows through is its
 /// transparency, and on black its colour is already multiplied by its
 /// coverage.
-fn premultiplied(black: [u8; 4], white: [u8; 4]) -> [u8; 4] {
+pub(crate) fn premultiplied(black: [u8; 4], white: [u8; 4]) -> [u8; 4] {
     // Green, the channel drawn most exactly.
     let through = white[1].saturating_sub(black[1]);
     let alpha = 255 - through;

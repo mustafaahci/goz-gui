@@ -50,8 +50,8 @@ impl App {
     }
 
     /// The window was hidden or minimized (`shown` false) or came back.
-    /// Hidden, it keeps no thumbnails; shown, the view asks for those it
-    /// draws.
+    /// Hidden, it keeps no thumbnails (nor the big icons shrunk for the
+    /// cells); shown, the view asks for those it draws.
     pub(super) fn memory_window_shown(&self, shown: bool) {
         if shown {
             return;
@@ -59,6 +59,7 @@ impl App {
         // SAFETY: a timer of this thread's window (set or not).
         unsafe { KillTimer(self.hwnd, TIMER_REST) };
         self.thumbs.release();
+        self.big_loads.forget_shrunk();
         runs::give_back_memory();
     }
 }
