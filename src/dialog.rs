@@ -37,24 +37,26 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyNameTextW, IsWindowEnabled, MAPVK_VK_TO_VSC, MapVirtualKeyW, VK_CONTROL,
     VK_MENU, VK_SHIFT,
 };
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows_sys::Win32::UI::Shell::{
+    DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BS_AUTORADIOBUTTON, BS_GROUPBOX, BS_RADIOBUTTON, BS_TYPEMASK, CB_ADDSTRING,
     CB_DELETESTRING, CB_GETEDITSEL, CB_MSGMAX, CB_SETCURSEL, CBT_CREATEWNDW, CBTACTIVATESTRUCT,
     CallNextHookEx, CreateDialogIndirectParamW, CreateWindowExW, DLGPROC, DS_CONTROL,
     DS_MODALFRAME, DS_SETFONT, DWLP_MSGRESULT, DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD,
     GW_HWNDNEXT, GW_OWNER, GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem,
-    GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    HCBT_ACTIVATE, HCBT_CREATEWND, HHOOK, HMENU, KillTimer, MapDialogRect, MoveWindow,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetCaretPos, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, UISF_HIDEACCEL, UISF_HIDEFOCUS,
-    USER_TIMER_MINIMUM, UnhookWindowsHookEx, WH_CBT, WINDOWPOS, WM_CHAR, WM_CTLCOLORBTN,
-    WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_ERASEBKGND,
-    WM_GETFONT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCDESTROY,
-    WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_QUERYUISTATE, WM_SETFONT, WM_SETREDRAW, WM_SETTINGCHANGE,
-    WM_SYSKEYDOWN, WM_TIMER, WM_WINDOWPOSCHANGING, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS,
-    WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    GetForegroundWindow, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, HCBT_ACTIVATE, HCBT_CREATEWND, HHOOK, HMENU, IsWindowVisible,
+    KillTimer, MapDialogRect, MoveWindow, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SendMessageW, SetCaretPos, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW,
+    UISF_HIDEACCEL, UISF_HIDEFOCUS, USER_TIMER_MINIMUM, UnhookWindowsHookEx, WH_CBT, WINDOWPOS,
+    WM_CHAR, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_QUERYUISTATE, WM_SETFONT,
+    WM_SETREDRAW, WM_SETTINGCHANGE, WM_SHOWWINDOW, WM_SYSKEYDOWN, WM_TIMER, WM_WINDOWPOSCHANGING,
+    WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::paint::fill;
@@ -435,9 +437,9 @@ const LATER: usize = 0x6c61;
 /// an item, whether or not it redraws (measured: 20 history formats, 15 ms;
 /// a WinForms v6 combo box alike), which made the dialogs that fill several
 /// as they open take 50 to 100 ms. So only the chosen item goes in now, for
-/// the box to show; the rest follow once the dialog has been drawn (a timer:
-/// timers come after every paint waiting), each box's in a message of its
-/// own, or at once when the box is used first (a key, a click, the wheel)
+/// the box to show; the rest follow once the dialog has been drawn (a timer
+/// set as it shows: timers come after every paint waiting), each box's in a
+/// message of its own, or at once when the box is used first (a key, a click, the wheel)
 /// or asked anything about its list (`CB_GETCURSEL` and every other `CB_*`
 /// message), so no caller can tell.
 pub fn fill_later(combo: HWND, items: Vec<String>, select: Option<usize>) {
@@ -463,8 +465,28 @@ pub fn fill_later(combo: HWND, items: Vec<String>, select: Option<usize>) {
     unsafe {
         if SetWindowSubclass(combo, Some(later_proc), LATER, later as usize) == 0 {
             fill_now(combo, later);
-        } else {
+        } else if IsWindowVisible(GetParent(combo)) != 0 {
+            // Made once the dialog shows: the list follows its first paint.
             SetTimer(combo, LATER, USER_TIMER_MINIMUM, None);
+        }
+    }
+}
+
+/// Dialog `dlg` is being shown: the lists still to come ([`fill_later`])
+/// go in once it has been drawn. Not before: a modal dialog without
+/// `WS_VISIBLE` is shown only once its message queue is empty, so a timer
+/// due before that would make it show later, not sooner.
+fn lists_after_show(dlg: HWND) {
+    // SAFETY: walks the children of this thread's dialog; the timers are
+    // theirs.
+    unsafe {
+        let mut child = GetWindow(dlg, GW_CHILD);
+        while !child.is_null() {
+            let mut data = 0usize;
+            if GetWindowSubclass(child, Some(later_proc), LATER, &mut data) != 0 {
+                SetTimer(child, LATER, USER_TIMER_MINIMUM, None);
+            }
+            child = GetWindow(child, GW_HWNDNEXT);
         }
     }
 }
@@ -1215,8 +1237,9 @@ fn paint_dark_radio(button: HWND, cd: &NMCUSTOMDRAW) {
 
 /// What every themed dialog handles alike: its colours (`WM_CTLCOLOR*`),
 /// the dark theme's radio buttons (`WM_NOTIFY`, see `radio_custom_draw`),
-/// and following the system's theme (`WM_SETTINGCHANGE`) when `look` says
-/// so. `Some` is the dialog procedure's answer.
+/// following the system's theme (`WM_SETTINGCHANGE`) when `look` says so,
+/// and the lists [`fill_later`] put off, once it shows (`WM_SHOWWINDOW`).
+/// `Some` is the dialog procedure's answer.
 pub fn common(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM, look: &Cell<Look>) -> Option<isize> {
     match msg {
         WM_CTLCOLORDLG | WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN
@@ -1233,6 +1256,11 @@ pub fn common(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM, look: &Cell<Look>) -> O
                 apply_theme(dlg, new.dark);
             }
             Some(0)
+        }
+        // Shown: the lists still to come follow (left to the dialog too).
+        WM_SHOWWINDOW if w != 0 => {
+            lists_after_show(dlg);
+            None
         }
         _ => None,
     }

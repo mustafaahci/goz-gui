@@ -27,8 +27,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ES_AUTOVSCROLL, ES_MULTILINE, EndDialog, GWLP_USERDATA, GetParent, GetWindowRect,
     GetWindowTextLengthW, IDCANCEL, IDOK, KillTimer, MINMAXINFO, SetTimer, SetWindowLongPtrW,
     USER_TIMER_MINIMUM, WM_CHAR, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG,
-    WM_KEYDOWN, WM_NCDESTROY, WM_NCPAINT, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE, WS_TABSTOP,
-    WS_THICKFRAME, WS_VSCROLL,
+    WM_KEYDOWN, WM_NCDESTROY, WM_NCPAINT, WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE,
+    WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::{enable, item, send, set_text};
@@ -313,9 +313,7 @@ impl Edit {
         fill_combo(dlg, ID_CASE, tri(), tri_index(f.match_case));
         fill_combo(dlg, ID_PATH, tri(), tri_index(f.match_path));
         enable(dlg, OK, !f.name.is_empty());
-        // SAFETY: a timer of this thread's dialog; timers come after the
-        // paints waiting, so it fires once the editor has been drawn.
-        unsafe { SetTimer(dlg, LAST_ROW, USER_TIMER_MINIMUM, None) };
+        // The last row's lists come once the editor shows (WM_SHOWWINDOW).
         // SAFETY: subclasses this thread's search box; the subclass removes
         // itself when the box goes.
         unsafe { SetWindowSubclass(item(dlg, ID_SEARCH), Some(search_proc), 1, 0) };
@@ -568,6 +566,15 @@ unsafe extern "system" fn edit_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_COMMAND => {
             let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
             isize::from(s.command(dlg, id, code))
+        }
+        // Shown (a modal dialog shows once its queue is empty): the last
+        // row's lists follow once it has been drawn, as timers come after
+        // the paints waiting. Set before then, the timer would hold the
+        // showing up instead.
+        WM_SHOWWINDOW if w != 0 => {
+            // SAFETY: a timer of this thread's dialog.
+            unsafe { SetTimer(dlg, LAST_ROW, USER_TIMER_MINIMUM, None) };
+            0
         }
         WM_TIMER if w == LAST_ROW => {
             s.make_last_row(dlg);
