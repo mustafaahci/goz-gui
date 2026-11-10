@@ -235,6 +235,12 @@ pub fn normal_place(hwnd: HWND) -> Option<(WindowPos, bool)> {
     if unsafe { GetWindowPlacement(hwnd, &mut wp) } == 0 {
         return None;
     }
+    place_of(&wp)
+}
+
+/// [`normal_place`] of a placement read before (the window's before it
+/// went fullscreen).
+pub fn place_of(wp: &WINDOWPLACEMENT) -> Option<(WindowPos, bool)> {
     let r = workspace_to_screen(Rect::from_win(&wp.rcNormalPosition), &monitors());
     if r.w <= 0 || r.h <= 0 {
         return None;

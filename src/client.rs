@@ -336,6 +336,35 @@ pub fn stream(
     search: &Search,
     mut page: impl FnMut(Vec<Row>, u64) -> Result<(), String>,
 ) -> Streamed {
+    let all = RowRange {
+        offset: 0,
+        limit: None,
+        details: true,
+    };
+    stream_range(stop, search, all, |rows, total| {
+        page(rows, total).map(|()| true)
+    })
+}
+
+/// The rows of a search [`stream_range`] asks for.
+pub struct RowRange {
+    /// The first row, and how many from it (`None`: to the end).
+    pub offset: u32,
+    pub limit: Option<u32>,
+    /// Sizes and dates too, not only the paths.
+    pub details: bool,
+}
+
+/// [`stream`] for the rows `range` names. `page` returns whether it wants
+/// more: `Ok(false)` ends the stream there (`Done` with the rows had so
+/// far), and the connection, which is this call's own, goes with it, so
+/// gozd stops sending.
+pub fn stream_range(
+    stop: &Stop,
+    search: &Search,
+    range: RowRange,
+    mut page: impl FnMut(Vec<Row>, u64) -> Result<bool, String>,
+) -> Streamed {
     let shared = &*stop.0;
     let mut conn = None;
     let pipe = match connect(&mut conn, shared) {
@@ -347,10 +376,10 @@ pub fn stream(
         query: search.query.clone(),
         scope: None,
         sort: search.sort,
-        offset: 0,
-        limit: None,
-        want_size: true,
-        want_mtime: true,
+        offset: range.offset,
+        limit: range.limit,
+        want_size: range.details,
+        want_mtime: range.details,
         match_case: search.match_case,
         want_total_size: false,
     });
@@ -370,8 +399,10 @@ pub fn stream(
                 let more = p.more;
                 rows += p.items.len() as u64;
                 let items = p.items.into_iter().map(Row::from_item).collect();
-                if let Err(why) = page(items, p.total) {
-                    return Streamed::Failed(Failure::Other(why));
+                match page(items, p.total) {
+                    Err(why) => return Streamed::Failed(Failure::Other(why)),
+                    Ok(false) => return Streamed::Done(rows),
+                    Ok(true) => {}
                 }
                 if !more {
                     return Streamed::Done(rows);

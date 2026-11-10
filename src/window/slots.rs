@@ -45,6 +45,7 @@ impl App {
         // F3 (tabs and windows).
 
         // F4 (search tools).
+        self.tools_start();
 
         // F5 (file tools).
 
@@ -62,6 +63,7 @@ impl App {
         // F3 (tabs and windows).
 
         // F4 (search tools).
+        self.tools_exit();
 
         // F5 (file tools).
 
@@ -71,7 +73,7 @@ impl App {
     /// A menu of the bar (or a submenu) is about to open, after the
     /// window readied its own items: the features check, grey or rebuild
     /// theirs.
-    pub(super) fn feature_menu_popup(&self, _popup: HMENU) {
+    pub(super) fn feature_menu_popup(&self, popup: HMENU) {
         // F1 (preview pane).
 
         // F2 (sidebars).
@@ -79,6 +81,7 @@ impl App {
         // F3 (tabs and windows).
 
         // F4 (search tools).
+        self.tools_menu_popup(popup);
 
         // F5 (file tools).
 
@@ -99,7 +102,9 @@ impl App {
             3200..=3299 | 4000..=4255 => false,
 
             // F4: 3300..=3399, and its custom filters 3800..=3999.
-            3300..=3399 | 3800..=3999 => false,
+            // (The custom filters' items run through `Filter::from_menu_id`
+            // before they get here.)
+            3300..=3399 | 3800..=3999 => self.tools_command(id),
 
             // F5: 3400..=3499.
             3400..=3499 => false,
@@ -113,7 +118,7 @@ impl App {
 
     /// A feature's WM_APP message (its range above): the answer, or `None`
     /// for DefWindowProc.
-    pub(super) fn feature_message(&self, msg: u32, _w: WPARAM, _l: LPARAM) -> Option<LRESULT> {
+    pub(super) fn feature_message(&self, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         match msg {
             // F1.
             m if (F1_MSG..F1_MSG + MSG_RANGE).contains(&m) => None,
@@ -125,7 +130,7 @@ impl App {
             m if (F3_MSG..F3_MSG + MSG_RANGE).contains(&m) => None,
 
             // F4.
-            m if (F4_MSG..F4_MSG + MSG_RANGE).contains(&m) => None,
+            m if (F4_MSG..F4_MSG + MSG_RANGE).contains(&m) => self.tools_message(m, w, l),
 
             // F5.
             m if (F5_MSG..F5_MSG + MSG_RANGE).contains(&m) => None,
@@ -151,7 +156,7 @@ impl App {
             t if (F3_TIMER..F3_TIMER + TIMER_RANGE).contains(&t) => false,
 
             // F4.
-            t if (F4_TIMER..F4_TIMER + TIMER_RANGE).contains(&t) => false,
+            t if (F4_TIMER..F4_TIMER + TIMER_RANGE).contains(&t) => self.tools_timer(t),
 
             // F5.
             t if (F5_TIMER..F5_TIMER + TIMER_RANGE).contains(&t) => false,

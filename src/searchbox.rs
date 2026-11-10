@@ -416,6 +416,27 @@ pub fn paint_cross(hdc: HDC, cx: i32, cy: i32, arm: f32, scale: f32, fg: u32, bg
     draw(hdc, cx, cy, &strokes, fg, bg);
 }
 
+/// A chevron pointing up (`up`) or down, 8 px wide at 100 %, centred on
+/// the pixel (`cx`, `cy`) over `bg`: the find bar's Previous and Next.
+pub fn paint_chevron(hdc: HDC, cx: i32, cy: i32, up: bool, scale: f32, fg: u32, bg: u32) {
+    let s = scale;
+    let half = 0.65 * s.max(1.0);
+    let dir = if up { -1.0 } else { 1.0 };
+    let strokes = [
+        Stroke::Line {
+            a: (-4.0 * s, -2.0 * s * dir),
+            b: (0.0, 2.0 * s * dir),
+            half,
+        },
+        Stroke::Line {
+            a: (0.0, 2.0 * s * dir),
+            b: (4.0 * s, -2.0 * s * dir),
+            half,
+        },
+    ];
+    draw(hdc, cx, cy, &strokes, fg, bg);
+}
+
 /// Back's ← (Forward's → when not `back`): a shaft 9 px long at 100 % and
 /// a head 4 px back along each side.
 fn arrow(scale: f32, back: bool) -> Vec<Stroke> {

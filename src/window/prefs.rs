@@ -152,6 +152,10 @@ impl App {
     /// The window's normal rectangle (screen pixels, with the DPI there),
     /// and whether it is maximized (or minimized from maximized).
     pub(super) fn placement_now(&self) -> (Option<WindowPos>, bool) {
+        // Fullscreen: the place it goes back to (F4's, `tools.rs`).
+        if let Some(place) = self.fullscreen_place() {
+            return place;
+        }
         let (pos, maximized) = match placement::normal_place(self.hwnd) {
             Some((pos, maximized)) => (Some(pos), maximized),
             None => (None, false),
@@ -248,6 +252,7 @@ impl App {
         self.save_bookmarks();
         self.save_runs();
         self.save_session(exit);
+        self.save_filters();
     }
 
     /// The store thread wrote a file with something to say, or could not

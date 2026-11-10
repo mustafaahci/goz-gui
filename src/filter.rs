@@ -1,8 +1,10 @@
 //! Search > Everything, Audio, … Video: result filters, each a run of search
 //! terms put in front of what the user typed. The extension lists are
-//! Everything 1.5's own, so a filter finds the same files in both.
+//! Everything 1.5's own, so a filter finds the same files in both. After
+//! them come the user's own filters (Search > Organize Filters...,
+//! `crate::filters`), in the menus, the filter bar and Ctrl+] / Ctrl+[.
 
-use crate::menu;
+use crate::{filters, menu};
 
 /// A result filter from the Search menu.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -17,6 +19,9 @@ pub enum Filter {
     Folder,
     Image,
     Video,
+    /// One of the user's own filters, by its id in `crate::filters`, which
+    /// names the same filter for as long as goz-gui runs.
+    Custom(u16),
 }
 
 const AUDIO: &str = "aac;ac3;adt;adts;aif;aifc;aiff;amr;ape;au;cda;dts;ec3;fla;flac;lpcm;m1a;m2a;\
@@ -56,6 +61,28 @@ impl Filter {
         Filter::Video,
     ];
 
+    /// Every filter the menus offer, in their order: the built-in ones,
+    /// then the user's (`crate::filters::listed`).
+    pub fn all() -> Vec<Filter> {
+        let mut out = Filter::ALL.to_vec();
+        out.extend(filters::listed().into_iter().map(Filter::Custom));
+        out
+    }
+
+    /// A built-in filter's place in [`Filter::ALL`] (0 for a custom one).
+    pub fn index(self) -> usize {
+        match self {
+            Filter::Everything | Filter::Custom(_) => 0,
+            Filter::Audio => 1,
+            Filter::Compressed => 2,
+            Filter::Document => 3,
+            Filter::Executable => 4,
+            Filter::Folder => 5,
+            Filter::Image => 6,
+            Filter::Video => 7,
+        }
+    }
+
     /// What the status bar calls an active filter; `None` for no filter.
     pub fn name(self) -> Option<&'static str> {
         match self {
@@ -67,6 +94,7 @@ impl Filter {
             Filter::Folder => Some("Folder"),
             Filter::Image => Some("Image"),
             Filter::Video => Some("Video"),
+            Filter::Custom(id) => Some(filters::name(id)),
         }
     }
 
@@ -76,15 +104,18 @@ impl Filter {
         self.name().unwrap_or("Everything")
     }
 
-    /// The filter named `title`, in any case.
+    /// The filter named `title`, in any case: a built-in one, else one of
+    /// the user's that the menus offer.
     pub fn from_title(title: &str) -> Option<Filter> {
         let title = title.trim();
         Filter::ALL
             .into_iter()
             .find(|filter| filter.title().eq_ignore_ascii_case(title))
+            .or_else(|| filters::find(title).map(Filter::Custom))
     }
 
-    /// The Search menu's label, with its access key.
+    /// The Search menu's label, with its access key (a custom filter's
+    /// name as it is, `&` shown as itself).
     pub fn label(self) -> &'static str {
         match self {
             Filter::Everything => "&Everything",
@@ -95,29 +126,55 @@ impl Filter {
             Filter::Folder => "&Folder",
             Filter::Image => "&Image",
             Filter::Video => "&Video",
+            Filter::Custom(id) => filters::label(id),
         }
     }
 
+    /// The menu command that chooses it: a built-in's by its place, a
+    /// custom one's by its place among those listed (0, no command, for
+    /// one no longer listed).
     pub fn menu_id(self) -> u16 {
-        menu::FILTER_FIRST + self as u16
+        match self {
+            Filter::Custom(id) => filters::listed()
+                .iter()
+                .position(|&i| i == id)
+                .filter(|&at| at < menu::CUSTOM_FILTERS)
+                .map_or(0, |at| menu::CUSTOM_FILTER_FIRST + at as u16),
+            f => menu::FILTER_FIRST + f.index() as u16,
+        }
     }
 
     pub fn from_menu_id(id: u16) -> Option<Filter> {
+        if let Some(at) = id.checked_sub(menu::CUSTOM_FILTER_FIRST)
+            && usize::from(at) < menu::CUSTOM_FILTERS
+        {
+            return filters::listed()
+                .get(usize::from(at))
+                .map(|&i| Filter::Custom(i));
+        }
         Filter::ALL
             .into_iter()
             .find(|filter| filter.menu_id() == id)
     }
 
     /// Search > Next Filter (`forward`) or Previous Filter: the one after or
-    /// before in the menu, round from the last to the first.
+    /// before in the menu, round from the last to the first (from a filter
+    /// no longer listed, as from Everything).
     pub fn cycle(self, forward: bool) -> Filter {
-        let n = Filter::ALL.len();
-        let at = self as usize;
-        Filter::ALL[if forward {
+        let all = Filter::all();
+        let n = all.len();
+        let at = all.iter().position(|&f| f == self).unwrap_or(0);
+        all[if forward {
             (at + 1) % n
         } else {
             (at + n - 1) % n
         }]
+    }
+
+    /// A built-in filter's search, as Everything's Organize Filters shows
+    /// it and `Filters.csv` keeps it; a custom filter's terms.
+    pub fn search(self) -> String {
+        self.terms().unwrap_or_default()
     }
 
     /// The extensions the filter keeps, `;`-separated.
@@ -129,7 +186,7 @@ impl Filter {
             Filter::Executable => Some(EXECUTABLE),
             Filter::Image => Some(IMAGE),
             Filter::Video => Some(VIDEO),
-            Filter::Everything | Filter::Folder => None,
+            Filter::Everything | Filter::Folder | Filter::Custom(_) => None,
         }
     }
 
@@ -138,65 +195,178 @@ impl Filter {
         match self {
             Filter::Everything => None,
             Filter::Folder => Some("folder:".into()),
+            Filter::Custom(id) => filters::terms(id),
             _ => self.extensions().map(|exts| format!("ext:{exts}")),
         }
     }
 
-    /// A term that makes gozd honour both the filter and the user's own
+    /// Terms that make gozd honour both the filter and the user's own
     /// terms where it would otherwise keep only the user's: gozd ANDs terms,
-    /// but of several `ext:` it keeps the last, and the same for `file:` and
-    /// `folder:`. Put last, this one wins.
+    /// but of several `ext:` it keeps the last, of `file:` and `folder:` the
+    /// last, and of several `size:` the last. Put last, these win: the
+    /// extensions both name, the sizes both allow, or nothing at all when
+    /// the two contradict.
     fn reconcile(self, text: &str) -> Option<String> {
-        let funcs = functions(text);
-        match self {
-            Filter::Everything => None,
-            Filter::Folder => funcs
-                .iter()
-                .any(|(name, _)| name == "file")
-                .then(|| NOTHING.to_owned()),
-            _ => {
-                let ours = self.extensions()?;
-                // gozd ignores an `ext:` with no extension in it.
-                let theirs = funcs.iter().rev().find_map(|(name, value)| {
-                    let exts: Vec<&str> = value
-                        .split(';')
-                        .map(|e| e.trim_start_matches('.'))
-                        .filter(|e| !e.is_empty())
-                        .collect();
-                    (name == "ext" && !exts.is_empty()).then_some(exts)
-                })?;
-                let both: Vec<&str> = theirs
-                    .into_iter()
-                    .filter(|e| ours.split(';').any(|o| o.eq_ignore_ascii_case(e)))
-                    .collect();
-                Some(if both.is_empty() {
-                    NOTHING.to_owned()
-                } else {
-                    format!("ext:{}", both.join(";"))
-                })
-            }
-        }
+        reconcile(&self.terms()?, text)
     }
 }
 
-/// The search gozd gets for `text`: the filter's terms, Match Path's
-/// directive, the text, and whatever keeps the filter in force beside the
-/// user's own `ext:`/`file:`.
-pub fn query(filter: Filter, match_path: bool, text: &str) -> String {
-    let mut q = String::new();
-    if let Some(terms) = filter.terms() {
-        q.push_str(&terms);
-        q.push(' ');
+/// [`Filter::reconcile`] for a filter whose terms are `terms`.
+fn reconcile(terms: &str, text: &str) -> Option<String> {
+    let ours = parsed(terms)?;
+    // A text gozd refuses is refused whatever comes after it.
+    let theirs = parsed(text)?;
+    if let (Some(a), Some(b)) = (ours.kind, theirs.kind)
+        && a != b
+    {
+        return Some(NOTHING.to_owned());
     }
-    if match_path {
-        q.push_str("matchpath: ");
+    let mut out = Vec::new();
+    if let (Some(ours), Some(theirs)) = (&ours.ext, &theirs.ext) {
+        let both: Vec<&str> = theirs
+            .iter()
+            .filter(|e| ours.contains(e))
+            .map(String::as_str)
+            .collect();
+        if both.is_empty() {
+            return Some(NOTHING.to_owned());
+        }
+        out.push(format!("ext:{}", both.join(";")));
     }
-    q.push_str(text);
-    if let Some(term) = filter.reconcile(text) {
-        q.push(' ');
-        q.push_str(&term);
+    if let (Some(a), Some(b)) = (ours.size, theirs.size) {
+        let (min, max) = (a.0.max(b.0), a.1.min(b.1));
+        if min > max {
+            return Some(NOTHING.to_owned());
+        }
+        out.push(match (min, max) {
+            (min, u64::MAX) => format!("size:>={min}"),
+            (0, max) => format!("size:<={max}"),
+            (min, max) => format!("size:{min}..{max}"),
+        });
     }
-    q
+    (!out.is_empty()).then(|| out.join(" "))
+}
+
+/// Files or folders only (`file:`, `folder:`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    File,
+    Folder,
+}
+
+/// The parts of a search a filter's terms and the user's both may give,
+/// of which gozd keeps only the last: its last `ext:` holding an
+/// extension (lower-cased, without its dot), its kind, its last `size:` as
+/// an inclusive byte range.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Parts {
+    ext: Option<Vec<String>>,
+    kind: Option<Kind>,
+    size: Option<(u64, u64)>,
+}
+
+/// Whether gozd refuses `text` for an operator it does not take: an
+/// unquoted `|` or `!`.
+fn has_operator(text: &str) -> bool {
+    let mut quoted = false;
+    for c in text.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            '|' | '!' if !quoted => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// [`Parts`] of `text`, read as goz's parser reads it; `None` for a text it
+/// refuses (an operator, an unknown function, a `size:` it cannot read).
+fn parsed(text: &str) -> Option<Parts> {
+    if has_operator(text) {
+        return None;
+    }
+    let mut p = Parts::default();
+    for (name, value) in functions(text) {
+        match name.as_str() {
+            "ext" => {
+                let exts: Vec<String> = value
+                    .split(';')
+                    .filter(|e| !e.is_empty())
+                    .map(|e| e.trim_start_matches('.').to_lowercase())
+                    .collect();
+                if !exts.is_empty() {
+                    p.ext = Some(exts);
+                }
+            }
+            "size" => p.size = Some(size_range(&value)?),
+            "file" => p.kind = Some(Kind::File),
+            "folder" | "dir" => p.kind = Some(Kind::Folder),
+            "dm" | "datemodified" | "path" | "case" | "matchpath" => {}
+            _ => return None,
+        }
+    }
+    Some(p)
+}
+
+/// A `size:` value as goz reads it, as an inclusive byte range: a named
+/// size (`tiny`, ...), a range `a..b`, a comparison, or a size (1024-based
+/// `kb`, `mb`, `gb`, `tb`, or `b`).
+fn size_range(value: &str) -> Option<(u64, u64)> {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    let v = value.trim();
+    let named = match v.to_ascii_lowercase().as_str() {
+        "empty" => Some((0, 0)),
+        "tiny" => Some((0, 10 * KB)),
+        "small" => Some((10 * KB, 100 * KB)),
+        "medium" => Some((100 * KB, MB)),
+        "large" => Some((MB, 16 * MB)),
+        "huge" => Some((16 * MB, 128 * MB)),
+        "gigantic" => Some((128 * MB, u64::MAX)),
+        _ => None,
+    };
+    if named.is_some() {
+        return named;
+    }
+    if let Some((lo, hi)) = v.split_once("..") {
+        let lo = if lo.trim().is_empty() { 0 } else { bytes(lo)? };
+        let hi = if hi.trim().is_empty() {
+            u64::MAX
+        } else {
+            bytes(hi)?
+        };
+        return Some((lo, hi));
+    }
+    for op in [">=", "<=", ">", "<"] {
+        if let Some(rest) = v.strip_prefix(op) {
+            let n = bytes(rest)?;
+            return Some(match op {
+                ">=" => (n, u64::MAX),
+                ">" => (n.saturating_add(1), u64::MAX),
+                "<=" => (0, n),
+                _ => (0, n.saturating_sub(1)),
+            });
+        }
+    }
+    let n = bytes(v.strip_prefix('=').unwrap_or(v))?;
+    Some((n, n))
+}
+
+/// `10mb`, `1024`, `2gb` as bytes (1024-based).
+fn bytes(s: &str) -> Option<u64> {
+    let lower = s.trim().to_ascii_lowercase();
+    let units = [
+        ("tb", 1u64 << 40),
+        ("gb", 1 << 30),
+        ("mb", 1 << 20),
+        ("kb", 1 << 10),
+        ("b", 1),
+    ];
+    let (num, mult) = units
+        .iter()
+        .find_map(|&(u, m)| lower.strip_suffix(u).map(|n| (n.to_owned(), m)))
+        .unwrap_or((lower.clone(), 1));
+    num.trim().parse::<u64>().ok()?.checked_mul(mult)
 }
 
 /// The `name:value` functions in `text`, names lower-cased, split the way
@@ -243,6 +413,26 @@ fn functions(text: &str) -> Vec<(String, String)> {
     }
     flush(&mut cur, &mut colon);
     out
+}
+
+/// The search gozd gets for `text`: the filter's terms, Match Path's
+/// directive, the text, and whatever keeps the filter in force beside the
+/// user's own `ext:`, `file:`/`folder:` and `size:`.
+pub fn query(filter: Filter, match_path: bool, text: &str) -> String {
+    let mut q = String::new();
+    if let Some(terms) = filter.terms() {
+        q.push_str(&terms);
+        q.push(' ');
+    }
+    if match_path {
+        q.push_str("matchpath: ");
+    }
+    q.push_str(text);
+    if let Some(term) = filter.reconcile(text) {
+        q.push(' ');
+        q.push_str(&term);
+    }
+    q
 }
 
 #[cfg(test)]
@@ -349,6 +539,99 @@ mod tests {
         assert_eq!(query(Filter::Everything, false, "a b"), "a b");
         assert_eq!(query(Filter::Everything, true, "a"), "matchpath: a");
         assert_eq!(query(Filter::Folder, true, "a"), "folder: matchpath: a");
+    }
+
+    #[test]
+    fn a_custom_filters_terms_meet_the_users() {
+        let q = |terms: &str, text: &str| {
+            let mut q = format!("{terms} {text}");
+            if let Some(t) = reconcile(terms, text) {
+                q.push(' ');
+                q.push_str(&t);
+            }
+            q
+        };
+        let parse = |s: &str| parse_query(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+        // Sizes: what both allow.
+        let p = parse(&q("size:>1mb", "size:<10mb"));
+        let size = p.filters.size.expect("size");
+        assert_eq!(
+            (size.min, size.max),
+            (1024 * 1024 + 1, 10 * 1024 * 1024 - 1)
+        );
+        let p = parse(&q("size:>1mb", "size:>5mb"));
+        assert_eq!(p.filters.size.map(|s| s.min), Some(5 * 1024 * 1024 + 1));
+        assert_eq!(p.filters.size.map(|s| s.max), Some(u64::MAX));
+        // None at all: nothing matches.
+        assert_eq!(exts(&q("size:>1mb", "size:<1kb")), Some(vec!["\\".into()]));
+        // Kinds that contradict, and extensions.
+        assert_eq!(exts(&q("file: report", "folder:")), Some(vec!["\\".into()]));
+        assert_eq!(reconcile("folder:", "dir:x"), None);
+        assert_eq!(
+            exts(&q("ext:mp3;flac size:>1mb", "ext:FLAC;wav")),
+            Some(vec!["flac".into()])
+        );
+        // Nothing of the user's to meet: the filter's terms alone.
+        assert_eq!(reconcile("ext:mp3 size:>1mb", "live"), None);
+        // A user's text gozd refuses: left for gozd to say why.
+        assert_eq!(reconcile("ext:mp3", "a|b ext:pdf"), None);
+    }
+
+    #[test]
+    fn parts_are_read_as_goz_reads_them() {
+        use goz_core::query::{LocalClock, parse_query_at};
+        struct Clock;
+        impl LocalClock for Clock {
+            fn now(&self) -> i64 {
+                133_801_632_000_000_000
+            }
+            fn to_local(&self, utc: i64) -> Option<i64> {
+                Some(utc)
+            }
+            fn to_utc(&self, local: i64) -> Option<i64> {
+                Some(local)
+            }
+            fn week_start(&self) -> u8 {
+                0
+            }
+        }
+        for text in [
+            "",
+            "report",
+            "ext:MP3;.flac x ext:pdf",
+            "ext: x",
+            "ext:;",
+            "\"ext:pdf\" a",
+            "file: size:>1mb",
+            "folder:x dir:y",
+            "size:tiny",
+            "size:1kb..2MB",
+            "size:..500",
+            "size:=12",
+            "size:<10kb size:>=3gb",
+            "size:huge dm:lastweek case: path:x matchpath:",
+            "a|b",
+            "!x",
+            "\"a|b\" ext:txt",
+            "parent:x",
+            "size:abc",
+            r"C:\Windows 12:30 *.rs",
+        ] {
+            let ours = parsed(text);
+            let goz = parse_query_at(text, false, &Clock).ok().map(|q| Parts {
+                ext: q.filters.ext.map(|v| {
+                    v.into_iter()
+                        .map(|e| String::from_utf8(e).expect("ascii"))
+                        .collect()
+                }),
+                kind: q.filters.kind.map(|k| match k {
+                    goz_core::query::Kind::File => super::Kind::File,
+                    goz_core::query::Kind::Folder => super::Kind::Folder,
+                }),
+                size: q.filters.size.map(|s| (s.min, s.max)),
+            });
+            assert_eq!(ours, goz, "{text}");
+        }
     }
 
     #[test]

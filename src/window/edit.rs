@@ -208,6 +208,10 @@ pub(super) unsafe extern "system" fn edit_proc(
 /// # Safety
 /// `w` and `l` are what `msg` carries, for the box `hwnd`.
 unsafe fn edit_message(app: &App, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    // The search box's menu and F2 (F4's, `tools.rs`).
+    if let Some(answer) = app.search_box_message(msg, w, l) {
+        return answer;
+    }
     // SAFETY: `w` and `l` are passed on as they came.
     unsafe {
         match msg {
@@ -286,7 +290,7 @@ fn word_end_after(text: &[u16], caret: usize) -> usize {
 
 /// Deletes the selection, or with none the word before the caret
 /// (`back`, Ctrl+Backspace) or after it (Ctrl+Delete); undoable.
-fn delete_word(edit: HWND, back: bool) {
+pub(super) fn delete_word(edit: HWND, back: bool) {
     let (mut start, mut end) = (0u32, 0u32);
     send(
         edit,

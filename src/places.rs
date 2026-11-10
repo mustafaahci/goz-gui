@@ -50,6 +50,8 @@ pub enum Which {
     SearchSyntax,
     /// Tools > Options.
     Options,
+    /// Search > Organize Filters.
+    FilterOrganize,
 }
 
 /// What Everything keeps for a dialog, under which keys.
@@ -71,7 +73,7 @@ struct Keys {
 }
 
 impl Which {
-    pub const ALL: [Which; 8] = [
+    pub const ALL: [Which; 9] = [
         Which::SearchHistory,
         Which::SearchHistorySelect,
         Which::RunHistory,
@@ -80,6 +82,7 @@ impl Which {
         Which::BookmarkEdit,
         Which::SearchSyntax,
         Which::Options,
+        Which::FilterOrganize,
     ];
 
     fn keys(self) -> Keys {
@@ -139,6 +142,15 @@ impl Which {
             Which::BookmarkEdit => k("bookmark_edit", false, false, "", &[], false),
             Which::SearchSyntax => k("help_search_syntax", true, true, "", &[], false),
             Which::Options => k("options", true, true, "", &[], false),
+            // Everything's four columns, which can be dragged.
+            Which::FilterOrganize => k(
+                "filter_organize",
+                true,
+                true,
+                "filter_organize_",
+                &["name", "search", "macro", "key"],
+                true,
+            ),
         }
     }
 }
@@ -180,7 +192,7 @@ impl Place {
 
 /// Every window's place, as the settings file holds them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Places([Place; 8]);
+pub struct Places([Place; 9]);
 
 impl Default for Places {
     fn default() -> Places {

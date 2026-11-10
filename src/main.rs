@@ -77,6 +77,12 @@ mod zoom;
 // F3 (tabs and windows).
 
 // F4 (search tools).
+mod advsearch;
+mod filter_dialogs;
+mod filters;
+mod find;
+mod goto;
+mod searchtools;
 
 // F5 (file tools).
 

@@ -101,6 +101,9 @@ mod typing;
 // F3 (tabs and windows).
 
 // F4 (search tools).
+mod custom_filters;
+mod findbar;
+mod tools;
 
 // F5 (file tools).
 
@@ -416,7 +419,8 @@ pub struct App {
     // F3 (tabs and windows).
 
     // F4 (search tools).
-
+    /// The find bar, the find under way, fullscreen.
+    tools: tools::Tools,
     // F5 (file tools).
 
     // F6 (integration and the Options pages).
@@ -935,7 +939,7 @@ impl App {
                 // F3 (tabs and windows).
 
                 // F4 (search tools).
-
+                tools: tools::Tools::new(),
                 // F5 (file tools).
 
                 // F6 (integration and the Options pages).
