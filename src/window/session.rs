@@ -5,7 +5,8 @@
 //! - **Saved**: the window's place, theme, On Top and status bar; and each
 //!   tab (`tabs.rs`): the search with its options and sort, the view and
 //!   columns, the row at the top of the list, the selected and focused
-//!   files by path, Back and Forward's entries; and the tabs closed. The
+//!   files by path (or that every row was selected), Back and Forward's
+//!   entries; and the tabs closed. The
 //!   store thread writes it at most every `session_store_save_delay` ms
 //!   (15 s) while it changes, and at exit. `session_store=0` turns all of
 //!   it off (nothing read or written, no menu item).
@@ -16,7 +17,9 @@
 //!   runs again; when its first rows come the list scrolls to the saved row
 //!   and the saved files are selected again as their rows arrive (the
 //!   refresh's `Reselect`), so a file now elsewhere in the results is still
-//!   found. The other tabs do the same when they are shown.
+//!   found; a tab that had every row selected has every row selected again,
+//!   the files that came since included, as a refresh keeps it. The other
+//!   tabs do the same when they are shown.
 //! - **Several goz-gui windows**: each writes its own session, so the file
 //!   holds the window written last, which is the last one closed.
 
@@ -24,7 +27,8 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use windows_sys::Win32::UI::Controls::{
-    LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_SCROLL, LVNI_FOCUSED,
+    LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_GETTOPINDEX, LVM_SCROLL,
+    LVNI_FOCUSED,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowPlacement, IsIconic, IsWindowVisible, IsZoomed, KillTimer,
@@ -34,7 +38,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::nav::NavState;
-use super::reselect::Reselect;
+use super::reselect::{self, Reselect};
 use super::{App, TIMER_SESSION, prefs, send};
 use crate::history::NavHistory;
 use crate::placement;
@@ -51,6 +55,16 @@ pub(super) struct PendingView {
     top: u64,
     focus: Option<Vec<u16>>,
     selection: Vec<Vec<u16>>,
+    /// Every row selected (`View::select_all`).
+    all: bool,
+}
+
+/// Where the list is and what it has selected, as a tab keeps it.
+struct Place {
+    top: u64,
+    focus: Option<Vec<u16>>,
+    selection: Vec<Vec<u16>>,
+    all: bool,
 }
 
 /// The session's settings and file, and the session read at startup.
@@ -216,12 +230,13 @@ impl App {
                 nav.current_index().unwrap_or(0),
             )
         };
-        let (top, focus, selection) = self.place_now();
+        let place = self.place_now();
         View {
             search: self.nav_state().to_search(),
-            top,
-            focus,
-            selection,
+            top: place.top,
+            focus: place.focus,
+            selection: place.selection,
+            select_all: place.all,
             nav,
             nav_index,
             display: Some(self.view()),
@@ -231,11 +246,16 @@ impl App {
 
     /// The row at the top of the list, and the focused and selected files
     /// by path: those held, and those a refresh or a restore is still to
-    /// select again.
-    fn place_now(&self) -> (u64, Option<Vec<u16>>, Vec<Vec<u16>>) {
+    /// select again; and whether every row is selected.
+    fn place_now(&self) -> Place {
         if let Some(v) = self.sessions.view.borrow().as_ref() {
             // A restore whose rows have not come yet.
-            return (v.top, v.focus.clone(), v.selection.clone());
+            return Place {
+                top: v.top,
+                focus: v.focus.clone(),
+                selection: v.selection.clone(),
+                all: v.all,
+            };
         }
         if self
             .model
@@ -246,7 +266,12 @@ impl App {
         {
             // A new search on its way: it shows from the top, with nothing
             // selected.
-            return (0, None, Vec::new());
+            return Place {
+                top: 0,
+                focus: None,
+                selection: Vec::new(),
+                all: false,
+            };
         }
         let top = self.top_index() as u64;
         let focused = usize::try_from(send(
@@ -256,6 +281,10 @@ impl App {
             LVNI_FOCUSED as isize,
         ))
         .ok();
+        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
+        let all = reselect::every_row(selected, self.model.borrow().total);
+        // With every row selected, the rows held are noted too: Everything
+        // reading the session selects those.
         let held = self.selected_held();
         let (mut focus, mut selection) = {
             let m = self.model.borrow();
@@ -274,7 +303,12 @@ impl App {
             selection.extend(paths.into_iter().take(room));
             focus = focus.or(sought_focus);
         }
-        (top, focus, selection)
+        Place {
+            top,
+            focus,
+            selection,
+            all,
+        }
     }
 
     /// Whether History > Restore Previous Session is there (`None`: the
@@ -359,6 +393,7 @@ impl App {
             top: view.top,
             focus: view.focus.clone(),
             selection: view.selection.clone(),
+            all: view.select_all,
         });
         searchbox::invalidate_nav(self);
     }
@@ -382,7 +417,7 @@ impl App {
 
     /// The first rows of a restored view's search came, `total` in all:
     /// the list scrolls to the saved row, and the saved files are selected
-    /// again as their rows arrive.
+    /// again as their rows arrive (every row at once, when every row was).
     pub(super) fn apply_view(&self, view: PendingView, total: u64) {
         // A tab's rows are in: the list, frozen while they came (`tabs.rs`),
         // takes its new size before it scrolls, and paints once this is
@@ -401,7 +436,13 @@ impl App {
                 send(self.list, LVM_SCROLL, 0, dy as isize);
             }
         }
-        let reselect = Reselect::sought_again(view.selection, view.focus);
+        let mut reselect = Reselect::sought_again(view.selection, view.focus);
+        if view.all && total > 0 {
+            // Every row was selected: every row is again, however many
+            // there are now (`reselect.rs`); the focus is still sought.
+            self.quietly(|| self.select_every_row());
+            reselect.every_row_selected();
+        }
         if !reselect.is_done() {
             *self.reselect.borrow_mut() = Some(reselect);
         }

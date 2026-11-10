@@ -41,7 +41,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::celltip::{self, CellTip};
 use crate::client::{BLOCK_ROWS, Failure, Job, Reply, Search, Worker};
 use crate::columns::Layout;
-use crate::copytext::{self, Field};
 use crate::dropdown::Dropdown;
 use crate::fileops::{self, FileOps};
 use crate::filter::{self, Filter};
@@ -152,6 +151,11 @@ const WM_LAUNCH: u32 = WM_APP + 13;
 /// File > Export's thread: wParam `crate::export::PROGRESS` or `ENDED`
 /// (lParam a `Box<crate::export::Ended>`).
 const WM_EXPORT: u32 = WM_APP + 14;
+/// The types' thread answered (`typeinfo`): the list paints again.
+const WM_TYPES: u32 = WM_APP + 15;
+/// Posted by a paint that met types not known yet: they are sent to the
+/// types' thread, together, once the paint is over.
+const WM_TYPES_ASK: u32 = WM_APP + 16;
 /// A thumbnail was made: a `Box<thumbs::ThumbReply>` in lParam. Kept apart
 /// from the numbers above so others can be added there.
 const WM_THUMB: u32 = WM_APP + 30;
@@ -1006,7 +1010,7 @@ impl App {
                     sort: SortSpec::default(),
                     match_case: false,
                 }))),
-                icons: Icons::new(hwnd, WM_ICON),
+                icons: Icons::new(hwnd, WM_ICON, WM_TYPES, WM_TYPES_ASK),
                 scratch: RefCell::new(Scratch::default()),
                 search_rc: Cell::new(RECT::default()),
                 status_rc: Cell::new(RECT::default()),
@@ -1811,6 +1815,18 @@ impl App {
                     self.on_icon(&reply);
                     0
                 }
+                WM_TYPES_ASK => {
+                    self.icons.types.send();
+                    0
+                }
+                WM_TYPES => {
+                    // Rows of those types show their icons and names now
+                    // (Details' rows and the thumbnail cells alike).
+                    if self.icons.types.arrived() {
+                        InvalidateRect(self.list, core::ptr::null(), 0);
+                    }
+                    0
+                }
                 WM_THUMB => {
                     let reply = Box::from_raw(l as *mut ThumbReply);
                     // Only a thumbnail kept puts the rest off: one thrown
@@ -2081,7 +2097,8 @@ impl App {
         if let Some(id) = column {
             let m = self.model.borrow();
             if let Some(row) = m.row(index) {
-                copytext::push(row, Field::of_column(id), &mut text);
+                // As drawn: the shell is not asked on this thread.
+                paint::push_cell(self, row, id, &mut text);
             }
         }
         let n = text.len().min(info.item.cchTextMax as usize - 1);
@@ -2401,7 +2418,7 @@ impl App {
                 // still the ones held: for a refresh, and for a new search
                 // when Options > Results keeps the selection.
                 let keep_selection = fresh && !self.ui.get().clear_selection;
-                let kept = (refresh || keep_selection).then(|| self.note_selection());
+                let kept = (refresh || keep_selection).then(|| self.note_selection(refresh));
                 let on_screen = self.view_blocks();
                 let mut m = self.model.borrow_mut();
                 let mut adopted = None;
@@ -2451,14 +2468,14 @@ impl App {
                         } else if let Some(kept) = kept_refresh {
                             // The list's selection is by row number, which
                             // now may be another file's.
-                            self.restore_selection(kept, total);
+                            self.restore_selection(kept);
                         } else if self.enter_pending.take() {
                             self.enter_select();
                         } else if let Some(kept) = kept_search {
                             // Another search: the files selected are
                             // selected again where they are in it, from
                             // its top.
-                            self.restore_selection(kept.for_new_search(), total);
+                            self.restore_selection(kept.for_new_search());
                             if total > 0 {
                                 send(self.list, LVM_ENSUREVISIBLE, 0, 0);
                             }
@@ -2474,7 +2491,8 @@ impl App {
                     }
                     None => {
                         if old_total != total {
-                            self.set_count(total, true);
+                            // A selection of every row stays one.
+                            self.recount(old_total, total);
                         }
                         let first = u64::from(block) * u64::from(BLOCK_ROWS);
                         let last = (first + u64::from(BLOCK_ROWS)).min(total).saturating_sub(1);

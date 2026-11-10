@@ -66,6 +66,7 @@ mod theme;
 mod thumbs;
 mod tray;
 mod typeahead;
+mod typeinfo;
 mod view;
 mod wide;
 mod window;

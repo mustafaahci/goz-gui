@@ -9,8 +9,15 @@
 //! held are noted by path; the list's selection is cleared, and each of
 //! those files is selected again as the block holding it arrives. A file
 //! that is gone stays unselected. Selected rows that are not held cannot be
-//! noted (nothing knows their paths), but no action takes them either. A
-//! selection of every row stays one while the result keeps its size.
+//! noted (nothing knows their paths), but no action takes them either.
+//!
+//! A selection of every row (Select All, or one that came to cover every
+//! row) stays one: after the refresh every row is selected, the files that
+//! came with it included, whatever the result's new size, and only the
+//! focus and the anchor are sought by path. Selecting every row is one
+//! message to the list whatever their number, so a refresh of millions of
+//! selected rows costs what one of a few does. The same holds when a later
+//! block brings a larger total, and for a tab shown again (`session.rs`).
 //!
 //! As soon as the user changes the selection, whatever has not come back
 //! yet is forgotten, so it never adds itself to a selection made since.
@@ -82,10 +89,10 @@ impl Reselect {
     }
 
     /// Every row is selected again (a refresh of a result all of which was
-    /// selected, at its old size): the files need not be sought, only the
-    /// focus and the anchor. Selecting each one again would change nothing
-    /// and cost the list a message a file.
-    fn every_row_selected(&mut self) {
+    /// selected, whatever its new size): the files need not be sought,
+    /// only the focus and the anchor. Selecting each one again would
+    /// change nothing and cost the list a message a file.
+    pub(super) fn every_row_selected(&mut self) {
         self.paths.clear();
     }
 
@@ -118,11 +125,45 @@ impl Reselect {
     }
 }
 
+/// Whether `selected` rows of `total` are every row: Select All, or a
+/// selection that came to cover them all. No rows: nothing is selected.
+pub(super) fn every_row(selected: u64, total: u64) -> bool {
+    selected > 0 && selected >= total
+}
+
+/// Whether the rows a block added (`old_total` rows before, `total` now)
+/// are to be selected: every row was, `selected` of `old_total`.
+fn new_rows_selected(selected: u64, old_total: u64, total: u64) -> bool {
+    total > old_total && every_row(selected, old_total)
+}
+
+/// How a refresh puts the selection back on its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Again {
+    /// Every row, as many as there are now (the files that came with the
+    /// refresh too): one message to the list; only the focus and the
+    /// anchor are sought by path.
+    All,
+    /// The files noted, each selected again where its row is now.
+    Files,
+}
+
+impl Again {
+    /// The way back for a selection of `selected` rows of `total`, noted
+    /// as the refresh's rows came.
+    fn of(selected: u64, total: u64) -> Again {
+        if every_row(selected, total) {
+            Again::All
+        } else {
+            Again::Files
+        }
+    }
+}
+
 /// The selection as a refresh found it.
 pub(super) struct Kept {
     reselect: Reselect,
-    /// Every row was selected, of this many.
-    all_of: Option<u64>,
+    again: Again,
 }
 
 impl Kept {
@@ -131,7 +172,7 @@ impl Kept {
     /// all of the last search's were.
     pub(super) fn for_new_search(self) -> Kept {
         Kept {
-            all_of: None,
+            again: Again::Files,
             ..self
         }
     }
@@ -186,11 +227,18 @@ impl App {
         self.reselect.borrow_mut().take();
     }
 
-    /// Notes what is selected, by path, before a refresh's rows replace
-    /// the rows on screen.
-    pub(super) fn note_selection(&self) -> Kept {
+    /// Notes what is selected, by path, before a refresh's rows (`refresh`)
+    /// or another search's replace the rows on screen.
+    pub(super) fn note_selection(&self, refresh: bool) -> Kept {
         let count = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
-        let held = if count > 0 {
+        let again = if refresh {
+            Again::of(count, self.model.borrow().total)
+        } else {
+            Again::Files
+        };
+        // Every row selected again after a refresh: the files need not be
+        // noted, only the focus and the anchor.
+        let held = if again == Again::Files && count > 0 {
             self.selected_held()
         } else {
             Vec::new()
@@ -203,38 +251,35 @@ impl App {
             LVNI_FOCUSED as isize,
         ));
         let mark = index(send(self.list, LVM_GETSELECTIONMARK, 0, 0));
-        let (mut reselect, total) = {
+        let mut reselect = {
             let m = self.model.borrow();
             let path = |i: usize| m.peek(i).map(|row| row.path.clone());
-            let reselect = Reselect {
+            Reselect {
                 paths: held.iter().filter_map(|&i| path(i)).collect(),
                 focus: focused.and_then(path),
                 mark: mark.and_then(path),
-            };
-            (reselect, m.total)
+            }
         };
         if let Some(older) = self.reselect.borrow_mut().take() {
             reselect.merge(older);
         }
-        Kept {
-            reselect,
-            all_of: (count > 0 && count >= total).then_some(total),
-        }
+        Kept { reselect, again }
     }
 
-    /// A refresh's rows are on screen, `total` of them: the selection by
-    /// row number is cleared, and the files noted in `kept` are selected
-    /// again as their rows arrive (`reselect_block`).
-    pub(super) fn restore_selection(&self, kept: Kept, total: u64) {
+    /// A refresh's rows are on screen: the selection by row number is
+    /// cleared, and the files noted in `kept` are selected again as their
+    /// rows arrive (`reselect_block`); or every row is, at once, when every
+    /// row was selected, however many rows there are now.
+    pub(super) fn restore_selection(&self, kept: Kept) {
         let Kept {
             mut reselect,
-            all_of,
+            again,
         } = kept;
-        let all = all_of == Some(total);
+        let all = again == Again::All;
         self.quietly(|| {
             self.clear_selection();
             if all {
-                self.set_state(usize::MAX, LVIS_SELECTED, LVIS_SELECTED);
+                self.select_every_row();
             }
         });
         if all {
@@ -242,6 +287,26 @@ impl App {
         }
         if !reselect.is_done() {
             *self.reselect.borrow_mut() = Some(reselect);
+        }
+    }
+
+    /// Every row selected: one message whatever their number (the list
+    /// keeps its selection as ranges).
+    pub(super) fn select_every_row(&self) {
+        self.set_state(usize::MAX, LVIS_SELECTED, LVIS_SELECTED);
+    }
+
+    /// A block of the rows on screen (not a refresh's or a search's first)
+    /// said the result has `total` rows, not `old_total`: the list takes
+    /// the new count, and a selection of every row stays one, so the rows
+    /// that came are selected too. Fewer rows need nothing more: the list
+    /// drops the rows past its end, and their selection with them.
+    pub(super) fn recount(&self, old_total: u64, total: u64) {
+        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
+        let all = new_rows_selected(selected, old_total, total);
+        self.set_count(total, true);
+        if all {
+            self.quietly(|| self.select_every_row());
         }
     }
 
@@ -398,6 +463,44 @@ mod tests {
         };
         r.every_row_selected();
         assert!(r.is_done());
+    }
+
+    #[test]
+    fn every_row_selected_is_every_row_again_whatever_the_new_size() {
+        // Select All of 5 M rows; the refresh's size does not enter into
+        // it: every row is selected again, the new ones included.
+        assert_eq!(Again::of(5_000_000, 5_000_000), Again::All);
+        // A selection that came to cover every row, row by row.
+        assert_eq!(Again::of(3, 3), Again::All);
+        // The list never counts more selected than it has rows; if the
+        // model is a block behind, it is still every row.
+        assert_eq!(Again::of(5_000_001, 5_000_000), Again::All);
+        // Anything less is the files, by path, as before.
+        assert_eq!(Again::of(4_999_999, 5_000_000), Again::Files);
+        assert_eq!(Again::of(1, 5_000_000), Again::Files);
+        // Nothing selected, or no rows: nothing to select again.
+        assert_eq!(Again::of(0, 5_000_000), Again::Files);
+        assert_eq!(Again::of(0, 0), Again::Files);
+        // Another search's rows are never all selected for it.
+        let kept = Kept {
+            reselect: Reselect::default(),
+            again: Again::All,
+        };
+        assert_eq!(kept.for_new_search().again, Again::Files);
+    }
+
+    #[test]
+    fn rows_a_block_adds_are_selected_only_when_every_row_was() {
+        // Every row of 5 M selected, then a block says 3 more.
+        assert!(new_rows_selected(5_000_000, 5_000_000, 5_000_003));
+        // Fewer rows: the list drops the ones past its end; nothing to add.
+        assert!(!new_rows_selected(5_000_000, 5_000_000, 4_999_990));
+        assert!(!new_rows_selected(5_000_000, 5_000_000, 5_000_000));
+        // All but one, or none: the new rows stay unselected.
+        assert!(!new_rows_selected(4_999_999, 5_000_000, 5_000_003));
+        assert!(!new_rows_selected(0, 5_000_000, 5_000_003));
+        // From no rows at all: nothing was selected.
+        assert!(!new_rows_selected(0, 0, 10));
     }
 
     #[test]

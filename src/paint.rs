@@ -231,8 +231,13 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                     }
                 }
                 COL_EXT => runs(hdc, &inner, filetype::of_row(row), &[], &fonts, false),
-                // Looked up once per extension (`filetype`), then kept.
-                COL_TYPE => runs(hdc, &inner, &filetype::name(row), &[], &fonts, false),
+                // Looked up once per extension, off this thread
+                // (`typeinfo`): empty until then.
+                COL_TYPE => {
+                    if let Some(name) = app.icons.type_name(row) {
+                        runs(hdc, &inner, &name, &[], &fonts, false);
+                    }
+                }
                 COL_DATE => {
                     if let Some(ft) = row.mtime {
                         scratch.text.clear();
@@ -247,6 +252,19 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
             DrawFocusRect(hdc, &focus_rc);
         }
         SelectObject(hdc, old_font);
+    }
+}
+
+/// Appends the text of cell `col` of `row` to `out`, as it is drawn now:
+/// a Type cell whose type is not known yet has none, and the shell is not
+/// asked on this thread (`typeinfo`).
+pub fn push_cell(app: &App, row: &crate::client::Row, col: usize, out: &mut Vec<u16>) {
+    if col == COL_TYPE {
+        if let Some(name) = app.icons.type_name(row) {
+            out.extend_from_slice(&name);
+        }
+    } else {
+        copytext::push(row, copytext::Field::of_column(col), out);
     }
 }
 
@@ -282,7 +300,7 @@ pub fn cell_text(
     left: i32,
 ) -> CellText {
     let mut text = Vec::new();
-    copytext::push(row, copytext::Field::of_column(col), &mut text);
+    push_cell(app, row, col, &mut text);
     let (mut folded, mut name_spans, mut parent_spans) = (Vec::new(), Vec::new(), Vec::new());
     if col == COL_NAME || col == COL_PATH {
         m.highlight.spans(

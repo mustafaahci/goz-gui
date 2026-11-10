@@ -16,7 +16,9 @@
 //!   `thumbnail_size`, `listview_item_focus` and `listview_selection` (full
 //!   paths, as Everything's), `columns` (the shown columns left to right,
 //!   each `{"name":…,"width":…}` at 96 DPI), and goz-gui's own
-//!   `listview_top_index` (the row at the top of the list), `nav_history`
+//!   `listview_top_index` (the row at the top of the list),
+//!   `listview_select_all` (1 when every row was selected: written only
+//!   then, and every row of the result is selected again), `nav_history`
 //!   (Back and Forward's entries, oldest first, each with the search keys
 //!   above) and `nav_history_index` (the current one). The open tabs come
 //!   first, left to right; the tabs closed (Reopen Closed Tab's, oldest
@@ -74,6 +76,10 @@ pub struct View {
     pub focus: Option<Vec<u16>>,
     /// The selected files' full paths.
     pub selection: Vec<Vec<u16>>,
+    /// Every row was selected (Select All): every row of the search's
+    /// result is selected again, however many there are now, and
+    /// `selection` (the rows that were held) is only for Everything.
+    pub select_all: bool,
     /// Back and Forward's entries, oldest first.
     pub nav: Vec<Search>,
     /// The current entry of `nav`.
@@ -294,6 +300,7 @@ fn read_view(tab: &Json) -> View {
             .filter_map(path)
             .take(MAX_SELECTION)
             .collect(),
+        select_all: flag(tab, "listview_select_all").unwrap_or(false),
         nav,
         nav_index,
         display: read_display(tab),
@@ -327,6 +334,9 @@ fn tab_members(v: &View, closed: bool) -> Vec<(String, Json)> {
                 .collect(),
         ),
     ));
+    if v.select_all {
+        tab.push(("listview_select_all".into(), Json::bit(true)));
+    }
     tab.push((
         "nav_history_index".into(),
         Json::int(i64::try_from(v.nav_index).unwrap_or(0)),
@@ -666,6 +676,7 @@ mod tests {
                         ..search("in a folder")
                     },
                 ],
+                select_all: false,
                 nav_index: 1,
                 display: None,
                 columns: None,
@@ -713,6 +724,34 @@ mod tests {
         assert!(!text.contains("window_x"));
         assert!(text.contains("\"listview_item_focus\":\"\","));
         assert_eq!(parse(text.as_bytes()), Ok(Some(bare)));
+    }
+
+    #[test]
+    fn a_tab_with_every_row_selected_reads_back_so() {
+        let all = View {
+            search: search(""),
+            selection: vec![w(r"C:\a"), w(r"C:\b")],
+            select_all: true,
+            ..View::default()
+        };
+        let s = Session {
+            tabs: vec![all, search_view("one by one")],
+            ..Session::default()
+        };
+        let text = s.to_text();
+        assert_eq!(parse(text.as_bytes()), Ok(Some(s.clone())));
+        // goz-gui's own key, after Everything's selection, and only on the
+        // tab that has every row selected.
+        assert!(text.contains(concat!(
+            "\"listview_selection\":[\"C:\\\\a\",\"C:\\\\b\"],\r\n",
+            "\t\t\t\t\"listview_select_all\":1,\r\n"
+        )));
+        assert_eq!(text.matches("listview_select_all").count(), 1);
+        // Everything's session has no such key: its tabs select their files.
+        let doc = "[{\"tabs\":[{\"search\":\"x\",\"listview_selection\":[\"C:\\\\x\"]}]}]";
+        let v = parse(doc.as_bytes()).unwrap().unwrap().view().clone();
+        assert!(!v.select_all);
+        assert_eq!(v.selection, [w(r"C:\x")]);
     }
 
     #[test]

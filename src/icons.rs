@@ -1,17 +1,18 @@
 //! Shell icons for result rows.
 //!
 //! Most files take their icon from their extension, which the shell answers
-//! from the registry without touching the file. Programs, shortcuts and
+//! from the registry without touching the file; each type's is looked up
+//! once, on a thread (`typeinfo`), and a file of a type not known yet shows
+//! the document icon of no known type meanwhile. Programs, shortcuts and
 //! icon files carry their own icon, which means reading the file, so those
-//! are looked up on a background thread and the row is redrawn when the
-//! answer arrives.
+//! are looked up on a background thread of their own and the row is
+//! redrawn when the answer arrives.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
-use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };
@@ -20,11 +21,14 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Controls::HIMAGELIST;
 use windows_sys::Win32::UI::Shell::{
-    SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
+    SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGSI_SYSICONINDEX,
+    SHGetFileInfoW, SHGetStockIconInfo, SHSTOCKICONINFO, SIID_DOCNOASSOC,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::client::Row;
+use crate::filetype;
+use crate::typeinfo::TypeInfo;
 use crate::wide::{nul, wz};
 
 /// Not looked at yet.
@@ -72,14 +76,20 @@ struct Shared {
 pub struct Icons {
     pub list: HIMAGELIST,
     folder: i32,
-    by_ext: RefCell<HashMap<Vec<u16>, i32>>,
+    /// A file's icon while its type's is looked up: the document of no
+    /// known type (the shell's stock icon), asked for as the window starts.
+    generic: i32,
+    /// Each type's icon and name (`typeinfo`).
+    pub types: TypeInfo,
     shared: Arc<Shared>,
 }
 
 impl Icons {
     /// Starts the icon thread; its answers arrive at `hwnd` as `msg`, with a
-    /// `Box<IconReply>` in `lParam`.
-    pub fn new(hwnd: HWND, msg: u32) -> Icons {
+    /// `Box<IconReply>` in `lParam`. The types' thread tells `hwnd` of its
+    /// answers as `types_msg`, and `ask_msg` is posted to send it what a
+    /// paint asked for (`TypeInfo::new`).
+    pub fn new(hwnd: HWND, msg: u32, types_msg: u32, ask_msg: u32) -> Icons {
         let mut info = info();
         // SAFETY: an attribute-only lookup; `info` is a plain out-struct.
         let list = unsafe {
@@ -92,6 +102,18 @@ impl Icons {
             )
         } as HIMAGELIST;
         let folder = info.iIcon;
+        // SAFETY: SHSTOCKICONINFO is plain data, its size set as asked; the
+        // stock icon's index only (0.3 ms; the same lookup by the name
+        // "file" took 2.5 to 3.4 ms).
+        let generic = unsafe {
+            let mut stock: SHSTOCKICONINFO = core::mem::zeroed();
+            stock.cbSize = size_of::<SHSTOCKICONINFO>() as u32;
+            if SHGetStockIconInfo(SIID_DOCNOASSOC, SHGSI_SYSICONINDEX, &mut stock) >= 0 {
+                stock.iSysImageIndex.max(0)
+            } else {
+                0
+            }
+        };
         // SAFETY: an unnamed manual-reset event.
         let work = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) } as usize;
         let shared = Arc::new(Shared {
@@ -111,7 +133,8 @@ impl Icons {
         Icons {
             list,
             folder,
-            by_ext: RefCell::new(HashMap::new()),
+            generic,
+            types: TypeInfo::new(hwnd, types_msg, ask_msg, list, vec![generic, folder]),
             shared,
         }
     }
@@ -136,7 +159,7 @@ impl Icons {
             return (self.folder, None);
         }
         let ext = extension(row.name());
-        let generic = self.by_ext(&ext);
+        let generic = self.of_type(&ext);
         let mut dropped = None;
         if own == UNSET && wants_own(&ext) {
             let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -164,30 +187,21 @@ impl Icons {
         if row.is_dir {
             self.folder
         } else {
-            self.by_ext(&extension(row.name()))
+            self.of_type(&extension(row.name()))
         }
     }
 
-    fn by_ext(&self, ext: &[u16]) -> i32 {
-        if let Some(&i) = self.by_ext.borrow().get(ext) {
-            return i;
-        }
-        let mut probe: Vec<u16> = "file.".encode_utf16().collect();
-        probe.extend_from_slice(ext);
-        probe.push(0);
-        let mut info = info();
-        // SAFETY: an attribute-only lookup by name; nothing is read from disk.
-        unsafe {
-            SHGetFileInfoW(
-                probe.as_ptr(),
-                FILE_ATTRIBUTE_NORMAL,
-                &mut info,
-                size_of::<SHFILEINFOW>() as u32,
-                SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
-            )
-        };
-        self.by_ext.borrow_mut().insert(ext.to_vec(), info.iIcon);
-        info.iIcon
+    /// The icon of files of extension `ext` (case-folded): the type's once
+    /// the types' thread has said, the generic one meanwhile (or for good,
+    /// if the shell has none).
+    fn of_type(&self, ext: &[u16]) -> i32 {
+        self.types.icon(ext).unwrap_or(self.generic)
+    }
+
+    /// The Type column's text for `row`, if its type is known; else it is
+    /// looked up on the types' thread, and the cell is empty meanwhile.
+    pub fn type_name(&self, row: &Row) -> Option<Rc<[u16]>> {
+        self.types.name(&filetype::key(row))
     }
 }
 
