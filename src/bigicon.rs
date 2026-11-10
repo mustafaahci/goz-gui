@@ -13,11 +13,16 @@
 //! An icon with no image that big (an old program's 32 or 48 px one) is
 //! taken at its own size, which the view centres, as the shell's picture
 //! did, rather than blown up.
+//!
+//! A handler may name instead an icon of the system image lists that a
+//! whole class of files shares (a shortcut to a help file: the .chm type's
+//! icon). That one is a single entry of the lists however many files show
+//! it, as a type's icon is, so the view draws it from them.
 
 use std::os::windows::ffi::OsStringExt;
 
 use windows::Win32::UI::Shell::{
-    BHID_SFUIObject, GIL_FORSHELL, GIL_NOTFILENAME, IExtractIconW, IShellItem,
+    BHID_SFUIObject, GIL_FORSHELL, GIL_NOTFILENAME, GIL_PERCLASS, IExtractIconW, IShellItem,
     SHCreateItemFromParsingName, SHDefExtractIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::HICON;
@@ -32,13 +37,13 @@ use windows_sys::Win32::System::LibraryLoader::{
     LoadLibraryExW, LoadResource, LockResource, SizeofResource,
 };
 use windows_sys::Win32::UI::Shell::{
-    SHGSI_ICONLOCATION, SHGetStockIconInfo, SHSTOCKICONINFO, SIID_APPLICATION,
+    PathCreateFromUrlW, SHGSI_ICONLOCATION, SHGetStockIconInfo, SHSTOCKICONINFO, SIID_APPLICATION,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DI_NORMAL, DestroyIcon, DrawIconEx, GetIconInfo, ICONINFO,
 };
 
-use crate::thumbs::{Bitmap, dib};
+use crate::thumbs::{Bitmap, Picture, dib};
 use crate::wide::nul;
 
 /// `RT_GROUP_ICON`: an icon's directory of images in a program.
@@ -46,13 +51,15 @@ const RT_GROUP_ICON: usize = 14;
 /// The smallest icon worth extracting for a thumbnail.
 const MIN_SIDE: i32 = 16;
 
-/// The icon `path` carries, at most `side` pixels square: premultiplied,
-/// ready for `AlphaBlend`. A program without an icon of its own (or a
-/// shortcut to one) gets Windows' icon for programs. `None` when its icon
-/// is its type's after all (a control panel item's) or it cannot be read:
-/// then the type's icon shows. For a thread with COM initialized; it reads
-/// the file.
-pub fn own_icon(path: &[u16], side: i32) -> Option<Bitmap> {
+/// The icon `path` carries, at most `side` pixels square: an image
+/// premultiplied, ready for `AlphaBlend`, or an icon of the system image
+/// lists that a class of files shares (a shortcut to a help file shows the
+/// .chm type's icon), for the view to draw from them. A program without an
+/// icon of its own (or a shortcut to one) gets Windows' icon for programs.
+/// `None` when its icon is its type's after all (a control panel item's)
+/// or it cannot be read: then the type's icon shows. For a thread with COM
+/// initialized; it reads the file.
+pub fn own_icon(path: &[u16], side: i32) -> Option<Picture> {
     let path = nul(path);
     // SAFETY: COM calls on this thread's objects with NUL-terminated
     // strings and buffers that outlive them; the icons extracted are ours
@@ -66,21 +73,24 @@ pub fn own_icon(path: &[u16], side: i32) -> Option<Bitmap> {
             .GetIconLocation(GIL_FORSHELL, &mut location, &mut index, &mut flags)
             .ok()?;
         let len = location.iter().position(|&c| c == 0).unwrap_or(0);
-        // "*": the icon is the system image list's, its type's (a control
-        // panel item's), which the view draws itself; its handler would
-        // give it only at 32 px.
-        if location[..len] == [u16::from(b'*')] {
-            return None;
+        let named = &location[..len];
+        // "*": the icon is the system image lists' entry `index` (its
+        // handler would give it only at 32 px), which the view draws from
+        // them; one of a class (a shortcut to a document: its target
+        // type's icon) is shared, one of the file's own is not.
+        if named == [u16::from(b'*')] {
+            return shared_icon(index, flags).map(Picture::Shared);
         }
-        let file = expanded(&location[..len]);
+        // An Internet shortcut's handler names its icon file as a file:
+        // URL (not a file name to it) and extracts it only up to 96 px: the
+        // file it names is extracted here, as any icon file is.
+        let from_url = file_url_path(named);
+        let names_file = from_url.is_some() || flags & GIL_NOTFILENAME == 0;
+        let file = expanded(from_url.as_deref().unwrap_or(named));
         // A program's location is no file and index to extract from (the
         // handler extracts it, and only at a size the program has), but
         // its icon is still its first, found by the file.
-        let in_file = if flags & GIL_NOTFILENAME == 0 {
-            index
-        } else {
-            0
-        };
+        let in_file = if names_file { index } else { 0 };
         let native = largest(&file, in_file);
         let want = extract_side(native, side);
         let mut icon = HICON::default();
@@ -96,8 +106,9 @@ pub fn own_icon(path: &[u16], side: i32) -> Option<Bitmap> {
         );
         // S_FALSE: the caller extracts it, from the file and index named,
         // or from the program whose first icon it is (one the handler does
-        // not take, such as a 150 px image).
-        if icon.is_invalid() && (flags & GIL_NOTFILENAME == 0 || native.is_some()) {
+        // not take, such as a 150 px image). Also what an Internet
+        // shortcut's handler gives over 96 px: S_OK and no icon.
+        if icon.is_invalid() && (names_file || native.is_some()) {
             let file_z = nul(&file);
             let _ = SHDefExtractIconW(
                 PCWSTR(file_z.as_ptr()),
@@ -112,15 +123,57 @@ pub fn own_icon(path: &[u16], side: i32) -> Option<Bitmap> {
             // A program with no icon of its own (or a shortcut to one, or
             // to one that is gone) shows Windows' icon for programs, as
             // the shell's picture did; anything else its type's icon.
-            return is_program(&file).then(|| stock_application(side)).flatten();
+            return is_program(&file)
+                .then(|| stock_application(side))
+                .flatten()
+                .map(Picture::Image);
         }
         // A handler may give a smaller icon than asked (one it has): taken
         // at its own size, not blown up.
         let at = icon_width(icon.0 as _).map_or(want, |w| w.clamp(MIN_SIDE, want));
         let out = render(icon.0 as _, at);
         DestroyIcon(icon.0 as _);
-        out
+        out.map(Picture::Image)
     }
+}
+
+/// The system image lists' entry `index` that a handler named as `"*"`
+/// with `flags`, when a class of files shares it (`GIL_PERCLASS`: a
+/// shortcut to a document gives its target type's icon, an offline
+/// program Windows' program icon). One of a single file's own (none seen)
+/// would be an entry of the jumbo list for that file alone, the 50 KB this
+/// module keeps clear of: `None`, and the type's icon shows.
+fn shared_icon(index: i32, flags: u32) -> Option<i32> {
+    (flags & GIL_PERCLASS != 0 && index >= 0).then_some(index)
+}
+
+/// Whether `text` is a `file:` URL (any case).
+fn is_file_url(text: &[u16]) -> bool {
+    let scheme: Vec<u16> = "file:".encode_utf16().collect();
+    text.len() > scheme.len()
+        && text[..scheme.len()]
+            .iter()
+            .zip(&scheme)
+            .all(|(&c, &s)| crate::highlight::fold(c) == s)
+}
+
+/// The path a `file:` URL names (`file:///C:/Program%20Files/x.ico` is
+/// `C:\Program Files\x.ico`); `None` for anything else.
+fn file_url_path(text: &[u16]) -> Option<Vec<u16>> {
+    if !is_file_url(text) {
+        return None;
+    }
+    let url = nul(text);
+    let mut out = vec![0u16; 1024];
+    let mut len = out.len() as u32;
+    // SAFETY: a NUL-terminated URL; the buffer with its length in
+    // characters, which the call sets to the path's (without its NUL).
+    let status = unsafe { PathCreateFromUrlW(url.as_ptr(), out.as_mut_ptr(), &mut len, 0) };
+    if status < 0 || len == 0 || len as usize >= out.len() {
+        return None;
+    }
+    out.truncate(len as usize);
+    Some(out)
 }
 
 /// `text` with its environment variables (`%SystemRoot%`) expanded, as
@@ -448,6 +501,45 @@ mod tests {
         assert_eq!(largest_in_directory(&ico[..6 + 16], 16), Some(32));
         assert_eq!(largest_in_directory(&ico[..6], 16), None);
         assert_eq!(largest_in_directory(&[0, 0, 1], 16), None);
+    }
+
+    #[test]
+    fn a_star_location_is_drawn_only_when_a_class_shares_it() {
+        // A shortcut to a help file: "*", GIL_PERCLASS | GIL_NOTFILENAME.
+        assert_eq!(shared_icon(157, 0x0c), Some(157));
+        // One to a text file (an extra flag the shell sets as well).
+        assert_eq!(shared_icon(55, 0x2c), Some(55));
+        // A file's own entry: not drawn from the lists; nor no index.
+        assert_eq!(shared_icon(300, 0x0a), None);
+        assert_eq!(shared_icon(-1, 0x0c), None);
+    }
+
+    #[test]
+    fn file_urls_name_their_file() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let path = |s: &str| file_url_path(&w(s)).map(|p| String::from_utf16_lossy(&p));
+        // A Steam game's shortcut, as its handler names its icon.
+        assert_eq!(
+            path("file:///C:/Program%20Files%20(x86)/Steam/steam/games/29492c.ico").as_deref(),
+            Some(r"C:\Program Files (x86)\Steam\steam\games\29492c.ico")
+        );
+        // Escaped characters a path may hold, and the scheme in any case.
+        assert_eq!(
+            path("FILE:///C:/a/dir%20%231%20%2541/hk.ico").as_deref(),
+            Some(r"C:\a\dir #1 %41\hk.ico")
+        );
+        // A location written with a variable, expanded after.
+        assert_eq!(
+            path("file:%25SystemRoot%25/System32/imageres.dll").as_deref(),
+            Some(r"%SystemRoot%\System32\imageres.dll")
+        );
+        // Not a file: URL.
+        assert_eq!(path("https://example.com/favicon.ico"), None);
+        assert_eq!(path(r"C:\Windows\System32\shell32.dll"), None);
+        assert_eq!(path("*"), None);
+        assert_eq!(path("file:"), None);
+        assert!(is_file_url(&w("File:///x")));
+        assert!(!is_file_url(&w("files/x")));
     }
 
     #[test]

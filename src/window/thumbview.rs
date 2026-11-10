@@ -41,7 +41,7 @@ use super::{App, send};
 use crate::highlight::Span;
 use crate::paint::{self, RowState};
 use crate::status::ViewButton;
-use crate::thumbs::{Bitmap, ThumbReply};
+use crate::thumbs::{Bitmap, Picture, ThumbReply};
 use crate::view::{self, View};
 use crate::window::Fonts;
 
@@ -350,21 +350,26 @@ impl App {
                 &mut scratch.name_spans,
                 &mut scratch.parent_spans,
             );
-            let drawn = self.thumbs.with(&row.path, |got| match got {
-                Some(Some(bitmap)) => {
+            // The icon of the system lists to draw, if no image is:
+            // `Some(None)` the type's.
+            let icon = self.thumbs.with(&row.path, |got| match got {
+                Some(Some(Picture::Image(bitmap))) => {
                     draw_bitmap(hdc, bitmap, &geo.thumb);
-                    true
+                    None
                 }
-                // The shell has no picture for it: its icon.
-                Some(None) => false,
+                // One a class of files shares (a shortcut to a help file:
+                // the .chm type's icon).
+                Some(Some(Picture::Shared(icon))) => Some(Some(*icon)),
+                // There is no picture for it: its type's icon.
+                Some(None) => Some(None),
                 None => {
                     self.thumbs.request(index, &row.path);
-                    false
+                    Some(None)
                 }
             });
             // The type's icon, never the file's own (`Icons::type_icon`):
             // a program's own icon comes as its thumbnail.
-            let icon = (!drawn).then(|| self.icons.type_icon(row));
+            let icon = icon.map(|shared| shared.unwrap_or_else(|| self.icons.type_icon(row)));
             (icon, row.name().to_vec(), scratch.name_spans.clone())
         };
         if let Some(icon) = icon {
@@ -488,11 +493,14 @@ impl App {
     }
 
     /// A thumbnail came from the thread: kept, and its item redrawn if it
-    /// still shows that file.
-    pub(super) fn on_thumb(&self, reply: ThumbReply) {
+    /// still shows that file. False when it was thrown away instead: made
+    /// for results, a size or a window no longer shown (`Thumbs::reset`,
+    /// `Thumbs::release`), or the view is Details now.
+    pub(super) fn on_thumb(&self, reply: ThumbReply) -> bool {
         let (index, path) = (reply.index, reply.path.clone());
-        if !self.view.get().thumbnails || !self.thumbs.accept(reply) {
-            return;
+        let taken = self.view.get().thumbnails && self.thumbs.accept(reply);
+        if !taken {
+            return false;
         }
         let same = self
             .model
@@ -502,6 +510,7 @@ impl App {
         if same {
             send(self.list, LVM_REDRAWITEMS, index, index as isize);
         }
+        true
     }
 
     /// Where Rename's box goes in icon view: over the name's lines.

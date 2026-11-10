@@ -6,8 +6,9 @@
 //! icon, so a page of Large cells over a folder of programs held the window
 //! for 100 to 180 ms while the cells drew those. The cells draw their
 //! type's icon now (a program's own comes as its thumbnail, made off these
-//! lists by `bigicon.rs`), but each type's big icon is still read the first
-//! time it is drawn. Here an icon is drawn only if it is loaded
+//! lists by `bigicon.rs`; a shortcut to a document shows its target type's
+//! icon, also from these lists), but each type's big icon is still read
+//! the first time it is drawn. Here an icon is drawn only if it is loaded
 //! (`ILD_ASYNC`); one that is not is loaded on a thread of its own, by
 //! drawing it there, and the window is told (a posted message) so that it
 //! paints again.

@@ -28,7 +28,7 @@ thread_local! {
 
 impl App {
     /// Memory was used and may be let go once the window rests: a
-    /// thumbnail arrived, or a pane closed. Each puts the rest off again
+    /// thumbnail was kept, or a pane closed. Each puts the rest off again
     /// (one timer, never repeating).
     pub(super) fn memory_settles(&self) {
         SECOND_REST.set(false);

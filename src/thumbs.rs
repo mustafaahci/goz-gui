@@ -10,7 +10,9 @@
 //! the shell's image factory (`IShellItemImageFactory`) only for types with
 //! a thumbnail handler (pictures, videos, documents that have one) and for
 //! folders; a program's, shortcut's or icon file's own icon is extracted
-//! at the size by [`crate::bigicon`]; every other type shows its type's
+//! at the size by [`crate::bigicon`] (or, where it is an icon a class of
+//! files shares, such as a shortcut to a help file, named for the view to
+//! draw from the system image lists); every other type shows its type's
 //! icon, which the view draws from the system image list. The factory
 //! would give those icons too, but it keeps each file's own icon in the
 //! process's jumbo image list for good (about 50 KB per program seen).
@@ -106,6 +108,26 @@ impl Drop for Bitmap {
         // SAFETY: the bitmap is owned here and selected into no DC once its
         // owner lets go of it (drawing borrows it).
         unsafe { DeleteObject(self.handle as HBITMAP) };
+    }
+}
+
+/// What a thumbnail cell shows of a file.
+pub enum Picture {
+    /// A bitmap made for it: the shell's picture of its contents, or its
+    /// own icon extracted at the size.
+    Image(Bitmap),
+    /// An icon of the system image lists that a class of files shares, by
+    /// its index (a shortcut to a help file shows the .chm type's icon):
+    /// drawn from the lists as a type's icon is.
+    Shared(i32),
+}
+
+impl Picture {
+    fn cost(&self) -> usize {
+        match self {
+            Picture::Image(bitmap) => bitmap.cost(),
+            Picture::Shared(_) => MIN_COST,
+        }
     }
 }
 
@@ -327,12 +349,12 @@ pub struct ThumbReply {
     pub generation: u64,
     pub index: usize,
     pub path: Box<[u16]>,
-    bitmap: Option<Bitmap>,
+    picture: Option<Picture>,
 }
 
 /// A cached thumbnail, and the item it was made for (where it showed).
 struct Entry {
-    bitmap: Option<Bitmap>,
+    picture: Option<Picture>,
     index: usize,
 }
 
@@ -369,8 +391,8 @@ impl Drop for Shared {
 /// The window's side: the cache, and the thread's queue.
 pub struct Thumbs {
     shared: Arc<Shared>,
-    /// Thumbnails by path; no bitmap where there is no picture to show
-    /// (the view draws the type's icon).
+    /// Thumbnails by path; no picture where there is none to show (the
+    /// view draws the type's icon).
     cache: std::cell::RefCell<Lru<Entry>>,
     generation: std::cell::Cell<u64>,
 }
@@ -447,12 +469,12 @@ impl Thumbs {
         self.queue().visible = visible;
     }
 
-    /// Calls `f` with the cached thumbnail of `path`: `Some(Some(_))` an
-    /// image, `Some(None)` none to be had (draw the icon), `None` not
-    /// made yet.
-    pub fn with<R>(&self, path: &[u16], f: impl FnOnce(Option<Option<&Bitmap>>) -> R) -> R {
+    /// Calls `f` with the cached thumbnail of `path`: `Some(Some(_))` a
+    /// picture, `Some(None)` none to be had (draw the type's icon), `None`
+    /// not made yet.
+    pub fn with<R>(&self, path: &[u16], f: impl FnOnce(Option<Option<&Picture>>) -> R) -> R {
         let mut cache = self.cache.borrow_mut();
-        f(cache.get(path).map(|e| e.bitmap.as_ref()))
+        f(cache.get(path).map(|e| e.picture.as_ref()))
     }
 
     /// Asks for the thumbnail of item `index`, `path`, unless it is already
@@ -480,9 +502,9 @@ impl Thumbs {
             return false;
         }
         self.queue().waiting.remove(&reply.path);
-        let cost = reply.bitmap.as_ref().map_or(MIN_COST, Bitmap::cost);
+        let cost = reply.picture.as_ref().map_or(MIN_COST, Picture::cost);
         let entry = Entry {
-            bitmap: reply.bitmap,
+            picture: reply.picture,
             index: reply.index,
         };
         // The evicted bitmaps are deleted as they drop here.
@@ -526,12 +548,12 @@ fn thumb_thread(shared: &Shared) {
             unsafe { WaitForSingleObject(shared.work as HANDLE, INFINITE) };
             continue;
         };
-        let bitmap = make(&request.path, side, &mut sources);
+        let picture = make(&request.path, side, &mut sources);
         let reply = Box::into_raw(Box::new(ThumbReply {
             generation,
             index: request.index,
             path: request.path,
-            bitmap,
+            picture,
         }));
         // SAFETY: the window owns the box once posted; reclaimed (and its
         // bitmap deleted) if not.
@@ -547,7 +569,7 @@ fn thumb_thread(shared: &Shared) {
 /// its contents where its type has one, its own icon where it carries one;
 /// `None` for the view to draw its type's icon. `sources` keeps what each
 /// extension's thumbnails are made from.
-fn make(path: &[u16], side: i32, sources: &mut HashMap<Vec<u16>, Source>) -> Option<Bitmap> {
+fn make(path: &[u16], side: i32, sources: &mut HashMap<Vec<u16>, Source>) -> Option<Picture> {
     let path_z = nul(path);
     // SAFETY: a NUL-terminated path.
     let attrs = unsafe { GetFileAttributesW(path_z.as_ptr()) };
@@ -563,7 +585,7 @@ fn make(path: &[u16], side: i32, sources: &mut HashMap<Vec<u16>, Source>) -> Opt
     match source {
         Source::TypeIcon => None,
         Source::OwnIcon => crate::bigicon::own_icon(path, side),
-        Source::Shell => shell_thumbnail(&path_z, side, is_dir),
+        Source::Shell => shell_thumbnail(&path_z, side, is_dir).map(Picture::Image),
     }
 }
 

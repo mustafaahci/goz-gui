@@ -63,7 +63,7 @@ use super::image::{Decoded, Wic};
 use super::settings::{Handlers, PreviewSettings};
 use super::stream::FileStream;
 use super::text;
-use crate::thumbs::premultiplied;
+use crate::thumbs::{Picture, premultiplied};
 use crate::wide::{nul, wz};
 
 /// What the pane asks to see.
@@ -592,9 +592,11 @@ fn icon_image(path: &[u16], ext: &[u16], side: i32) -> Option<Decoded> {
     let own = ext
         .split_first()
         .is_some_and(|(_, e)| crate::icons::wants_own(e));
-    let Some(bitmap) = own.then(|| crate::bigicon::own_icon(path, side)).flatten() else {
-        // The type's icon: one entry of the shell's lists for every file
-        // of the type.
+    let Some(Picture::Image(bitmap)) = own.then(|| crate::bigicon::own_icon(path, side)).flatten()
+    else {
+        // The type's icon, or the one a class of files shares that the
+        // file's handler names (a shortcut to a help file): one entry of
+        // the shell's lists for every file that shows it.
         return shell_image(path, side, SIIGBF_ICONONLY);
     };
     let natural = (bitmap.width, bitmap.height);

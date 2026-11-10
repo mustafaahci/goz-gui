@@ -1813,8 +1813,12 @@ impl App {
                 }
                 WM_THUMB => {
                     let reply = Box::from_raw(l as *mut ThumbReply);
-                    self.on_thumb(*reply);
-                    self.memory_settles();
+                    // Only a thumbnail kept puts the rest off: one thrown
+                    // away keeps nothing, and a hidden window (the
+                    // thumbnails let go) sets no timer.
+                    if self.on_thumb(*reply) {
+                        self.memory_settles();
+                    }
                     0
                 }
                 thumbview::WM_BIG_ICONS => {
