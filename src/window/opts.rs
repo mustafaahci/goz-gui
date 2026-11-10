@@ -1,93 +1,86 @@
-//! Tools > Options from the window's side: what the page starts with, and
-//! applying what it hands back.
+//! Tools > Options from the window's side: the pages the dialog shows
+//! (each a module here, `crate::options` the dialog), the page it opens on,
+//! and what follows an OK or Apply.
 
 use super::App;
-use crate::options::{self, Values};
-use crate::{dialog, integration};
+use crate::dialog;
+use crate::options::{self, Page};
+use crate::settings::Background;
+
+mod general;
+mod history;
+mod keyboard;
+mod search;
+mod ui;
+mod view;
+
+/// The pages, in any order: the dialog puts them in Everything's
+/// (`Page::order`, `Page::parent`).
+fn pages() -> Vec<Box<dyn Page>> {
+    #[allow(unused_mut, reason = "the features push their pages below")]
+    let mut pages: Vec<Box<dyn Page>> = vec![
+        Box::new(general::General),
+        Box::new(ui::Ui),
+        Box::new(search::Search),
+        Box::new(view::View),
+        Box::new(keyboard::Keyboard),
+        Box::new(history::History),
+    ];
+    // Wave 1: each feature adds its pages on its own lines below, so their
+    // changes never meet (FRAMEWORK.md).
+
+    // F1 (preview pane).
+
+    // F2 (sidebars).
+
+    // F3 (tabs and windows).
+
+    // F4 (search tools).
+
+    // F5 (file tools).
+
+    // F6 (integration and the Options pages).
+
+    pages
+}
 
 impl App {
-    fn options_now(&self) -> Values {
-        let base = self.prefs.borrow().base.clone();
-        let h = base.history;
-        Values {
-            start_with_windows: integration::starts_with_windows(),
-            folder_item: integration::has_folder_item(),
-            background: self.background(),
-            enter: self.enter_action(),
-            suggest: h.search_always_suggest,
-            search_history: h.search_enabled,
-            search_limit: !h.search_keep_forever,
-            search_days: h.search_days_to_keep,
-            run_history: h.run_enabled,
-            run_limit: !h.run_keep_forever,
-            run_days: h.run_days_to_keep,
-            theme: self.theme_mode(),
-            on_top: self.on_top.get(),
-            status_bar: self.status_bar_visible(),
-            nav_bar: self.nav_bar_visible(),
-        }
-    }
-
     pub(super) fn options_dialog(&self) {
-        let initial = self.options_now();
+        let first = self.prefs.borrow().base.options_page.clone();
         // Dialogs opened from a background command do not take the
         // foreground (see `dialog::Quiet`).
         let _quiet = dialog::Quiet::begin();
-        options::show(self.hwnd, dialog::app_look(), initial, &|v| {
-            self.apply_options(v)
-        });
+        let last = options::show(self, pages(), &first);
+        if last != first {
+            self.prefs.borrow_mut().base.options_page = last;
+            self.settings_changed();
+        }
     }
 
-    fn apply_options(&self, v: &Values) {
-        let mut problems: Vec<&str> = Vec::new();
-        if v.start_with_windows != integration::starts_with_windows()
-            && !integration::set_starts_with_windows(v.start_with_windows)
-        {
-            problems.push("starting with Windows could not be changed");
-        }
-        if v.folder_item != integration::has_folder_item()
-            && !integration::set_folder_item(v.folder_item)
-        {
-            problems.push("the folder item in Explorer could not be changed");
-        }
-        let taken = self.apply_background(v.background);
-        {
-            let mut prefs = self.prefs.borrow_mut();
-            let b = &mut prefs.base;
-            b.background = v.background;
-            b.enter_action = v.enter;
-            b.nav_bar = v.nav_bar;
-            let h = &mut b.history;
-            h.search_always_suggest = v.suggest;
-            h.search_enabled = v.search_history;
-            h.search_keep_forever = !v.search_limit;
-            h.search_days_to_keep = v.search_days;
-            h.run_enabled = v.run_history;
-            h.run_keep_forever = !v.run_limit;
-            h.run_days_to_keep = v.run_days;
-        }
-        self.set_enter_action(v.enter);
-        self.set_suggest(v.suggest);
-        if v.theme != self.theme_mode() {
-            self.set_theme_mode(v.theme);
-        }
-        if v.on_top != self.on_top.get() {
-            self.set_on_top(v.on_top);
-        }
-        if v.status_bar != self.status_bar_visible() {
-            self.set_status_bar_visible(v.status_bar);
-        }
-        if v.nav_bar != self.nav_bar_visible() {
-            self.set_nav_bar_visible(v.nav_bar);
-        }
+    /// OK or Apply applied pages: the settings file follows, and the
+    /// status bar says what could not be done.
+    pub fn options_applied(&self, problems: Vec<String>) {
         self.settings_changed();
+        if !problems.is_empty() {
+            self.show_note(problems.join("; "));
+        }
+    }
+
+    /// Changes the tray and hotkey settings as `change` says (the UI and
+    /// Keyboard pages each have some of them) and puts them in place.
+    fn change_background(&self, change: impl FnOnce(&mut Background), problems: &mut Vec<String>) {
+        let mut b = self.background();
+        change(&mut b);
+        if b == self.background() {
+            return;
+        }
+        let taken = self.apply_background(b);
+        self.prefs.borrow_mut().base.background = b;
         if !taken.is_empty() {
-            self.show_note(format!(
+            problems.push(format!(
                 "Another program already uses the {} hotkey",
                 taken.join(" and ")
             ));
-        } else if !problems.is_empty() {
-            self.show_note(format!("Options: {}", problems.join("; ")));
         }
     }
 }

@@ -8,7 +8,7 @@
 //! the list's own, handled by its subclass through [`list_command`].
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_ADD, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F4, VK_F5, VK_HOME, VK_INSERT, VK_LEFT,
+    VK_ADD, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F4, VK_F5, VK_F6, VK_HOME, VK_INSERT, VK_LEFT,
     VK_NUMPAD0, VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -74,6 +74,25 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     (CTRL, VK_OEM_MINUS, menu::ZOOM_OUT),
     (CTRL, key(b'0'), menu::ZOOM_RESET),
     (CTRL, VK_NUMPAD0, menu::ZOOM_RESET),
+    // Everything 1.5's Window | Next Frame and Previous Frame, and View |
+    // Close Pane (Global).
+    (NONE, VK_F6, menu::NEXT_FRAME),
+    (SHIFT, VK_F6, menu::PREV_FRAME),
+    (SHIFT, VK_ESCAPE, menu::CLOSE_PANE),
+    // Wave 1: each feature's shortcuts go in its own section below, so
+    // their lines never meet (FRAMEWORK.md).
+
+    // F1 (preview pane).
+
+    // F2 (sidebars).
+
+    // F3 (tabs and windows).
+
+    // F4 (search tools).
+
+    // F5 (file tools).
+
+    // F6 (integration).
 ];
 
 pub fn accelerators() -> HACCEL {
@@ -240,6 +259,22 @@ mod tests {
         assert!(ACCELERATORS.contains(&(CTRL, 443 - 0x100, menu::ZOOM_IN)));
         assert!(ACCELERATORS.contains(&(CTRL, 445 - 0x100, menu::ZOOM_OUT)));
         assert!(ACCELERATORS.contains(&(CTRL, 304 - 0x100, menu::ZOOM_RESET)));
+    }
+
+    #[test]
+    fn frame_keys() {
+        // Everything's `window_next_frame_keys=117`,
+        // `window_previous_frame_keys=1141` and `view_close_pane_keys=1051`
+        // (0x400 is Shift).
+        assert!(ACCELERATORS.contains(&(NONE, 117, menu::NEXT_FRAME)));
+        assert!(ACCELERATORS.contains(&(SHIFT, 1141 - 0x400, menu::PREV_FRAME)));
+        assert!(ACCELERATORS.contains(&(SHIFT, 1051 - 0x400, menu::CLOSE_PANE)));
+        // Plain Esc stays the search box's and the list's.
+        assert!(
+            !ACCELERATORS
+                .iter()
+                .any(|&(m, k, _)| m == NONE && k == VK_ESCAPE)
+        );
     }
 
     #[test]

@@ -7,9 +7,10 @@
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CheckMenuItem, CreateMenu, CreatePopupMenu, DeleteMenu, EnableMenuItem, GetMenuItemCount,
-    HMENU, InsertMenuItemW, MENUITEMINFOW, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_ENABLED,
-    MF_GRAYED, MF_UNCHECKED, MFS_GRAYED, MFT_RADIOCHECK, MFT_SEPARATOR, MFT_STRING, MIIM_FTYPE,
-    MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, SetMenuDefaultItem,
+    GetMenuItemID, GetMenuItemInfoW, HMENU, InsertMenuItemW, MENUITEMINFOW, MF_BYCOMMAND,
+    MF_BYPOSITION, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_UNCHECKED, MFS_GRAYED, MFT_RADIOCHECK,
+    MFT_SEPARATOR, MFT_STRING, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU,
+    SetMenuDefaultItem,
 };
 
 use crate::columns::{self, COL_NAME, COLS};
@@ -124,6 +125,47 @@ pub const BOOKMARKS: usize = 1000;
 pub const SHELL_FIRST: u16 = 0x7000;
 pub const SHELL_LAST: u16 = 0x7fff;
 
+// Wave 1: each feature's commands come from a range of its own, so ids
+// from work done side by side never meet (FRAMEWORK.md). A range's
+// commands reach `App::feature_command` (window/slots.rs).
+/// F1, the preview pane: 3000..=3099.
+pub const F1_FIRST: u16 = 3000;
+/// F2, the sidebars: 3100..=3199.
+pub const F2_FIRST: u16 = 3100;
+/// F3, tabs and windows: 3200..=3299.
+pub const F3_FIRST: u16 = 3200;
+/// F4, the search tools: 3300..=3399.
+pub const F4_FIRST: u16 = 3300;
+/// F5, the file tools: 3400..=3499.
+pub const F5_FIRST: u16 = 3400;
+/// F6, integration and the Options pages: 3500..=3599.
+pub const F6_FIRST: u16 = 3500;
+/// The framework's own: 3600..=3699 (below).
+pub const FRAMEWORK_FIRST: u16 = 3600;
+/// F4's custom filters in the Search menu and the filter bar, one each:
+/// 3800..=3999.
+pub const CUSTOM_FILTER_FIRST: u16 = 3800;
+pub const CUSTOM_FILTERS: usize = 200;
+/// F3's tabs in the tab strip's overflow list, one each: 4000..=4255.
+pub const TAB_ENTRY_FIRST: u16 = 4000;
+pub const TAB_ENTRIES: usize = 256;
+/// The size of each feature's range.
+pub const FEATURE_RANGE: u16 = 100;
+
+// The framework's: View > Folders, Bookmarks, Filters and Preview (each
+// shows only once its pane is registered), and the frame keys, which have
+// no menu item (Everything's "Close Pane", "Next Frame", "Previous
+// Frame").
+pub const VIEW_PANE_FOLDERS: u16 = 3600;
+pub const VIEW_PANE_BOOKMARKS: u16 = 3601;
+pub const VIEW_PANE_FILTERS: u16 = 3602;
+pub const VIEW_PANE_PREVIEW: u16 = 3603;
+/// Shift+Esc: the pane with the keyboard closes.
+pub const CLOSE_PANE: u16 = 3610;
+/// F6 and Shift+F6: the keyboard to the next or previous frame.
+pub const NEXT_FRAME: u16 = 3611;
+pub const PREV_FRAME: u16 = 3612;
+
 // Tools.
 pub const SERVICE_START: u16 = 1700;
 pub const SERVICE_STOP: u16 = 1701;
@@ -167,7 +209,8 @@ fn access_key(text: &str) -> Option<char> {
         .map(|c| c.to_ascii_uppercase())
 }
 
-enum Item<'a> {
+/// A menu item as goz-gui makes them.
+pub enum Item<'a> {
     Cmd(u16, &'a str),
     /// One of a group of which exactly one is checked, shown with a dot.
     Radio(u16, &'a str),
@@ -246,10 +289,20 @@ fn truncate(menu: HMENU, keep: usize) {
 #[derive(Clone, Copy)]
 pub struct Bar {
     pub bar: HMENU,
+    /// Rebuilt as it opens (`fill_file`): an item for it goes there.
     pub file: HMENU,
     pub edit: HMENU,
+    pub view: HMENU,
+    #[allow(dead_code, reason = "for the features' menu items (FRAMEWORK.md)")]
+    pub search: HMENU,
+    /// Its entries after Back, Forward and Home are rebuilt as it opens.
     pub history: HMENU,
+    /// Its bookmarks after its own three items are rebuilt as it opens.
     pub bookmarks: HMENU,
+    #[allow(dead_code, reason = "for the features' menu items (FRAMEWORK.md)")]
+    pub tools: HMENU,
+    #[allow(dead_code, reason = "for the features' menu items (FRAMEWORK.md)")]
+    pub help: HMENU,
 }
 
 /// The History menu's own items, before the entries.
@@ -356,9 +409,86 @@ pub fn menu_bar(run_history: bool) -> Bar {
         bar,
         file,
         edit,
+        view,
+        search,
         history,
         bookmarks,
+        tools,
+        help,
     }
+}
+
+/// A popup menu of `items`, for a submenu a feature adds (`add_items`).
+#[allow(dead_code, reason = "for the features' menu items (FRAMEWORK.md)")]
+pub fn submenu(items: &[Item<'_>]) -> HMENU {
+    popup(items)
+}
+
+/// Puts `items` in `menu`, in order, right after the item that runs
+/// `after` (at the end if none does), or at the top for `None`: how a
+/// feature adds its commands to a menu of the bar that is not rebuilt as
+/// it opens (Edit, View, Search, Tools, Help), as the window starts.
+#[allow(dead_code, reason = "for the features' menu items (FRAMEWORK.md)")]
+pub fn add_items(menu: HMENU, after: Option<u16>, items: &[Item<'_>]) {
+    let at = match after {
+        None => Some(0),
+        Some(cmd) => position_of(menu, cmd).map(|p| p + 1),
+    };
+    for (i, item) in items.iter().enumerate() {
+        insert(menu, at.map_or(u32::MAX, |p| p + i as u32), item);
+    }
+}
+
+/// The position of the item that runs `cmd` in `menu` (not its submenus).
+fn position_of(menu: HMENU, cmd: u16) -> Option<u32> {
+    // SAFETY: reads the items of a menu of this thread.
+    unsafe {
+        let n = GetMenuItemCount(menu).max(0) as u32;
+        (0..n).find(|&i| GetMenuItemID(menu, i as i32) == u32::from(cmd))
+    }
+}
+
+/// Whether the item at `pos` of `menu` is a separator.
+fn is_separator(menu: HMENU, pos: u32) -> bool {
+    // SAFETY: reads one item of a menu of this thread into a plain struct.
+    unsafe {
+        let mut mii: MENUITEMINFOW = core::mem::zeroed();
+        mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
+        mii.fMask = MIIM_FTYPE;
+        GetMenuItemInfoW(menu, pos, 1, &mut mii) != 0 && mii.fType & MFT_SEPARATOR != 0
+    }
+}
+
+/// Puts the panes' items (`items`: command and label, in order) in the
+/// View menu as a group after Status Bar, as Everything's: Folders,
+/// Bookmarks, Filters, Preview. None leaves the menu as it was.
+pub fn set_pane_items(view: HMENU, items: &[(u16, &str)]) {
+    // The group as it was goes first: its items, then its separator, which
+    // leaves two separators in a row after Status Bar.
+    for cmd in VIEW_PANE_FOLDERS..=VIEW_PANE_PREVIEW {
+        // SAFETY: deletes an item of this menu by command; a missing one
+        // is reported and ignored.
+        unsafe { DeleteMenu(view, u32::from(cmd), MF_BYCOMMAND) };
+    }
+    let Some(at) = position_of(view, STATUS_BAR).map(|p| p + 1) else {
+        return;
+    };
+    if is_separator(view, at) && is_separator(view, at + 1) {
+        // SAFETY: deletes the group's separator by position.
+        unsafe { DeleteMenu(view, at, MF_BYPOSITION) };
+    }
+    if items.is_empty() {
+        return;
+    }
+    insert(view, at, &Sep);
+    for (i, &(cmd, label)) in items.iter().enumerate() {
+        insert(view, at + 1 + i as u32, &Cmd(cmd, label));
+    }
+}
+
+/// Checks or unchecks the item that runs `id` in `menu` and its submenus.
+pub fn check_item(menu: HMENU, id: u16, on: bool) {
+    check(menu, id, on);
 }
 
 /// View > Sort By, and the background menu's.
@@ -706,7 +836,19 @@ const _: () = {
     assert!(FILTER_FIRST + Filter::ALL.len() as u16 <= INDEX_STATUS);
     assert!(NAV_ENTRY_FIRST + NAV_ENTRIES as u16 <= BOOKMARK_ADD);
     assert!(ABOUT < BOOKMARK_FIRST);
-    assert!(BOOKMARK_FIRST as usize + BOOKMARKS <= SHELL_FIRST as usize);
+    assert!(BOOKMARK_FIRST as usize + BOOKMARKS <= F1_FIRST as usize);
+    // The features' ranges follow each other, then the framework's, the
+    // custom filters and the tab entries, all below the shell's.
+    assert!(F2_FIRST == F1_FIRST + FEATURE_RANGE);
+    assert!(F3_FIRST == F2_FIRST + FEATURE_RANGE);
+    assert!(F4_FIRST == F3_FIRST + FEATURE_RANGE);
+    assert!(F5_FIRST == F4_FIRST + FEATURE_RANGE);
+    assert!(F6_FIRST == F5_FIRST + FEATURE_RANGE);
+    assert!(FRAMEWORK_FIRST == F6_FIRST + FEATURE_RANGE);
+    assert!(VIEW_PANE_FOLDERS >= FRAMEWORK_FIRST && PREV_FRAME < FRAMEWORK_FIRST + FEATURE_RANGE);
+    assert!(FRAMEWORK_FIRST + FEATURE_RANGE <= CUSTOM_FILTER_FIRST);
+    assert!(CUSTOM_FILTER_FIRST as usize + CUSTOM_FILTERS <= TAB_ENTRY_FIRST as usize);
+    assert!(TAB_ENTRY_FIRST as usize + TAB_ENTRIES <= SHELL_FIRST as usize);
     assert!(SHELL_FIRST < SHELL_LAST);
 };
 
@@ -727,6 +869,85 @@ mod tests {
         }
         assert_eq!(column_of(RESET_COLUMNS), None);
         assert_eq!(column_of(COLUMN_FIRST - 1), None);
+    }
+
+    /// The labels of a menu's items, a separator as "-".
+    fn labels(menu: HMENU) -> Vec<String> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetMenuStringW;
+        // SAFETY: reads the items of a menu this test made.
+        let n = unsafe { GetMenuItemCount(menu) }.max(0) as u32;
+        (0..n)
+            .map(|i| {
+                if is_separator(menu, i) {
+                    return "-".to_owned();
+                }
+                let mut buf = [0u16; 128];
+                // SAFETY: the buffer and its length.
+                let len = unsafe {
+                    GetMenuStringW(menu, i, buf.as_mut_ptr(), buf.len() as i32, MF_BYPOSITION)
+                };
+                String::from_utf16_lossy(&buf[..len.max(0) as usize])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pane_items_go_in_a_group_after_the_status_bar() {
+        let bar = menu_bar(true);
+        let before = labels(bar.view);
+        assert_eq!(&before[..3], ["Filt&er Bar", "Status &Bar", "-"]);
+        set_pane_items(bar.view, &[]);
+        assert_eq!(labels(bar.view), before, "nothing registered");
+        set_pane_items(bar.view, &[(VIEW_PANE_PREVIEW, "&Preview\tAlt+P")]);
+        let one = labels(bar.view);
+        assert_eq!(
+            &one[..5],
+            ["Filt&er Bar", "Status &Bar", "-", "&Preview\tAlt+P", "-"]
+        );
+        assert_eq!(one.len(), before.len() + 2);
+        // Again with more: the group is put back whole, not added to.
+        set_pane_items(
+            bar.view,
+            &[
+                (VIEW_PANE_FOLDERS, "&Folders"),
+                (VIEW_PANE_PREVIEW, "&Preview\tAlt+P"),
+            ],
+        );
+        let two = labels(bar.view);
+        assert_eq!(&two[2..6], ["-", "&Folders", "&Preview\tAlt+P", "-"]);
+        assert_eq!(two.len(), before.len() + 3);
+        // And none again: as it was.
+        set_pane_items(bar.view, &[]);
+        assert_eq!(labels(bar.view), before);
+    }
+
+    #[test]
+    fn features_add_items_where_they_belong() {
+        let bar = menu_bar(true);
+        let before = labels(bar.edit);
+        add_items(
+            bar.edit,
+            Some(PASTE),
+            &[Sep, Cmd(F5_FIRST, "Copy &to Folder...")],
+        );
+        let after = labels(bar.edit);
+        assert_eq!(
+            &after[..5],
+            [
+                "Cu&t	Ctrl+X",
+                "&Copy	Ctrl+C",
+                "&Paste	Ctrl+V",
+                "-",
+                "Copy &to Folder..."
+            ]
+        );
+        assert_eq!(after.len(), before.len() + 2);
+        // At the top, and at the end when the item is not there.
+        add_items(bar.edit, None, &[Cmd(F4_FIRST, "&Find...")]);
+        add_items(bar.edit, Some(F6_FIRST), &[Cmd(F6_FIRST + 1, "Last")]);
+        let all = labels(bar.edit);
+        assert_eq!(all[0], "&Find...");
+        assert_eq!(all.last().map(String::as_str), Some("Last"));
     }
 
     #[test]

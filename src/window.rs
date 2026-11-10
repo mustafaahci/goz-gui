@@ -1,4 +1,7 @@
-//! The main window: search field, virtual results list, status bar.
+//! The main window: search field, virtual results list, status bar, and the
+//! regions around them (`crate::layout`): the tab strip and the find bar
+//! (`crate::strip`), and the docks either side of the results with their
+//! panes (`crate::dock`, `crate::pane`, `docks.rs`).
 //!
 //! Everything here runs on the UI thread. State that the window procedure
 //! touches sits in `Cell`/`RefCell`s on one `App` that lives as long as the
@@ -45,12 +48,15 @@ use crate::filter::{self, Filter};
 use crate::highlight::{Highlight, Span};
 use crate::history::{NavHistory, SearchHistory};
 use crate::icons::{GENERIC, IconReply, Icons};
+use crate::layout::Regions;
 use crate::model::{Model, Pending};
+use crate::pane::PaneEvent;
 use crate::placement::{self, Rect};
 use crate::searchbox::Button;
 use crate::settings::{OnTop, Settings};
 use crate::status::Indicator;
 use crate::store::writer::Writer;
+use crate::strip::{Strip, StripSlot};
 use crate::theme::{Palette, ThemeMode};
 use crate::thumbs::{ThumbReply, Thumbs};
 use crate::typeahead::TypeAhead;
@@ -69,6 +75,7 @@ mod bookmarks;
 mod cols;
 mod commands;
 mod context;
+mod docks;
 mod edit;
 mod export;
 mod files;
@@ -81,8 +88,23 @@ mod results;
 mod runs;
 mod searches;
 mod session;
+pub mod slots;
 mod thumbview;
 mod typing;
+// Wave 1: each feature declares its window-side modules on its own lines
+// below, so their changes never meet (FRAMEWORK.md).
+
+// F1 (preview pane).
+
+// F2 (sidebars).
+
+// F3 (tabs and windows).
+
+// F4 (search tools).
+
+// F5 (file tools).
+
+// F6 (integration and the Options pages).
 
 pub const WM_REPLY: u32 = WM_APP + 1;
 pub const WM_ICON: u32 = WM_APP + 2;
@@ -119,6 +141,10 @@ const WM_EXPORT: u32 = WM_APP + 14;
 /// A thumbnail was made: a `Box<thumbs::ThumbReply>` in lParam. Kept apart
 /// from the numbers above so others can be added there.
 const WM_THUMB: u32 = WM_APP + 30;
+/// The framework's messages are `WM_APP + 100..120`; the features' follow
+/// (`slots.rs`). A pane's close button was clicked: wParam is the pane's
+/// `PaneId::code`.
+pub const WM_PANE_CLOSE: u32 = WM_APP + 100;
 
 const ID_EDIT: usize = 100;
 const ID_LIST: usize = 101;
@@ -142,6 +168,7 @@ const TIMER_STORE_RETRY: usize = 9;
 const TIMER_SETTLE: usize = 10;
 /// Time to search again, so the results follow the files (`live.rs`).
 const TIMER_LIVE: usize = 11;
+// The framework's timers are 100..110; the features' follow (`slots.rs`).
 
 /// The search options; the default is History > Home's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -368,6 +395,31 @@ pub struct App {
     thumb_grid: Cell<Option<thumbview::Grid>>,
     /// The status bar's view button under the mouse.
     pub view_hot: Cell<Option<status::ViewButton>>,
+    /// The panes registered and open, the docks' sizes, a divider being
+    /// dragged.
+    docks: RefCell<docks::Docks>,
+    /// The tab strip and the find bar a feature put in (by `StripSlot`).
+    strips: RefCell<[Option<Rc<dyn Strip>>; 2]>,
+    /// The strip holding the mouse, which gets every mouse message.
+    strip_capture: Cell<Option<StripSlot>>,
+    /// Where the regions went in the last layout.
+    regions: Cell<Regions>,
+    /// The window was on screen when the panes were last told.
+    panes_shown: Cell<bool>,
+    // Wave 1: each feature adds the state it keeps on its own lines below
+    // (and in `App::new`), so their changes never meet (FRAMEWORK.md).
+
+    // F1 (preview pane).
+
+    // F2 (sidebars).
+
+    // F3 (tabs and windows).
+
+    // F4 (search tools).
+
+    // F5 (file tools).
+
+    // F6 (integration and the Options pages).
 }
 
 /// How the program that started goz-gui asked for its window to be shown
@@ -539,6 +591,7 @@ See Help > Search Syntax and the README for goz-gui's switches."
             (sessions, marks, runs),
         ));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as *const App as isize);
+        APP.set(Some(app));
         app.init(start.is_none());
         crate::instance::listen(&key, hwnd, WM_LAUNCH);
         let taken = app.apply_background(prefs_background(app));
@@ -598,15 +651,12 @@ See Help > Search Syntax and the README for goz-gui's switches."
         let mut msg: MSG = core::mem::zeroed();
         while GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0) > 0 {
             dropdown::click_elsewhere(app, &msg);
-            if msg.message == WM_KEYDOWN
-                && msg.wParam == usize::from(VK_TAB)
-                && (msg.hwnd == app.edit || msg.hwnd == app.list)
+            // A pane or strip takes the keys its controls keep first.
+            if matches!(
+                msg.message,
+                WM_KEYDOWN | WM_SYSKEYDOWN | WM_CHAR | WM_SYSCHAR
+            ) && app.frame_key(&msg)
             {
-                if msg.hwnd == app.edit {
-                    app.focus_list();
-                } else {
-                    SetFocus(app.edit);
-                }
                 continue;
             }
             // Shortcuts are the main window's; another window of the thread
@@ -621,6 +671,17 @@ See Help > Search Syntax and the README for goz-gui's switches."
                 continue;
             }
             if ours && TranslateAcceleratorW(hwnd, accel, &msg) != 0 {
+                continue;
+            }
+            // Tab and Shift+Tab go round the tab stops: the search box, the
+            // panes that are tab stops, the results (a pane or strip may
+            // keep it among its own controls); so does Ctrl+Tab while no
+            // shortcut above takes it.
+            if msg.message == WM_KEYDOWN
+                && msg.wParam == usize::from(VK_TAB)
+                && !key_down(VK_MENU)
+                && app.tab_key(msg.hwnd, key_down(VK_SHIFT))
+            {
                 continue;
             }
             TranslateMessage(&msg);
@@ -643,6 +704,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         (*app).handle(msg, w, l)
     }
+}
+
+thread_local! {
+    /// The window's `App`, once it is attached.
+    static APP: Cell<Option<&'static App>> = const { Cell::new(None) };
+}
+
+/// The `App` of the main window `main` (a pane's parent), once it is
+/// attached.
+pub fn app_of(main: HWND) -> Option<&'static App> {
+    APP.get().filter(|app| !main.is_null() && app.hwnd == main)
 }
 
 /// goz-gui's icon, resource 1 (build.rs embeds it), at `size` pixels; null
@@ -849,6 +921,24 @@ impl App {
                 big_icons: Cell::new([0; 2]),
                 thumb_grid: Cell::new(None),
                 view_hot: Cell::new(None),
+                docks: RefCell::new(docks::Docks::new(s.docks)),
+                strips: RefCell::new([None, None]),
+                strip_capture: Cell::new(None),
+                regions: Cell::new(Regions::default()),
+                panes_shown: Cell::new(false),
+                // Wave 1 (FRAMEWORK.md).
+
+                // F1 (preview pane).
+
+                // F2 (sidebars).
+
+                // F3 (tabs and windows).
+
+                // F4 (search tools).
+
+                // F5 (file tools).
+
+                // F6 (integration and the Options pages).
             })
         }
     }
@@ -892,6 +982,9 @@ impl App {
         if self.view.get().thumbnails {
             self.put_view();
         }
+        // The panes this build has (and the test hook's), opened as the
+        // settings left them.
+        self.register_panes();
         if default_size {
             // SAFETY: sizes the window for its monitor's DPI before it shows.
             unsafe {
@@ -1054,6 +1147,7 @@ impl App {
         dropdown::apply_theme(self);
         searchbox::theme_tooltip(self, dark);
         celltip::set_theme(self, dark);
+        self.docks_theme(dark);
         theme::flush_menus();
         // SAFETY: repaints this thread's windows.
         unsafe {
@@ -1067,15 +1161,19 @@ impl App {
         }
     }
 
-    /// Places the search frame, the list and the status bar. At 100 % with
-    /// the usual 9 pt message font (15 px) the heights are Everything
-    /// 1.5's, measured on its window: 5 px above the search frame, the
-    /// frame 23 px, 3 px below it, then the list (header 27 px, rows 19 px),
-    /// and a 23 px status bar; 3 px either side of the frame. The nav bar,
-    /// when shown, takes two 23 px squares and a 3 px gap left of the frame.
+    /// Lays the window's regions out (`crate::layout`): the tab strip, the
+    /// search row, the docks with their panes either side of the results
+    /// and the find bar, and the status bar. At 100 % with the usual 9 pt
+    /// message font (15 px) the heights are Everything 1.5's, measured on
+    /// its window: 5 px above the search frame, the frame 23 px, 3 px below
+    /// it, then the list (header 27 px, rows 19 px), and a 23 px status
+    /// bar; 3 px either side of the frame. The nav bar, when shown, takes
+    /// two 23 px squares and a 3 px gap left of the frame. The docks are
+    /// `left_sidebar_wide` and `right_sidebar_wide` (256 px) with a 6 px
+    /// divider each, as Everything's.
     fn layout(&self) {
         let mut rc = RECT::default();
-        // SAFETY: reads and moves this thread's windows.
+        // SAFETY: reads this thread's window's size.
         unsafe { GetClientRect(self.hwnd, &mut rc) };
         let (side, above, below) = (self.scale(3), self.scale(5), self.scale(3));
         let fh = self.ui_fonts.borrow().height;
@@ -1086,6 +1184,23 @@ impl App {
         } else {
             0
         };
+        let (tabs_h, find_h) = self.strip_heights();
+        let (left, right) = self.dock_widths();
+        let (min_dock, min_center) = self.dock_limits();
+        let r = crate::layout::regions(&crate::layout::Inputs {
+            width: rc.right,
+            height: rc.bottom,
+            tabs: tabs_h,
+            search: (above, search_h, below),
+            status: status_h,
+            find: find_h,
+            left,
+            right,
+            divider: self.scale(crate::dock::DIVIDER),
+            min_dock,
+            min_center,
+        });
+        self.regions.set(r);
         let nav = if self.nav_bar.get() {
             searchbox::nav_room(search_h, self.scale(searchbox::NAV_GAP))
         } else {
@@ -1105,11 +1220,12 @@ impl App {
         } else {
             0
         };
+        let top = r.search.top + above;
         let search = RECT {
             left: side + nav,
-            top: above,
+            top,
             right: (rc.right - side - filter_w).max(side + nav),
-            bottom: above + search_h,
+            bottom: top + search_h,
         };
         self.filter_rc.set(if filter_w > 0 {
             RECT {
@@ -1120,39 +1236,37 @@ impl App {
         } else {
             RECT::default()
         });
-        let status = RECT {
-            left: 0,
-            top: (rc.bottom - status_h).max(0),
-            right: rc.right,
-            bottom: rc.bottom,
-        };
         self.search_rc.set(search);
-        self.status_rc.set(status);
+        self.status_rc.set(r.status);
         let inset = self.scale(7);
-        let list_top = search.bottom + below;
         // The text stops short of the clear and history buttons.
         let edit_right = searchbox::frame_of(self).edit_right;
         searchbox::place_tooltip(self);
-        // SAFETY: as above.
-        unsafe {
-            MoveWindow(
-                self.edit,
-                search.left + inset,
-                search.top + (search_h - fh) / 2,
-                (edit_right - search.left - inset).max(0),
-                fh,
-                1,
-            );
-            MoveWindow(
-                self.list,
-                0,
-                list_top,
-                rc.right,
-                (status.top - list_top).max(0),
-                1,
-            );
-            InvalidateRect(self.hwnd, core::ptr::null(), 0);
+        // The search box, the results and the panes move together, so
+        // dragging a divider repaints them once and in step.
+        let mut moves = docks::Defer::new();
+        let edit_left = search.left + inset;
+        let edit_top = search.top + (search_h - fh) / 2;
+        moves.put(
+            self.edit,
+            RECT {
+                left: edit_left,
+                top: edit_top,
+                right: edit_left + (edit_right - edit_left).max(0),
+                bottom: edit_top + fh,
+            },
+        );
+        moves.put(self.list, r.list);
+        self.place_panes(&r, &mut moves);
+        moves.run();
+        for slot in [StripSlot::Tabs, StripSlot::FindBar] {
+            if let Some(strip) = self.strip(slot) {
+                strip.place(self, self.strip_rect(slot));
+            }
         }
+        // SAFETY: repaints this thread's window (its children paint
+        // themselves).
+        unsafe { InvalidateRect(self.hwnd, core::ptr::null(), 0) };
     }
 
     unsafe fn handle(&self, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -1167,6 +1281,39 @@ impl App {
             {
                 return answer;
             }
+            // What a strip's own controls send their parent (this window)
+            // goes to the strip.
+            if matches!(
+                msg,
+                WM_COMMAND
+                    | WM_NOTIFY
+                    | WM_CTLCOLOREDIT
+                    | WM_CTLCOLORSTATIC
+                    | WM_CTLCOLORBTN
+                    | WM_CTLCOLORLISTBOX
+                    | WM_DRAWITEM
+            ) && let Some(answer) = self.strip_message(msg, w, l)
+            {
+                return answer;
+            }
+            // The strips see the mouse over them first (and all of it
+            // while one holds it); a button they take goes no further.
+            if matches!(
+                msg,
+                WM_MOUSEMOVE
+                    | WM_MOUSELEAVE
+                    | WM_CAPTURECHANGED
+                    | WM_LBUTTONDOWN
+                    | WM_LBUTTONUP
+                    | WM_LBUTTONDBLCLK
+                    | WM_RBUTTONDOWN
+                    | WM_RBUTTONUP
+                    | WM_MBUTTONDOWN
+                    | WM_MBUTTONUP
+            ) && self.strip_mouse(msg, w, point(l))
+            {
+                return 0;
+            }
             match msg {
                 WM_SIZE => {
                     // The dropdown hangs under the search frame where it was.
@@ -1179,6 +1326,9 @@ impl App {
                     if w != SIZE_MINIMIZED as usize {
                         self.arm_live();
                     }
+                    self.panes_window_shown(
+                        w != SIZE_MINIMIZED as usize && IsWindowVisible(self.hwnd) != 0,
+                    );
                     self.settings_changed();
                     0
                 }
@@ -1186,6 +1336,7 @@ impl App {
                     if w != 0 {
                         self.arm_live();
                     }
+                    self.panes_window_shown(w != 0 && IsIconic(self.hwnd) == 0);
                     DefWindowProcW(self.hwnd, msg, w, l)
                 }
                 WM_MOVE => {
@@ -1216,8 +1367,11 @@ impl App {
                     GetStockObject(DC_BRUSH) as LRESULT
                 }
                 WM_MOUSEMOVE => {
-                    searchbox::mouse_move(self, point(l));
-                    status::view_hover(self, Some(point(l)));
+                    // A divider being dragged takes the mouse.
+                    if !self.divider_move(point(l)) {
+                        searchbox::mouse_move(self, point(l));
+                        status::view_hover(self, Some(point(l)));
+                    }
                     0
                 }
                 WM_MOUSELEAVE => {
@@ -1227,7 +1381,9 @@ impl App {
                 }
                 WM_LBUTTONDOWN => {
                     let pt = point(l);
-                    if in_rect(&self.filter_rc.get(), pt) {
+                    if self.divider_down(pt) {
+                        // A divider's drag starts.
+                    } else if in_rect(&self.filter_rc.get(), pt) {
                         self.filter_bar_click();
                     } else if let Some(button) = status::view_button_at(self, pt) {
                         self.view_button(button);
@@ -1240,12 +1396,15 @@ impl App {
                     0
                 }
                 WM_LBUTTONUP => {
-                    if let Some(button) = searchbox::button_up(self, point(l)) {
+                    if !self.divider_up()
+                        && let Some(button) = searchbox::button_up(self, point(l))
+                    {
                         self.search_button(button);
                     }
                     0
                 }
                 WM_CAPTURECHANGED => {
+                    self.divider_up();
                     searchbox::capture_lost(self);
                     0
                 }
@@ -1322,6 +1481,14 @@ impl App {
                 WM_SETCURSOR if u32::from(loword(l as usize)) == HTCLIENT && self.busy_cursor() => {
                     1
                 }
+                // Over a divider: the resize cursor.
+                WM_SETCURSOR
+                    if w as HWND == self.hwnd
+                        && u32::from(loword(l as usize)) == HTCLIENT
+                        && self.divider_cursor() =>
+                {
+                    1
+                }
                 results::WM_FETCHED => {
                     self.fetch_done();
                     0
@@ -1360,9 +1527,20 @@ impl App {
                         celltip::timer(self);
                     } else if w == TIMER_LIVE {
                         self.live_tick();
+                    } else if slots::is_feature_timer(w) {
+                        self.feature_timer(w);
                     }
                     0
                 }
+                WM_PANE_CLOSE => {
+                    if let Some(id) = crate::dock::PaneId::from_code(w) {
+                        self.show_pane(id, false);
+                    }
+                    0
+                }
+                m if slots::is_feature_message(m) => self
+                    .feature_message(m, w, l)
+                    .unwrap_or_else(|| DefWindowProcW(self.hwnd, msg, w, l)),
                 WM_EXPORT => {
                     if w == crate::export::ENDED {
                         let ended = Box::from_raw(l as *mut crate::export::Ended);
@@ -1453,7 +1631,9 @@ impl App {
                     if u32::from(loword(w)) == WA_INACTIVE {
                         dropdown::close(self);
                         let focus = GetFocus();
-                        if focus == self.edit || focus == self.list {
+                        // The search box, the results, or a pane's or
+                        // strip's window: it has the keyboard back after.
+                        if self.frame_of(focus).is_some() {
                             self.last_focus.set(focus);
                         }
                     } else {
@@ -1463,7 +1643,7 @@ impl App {
                     DefWindowProcW(self.hwnd, msg, w, l)
                 }
                 WM_SETFOCUS => {
-                    SetFocus(self.last_focus.get());
+                    SetFocus(self.focus_to_restore(self.last_focus.get()));
                     0
                 }
                 WM_DPICHANGED => {
@@ -1540,6 +1720,11 @@ impl App {
                     }
                     // The window is still there to read its placement from.
                     self.save_and_flush();
+                    // The features, then the panes' contents, let go of
+                    // what they hold; the settings keep the panes open for
+                    // next time.
+                    self.exit_features();
+                    self.close_all_panes();
                     self.worker.quit();
                     PostQuitMessage(0);
                     0
@@ -1602,6 +1787,7 @@ impl App {
                     }
                     self.selection_changed();
                     self.invalidate_status();
+                    self.pane_event(PaneEvent::SelectionChanged);
                 }
                 NM_CUSTOMDRAW => {
                     let cd = &*(l as *const NMCUSTOMDRAW);
@@ -1798,6 +1984,7 @@ impl App {
             // filter bar shows the filter, however it was chosen.
             searchbox::invalidate_nav(self);
             self.invalidate_filter_bar();
+            self.pane_event(PaneEvent::SearchChanged);
         }
     }
 
@@ -1953,6 +2140,7 @@ impl App {
                         }
                         // SAFETY: repaints the list.
                         unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
+                        self.pane_event(PaneEvent::ResultsChanged { refresh: keep });
                     }
                     None => {
                         if old_total != total {
@@ -2255,7 +2443,11 @@ impl App {
             );
         }
         self.set_window_icons();
+        self.docks_dpi(dpi);
         self.layout();
+        // A pane's title row follows the font: its content is placed again
+        // even where the pane kept its size.
+        self.docks_place_all();
         if self.view.get().thumbnails {
             // The thumbnails' size and spacing follow the DPI.
             self.put_view();

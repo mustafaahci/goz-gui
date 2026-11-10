@@ -183,6 +183,7 @@ impl App {
         s.export_type = self.export_type.get();
         s.columns = self.layout.get();
         s.view = self.view();
+        s.docks = self.dock_settings();
         // The dialogs' places, the Search Syntax window's as it is now if
         // it is open.
         syntax::keep_place();

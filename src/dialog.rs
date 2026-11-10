@@ -6,20 +6,22 @@
 
 use std::cell::Cell;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DrawTextW,
-    GetMonitorInfoW, HBRUSH, HDC, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromRect,
-    RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, SetBkColor, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
+    DT_VCENTER, DrawTextW, EndPaint, GetMonitorInfoW, GetTextExtentPoint32W, GetWindowDC, HBRUSH,
+    HDC, HFONT, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromRect, PAINTSTRUCT, RDW_ALLCHILDREN,
+    RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, ReleaseDC, SelectObject, SetBkColor,
+    SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
-    CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, HDM_GETITEMCOUNT, HIMAGELIST, ILD_TRANSPARENT,
-    ImageList_Draw, LVCF_FMT, LVCFMT_JUSTIFYMASK, LVCFMT_RIGHT, LVCOLUMNW, LVIF_IMAGE, LVIR_BOUNDS,
-    LVIR_ICON, LVIR_LABEL, LVIS_SELECTED, LVITEMW, LVM_GETCOLUMNW, LVM_GETHEADER, LVM_GETIMAGELIST,
+    CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, HDM_GETITEMCOUNT, HIMAGELIST, HKM_GETHOTKEY,
+    HOTKEYF_ALT, HOTKEYF_CONTROL, HOTKEYF_EXT, HOTKEYF_SHIFT, ILD_TRANSPARENT, ImageList_Draw,
+    LVCF_FMT, LVCFMT_JUSTIFYMASK, LVCFMT_RIGHT, LVCOLUMNW, LVIF_IMAGE, LVIR_BOUNDS, LVIR_ICON,
+    LVIR_LABEL, LVIS_SELECTED, LVITEMW, LVM_GETCOLUMNW, LVM_GETHEADER, LVM_GETIMAGELIST,
     LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSTATE, LVM_GETITEMTEXTW, LVM_GETITEMW,
     LVM_GETSUBITEMRECT, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVSIL_SMALL,
     NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW, TVM_SETBKCOLOR, TVM_SETLINECOLOR,
@@ -27,19 +29,24 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::HiDpi::SystemParametersInfoForDpi;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, GetKeyNameTextW, IsWindowEnabled, MAPVK_VK_TO_VSC, MapVirtualKeyW, VK_CONTROL,
+    VK_MENU, VK_SHIFT,
+};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_GROUPBOX, BS_TYPEMASK, CBT_CREATEWNDW, CBTACTIVATESTRUCT, CallNextHookEx, DLGPROC,
-    DS_MODALFRAME, DS_SETFONT, DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD, GW_HWNDNEXT,
-    GW_OWNER, GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem,
-    GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    HCBT_ACTIVATE, HCBT_CREATEWND, HHOOK, MapDialogRect, MoveWindow, NONCLIENTMETRICSW,
-    SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SendMessageW, SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, WH_CBT, WINDOWPOS,
+    BS_GROUPBOX, BS_TYPEMASK, CBT_CREATEWNDW, CBTACTIVATESTRUCT, CallNextHookEx,
+    CreateDialogIndirectParamW, DLGPROC, DS_CONTROL, DS_MODALFRAME, DS_SETFONT,
+    DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD, GW_HWNDNEXT, GW_OWNER, GWL_STYLE,
+    GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem, GetForegroundWindow, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HCBT_ACTIVATE, HCBT_CREATEWND,
+    HHOOK, MapDialogRect, MoveWindow, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW,
+    SetCaretPos, SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, WH_CBT, WINDOWPOS,
     WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC,
-    WM_NCDESTROY, WM_NOTIFY, WM_SETTINGCHANGE, WM_WINDOWPOSCHANGING, WS_CAPTION, WS_CHILD,
-    WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    WM_ERASEBKGND, WM_GETFONT, WM_NCDESTROY, WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_SETTINGCHANGE,
+    WM_WINDOWPOSCHANGING, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_POPUP,
+    WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::paint::fill;
@@ -100,11 +107,24 @@ impl Template {
     /// A modal dialog of `cx` × `cy` dialog units in the message font, with
     /// a title bar and a close box; `style` adds to that (`WS_THICKFRAME`).
     pub fn new(title: &str, style: u32, cx: i16, cy: i16) -> Template {
-        let mut t = Template { words: Vec::new() };
         let style =
             style | WS_POPUP | WS_CAPTION | WS_SYSMENU | (DS_MODALFRAME | DS_SETFONT) as u32;
+        Template::with_styles(title, style, 0, cx, cy)
+    }
+
+    /// A page of another dialog, `cx` × `cy` dialog units in the message
+    /// font: a child dialog (`DS_CONTROL`, `WS_EX_CONTROLPARENT`) whose
+    /// controls the parent's Tab, arrow and access keys reach as its own.
+    /// Made hidden with [`Template::create_child`].
+    pub fn child(cx: i16, cy: i16) -> Template {
+        let style = WS_CHILD | WS_CLIPSIBLINGS | (DS_CONTROL | DS_SETFONT) as u32;
+        Template::with_styles("", style, WS_EX_CONTROLPARENT, cx, cy)
+    }
+
+    fn with_styles(title: &str, style: u32, ex_style: u32, cx: i16, cy: i16) -> Template {
+        let mut t = Template { words: Vec::new() };
         t.dword(style);
-        t.dword(0);
+        t.dword(ex_style);
         // The control count, then the position and size.
         for v in [0, 0, 0, cx, cy] {
             t.words.push(v as u16);
@@ -163,15 +183,21 @@ impl Template {
         self
     }
 
-    /// Shows the dialog, owned by `owner`, until it ends; returns what
-    /// `EndDialog` was given (-1 if it could not be made). `param` reaches
-    /// `proc` as WM_INITDIALOG's lParam.
-    pub fn run(&self, owner: HWND, proc: DLGPROC, param: LPARAM) -> isize {
-        // The template must start on a 4-byte boundary, which u32s do.
+    /// The template as the dialog functions take it: on a 4-byte boundary,
+    /// which u32s are.
+    fn aligned(&self) -> Vec<u32> {
         let mut aligned = vec![0u32; self.words.len().div_ceil(2)];
         for (i, &w) in self.words.iter().enumerate() {
             aligned[i / 2] |= u32::from(w) << (16 * (i % 2));
         }
+        aligned
+    }
+
+    /// Shows the dialog, owned by `owner`, until it ends; returns what
+    /// `EndDialog` was given (-1 if it could not be made). `param` reaches
+    /// `proc` as WM_INITDIALOG's lParam.
+    pub fn run(&self, owner: HWND, proc: DLGPROC, param: LPARAM) -> isize {
+        let aligned = self.aligned();
         // SAFETY: a complete template that outlives the modal call, a dialog
         // procedure, and a window of this thread as the owner.
         unsafe {
@@ -179,6 +205,25 @@ impl Template {
                 GetModuleHandleW(core::ptr::null()),
                 aligned.as_ptr().cast(),
                 owner,
+                proc,
+                param,
+            )
+        }
+    }
+
+    /// Makes a [`Template::child`] page in `parent` (hidden until shown);
+    /// null if it could not be made. `param` reaches `proc` as
+    /// WM_INITDIALOG's lParam.
+    pub fn create_child(&self, parent: HWND, proc: DLGPROC, param: LPARAM) -> HWND {
+        let aligned = self.aligned();
+        // SAFETY: a complete template (the system copies what it needs
+        // before returning), a dialog procedure, and a window of this
+        // thread as the parent.
+        unsafe {
+            CreateDialogIndirectParamW(
+                GetModuleHandleW(core::ptr::null()),
+                aligned.as_ptr().cast(),
+                parent,
                 proc,
                 param,
             )
@@ -249,16 +294,30 @@ pub fn apply_theme(dlg: HWND, dark: bool) {
             theme::allow(child, dark);
             match class_of(child).as_str() {
                 // A themed group box draws its caption in the theme's dark
-                // text whatever WM_CTLCOLORSTATIC says: unthemed in dark, it
-                // takes the dialog's text colour.
+                // text whatever WM_CTLCOLORSTATIC says, and an unthemed one
+                // a white etched frame: in the dark theme it is drawn here.
                 "Button"
-                    if dark
-                        && GetWindowLongPtrW(child, GWL_STYLE) as u32 & BS_TYPEMASK as u32
-                            == BS_GROUPBOX as u32 =>
+                    if GetWindowLongPtrW(child, GWL_STYLE) as u32 & BS_TYPEMASK as u32
+                        == BS_GROUPBOX as u32 =>
                 {
-                    theme::unthemed(child);
+                    theme::set_class(child, None);
+                    SetWindowSubclass(child, Some(group_proc), 1, usize::from(dark));
                 }
                 "Button" => theme::set_class(child, dark.then_some("DarkMode_Explorer")),
+                // A hotkey box draws white whatever its parent says: in the
+                // dark theme it is drawn here, its edge too.
+                "msctls_hotkey32" => {
+                    SetWindowSubclass(child, Some(hotkey_proc), 1, usize::from(dark));
+                    SetWindowPos(
+                        child,
+                        core::ptr::null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    );
+                }
                 // A box of several lines has a scroll bar, which the
                 // Explorer style makes dark (its edge is drawn by its
                 // owner).
@@ -314,6 +373,267 @@ pub fn apply_theme(dlg: HWND, dark: bool) {
             core::ptr::null_mut(),
             RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
         );
+    }
+}
+
+/// A group box's subclass: in the dark theme (`dark` set) its frame is a
+/// line of the theme's border colour and its caption the theme's text,
+/// as Windows draws neither.
+unsafe extern "system" fn group_proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    _id: usize,
+    dark: usize,
+) -> LRESULT {
+    // SAFETY: `l` is read as each message defines it; the subclass goes
+    // with the group box.
+    unsafe {
+        match msg {
+            // The box is see-through: what is inside it is its parent's.
+            WM_ERASEBKGND if dark != 0 => return 1,
+            WM_PAINT if dark != 0 => {
+                paint_dark_group(hwnd);
+                return 0;
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(group_proc), 1);
+            }
+            _ => {}
+        }
+        DefSubclassProc(hwnd, msg, w, l)
+    }
+}
+
+fn paint_dark_group(hwnd: HWND) {
+    let pal = Palette::new(true);
+    // SAFETY: a standard WM_PAINT on this thread's group box; the font
+    // selected is put back.
+    unsafe {
+        let mut ps: PAINTSTRUCT = core::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut rc = RECT::default();
+        GetClientRect(hwnd, &mut rc);
+        let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HFONT;
+        let old = SelectObject(hdc, font);
+        let text: Vec<u16> = crate::wide::window_text(hwnd).encode_utf16().collect();
+        let mut size = SIZE::default();
+        GetTextExtentPoint32W(hdc, text.as_ptr(), text.len() as i32, &mut size);
+        let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+        let px = |v: i32| v * dpi / 96;
+        // The frame runs through the caption's middle, broken for it.
+        let top = rc.top + size.cy / 2;
+        let caption = RECT {
+            left: rc.left + px(7),
+            top: rc.top,
+            right: (rc.left + px(7) + size.cx + px(4)).min(rc.right),
+            bottom: rc.top + size.cy,
+        };
+        let line = |r: RECT| fill(hdc, &r, pal.border);
+        line(RECT {
+            left: rc.left,
+            top,
+            right: caption.left,
+            bottom: top + 1,
+        });
+        line(RECT {
+            left: caption.right,
+            top,
+            right: rc.right,
+            bottom: top + 1,
+        });
+        line(RECT {
+            top,
+            right: rc.left + 1,
+            ..rc
+        });
+        line(RECT {
+            top,
+            left: rc.right - 1,
+            ..rc
+        });
+        line(RECT {
+            top: rc.bottom - 1,
+            ..rc
+        });
+        if !text.is_empty() {
+            fill(hdc, &caption, pal.chrome);
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, pal.fg);
+            let mut tr = RECT {
+                left: caption.left + px(2),
+                ..caption
+            };
+            DrawTextW(
+                hdc,
+                text.as_ptr(),
+                text.len() as i32,
+                &mut tr,
+                DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+        SelectObject(hdc, old);
+        EndPaint(hwnd, &ps);
+    }
+}
+
+/// A hotkey box's subclass: in the dark theme (`dark` set) its face, its
+/// edge and the key it holds ("Ctrl + Shift + F", or "None") are drawn
+/// here in the theme's colours, the caret after the text.
+unsafe extern "system" fn hotkey_proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    _id: usize,
+    dark: usize,
+) -> LRESULT {
+    // SAFETY: `l` is read as each message defines it; the subclass goes
+    // with the box.
+    unsafe {
+        match msg {
+            WM_ERASEBKGND if dark != 0 => return 1,
+            WM_PAINT if dark != 0 => {
+                paint_dark_hotkey(hwnd);
+                return 0;
+            }
+            WM_NCPAINT if dark != 0 => {
+                paint_dark_edge(hwnd);
+                return 0;
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(hotkey_proc), 1);
+            }
+            _ => {}
+        }
+        DefSubclassProc(hwnd, msg, w, l)
+    }
+}
+
+/// The name of a key as a hotkey box shows it: `key` is its
+/// `HKM_GETHOTKEY` (virtual key low, `HOTKEYF_*` high).
+fn hotkey_text(key: u16) -> String {
+    let (vk, mods) = (key & 0xff, (key >> 8) as u8);
+    let name = |vk: u16, extended: bool| -> String {
+        // SAFETY: maps a key to its scan code and reads its name into the
+        // buffer, with its length.
+        unsafe {
+            let scan = MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC);
+            let l = (scan << 16) | if extended { 1 << 24 } else { 0 };
+            let mut buf = [0u16; 64];
+            let n = GetKeyNameTextW(l as i32, buf.as_mut_ptr(), buf.len() as i32);
+            String::from_utf16_lossy(&buf[..n.max(0) as usize])
+        }
+    };
+    let mut parts = Vec::new();
+    for (flag, key) in [
+        (HOTKEYF_CONTROL, VK_CONTROL),
+        (HOTKEYF_SHIFT, VK_SHIFT),
+        (HOTKEYF_ALT, VK_MENU),
+    ] {
+        if mods & flag as u8 != 0 {
+            parts.push(name(key, false));
+        }
+    }
+    if vk != 0 {
+        parts.push(name(vk, mods & HOTKEYF_EXT as u8 != 0));
+    } else if !parts.is_empty() {
+        // Modifiers held so far, the key still to come.
+        parts.push(String::new());
+    }
+    if parts.is_empty() {
+        "None".to_owned()
+    } else {
+        parts.join(" + ")
+    }
+}
+
+fn paint_dark_hotkey(hwnd: HWND) {
+    let pal = Palette::new(true);
+    // SAFETY: a standard WM_PAINT on this thread's box; the font selected
+    // is put back.
+    unsafe {
+        let mut ps: PAINTSTRUCT = core::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut rc = RECT::default();
+        GetClientRect(hwnd, &mut rc);
+        let enabled = IsWindowEnabled(hwnd) != 0;
+        fill(hdc, &rc, if enabled { pal.bg } else { pal.chrome });
+        let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HFONT;
+        let old = SelectObject(hdc, font);
+        let key = SendMessageW(hwnd, HKM_GETHOTKEY, 0, 0) as u16;
+        let text: Vec<u16> = hotkey_text(key).encode_utf16().collect();
+        let mut size = SIZE::default();
+        GetTextExtentPoint32W(hdc, text.as_ptr(), text.len() as i32, &mut size);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, if enabled { pal.fg } else { pal.dim });
+        let x = rc.left + 1;
+        let y = rc.top + (rc.bottom - rc.top - size.cy) / 2;
+        let mut tr = RECT {
+            left: x,
+            top: y,
+            right: rc.right,
+            bottom: y + size.cy,
+        };
+        DrawTextW(
+            hdc,
+            text.as_ptr(),
+            text.len() as i32,
+            &mut tr,
+            DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old);
+        EndPaint(hwnd, &ps);
+        if GetFocus() == hwnd {
+            SetCaretPos(x + size.cx, y);
+        }
+    }
+}
+
+/// A one-line edge in the theme's border colour, the box's face between it
+/// and the client area, for a control drawn here whose edge Windows draws
+/// light.
+fn paint_dark_edge(hwnd: HWND) {
+    let pal = Palette::new(true);
+    // SAFETY: draws in this thread's window's frame, through its window DC,
+    // released after.
+    unsafe {
+        let (mut wr, mut client) = (RECT::default(), RECT::default());
+        GetWindowRect(hwnd, &mut wr);
+        GetClientRect(hwnd, &mut client);
+        let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
+        let hdc = GetWindowDC(hwnd);
+        let all = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        let face = if IsWindowEnabled(hwnd) != 0 {
+            pal.bg
+        } else {
+            pal.chrome
+        };
+        // The frame's width either side of the client area.
+        let ex = ((w - client.right) / 2).max(0);
+        let ey = ((h - client.bottom) / 2).max(0);
+        fill(hdc, &RECT { bottom: ey, ..all }, face);
+        fill(hdc, &RECT { top: h - ey, ..all }, face);
+        fill(hdc, &RECT { right: ex, ..all }, face);
+        fill(
+            hdc,
+            &RECT {
+                left: w - ex,
+                ..all
+            },
+            face,
+        );
+        fill(hdc, &RECT { bottom: 1, ..all }, pal.border);
+        fill(hdc, &RECT { top: h - 1, ..all }, pal.border);
+        fill(hdc, &RECT { right: 1, ..all }, pal.border);
+        fill(hdc, &RECT { left: w - 1, ..all }, pal.border);
+        ReleaseDC(hwnd, hdc);
     }
 }
 

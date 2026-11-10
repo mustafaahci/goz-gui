@@ -48,6 +48,8 @@ pub enum Which {
     BookmarkEdit,
     /// Help > Search Syntax.
     SearchSyntax,
+    /// Tools > Options.
+    Options,
 }
 
 /// What Everything keeps for a dialog, under which keys.
@@ -69,7 +71,7 @@ struct Keys {
 }
 
 impl Which {
-    pub const ALL: [Which; 7] = [
+    pub const ALL: [Which; 8] = [
         Which::SearchHistory,
         Which::SearchHistorySelect,
         Which::RunHistory,
@@ -77,6 +79,7 @@ impl Which {
         Which::BookmarkSelect,
         Which::BookmarkEdit,
         Which::SearchSyntax,
+        Which::Options,
     ];
 
     fn keys(self) -> Keys {
@@ -135,6 +138,7 @@ impl Which {
             ),
             Which::BookmarkEdit => k("bookmark_edit", false, false, "", &[], false),
             Which::SearchSyntax => k("help_search_syntax", true, true, "", &[], false),
+            Which::Options => k("options", true, true, "", &[], false),
         }
     }
 }
@@ -176,7 +180,7 @@ impl Place {
 
 /// Every window's place, as the settings file holds them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Places([Place; 7]);
+pub struct Places([Place; 8]);
 
 impl Default for Places {
     fn default() -> Places {
@@ -552,6 +556,33 @@ mod tests {
 
     fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
         Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn options_keeps_everythings_keys() {
+        // As Everything 1.5.0.1424b writes them.
+        let p = read(&[
+            ("options_x", "604"),
+            ("options_y", "300"),
+            ("options_wide", "592"),
+            ("options_high", "551"),
+            ("options_maximized", "1"),
+        ]);
+        let o = p.get(Which::Options);
+        assert_eq!((o.x, o.y, o.width, o.height), (604, 300, 592, 551));
+        assert!(o.maximized && o.columns.is_empty());
+        let keys: Vec<String> = p.to_keys().into_iter().map(|(k, _)| k).collect();
+        for k in [
+            "options_x",
+            "options_y",
+            "options_wide",
+            "options_high",
+            "options_maximized",
+        ] {
+            assert!(keys.iter().any(|have| have == k), "{k}");
+        }
+        // Its tree's width (`options_tree_wide`) is not goz-gui's to write.
+        assert!(!keys.iter().any(|k| k.starts_with("options_tree")));
     }
 
     #[test]

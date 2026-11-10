@@ -22,6 +22,7 @@ use goz_core::types::{SortDir, SortKey, SortSpec};
 
 use crate::bookmarks::{self, sort_key, sort_name};
 use crate::columns::Layout;
+use crate::dock::DockSettings;
 use crate::filter::Filter;
 use crate::menu;
 use crate::places::Places;
@@ -313,6 +314,26 @@ pub struct Settings {
     /// Details or thumbnails (`view`, `thumbnail_size`,
     /// `statusbar_view_thumbnail_size`).
     pub view: View,
+    /// The docks and their panes (`left_sidebar_wide`, `<pane>_visible`,
+    /// ..., see `crate::dock`).
+    pub docks: DockSettings,
+    /// `options_last_page`: the Options page shown last, by name.
+    pub options_page: String,
+    // Wave 1: each feature adds its settings on its own lines below (here,
+    // in `Default`, `from_ini` and `to_pairs`), so their changes never meet
+    // (FRAMEWORK.md).
+
+    // F1 (preview pane).
+
+    // F2 (sidebars).
+
+    // F3 (tabs and windows).
+
+    // F4 (search tools).
+
+    // F5 (file tools).
+
+    // F6 (integration and the Options pages).
 }
 
 /// Running in the background, the tray icon and the global hotkeys, under
@@ -379,6 +400,21 @@ impl Default for Settings {
             utf8_bom: false,
             export_type: 0,
             view: View::default(),
+            docks: DockSettings::default(),
+            options_page: String::new(),
+            // Wave 1 (FRAMEWORK.md).
+
+            // F1 (preview pane).
+
+            // F2 (sidebars).
+
+            // F3 (tabs and windows).
+
+            // F4 (search tools).
+
+            // F5 (file tools).
+
+            // F6 (integration and the Options pages).
         }
     }
 }
@@ -565,6 +601,21 @@ impl Settings {
                 .filter(|&n| n < 3)
                 .unwrap_or(d.export_type),
             view: View::from_keys(|k| ini.get(k)),
+            docks: DockSettings::from_keys(|k| ini.get(k)),
+            options_page: ini.get("options_last_page").unwrap_or_default().to_owned(),
+            // Wave 1 (FRAMEWORK.md).
+
+            // F1 (preview pane).
+
+            // F2 (sidebars).
+
+            // F3 (tabs and windows).
+
+            // F4 (search tools).
+
+            // F5 (file tools).
+
+            // F6 (integration and the Options pages).
         }
     }
 
@@ -659,6 +710,22 @@ impl Settings {
         out.extend(self.columns.to_keys());
         out.extend(self.places.to_keys());
         out.extend(self.view.to_keys());
+        out.extend(self.docks.to_keys());
+        out.push(("options_last_page".into(), self.options_page.clone()));
+        // Wave 1 (FRAMEWORK.md).
+
+        // F1 (preview pane).
+
+        // F2 (sidebars).
+
+        // F3 (tabs and windows).
+
+        // F4 (search tools).
+
+        // F5 (file tools).
+
+        // F6 (integration and the Options pages).
+
         out
     }
 
@@ -829,6 +896,24 @@ mod tests {
             utf8_bom: true,
             export_type: 2,
             view: View::thumbnails(crate::view::EXTRA_LARGE),
+            docks: {
+                let mut d = DockSettings {
+                    left_wide: 320,
+                    right_wide: 200,
+                    ..DockSettings::default()
+                };
+                let id = crate::dock::PaneId::Preview;
+                d.set_pane(
+                    id,
+                    crate::dock::PaneLayout {
+                        visible: true,
+                        high: 300,
+                        ..id.default_layout()
+                    },
+                );
+                d
+            },
+            options_page: "History".into(),
         };
         let mut ini = Ini::default();
         for (k, v) in s.to_pairs() {
@@ -863,6 +948,16 @@ mod tests {
             "live_update_interval_ms=0",
             "utf8_bom=1",
             "last_export_type=2",
+            "left_sidebar_wide=320",
+            "right_sidebar_wide=200",
+            "preview_visible=1",
+            "preview_side=1",
+            "preview_high=300",
+            "folders_sidebar_visible=0",
+            "folders_sidebar_tab_stop=1",
+            "pane_title=1",
+            "pane_min_wide=32",
+            "options_last_page=History",
         ] {
             assert!(text.contains(&format!("{line}\r\n")), "{line} in\n{text}");
         }

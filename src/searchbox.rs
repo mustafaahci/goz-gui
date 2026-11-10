@@ -395,6 +395,27 @@ fn cross(scale: f32) -> Vec<Stroke> {
     ]
 }
 
+/// A × whose arms reach `arm` px from its centre at 100 % (the search
+/// box's reach 3), centred on the pixel (`cx`, `cy`) over `bg`: the panes'
+/// close buttons.
+pub fn paint_cross(hdc: HDC, cx: i32, cy: i32, arm: f32, scale: f32, fg: u32, bg: u32) {
+    let arm = (arm * scale).round().max(2.0);
+    let half = 0.6 * scale.max(1.0);
+    let strokes = [
+        Stroke::Line {
+            a: (-arm, -arm),
+            b: (arm, arm),
+            half,
+        },
+        Stroke::Line {
+            a: (-arm, arm),
+            b: (arm, -arm),
+            half,
+        },
+    ];
+    draw(hdc, cx, cy, &strokes, fg, bg);
+}
+
 /// Back's ← (Forward's → when not `back`): a shaft 9 px long at 100 % and
 /// a head 4 px back along each side.
 fn arrow(scale: f32, back: bool) -> Vec<Stroke> {

@@ -17,6 +17,7 @@ mod columns;
 mod copytext;
 mod csv;
 mod dialog;
+mod dock;
 mod dropdown;
 mod export;
 mod filedlg;
@@ -35,11 +36,13 @@ mod instance;
 mod integration;
 mod json;
 mod keys;
+mod layout;
 mod menu;
 mod model;
 mod msgbox;
 mod options;
 mod paint;
+mod pane;
 mod placement;
 mod places;
 mod popup;
@@ -53,7 +56,9 @@ mod settings;
 mod shell;
 mod status;
 mod store;
+mod strip;
 mod syntax;
+mod testpane;
 mod theme;
 mod thumbs;
 mod tray;
@@ -62,12 +67,26 @@ mod view;
 mod wide;
 mod window;
 mod zoom;
+// Wave 1: each feature declares its modules on its own lines below, so
+// their changes never meet (FRAMEWORK.md).
+
+// F1 (preview pane).
+
+// F2 (sidebars).
+
+// F3 (tabs and windows).
+
+// F4 (search tools).
+
+// F5 (file tools).
+
+// F6 (integration and the Options pages).
 
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };
 use windows_sys::Win32::UI::Controls::{
-    ICC_BAR_CLASSES, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
+    ICC_BAR_CLASSES, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
     ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
 };
 
@@ -81,11 +100,13 @@ fn main() {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             // Bar classes bring the tooltips of the search box buttons;
-            // the tree view is Organize Bookmarks' folders.
+            // the tree view is Organize Bookmarks' folders and Options'
+            // pages, the tab Options' page name.
             dwICC: ICC_LISTVIEW_CLASSES
                 | ICC_STANDARD_CLASSES
                 | ICC_BAR_CLASSES
                 | ICC_TREEVIEW_CLASSES
+                | ICC_TAB_CLASSES
                 | ICC_HOTKEY_CLASS,
         };
         InitCommonControlsEx(&icc);

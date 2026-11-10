@@ -1,5 +1,5 @@
-//! Drawing: result rows with their matches in bold, the search band, and
-//! the dark menu bar.
+//! Drawing: result rows with their matches in bold, the search band, the
+//! main window's own surface, and the dark menu bar.
 
 use windows_sys::Win32::Foundation::{RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -385,7 +385,8 @@ fn overlaps(a: &RECT, b: &RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
-/// The main window's own surface: the search band and the status bar.
+/// The main window's own surface: the search band, the status bar, the
+/// docks' dividers and the strips' rows (the panes paint themselves).
 ///
 /// Only the invalid part is drawn, through a buffer of its size: the status
 /// bar repaints on every selection change and block that arrives, and a
@@ -443,6 +444,9 @@ pub fn window(app: &App) {
         if overlaps(&app.status_rc.get(), &dirty) {
             status::paint(app, mem);
         }
+        // The docks' dividers, and the tab strip's and find bar's rows.
+        app.paint_dividers(mem, &dirty);
+        app.paint_strips(mem, &dirty);
 
         BitBlt(
             hdc, dirty.left, dirty.top, w, h, mem, dirty.left, dirty.top, SRCCOPY,

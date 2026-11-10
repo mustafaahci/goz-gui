@@ -126,13 +126,15 @@ fn edit_message(id: u16) -> Option<u32> {
 }
 
 impl App {
-    /// The text box that has the keyboard, if one does: the search box, or
-    /// the box of a rename in progress (the list's own edit control).
+    /// The text box that has the keyboard, if one does: the search box,
+    /// the box of a rename in progress (the list's own edit control), or a
+    /// pane's or strip's.
     fn text_box(&self) -> Option<HWND> {
         // SAFETY: reads this thread's focus.
         let focus = unsafe { GetFocus() };
         let rename = send(self.list, LVM_GETEDITCONTROL, 0, 0) as HWND;
-        (!focus.is_null() && (focus == self.edit || focus == rename)).then_some(focus)
+        (!focus.is_null() && (focus == self.edit || focus == rename || self.frame_text_box(focus)))
+            .then_some(focus)
     }
 
     /// A command from the menu bar or the accelerator table. Edit > Cut,
@@ -281,6 +283,9 @@ impl App {
                     self.go_to_history(i);
                 } else if let Some(i) = index_in(id, menu::BOOKMARK_FIRST, menu::BOOKMARKS) {
                     self.open_bookmark(i);
+                } else if !self.pane_command(id) {
+                    // A feature's own (slots.rs).
+                    self.feature_command(id);
                 }
             }
         }
@@ -337,6 +342,10 @@ impl App {
             self.fill_bookmarks_menu(popup);
         }
         menu::update(popup, &self.menu_state(can_copy, can_paste));
+        // View's pane items, checked while their pane is open; then the
+        // features' own (slots.rs).
+        self.check_pane_items(popup);
+        self.feature_menu_popup(popup);
     }
 
     fn menu_state(&self, can_copy: bool, can_paste: bool) -> menu::State {
