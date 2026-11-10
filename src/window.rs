@@ -2140,9 +2140,10 @@ impl App {
         }
         let text = window_text(self.edit);
         let o = self.opts.get();
+        // The Folders pane's folder goes in front of the text (F2).
+        let scoped = self.scoped_search(&text);
         let search = Arc::new(Search {
-            // The Folders pane's folder goes in front of the text (F2).
-            query: filter::query(o.filter, o.match_path, &self.scoped_search(&text)),
+            query: filter::query(o.filter, o.match_path, &scoped),
             sort: o.sort,
             match_case: o.match_case,
         });
@@ -2155,7 +2156,9 @@ impl App {
             keep_place,
         });
         self.worker.begin(epoch);
-        let hidden = self.ui.get().hide_empty && text.trim().is_empty();
+        // A folder chosen in the Folders pane is a search of its own: the
+        // folder's contents show though the box is empty.
+        let hidden = self.ui.get().hide_empty && scoped.trim().is_empty();
         if hidden {
             // Options > Results' "Hide results when the search is empty":
             // gozd is not asked; the empty answer comes as its would, so
