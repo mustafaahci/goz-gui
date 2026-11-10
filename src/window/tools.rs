@@ -9,13 +9,13 @@ use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow,
+    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::Controls::{
     EM_CANUNDO, EM_GETSEL, EM_REPLACESEL, EM_SETSEL, EM_UNDO, LVIS_SELECTED, LVM_GETCOLUMNWIDTH,
-    LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVNI_FOCUSED, LVNI_SELECTED,
+    LVM_GETITEMCOUNT, LVM_GETITEMSTATE, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVNI_FOCUSED,
+    LVNI_SELECTED,
 };
 use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -29,7 +29,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetMenu, SetWindowLongPtrW, SetWindowPlacement,
     SetWindowPos, ShowWindow, WINDOWPLACEMENT, WM_CLEAR, WM_CONTEXTMENU, WM_COPY, WM_CUT,
-    WM_KEYDOWN, WM_PASTE, WM_SETREDRAW, WS_CAPTION, WS_THICKFRAME,
+    WM_KEYDOWN, WM_PASTE, WS_CAPTION, WS_THICKFRAME,
 };
 
 use super::findbar::{FindBar, Finding, Report, TIMER_TYPED, WM_FIND};
@@ -251,48 +251,78 @@ impl App {
     // ---- Edit > Invert Selection ----
 
     /// Selects the rows not selected and deselects the others, keeping the
-    /// focus. With millions of rows the list holds the selection as ranges:
-    /// everything is selected in one go, then the rows that were selected
-    /// are deselected one by one, which costs what the old selection
-    /// counts, not what the result does.
+    /// focus. With millions of rows the list holds the selection as ranges,
+    /// but takes it only one row at a time, or all rows at once: every row
+    /// is selected (or none), then the rows of the smaller side are set
+    /// one by one. Which rows those are comes from the selection kept from
+    /// the list's notifications (`selection.rs`), so inverting all rows but
+    /// a few costs those few, not the millions selected.
     fn invert_selection(&self) {
         let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
         if count == 0 {
             return;
         }
         let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize;
-        let mut was = Vec::with_capacity(selected.min(1 << 20));
-        if selected < count {
-            let mut at = usize::MAX;
-            loop {
-                let next = send(self.list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize);
-                if next < 0 {
-                    break;
-                }
-                was.push(next as usize);
-                at = next as usize;
+        // All rows selected first (and the ones selected now deselected
+        // after), or none (and the ones not selected now selected after).
+        let (all, rows) = match self.kept_selection(count, selected) {
+            Some(sel) if selected <= count.saturating_sub(selected) => {
+                (true, sel.ranges().collect())
             }
-        }
+            Some(sel) => (false, sel.gaps()),
+            None if selected >= count => (false, Vec::new()),
+            None => (true, self.selected_scanned()),
+        };
         // The user chose other rows: an action waiting for the old ones is
-        // not wanted; the rows change unseen, then repaint once.
+        // not wanted; the rows change unseen, then repaint once, and the
+        // status bar and the panes hear of it once (`in_bulk`).
         self.cancel_fetch();
-        send(self.list, WM_SETREDRAW, 0, 0);
-        self.quietly(|| {
-            if selected >= count {
-                self.set_state(usize::MAX, 0, LVIS_SELECTED);
+        self.in_bulk(|| {
+            let (first, then) = if all {
+                (LVIS_SELECTED, 0)
             } else {
-                self.set_state(usize::MAX, LVIS_SELECTED, LVIS_SELECTED);
-                for i in was {
-                    self.set_state(i, 0, LVIS_SELECTED);
-                }
+                (0, LVIS_SELECTED)
+            };
+            self.set_state(usize::MAX, first, LVIS_SELECTED);
+            for i in rows.into_iter().flatten() {
+                self.set_state(i, then, LVIS_SELECTED);
             }
         });
-        send(self.list, WM_SETREDRAW, 1, 0);
-        // SAFETY: repaints the list.
-        unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
         self.selection_changed();
-        self.invalidate_status();
-        self.pane_event(crate::pane::PaneEvent::SelectionChanged);
+    }
+
+    /// The selection kept from the list's notifications, if it agrees with
+    /// the list: as many rows of as many selected, and the list has the
+    /// edges of its first ranges (and the rows beside them) as it does.
+    fn kept_selection(&self, count: usize, selected: usize) -> Option<crate::selection::Selection> {
+        let (samples, sel) = {
+            let sel = self.sel.borrow();
+            if sel.count() != count || sel.len() != selected {
+                return None;
+            }
+            (sel.samples(64), sel.clone())
+        };
+        let agrees = samples.into_iter().all(|(row, on)| {
+            let bits = send(self.list, LVM_GETITEMSTATE, row, LVIS_SELECTED as isize) as u32;
+            (bits & LVIS_SELECTED != 0) == on
+        });
+        agrees.then_some(sel)
+    }
+
+    /// Every selected row, one range each, asked of the list row by row:
+    /// when the kept selection does not agree with it.
+    fn selected_scanned(&self) -> Vec<core::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let mut at = usize::MAX;
+        loop {
+            let next = send(self.list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize);
+            if next < 0 {
+                break;
+            }
+            out.push(next as usize..next as usize + 1);
+            at = next as usize;
+        }
+        out
     }
 
     // ---- Edit > Go To... ----

@@ -21,19 +21,19 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
-    CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, HIMAGELIST, ILC_COLOR32, ILD_TRANSPARENT,
-    ImageList_Create, ImageList_Destroy, ImageList_Draw, ImageList_GetIcon, ImageList_GetIconSize,
-    LVA_DEFAULT, LVIR_ICON, LVIS_FOCUSED, LVIS_SELECTED, LVM_ARRANGE, LVM_ENSUREVISIBLE,
-    LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSPACING, LVM_GETITEMSTATE,
-    LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETICONSPACING,
-    LVM_SETIMAGELIST, LVNI_FOCUSED, LVS_AUTOARRANGE, LVS_ICON, LVS_OWNERDRAWFIXED, LVS_REPORT,
-    LVS_TYPEMASK, LVSIL_NORMAL, NMCUSTOMDRAW,
+    CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, CLR_DEFAULT, CLR_NONE, HIMAGELIST, ILC_COLOR32,
+    ILD_ASYNC, ILD_SCALE, ILD_TRANSPARENT, IMAGELISTDRAWPARAMS, ImageList_Create,
+    ImageList_Destroy, ImageList_DrawIndirect, ImageList_GetIconSize, LVA_DEFAULT, LVIR_ICON,
+    LVIS_FOCUSED, LVIS_SELECTED, LVM_ARRANGE, LVM_ENSUREVISIBLE, LVM_GETCOUNTPERPAGE,
+    LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSPACING, LVM_GETITEMSTATE, LVM_GETNEXTITEM,
+    LVM_GETTOPINDEX, LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETICONSPACING, LVM_SETIMAGELIST,
+    LVNI_FOCUSED, LVS_AUTOARRANGE, LVS_ICON, LVS_OWNERDRAWFIXED, LVS_REPORT, LVS_TYPEMASK,
+    LVSIL_NORMAL, NMCUSTOMDRAW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows_sys::Win32::UI::Shell::SHGetImageList;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DI_NORMAL, DestroyIcon, DrawIconEx, GWL_STYLE, GetClientRect, GetWindowLongPtrW,
-    SetWindowLongPtrW, WM_SETFONT,
+    GWL_STYLE, GetClientRect, GetWindowLongPtrW, SetWindowLongPtrW, WM_APP, WM_SETFONT,
 };
 use windows_sys::core::GUID;
 
@@ -51,6 +51,10 @@ const IID_IMAGE_LIST: GUID = GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0
 /// `SHIL_EXTRALARGE` (48 px) and `SHIL_JUMBO` (256 px).
 const SHIL_EXTRALARGE: i32 = 2;
 const SHIL_JUMBO: i32 = 4;
+
+/// The big icons' thread (`bigicons.rs`) loaded icons that were drawn
+/// before they were: the thumbnails paint again. Beside `WM_THUMB`.
+pub(super) const WM_BIG_ICONS: u32 = WM_APP + 33;
 
 impl App {
     pub fn view(&self) -> View {
@@ -106,8 +110,10 @@ impl App {
     pub(super) fn put_view(&self) {
         let v = self.view.get();
         let dpi = self.dpi.get();
-        // Another size, or none wanted (their memory is not, in Details).
+        // Another size, or none wanted (their memory is not, in Details);
+        // nor are the big icons of the old size still to load.
         self.reset_thumbs();
+        self.big_loads.forget_queued();
         if v.thumbnails {
             // The shell's big icon lists, asked for here rather than in
             // the middle of a paint.
@@ -382,47 +388,93 @@ impl App {
     }
 
     /// The system's big icon `icon` in `square`: the 48 px one where it
-    /// fits, else the 256 px one shrunk to the square (the 48 px one, centred,
-    /// where the 256 px one is only that in a corner).
+    /// fits, else the 256 px one shrunk to the square by the list (the 48 px
+    /// one, centred, where the 256 px one is only that in a corner).
+    ///
+    /// Only an icon already loaded is drawn: one that is not (the first
+    /// draw of a program's own icon reads it from the file, up to 9 ms) is
+    /// loaded on a thread (`bigicons.rs`), and the list paints again when
+    /// it is. Meanwhile the 48 px one stands in for the 256 px one if it is
+    /// loaded; else the cell shows no icon for that moment.
     fn draw_big_icon(&self, hdc: HDC, icon: i32, square: &RECT) {
+        if icon < 0 {
+            return;
+        }
         let side = square.right - square.left;
-        // A type with no icon that big (.cfg, .md, .toml) is in Windows'
-        // jumbo list as its 48 px icon in the top left corner of an empty
-        // 256 px square: shrunk to the cell, it would be a speck in the
-        // corner until the shell's picture came. The 48 px one, centred,
-        // as that picture shows it.
-        let jumbo =
-            side >= self.scale(96) && !(icon >= 0 && jumbo_is_padded(self.big_icons(true), icon));
+        let mut jumbo = side >= self.scale(96);
+        // Whether the icon drawn is the one wanted, to be loaded if it is
+        // not, or a stand-in, drawn only if it is.
+        let mut wanted = true;
+        if jumbo {
+            let list = self.big_icons(true);
+            // A type with no icon that big (.cfg, .md, .toml) is in
+            // Windows' jumbo list as its 48 px icon in the top left corner
+            // of an empty 256 px square: shrunk to the cell, it would be a
+            // speck in the corner until the shell's picture came. The 48 px
+            // one, centred, as that picture shows it. (Not measured while
+            // the thread is still loading it.)
+            let known = if self.big_loads.waiting(list, icon) {
+                None
+            } else {
+                jumbo_is_padded(list, icon)
+            };
+            match known {
+                Some(padded) => jumbo = !padded,
+                None => {
+                    self.big_loads.load(list, icon);
+                    jumbo = false;
+                    wanted = false;
+                }
+            }
+        }
         let list = self.big_icons(jumbo);
-        if list == 0 || icon < 0 {
+        if list == 0 {
             return;
         }
         let (mut cx, mut cy) = (0, 0);
-        // SAFETY: reads the size of a system image list, then draws one of
-        // its icons; an icon made for scaling is destroyed after.
-        unsafe {
-            ImageList_GetIconSize(list, &mut cx, &mut cy);
-            if cx <= side && cy <= side {
-                let x = square.left + (side - cx) / 2;
-                let y = square.top + (side - cy) / 2;
-                ImageList_Draw(list, icon, hdc, x, y, ILD_TRANSPARENT);
-            } else {
-                let hicon = ImageList_GetIcon(list, icon, ILD_TRANSPARENT);
-                if !hicon.is_null() {
-                    DrawIconEx(
-                        hdc,
-                        square.left,
-                        square.top,
-                        hicon,
-                        side,
-                        side,
-                        0,
-                        core::ptr::null_mut(),
-                        DI_NORMAL,
-                    );
-                    DestroyIcon(hicon);
-                }
-            }
+        // SAFETY: reads the size of a system image list.
+        unsafe { ImageList_GetIconSize(list, &mut cx, &mut cy) };
+        let (x, y, w, h, style) = if cx <= side && cy <= side {
+            let x = square.left + (side - cx) / 2;
+            let y = square.top + (side - cy) / 2;
+            (x, y, 0, 0, ILD_TRANSPARENT)
+        } else {
+            // Shrunk by the list itself: an icon made of it and drawn
+            // shrunk (ImageList_GetIcon, DrawIconEx) cost 0.7 ms a cell,
+            // 45 ms for a window of Large cells; this is 20 times less,
+            // and looks the same.
+            (
+                square.left,
+                square.top,
+                side,
+                side,
+                ILD_TRANSPARENT | ILD_SCALE,
+            )
+        };
+        let params = IMAGELISTDRAWPARAMS {
+            cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
+            himl: list,
+            i: icon,
+            hdcDst: hdc,
+            x,
+            y,
+            cx: w,
+            cy: h,
+            rgbBk: CLR_NONE as u32,
+            rgbFg: CLR_DEFAULT as u32,
+            fStyle: style,
+            // SAFETY: the rest of the struct is plain data.
+            ..unsafe { core::mem::zeroed() }
+        };
+        self.big_loads.draw(&params, wanted);
+    }
+
+    /// Big icons were loaded on their thread: the thumbnails paint again,
+    /// with them.
+    pub(super) fn big_icons_loaded(&self) {
+        if self.big_loads.arrived() && self.view.get().thumbnails {
+            // SAFETY: repaints this thread's list.
+            unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
         }
     }
 
@@ -547,31 +599,49 @@ fn draw_bitmap(hdc: HDC, bitmap: &Bitmap, square: &RECT) {
 }
 
 /// Whether the system jumbo list's icon `icon` is a small icon in the top
-/// left corner of an otherwise empty square. Worked out once per icon (two
-/// draws into a scratch bitmap) and kept: the system list's indexes last as
-/// long as the process.
-fn jumbo_is_padded(list: HIMAGELIST, icon: i32) -> bool {
+/// left corner of an otherwise empty square; `None` while the icon is not
+/// loaded. Worked out once per icon (two draws into a scratch bitmap) and
+/// kept: the system list's indexes last as long as the process.
+fn jumbo_is_padded(list: HIMAGELIST, icon: i32) -> Option<bool> {
     thread_local! {
         static PADDED: RefCell<HashMap<i32, bool>> = RefCell::new(HashMap::new());
     }
     if list == 0 {
-        return false;
+        return Some(false);
     }
     if let Some(known) = PADDED.with(|p| p.borrow().get(&icon).copied()) {
-        return known;
+        return Some(known);
     }
     // Not borrowed while drawing: the shell's list can take messages while
-    // it loads an icon, and those can paint (and come back here).
-    let padded = drawn_extent(list, icon)
-        .is_some_and(|(right, bottom, side)| corner_only(right, bottom, side));
+    // it draws, and those can paint (and come back here).
+    let padded = match drawn_extent(list, icon) {
+        Extent::NotLoaded => return None,
+        Extent::Unknown => false,
+        Extent::Drawn {
+            right,
+            bottom,
+            side,
+        } => corner_only(right, bottom, side),
+    };
     PADDED.with(|p| p.borrow_mut().insert(icon, padded));
-    padded
+    Some(padded)
+}
+
+/// How far an icon draws (`drawn_extent`).
+enum Extent {
+    /// It draws as far right and down as this, in a square of `side`.
+    Drawn { right: i32, bottom: i32, side: i32 },
+    /// The list has not loaded it yet (and is not made to here).
+    NotLoaded,
+    /// It could not be measured.
+    Unknown,
 }
 
 /// How far right and down icon `icon` of `list` draws anything, and the
 /// list's icon side. It is drawn twice into a scratch bitmap, on black and
-/// on white, so that no colour of its own can hide one of its pixels.
-fn drawn_extent(list: HIMAGELIST, icon: i32) -> Option<(i32, i32, i32)> {
+/// on white, so that no colour of its own can hide one of its pixels; only
+/// if it is loaded (`ILD_ASYNC`).
+fn drawn_extent(list: HIMAGELIST, icon: i32) -> Extent {
     let (mut cx, mut cy) = (0, 0);
     // SAFETY: a DIB section and a memory DC made, used and deleted here.
     // The pixels are touched only through slices made between the draws
@@ -580,7 +650,7 @@ fn drawn_extent(list: HIMAGELIST, icon: i32) -> Option<(i32, i32, i32)> {
     unsafe {
         ImageList_GetIconSize(list, &mut cx, &mut cy);
         if cx <= 0 || cy <= 0 {
-            return None;
+            return Extent::Unknown;
         }
         let mut bi: BITMAPINFO = core::mem::zeroed();
         bi.bmiHeader = BITMAPINFOHEADER {
@@ -606,15 +676,29 @@ fn drawn_extent(list: HIMAGELIST, icon: i32) -> Option<(i32, i32, i32)> {
             if !dib.is_null() {
                 DeleteObject(dib);
             }
-            return None;
+            return Extent::Unknown;
         }
         let count = (cx * cy) as usize;
         let dc = CreateCompatibleDC(core::ptr::null_mut());
         let old = SelectObject(dc, dib);
+        let params = IMAGELISTDRAWPARAMS {
+            cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
+            himl: list,
+            i: icon,
+            hdcDst: dc,
+            rgbBk: CLR_NONE as u32,
+            rgbFg: CLR_DEFAULT as u32,
+            fStyle: ILD_TRANSPARENT | ILD_ASYNC,
+            ..core::mem::zeroed()
+        };
         let (mut right, mut bottom) = (0, 0);
+        let mut loaded = true;
         for back in [0u32, 0x00ff_ffff] {
             core::slice::from_raw_parts_mut(bits.cast::<u32>(), count).fill(back);
-            ImageList_Draw(list, icon, dc, 0, 0, ILD_TRANSPARENT);
+            if ImageList_DrawIndirect(&params) == 0 {
+                loaded = false;
+                break;
+            }
             GdiFlush();
             let pixels = core::slice::from_raw_parts(bits.cast::<u32>(), count);
             for (i, p) in pixels.iter().enumerate() {
@@ -628,7 +712,14 @@ fn drawn_extent(list: HIMAGELIST, icon: i32) -> Option<(i32, i32, i32)> {
         SelectObject(dc, old);
         DeleteDC(dc);
         DeleteObject(dib);
-        Some((right, bottom, cx.min(cy)))
+        if !loaded {
+            return Extent::NotLoaded;
+        }
+        Extent::Drawn {
+            right,
+            bottom,
+            side: cx.min(cy),
+        }
     }
 }
 

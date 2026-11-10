@@ -7,6 +7,7 @@
 #![windows_subsystem = "windows"]
 
 mod actions;
+mod bigicons;
 mod bookmark_dialogs;
 mod bookmarks;
 mod celltip;
@@ -51,6 +52,7 @@ mod run_dialog;
 mod run_history;
 mod run_history_file;
 mod searchbox;
+mod selection;
 mod session;
 mod settings;
 mod shell;
