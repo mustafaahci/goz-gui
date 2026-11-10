@@ -23,18 +23,19 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST,
-    EN_CHANGE, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, EndDialog, GWLP_USERDATA, GetParent,
-    GetWindowRect, GetWindowTextLengthW, IDCANCEL, IDOK, MINMAXINFO, SetWindowLongPtrW, WM_CHAR,
-    WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY, WM_NCPAINT,
-    WM_SETREDRAW, WM_SIZE, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
+    BS_DEFPUSHBUTTON, CB_GETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, EN_CHANGE, ES_AUTOHSCROLL,
+    ES_AUTOVSCROLL, ES_MULTILINE, EndDialog, GWLP_USERDATA, GetParent, GetWindowRect,
+    GetWindowTextLengthW, IDCANCEL, IDOK, KillTimer, MINMAXINFO, SetTimer, SetWindowLongPtrW,
+    USER_TIMER_MINIMUM, WM_CHAR, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG,
+    WM_KEYDOWN, WM_NCDESTROY, WM_NCPAINT, WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE,
+    WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::{enable, item, send, set_text};
 use crate::bookmarks::{Fields, SORT_KEYS, one_line, sort_name};
 use crate::dialog::{
-    Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, anchor, apply_theme,
-    center_on_owner, common, state,
+    Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, anchor, center_on_owner, common,
+    fill_later, make_control, state, theme_control, theme_new,
 };
 use crate::filter::Filter;
 use crate::paint::fill;
@@ -164,7 +165,12 @@ struct Edit {
     result: RefCell<Option<Fields>>,
     /// The editor's size as it opened, the smallest it can be made.
     min: Cell<(i32, i32)>,
+    /// Whether the last row's lists are made yet (`make_last_row`).
+    last_row: Cell<bool>,
 }
+
+/// The editor's timer: it has been drawn, the last row's lists can be made.
+const LAST_ROW: usize = 1;
 
 /// Shows the editor titled `title` over `owner` with `fields`; the fields
 /// as the user left them on OK.
@@ -180,9 +186,9 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
         look: Cell::new(look),
         result: RefCell::new(None),
         min: Cell::new((0, 0)),
+        last_row: Cell::new(false),
     };
     let label = SS_LEFT;
-    let combo = WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32;
     let (lx, lw, fx) = (7, 62, 72);
     let mut t = Template::new(title, WS_THICKFRAME, SIZE.0, SIZE.1);
     t.control(Class::Static, "&Name:", STATIC, label, 0, (lx, 9, lw, 8))
@@ -206,7 +212,7 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
             Class::Named("ComboBox"),
             "",
             ID_CASE,
-            combo,
+            combo_style(false),
             0,
             (fx, 25, 80, 80),
         )
@@ -222,7 +228,7 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
             Class::Named("ComboBox"),
             "",
             ID_PATH,
-            combo,
+            combo_style(false),
             0,
             (fx, 43, 80, 80),
         )
@@ -232,7 +238,7 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
             Class::Named("ComboBox"),
             "",
             ID_SEARCH_MODE,
-            combo,
+            combo_style(false),
             0,
             (fx, 61, 56, 60),
         )
@@ -240,7 +246,9 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
             Class::Edit,
             "",
             ID_SEARCH,
-            WS_TABSTOP | WS_VSCROLL | (ES_MULTILINE | ES_AUTOVSCROLL) as u32,
+            // Lines, but no scroll bar (as in Everything's editor): one
+            // costs the box 5 to 9 ms to make; it scrolls with its caret.
+            WS_TABSTOP | (ES_MULTILINE | ES_AUTOVSCROLL) as u32,
             WS_EX_CLIENTEDGE,
             SEARCH,
         )
@@ -252,10 +260,8 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
             0,
             FILTER_LABEL,
         )
-        .control(Class::Named("ComboBox"), "", ID_FILTER, combo, 0, FILTER)
+        // The Filter, Sort and direction lists come after (`make_last_row`).
         .control(Class::Static, "Sor&t:", ID_SORT_LABEL, label, 0, SORT_LABEL)
-        .control(Class::Named("ComboBox"), "", ID_SORT, combo, 0, SORT)
-        .control(Class::Named("ComboBox"), "", ID_DIR, combo, 0, DIR)
         .control(
             Class::Button,
             "OK",
@@ -269,17 +275,18 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
     state.result.into_inner()
 }
 
+/// A list's style: a drop-down list, with a scroll bar if `long`. A list of
+/// two or three needs none, and a scroll bar costs a themed list a few
+/// milliseconds to make.
+fn combo_style(long: bool) -> u32 {
+    let style = WS_TABSTOP | CBS_DROPDOWNLIST as u32;
+    if long { style | WS_VSCROLL } else { style }
+}
+
 fn fill_combo(dlg: HWND, id: u16, items: impl IntoIterator<Item = String>, select: usize) {
-    let combo = item(dlg, id);
-    // A themed list redraws for each item added (a few ms each, six lists
-    // here): filled unseen, as the dialog is not shown yet.
-    send(combo, WM_SETREDRAW, 0, 0);
-    for text in items {
-        let text = wz(&text);
-        send(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
-    }
-    send(combo, CB_SETCURSEL, select, 0);
-    send(combo, WM_SETREDRAW, 1, 0);
+    // A themed list takes half a millisecond an item (six lists here): the
+    // chosen item now, the rest once the editor shows (`fill_later`).
+    fill_later(item(dlg, id), items.into_iter().collect(), Some(select));
 }
 
 fn selection(dlg: HWND, id: u16) -> usize {
@@ -305,6 +312,56 @@ impl Edit {
         let tri = || TRI.iter().map(|&s| s.to_owned());
         fill_combo(dlg, ID_CASE, tri(), tri_index(f.match_case));
         fill_combo(dlg, ID_PATH, tri(), tri_index(f.match_path));
+        enable(dlg, OK, !f.name.is_empty());
+        // The last row's lists come once the editor shows (WM_SHOWWINDOW).
+        // SAFETY: subclasses this thread's search box; the subclass removes
+        // itself when the box goes.
+        unsafe { SetWindowSubclass(item(dlg, ID_SEARCH), Some(search_proc), 1, 0) };
+        theme_new(dlg, self.look.get().dark);
+        center_on_owner(dlg);
+        let mut wr = RECT::default();
+        // SAFETY: reads this thread's dialog.
+        unsafe { GetWindowRect(dlg, &mut wr) };
+        self.min.set((wr.right - wr.left, wr.bottom - wr.top));
+        places::restore(
+            dlg,
+            Which::BookmarkEdit,
+            core::ptr::null_mut(),
+            self.min.get(),
+        );
+        anchor(dlg, SIZE, &ANCHORS);
+    }
+
+    /// Makes the last row's lists (Filter, Sort and its direction), once
+    /// the editor has been drawn or as soon as they are read. Six themed
+    /// lists took about 35 ms to make as the editor opened (each 5 to 7 ms
+    /// in comctl32, whatever their items); with three made after its first
+    /// paint, it shows sooner and the rest come a frame later, still in its
+    /// opening animation.
+    fn make_last_row(&self, dlg: HWND) {
+        if self.last_row.replace(true) {
+            return;
+        }
+        // SAFETY: a timer of this thread's dialog (fired or not).
+        unsafe { KillTimer(dlg, LAST_ROW) };
+        let f = &self.was;
+        let filter = make_control(
+            dlg,
+            "ComboBox",
+            ID_FILTER,
+            combo_style(true),
+            FILTER,
+            item(dlg, ID_FILTER_LABEL),
+        );
+        let sort = make_control(
+            dlg,
+            "ComboBox",
+            ID_SORT,
+            combo_style(true),
+            SORT,
+            item(dlg, ID_SORT_LABEL),
+        );
+        let dir = make_control(dlg, "ComboBox", ID_DIR, combo_style(false), DIR, sort);
         let no_change = || std::iter::once(NO_CHANGE.to_owned());
         let filter_titles: Vec<&str> = Filter::all().iter().map(|f| f.title()).collect();
         let (_, at) = choices(&filter_titles, &f.filter);
@@ -329,27 +386,17 @@ impl Edit {
             usize::from(f.descending),
         );
         enable(dlg, ID_DIR, at != 0);
-        enable(dlg, OK, !f.name.is_empty());
-        // SAFETY: subclasses this thread's search box; the subclass removes
-        // itself when the box goes.
-        unsafe { SetWindowSubclass(item(dlg, ID_SEARCH), Some(search_proc), 1, 0) };
-        apply_theme(dlg, self.look.get().dark);
-        center_on_owner(dlg);
-        let mut wr = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetWindowRect(dlg, &mut wr) };
-        self.min.set((wr.right - wr.left, wr.bottom - wr.top));
-        places::restore(
-            dlg,
-            Which::BookmarkEdit,
-            core::ptr::null_mut(),
-            self.min.get(),
-        );
+        let dark = self.look.get().dark;
+        for list in [filter, sort, dir] {
+            theme_control(list, dark, true);
+        }
+        // Where the editor's size (kept, or changed meanwhile) puts them.
         anchor(dlg, SIZE, &ANCHORS);
     }
 
     /// The fields as the dialog shows them.
     fn read(&self, dlg: HWND) -> Fields {
+        self.make_last_row(dlg);
         let was = &self.was;
         // A text shown on one line (a name on several) comes back as it
         // was unless it was edited.
@@ -519,6 +566,19 @@ unsafe extern "system" fn edit_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_COMMAND => {
             let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
             isize::from(s.command(dlg, id, code))
+        }
+        // Shown (a modal dialog shows once its queue is empty): the last
+        // row's lists follow once it has been drawn, as timers come after
+        // the paints waiting. Set before then, the timer would hold the
+        // showing up instead.
+        WM_SHOWWINDOW if w != 0 => {
+            // SAFETY: a timer of this thread's dialog.
+            unsafe { SetTimer(dlg, LAST_ROW, USER_TIMER_MINIMUM, None) };
+            0
+        }
+        WM_TIMER if w == LAST_ROW => {
+            s.make_last_row(dlg);
+            1
         }
         WM_SIZE => {
             anchor(dlg, SIZE, &ANCHORS);

@@ -80,6 +80,7 @@ mod edit;
 mod export;
 mod files;
 mod live;
+mod memory;
 mod nav;
 mod opts;
 mod prefs;
@@ -181,6 +182,9 @@ const TIMER_STORE_RETRY: usize = 9;
 const TIMER_SETTLE: usize = 10;
 /// Time to search again, so the results follow the files (`live.rs`).
 const TIMER_LIVE: usize = 11;
+/// The window has rested since thumbnails came or a pane closed: memory
+/// not looked at goes (`memory.rs`).
+const TIMER_REST: usize = 12;
 // The framework's timers are 100..110; the features' follow (`slots.rs`).
 
 /// The search options; the default is History > Home's.
@@ -1710,6 +1714,8 @@ impl App {
                         celltip::timer(self);
                     } else if w == TIMER_LIVE {
                         self.live_tick();
+                    } else if w == TIMER_REST {
+                        self.memory_rested();
                     } else if slots::is_feature_timer(w) {
                         self.feature_timer(w);
                     }
@@ -1808,6 +1814,7 @@ impl App {
                 WM_THUMB => {
                     let reply = Box::from_raw(l as *mut ThumbReply);
                     self.on_thumb(*reply);
+                    self.memory_settles();
                     0
                 }
                 thumbview::WM_BIG_ICONS => {

@@ -34,21 +34,21 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_GETLBTEXT,
-    CB_GETLBTEXTLEN, CBN_EDITCHANGE, CBN_SELCHANGE, CBS_AUTOHSCROLL, CBS_DROPDOWN, DWLP_MSGRESULT,
-    EndDialog, FindWindowExW, GWLP_USERDATA, GetWindowRect, IDCANCEL, IDOK, KillTimer, MINMAXINFO,
+    BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN,
+    CBN_EDITCHANGE, CBN_SELCHANGE, CBS_AUTOHSCROLL, CBS_DROPDOWN, DWLP_MSGRESULT, EndDialog,
+    FindWindowExW, GWLP_USERDATA, GetWindowRect, IDCANCEL, IDOK, KillTimer, MINMAXINFO,
     PostMessageW, SetTimer, SetWindowLongPtrW, SetWindowTextW, WM_APP, WM_CHAR, WM_COMMAND,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY,
-    WM_NOTIFY, WM_SETREDRAW, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP,
-    WS_THICKFRAME, WS_VSCROLL,
+    WM_NOTIFY, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
+    WS_VSCROLL,
 };
 
 use super::name_of;
 use super::rename::{self, FormatError, Options, Problem, Subject};
 use super::ui::{self, checked, copy_text, enable, error_colour, item, send, set_check};
 use crate::dialog::{
-    self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, apply_theme,
-    center_on_owner, common, fill_last_column, list_custom_draw, state,
+    self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner, common,
+    fill_last_column, list_custom_draw, state,
 };
 use crate::fileops::parent;
 use crate::places::{self, Which};
@@ -489,15 +489,9 @@ impl Dlg {
             (ID_NEW, &self.start.new_history),
         ] {
             let combo = item(dlg, id);
-            // A themed list redraws for each item added (a few ms each,
-            // 20 formats kept for each box): filled unseen, as the dialog
-            // is not shown yet.
-            send(combo, WM_SETREDRAW, 0, 0);
-            for h in history {
-                let text = wz(h);
-                send(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
-            }
-            send(combo, WM_SETREDRAW, 1, 0);
+            // A themed list takes half a millisecond an item (20 formats
+            // kept for each box): put in once the dialog shows.
+            dialog::fill_later(combo, history.clone(), None);
             // SAFETY: subclasses this thread's box (Ctrl+Space); the
             // dialog outlives it, and the subclass removes itself.
             unsafe {
@@ -517,7 +511,7 @@ impl Dlg {
         // The last column (Path) takes the room the others leave, sized
         // once the rows are in (they may bring the vertical scroll bar).
         fill_last_column(list);
-        apply_theme(dlg, self.look.get().dark);
+        dialog::theme_new(dlg, self.look.get().dark);
         center_on_owner(dlg);
         let mut wr = RECT::default();
         // SAFETY: reads this thread's dialog.

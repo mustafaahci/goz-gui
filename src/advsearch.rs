@@ -21,15 +21,16 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
-    CBS_DROPDOWNLIST, ES_AUTOHSCROLL, ES_NUMBER, EndDialog, GWLP_USERDATA, GetDlgItem, IDCANCEL,
-    IDOK, MB_ICONWARNING, MB_OK, SendMessageW, SetWindowLongPtrW, SetWindowTextW, WM_COMMAND,
-    WM_INITDIALOG, WM_NOTIFY, WM_SETREDRAW, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
+    BM_GETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_GETCURSEL, CBS_DROPDOWNLIST, ES_AUTOHSCROLL,
+    ES_NUMBER, EndDialog, GWLP_USERDATA, GetDlgItem, IDCANCEL, IDOK, KillTimer, MB_ICONWARNING,
+    MB_OK, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowTextW, USER_TIMER_MINIMUM,
+    WM_COMMAND, WM_INITDIALOG, WM_NOTIFY, WM_SHOWWINDOW, WM_TIMER, WS_EX_CLIENTEDGE, WS_TABSTOP,
+    WS_VSCROLL,
 };
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common, state};
+use crate::dialog::{Class, Look, Template, center_on_owner, common, state, theme_new};
 use crate::msgbox;
 use crate::searchtools::folder_term;
 use crate::wide::{window_text, wz};
@@ -259,8 +260,13 @@ const ID_SIZE_TO: u16 = 1066;
 const ID_SIZE_TO_UNIT: u16 = 1067;
 const ID_DATE_FROM: u16 = 1036;
 const ID_DATE_TO: u16 = 1038;
+const ID_FILTER_LABEL: u16 = 1056;
 const ID_FILTER: u16 = 1057;
 const ID_EXT: u16 = 1059;
+/// Where the Filter list goes (it is made once the dialog shows).
+const FILTER_AT: crate::dialog::Units = (7, 183, 286, 160);
+/// The dialog's timer: it has been drawn, the Filter list can be made.
+const MAKE_FILTER: usize = 1;
 const OK: u16 = IDOK as u16;
 const CANCEL: u16 = IDCANCEL as u16;
 
@@ -287,6 +293,8 @@ struct Dlg<'a> {
     look: Cell<Look>,
     browsed: RefCell<Option<String>>,
     result: RefCell<Option<Done>>,
+    /// Whether the Filter list is made yet (`make_filter`).
+    filter_made: Cell<bool>,
 }
 
 fn item(dlg: HWND, id: u16) -> HWND {
@@ -315,10 +323,13 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         look: Cell::new(look),
         browsed: RefCell::new(None),
         result: RefCell::new(None),
+        filter_made: Cell::new(false),
     };
     let label = SS_LEFT;
     let edit = WS_TABSTOP | ES_AUTOHSCROLL as u32;
-    let combo = WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32;
+    // Five units need no scroll bar, which costs a themed list a few
+    // milliseconds to make.
+    let units = WS_TABSTOP | CBS_DROPDOWNLIST as u32;
     let check = WS_TABSTOP | BS_AUTOCHECKBOX as u32;
     let picker = WS_TABSTOP | DTS_SHORTDATEFORMAT | DTS_SHOWNONE;
     let (lx, fx, right) = (7, 82, 293);
@@ -418,7 +429,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         Class::Named("ComboBox"),
         "",
         ID_SIZE_FROM_UNIT,
-        combo,
+        units,
         0,
         (71, 119, 44, 120),
     )
@@ -435,7 +446,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         Class::Named("ComboBox"),
         "",
         ID_SIZE_TO_UNIT,
-        combo,
+        units,
         0,
         (199, 119, 44, 120),
     )
@@ -467,19 +478,12 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
     .control(
         Class::Static,
         "&Filter:",
-        STATIC,
+        ID_FILTER_LABEL,
         label,
         0,
         (lx, 172, 100, 8),
     )
-    .control(
-        Class::Named("ComboBox"),
-        "",
-        ID_FILTER,
-        combo,
-        0,
-        (lx, 183, right - lx, 160),
-    )
+    // The Filter list comes once the dialog shows (`make_filter`).
     .control(
         Class::Static,
         "E&xtension:",
@@ -517,16 +521,9 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
 }
 
 fn fill_combo(dlg: HWND, id: u16, items: impl IntoIterator<Item = String>, select: usize) {
-    let combo = item(dlg, id);
-    // A themed list redraws for each item added (a few ms each): it is
-    // filled unseen and drawn once, which keeps the dialog's opening short.
-    send(combo, WM_SETREDRAW, 0, 0);
-    for text in items {
-        let text = wz(&text);
-        send(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
-    }
-    send(combo, CB_SETCURSEL, select, 0);
-    send(combo, WM_SETREDRAW, 1, 0);
+    // A themed list takes half a millisecond an item: the chosen item now,
+    // the rest once the dialog shows (`dialog::fill_later`).
+    crate::dialog::fill_later(item(dlg, id), items.into_iter().collect(), Some(select));
 }
 
 fn selection(dlg: HWND, id: u16) -> usize {
@@ -564,17 +561,11 @@ impl Dlg<'_> {
         let units = || UNITS.iter().map(|(n, _)| (*n).to_owned());
         fill_combo(dlg, ID_SIZE_FROM_UNIT, units(), DEFAULT_UNIT);
         fill_combo(dlg, ID_SIZE_TO_UNIT, units(), DEFAULT_UNIT);
-        fill_combo(
-            dlg,
-            ID_FILTER,
-            self.start.filters.iter().cloned(),
-            self.start.filter,
-        );
         // No date until one is ticked.
         for id in [ID_DATE_FROM, ID_DATE_TO] {
             send(item(dlg, id), DTM_SETSYSTEMTIME, GDT_NONE as usize, 0);
         }
-        apply_theme(dlg, self.look.get().dark);
+        theme_new(dlg, self.look.get().dark);
         for id in [ID_DATE_FROM, ID_DATE_TO] {
             let picker = item(dlg, id);
             // SAFETY: subclasses this thread's date picker; the subclass
@@ -582,6 +573,32 @@ impl Dlg<'_> {
             unsafe { SetWindowSubclass(picker, Some(picker_proc), 1, dlg as usize) };
         }
         center_on_owner(dlg);
+    }
+
+    /// Makes the Filter list, once the dialog has been drawn or as soon as
+    /// it is read: each themed list costs 5 to 7 ms to make in comctl32,
+    /// and the dialog has three (the units' two before it).
+    fn make_filter(&self, dlg: HWND) {
+        if self.filter_made.replace(true) {
+            return;
+        }
+        // SAFETY: a timer of this thread's dialog (fired or not).
+        unsafe { KillTimer(dlg, MAKE_FILTER) };
+        let list = crate::dialog::make_control(
+            dlg,
+            "ComboBox",
+            ID_FILTER,
+            WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
+            FILTER_AT,
+            item(dlg, ID_FILTER_LABEL),
+        );
+        fill_combo(
+            dlg,
+            ID_FILTER,
+            self.start.filters.iter().cloned(),
+            self.start.filter,
+        );
+        crate::dialog::theme_control(list, self.look.get().dark, true);
     }
 
     fn form(&self, dlg: HWND) -> Result<Form, Problem> {
@@ -606,6 +623,7 @@ impl Dlg<'_> {
     }
 
     fn ok(&self, dlg: HWND) {
+        self.make_filter(dlg);
         match self.form(dlg).and_then(|f| query(&f)) {
             Ok(query) => {
                 *self.result.borrow_mut() = Some(Done {
@@ -836,6 +854,18 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isi
         WM_INITDIALOG => {
             s.init(dlg);
             // The keyboard in the first box, the words.
+            1
+        }
+        // Shown (a modal dialog shows once its queue is empty): the Filter
+        // list follows once it has been drawn, as timers come after the
+        // paints waiting.
+        WM_SHOWWINDOW if w != 0 => {
+            // SAFETY: a timer of this thread's dialog.
+            unsafe { SetTimer(dlg, MAKE_FILTER, USER_TIMER_MINIMUM, None) };
+            0
+        }
+        WM_TIMER if w == MAKE_FILTER => {
+            s.make_filter(dlg);
             1
         }
         WM_COMMAND => {

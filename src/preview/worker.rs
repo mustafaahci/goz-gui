@@ -583,6 +583,28 @@ fn shell_image(
     }
 }
 
+/// The icon of the file `path` (extension `ext`, lower case with its dot),
+/// `side` pixels square. A program's, shortcut's or icon file's own icon is
+/// extracted off the system image lists (`bigicon`: the shell's factory
+/// would keep each such file's icon in the jumbo list for good, about
+/// 50 KB a program); any other file shows its type's icon, from the shell.
+fn icon_image(path: &[u16], ext: &[u16], side: i32) -> Option<Decoded> {
+    let own = ext
+        .split_first()
+        .is_some_and(|(_, e)| crate::icons::wants_own(e));
+    let Some(bitmap) = own.then(|| crate::bigicon::own_icon(path, side)).flatten() else {
+        // The type's icon: one entry of the shell's lists for every file
+        // of the type.
+        return shell_image(path, side, SIIGBF_ICONONLY);
+    };
+    let natural = (bitmap.width, bitmap.height);
+    Some(Decoded {
+        bitmap,
+        natural,
+        opaque: false,
+    })
+}
+
 /// A preview handler held: its class, and whether a file is loaded in it.
 struct Loaded {
     clsid: GUID,
@@ -716,7 +738,7 @@ impl State<'_> {
             return Shown::Picture(thumb);
         }
         Shown::Icon {
-            icon: shell_image(&r.path, r.icon_side, SIIGBF_ICONONLY),
+            icon: icon_image(&r.path, &ext, r.icon_side),
             online_only: false,
         }
     }
