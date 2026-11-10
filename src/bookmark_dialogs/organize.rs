@@ -115,8 +115,12 @@ enum Keep {
     At(Option<usize>),
 }
 
-/// The question Delete asks, and its title.
-fn delete_question(list: &Bookmarks, tree: &Tree, items: &[Item]) -> (&'static str, String) {
+/// The question Delete asks, and its title (also the Bookmarks pane's).
+pub(super) fn delete_question(
+    list: &Bookmarks,
+    tree: &Tree,
+    items: &[Item],
+) -> (&'static str, String) {
     match items {
         [Item::Row(r)] if list.rows()[*r].kind() == Kind::Separator => {
             ("Delete Separator", "Delete this separator?".into())

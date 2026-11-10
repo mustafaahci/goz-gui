@@ -117,11 +117,13 @@ impl App {
     }
 
     /// Reads the file again if another program changed it.
-    fn refresh_bookmarks(&self) {
+    pub(super) fn refresh_bookmarks(&self) {
         let (_, note) = self.bookmarks.file.refresh();
         if let Some(note) = note {
             self.show_note(note);
         }
+        // F2: the Bookmarks pane shows what was read.
+        self.bookmarks_changed();
     }
 
     /// Rebuilds the Bookmarks menu's list as it opens.
@@ -171,6 +173,8 @@ impl App {
         if let Some(note) = note {
             self.show_note(note);
         }
+        // F2: the write merged another goz-gui's changes in.
+        self.bookmarks_changed();
         let dlg = self.bookmarks.dialog.get();
         // SAFETY: checks and posts to a window of this thread.
         unsafe {
@@ -263,7 +267,7 @@ impl App {
     /// A bookmark's search with its options, as a new navigation entry. An
     /// option the bookmark does not set stays as it is; with no search
     /// ("(No change)") the search in the box stays.
-    fn open_chosen(&self, c: &Chosen) {
+    pub(super) fn open_chosen(&self, c: &Chosen) {
         let o = self.opts.get();
         let s = c.settings;
         let text = match &c.search {
@@ -285,6 +289,8 @@ impl App {
         let changed = self.bookmarks.file.change(op);
         if changed {
             self.save_bookmarks();
+            // F2: the Bookmarks pane shows the change.
+            self.bookmarks_changed();
         }
         changed
     }

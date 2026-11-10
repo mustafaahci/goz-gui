@@ -50,7 +50,7 @@ fn is_separator(menu: HMENU, pos: u32) -> bool {
 
 /// No separator first, last, or after another: what taking items out of
 /// the shell's part can leave.
-fn tidy_separators(menu: HMENU) {
+pub(super) fn tidy_separators(menu: HMENU) {
     // SAFETY: counts and deletes items of a menu of this thread.
     unsafe {
         let mut pos = 0u32;
@@ -260,7 +260,7 @@ impl App {
 
     /// Shows `popup` at `pt` (screen) with `shell`'s menu getting the
     /// messages it needs while it is up; the id chosen (0 for none).
-    fn track_with_shell(
+    pub(super) fn track_with_shell(
         &self,
         popup: HMENU,
         pt: POINT,

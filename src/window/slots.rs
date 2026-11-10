@@ -41,6 +41,7 @@ impl App {
         // F1 (preview pane).
 
         // F2 (sidebars).
+        self.start_sidebars();
 
         // F3 (tabs and windows).
 
@@ -58,6 +59,7 @@ impl App {
         // F1 (preview pane).
 
         // F2 (sidebars).
+        self.exit_sidebars();
 
         // F3 (tabs and windows).
 
@@ -93,7 +95,7 @@ impl App {
             3000..=3099 => false,
 
             // F2: 3100..=3199.
-            3100..=3199 => false,
+            3100..=3199 => self.sidebar_command(id),
 
             // F3: 3200..=3299, and its tab entries 4000..=4255.
             3200..=3299 | 4000..=4255 => false,

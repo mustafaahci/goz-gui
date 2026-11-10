@@ -29,6 +29,9 @@ pub(super) const NAV_DELAY_MS: u32 = 1500;
 pub(super) struct NavState {
     text: String,
     opts: Options,
+    /// The Folders sidebar's folder (`sidebars.rs`), which Back and Forward
+    /// bring back with the search.
+    folder: Option<String>,
 }
 
 impl NavState {
@@ -41,6 +44,7 @@ impl NavState {
             match_path: o.match_path,
             filter: o.filter,
             sort: o.sort,
+            folder: self.folder.clone(),
         }
     }
 
@@ -53,6 +57,7 @@ impl NavState {
                 filter: s.filter,
                 sort: s.sort,
             },
+            folder: s.folder.clone(),
         }
     }
 }
@@ -63,6 +68,7 @@ impl App {
         NavState {
             text: window_text(self.edit),
             opts: self.opts.get(),
+            folder: self.folder_selection(),
         }
     }
 
@@ -170,17 +176,26 @@ impl App {
     /// screen, which becomes one first, so Back returns to it. Home uses it;
     /// so can a bookmark (M1 WP5).
     pub(super) fn navigate(&self, text: &str, opts: Options) {
+        // The Folders sidebar's folder stays as it is.
+        self.navigate_to(text, opts, self.folder_selection());
+    }
+
+    /// [`navigate`](Self::navigate) with the Folders sidebar's `folder`
+    /// (`None`: none), for a search that names its own folder (`-path`).
+    pub(super) fn navigate_to(&self, text: &str, opts: Options, folder: Option<String>) {
         self.commit_nav();
         self.restore(&NavState {
             text: text.to_owned(),
             opts,
+            folder,
         });
         self.commit_nav();
     }
 
-    /// Shows `state`'s search, options, filter and sort.
+    /// Shows `state`'s search, options, filter, sort and folder.
     pub(super) fn restore(&self, state: &NavState) {
         dropdown::close(self);
+        self.restore_folder(state.folder.clone());
         self.opts.set(state.opts);
         self.show_sort();
         self.invalidate_status();
@@ -218,7 +233,8 @@ fn sort_label(sort: SortSpec) -> String {
 /// The History menu's label of each entry: its search (`(Empty)` for none),
 /// and, when another listed entry has the same search with other options,
 /// what tells them apart: the sort when the sorts differ, and Match Case,
-/// Match Path or the filter when they are on and differ (`*.exe  (Size ↓)`).
+/// Match Path, the filter or the Folders sidebar's folder when they are on
+/// and differ (`*.exe  (Size ↓)`, `*.exe  (C:\Windows)`).
 fn entry_labels(entries: &[&NavState]) -> Vec<String> {
     entries
         .iter()
@@ -243,6 +259,11 @@ fn entry_labels(entries: &[&NavState]) -> Vec<String> {
                 && same.iter().any(|s| s.opts.filter != o.filter)
             {
                 parts.push(name.to_owned());
+            }
+            if let Some(folder) = &e.folder
+                && same.iter().any(|s| s.folder != e.folder)
+            {
+                parts.push(folder.clone());
             }
             let text = if e.text.is_empty() {
                 "(Empty)"
@@ -271,6 +292,7 @@ mod tests {
         let base = NavState {
             text: "foo".into(),
             opts: Options::default(),
+            folder: None,
         };
         let mut n = NavHistory::default();
         assert!(n.commit(base.clone()));
@@ -299,6 +321,11 @@ mod tests {
                 ..base.clone()
             }));
         }
+        // So does the Folders sidebar's folder.
+        assert!(n.commit(NavState {
+            folder: Some(r"C:\Windows".into()),
+            ..base.clone()
+        }));
         // Home is the empty search with the default options.
         let home = NavState::default();
         assert_eq!(home.text, "");
@@ -309,7 +336,22 @@ mod tests {
         NavState {
             text: text.into(),
             opts,
+            folder: None,
         }
+    }
+
+    #[test]
+    fn the_folder_goes_to_a_session_and_back_and_tells_entries_apart() {
+        let s = NavState {
+            folder: Some(r"D:\Music".into()),
+            ..state("live", Options::default())
+        };
+        let search = s.to_search();
+        assert_eq!(search.folder.as_deref(), Some(r"D:\Music"));
+        assert_eq!(NavState::from_search(&search), s);
+        let entries = [s.clone(), state("live", Options::default())];
+        let refs: Vec<&NavState> = entries.iter().collect();
+        assert_eq!(entry_labels(&refs), [r"live  (D:\Music)", "live"]);
     }
 
     #[test]

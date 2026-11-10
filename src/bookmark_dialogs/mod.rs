@@ -247,6 +247,48 @@ fn sibling_named(tree: &Tree, node: usize, name: &str) -> Option<usize> {
     })
 }
 
+/// Asks whether to delete `items` of `list` (bookmarks, or folders with
+/// everything in them), as Organize Bookmarks' Delete does, and deletes
+/// them: the Bookmarks pane's Delete. True when they went.
+pub fn delete(owner: HWND, host: &dyn Host, list: &Bookmarks, items: &[Item]) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+    let tree = Tree::build(list);
+    let targets = items
+        .iter()
+        .map(|&i| crate::bookmarks::ops::Target::of(list, &tree, i))
+        .collect();
+    let (title, question) = organize::delete_question(list, &tree, items);
+    ask(owner, title, &question) && host.change(Op::Delete(targets))
+}
+
+/// Asks for a new name for the folder of `list` at `path`, as Organize
+/// Bookmarks' Edit... does, and renames it: the Bookmarks pane's Edit... on
+/// a folder. True when it was renamed.
+pub fn rename_folder(
+    owner: HWND,
+    host: &dyn Host,
+    list: &Bookmarks,
+    path: &[String],
+    look: crate::dialog::Look,
+) -> bool {
+    let tree = Tree::build(list);
+    let (Some(node), Some((old, parent))) = (tree.find(path), path.split_last()) else {
+        return false;
+    };
+    let parent_node = tree.find(parent).unwrap_or(TOP);
+    let problem = |name: &str| folder_name_problem(&tree, parent_node, name, Some(node));
+    let Some(name) = pick::folder_name(owner, "Rename Folder", old, &problem, look) else {
+        return false;
+    };
+    &name != old
+        && host.change(Op::Rename {
+            folder: path.to_vec(),
+            name,
+        })
+}
+
 /// Why `name` cannot be a folder's name in `node` (for a rename, `own` is
 /// the folder renamed): `None` when it can.
 fn folder_name_problem(tree: &Tree, node: usize, name: &str, own: Option<usize>) -> Option<String> {

@@ -52,6 +52,9 @@ pub struct Search {
     pub match_path: bool,
     pub filter: Filter,
     pub sort: SortSpec,
+    /// The Folders sidebar's folder, which keeps the search inside it
+    /// (Everything's `folders_sidebar_selection`, a list of one here).
+    pub folder: Option<String>,
 }
 
 /// The results as they were: the search, where the list was scrolled to,
@@ -104,8 +107,11 @@ fn flag(o: &Json, key: &str) -> Option<bool> {
     o.get(key).and_then(Json::as_flag)
 }
 
-fn search_members(s: &Search) -> Vec<(String, Json)> {
-    vec![
+/// A search's keys. `tab`: a tab's, which always has the folder's key, as
+/// Everything's; a navigation entry has it only with a folder, so one
+/// without stays on one line.
+fn search_members(s: &Search, tab: bool) -> Vec<(String, Json)> {
+    let mut members = vec![
         ("search".into(), Json::str(&s.text)),
         ("match_case".into(), Json::bit(s.match_case)),
         ("match_path".into(), Json::bit(s.match_path)),
@@ -121,7 +127,14 @@ fn search_members(s: &Search) -> Vec<(String, Json)> {
             "sort_ascending".into(),
             Json::bit(s.sort.dir == SortDir::Asc),
         ),
-    ]
+    ];
+    if tab || s.folder.is_some() {
+        members.push((
+            "folders_sidebar_selection".into(),
+            Json::Array(s.folder.iter().map(|f| Json::str(f)).collect()),
+        ));
+    }
+    members
 }
 
 /// The search keys of a tab or a navigation entry; what is missing or
@@ -149,6 +162,15 @@ fn read_search(o: &Json) -> Search {
             .and_then(|t| Filter::from_title(&t))
             .unwrap_or_default(),
         sort,
+        // The first folder of Everything's list (goz-gui scopes to one).
+        folder: o
+            .get("folders_sidebar_selection")
+            .and_then(Json::as_array)
+            .and_then(|a| {
+                a.iter()
+                    .find_map(|v| v.as_text().filter(|t| !t.trim().is_empty()))
+            })
+            .map(|f| crate::sidebars::normalize(&f)),
     }
 }
 
@@ -284,7 +306,7 @@ impl Session {
         win.push(("tab_cursel".into(), Json::int(0)));
         let v = &self.view;
         let mut tab: Vec<(String, Json)> = vec![("is_closed".into(), Json::int(0))];
-        tab.extend(search_members(&v.search));
+        tab.extend(search_members(&v.search, true));
         tab.push((
             "listview_top_index".into(),
             Json::int(i64::try_from(v.top).unwrap_or(i64::MAX)),
@@ -312,7 +334,7 @@ impl Session {
             Json::Array(
                 v.nav
                     .iter()
-                    .map(|s| Json::Object(search_members(s)))
+                    .map(|s| Json::Object(search_members(s, false)))
                     .collect(),
             ),
         ));
@@ -495,6 +517,7 @@ mod tests {
                         key: SortKey::Size,
                         dir: SortDir::Asc,
                     },
+                    folder: Some(r"C:\Windows".into()),
                 },
                 top: 2048,
                 focus: Some(w(r"C:\Windows\System32\kernel32.dll")),
@@ -509,6 +532,10 @@ mod tests {
                         ..search("*.exe")
                     },
                     search("é😀"),
+                    Search {
+                        folder: Some(r"D:\".into()),
+                        ..search("in a folder")
+                    },
                 ],
                 nav_index: 1,
             },
@@ -530,6 +557,10 @@ mod tests {
             "\t\t\t\t\"listview_item_focus\":\"C:\\\\Windows\\\\System32\\\\kernel32.dll\",\r\n",
             "\"C:\\\\\\ud800x\"]",
             "\t\t\t\t\t{\"search\":\"*.exe\",\"match_case\":0,\"match_path\":0,\"filter\":\"\",\"sort\":\"Date Modified\",\"sort_ascending\":0},\r\n",
+            // The Folders sidebar's folder, Everything's key: always in the
+            // tab, in a navigation entry only when it has one.
+            "\t\t\t\t\"folders_sidebar_selection\":[\"C:\\\\Windows\"],\r\n",
+            "\t\t\t\t\t\t\"folders_sidebar_selection\":[\"D:\\\\\"]\r\n",
             "\t\t\t}\r\n\t\t]\r\n\t}\r\n]\r\n",
         ] {
             assert!(text.contains(line), "{line:?} in\n{text}");

@@ -73,6 +73,9 @@ mod zoom;
 // F1 (preview pane).
 
 // F2 (sidebars).
+mod foldertree;
+mod sidebars;
+mod treeview;
 
 // F3 (tabs and windows).
 

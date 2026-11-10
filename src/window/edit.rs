@@ -286,7 +286,7 @@ fn word_end_after(text: &[u16], caret: usize) -> usize {
 
 /// Deletes the selection, or with none the word before the caret
 /// (`back`, Ctrl+Backspace) or after it (Ctrl+Delete); undoable.
-fn delete_word(edit: HWND, back: bool) {
+pub(super) fn delete_word(edit: HWND, back: bool) {
     let (mut start, mut end) = (0u32, 0u32);
     send(
         edit,

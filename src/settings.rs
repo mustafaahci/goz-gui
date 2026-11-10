@@ -326,7 +326,9 @@ pub struct Settings {
     // F1 (preview pane).
 
     // F2 (sidebars).
-
+    /// The sidebars' own keys (`folders_sidebar_labels`,
+    /// `bookmarks_sidebar_expanded`, ..., see `crate::sidebars`).
+    pub sidebars: crate::sidebars::Settings,
     // F3 (tabs and windows).
 
     // F4 (search tools).
@@ -407,7 +409,7 @@ impl Default for Settings {
             // F1 (preview pane).
 
             // F2 (sidebars).
-
+            sidebars: crate::sidebars::Settings::default(),
             // F3 (tabs and windows).
 
             // F4 (search tools).
@@ -608,7 +610,7 @@ impl Settings {
             // F1 (preview pane).
 
             // F2 (sidebars).
-
+            sidebars: crate::sidebars::Settings::from_keys(|k| ini.get(k)),
             // F3 (tabs and windows).
 
             // F4 (search tools).
@@ -717,6 +719,7 @@ impl Settings {
         // F1 (preview pane).
 
         // F2 (sidebars).
+        out.extend(self.sidebars.to_keys());
 
         // F3 (tabs and windows).
 
@@ -914,6 +917,13 @@ mod tests {
                 d
             },
             options_page: "History".into(),
+            // F2 (sidebars).
+            sidebars: crate::sidebars::Settings {
+                clear_on_close: true,
+                match_only_when_shown: false,
+                labels: false,
+                bookmarks_expanded: vec!["Music".into(), "Music/Rock".into()],
+            },
         };
         let mut ini = Ini::default();
         for (k, v) in s.to_pairs() {
