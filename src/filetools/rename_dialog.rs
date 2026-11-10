@@ -39,8 +39,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EndDialog, FindWindowExW, GWLP_USERDATA, GetWindowRect, IDCANCEL, IDOK, KillTimer, MINMAXINFO,
     PostMessageW, SetTimer, SetWindowLongPtrW, SetWindowTextW, WM_APP, WM_CHAR, WM_COMMAND,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY,
-    WM_NOTIFY, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
-    WS_VSCROLL,
+    WM_NOTIFY, WM_SETREDRAW, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP,
+    WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::name_of;
@@ -489,10 +489,15 @@ impl Dlg {
             (ID_NEW, &self.start.new_history),
         ] {
             let combo = item(dlg, id);
+            // A themed list redraws for each item added (a few ms each,
+            // 20 formats kept for each box): filled unseen, as the dialog
+            // is not shown yet.
+            send(combo, WM_SETREDRAW, 0, 0);
             for h in history {
                 let text = wz(h);
                 send(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
             }
+            send(combo, WM_SETREDRAW, 1, 0);
             // SAFETY: subclasses this thread's box (Ctrl+Space); the
             // dialog outlives it, and the subclass removes itself.
             unsafe {

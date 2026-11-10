@@ -27,7 +27,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EN_CHANGE, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, EndDialog, GWLP_USERDATA, GetParent,
     GetWindowRect, GetWindowTextLengthW, IDCANCEL, IDOK, MINMAXINFO, SetWindowLongPtrW, WM_CHAR,
     WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY, WM_NCPAINT,
-    WM_SIZE, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
+    WM_SETREDRAW, WM_SIZE, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::{enable, item, send, set_text};
@@ -271,11 +271,15 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
 
 fn fill_combo(dlg: HWND, id: u16, items: impl IntoIterator<Item = String>, select: usize) {
     let combo = item(dlg, id);
+    // A themed list redraws for each item added (a few ms each, six lists
+    // here): filled unseen, as the dialog is not shown yet.
+    send(combo, WM_SETREDRAW, 0, 0);
     for text in items {
         let text = wz(&text);
         send(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
     }
     send(combo, CB_SETCURSEL, select, 0);
+    send(combo, WM_SETREDRAW, 1, 0);
 }
 
 fn selection(dlg: HWND, id: u16) -> usize {

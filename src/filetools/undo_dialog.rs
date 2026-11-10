@@ -31,8 +31,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DM_SETDEFID, DWLP_MSGRESULT, EN_CHANGE, ES_AUTOHSCROLL, EndDialog, GWLP_USERDATA,
     GetClientRect, GetWindowRect, IDCANCEL, IDOK, MINMAXINFO, MoveWindow, SM_CXVSCROLL,
     SetWindowLongPtrW, SetWindowTextW, WM_APP, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO,
-    WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP,
-    WS_THICKFRAME, WS_VSCROLL,
+    WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETREDRAW, WM_SIZE, WS_EX_CLIENTEDGE,
+    WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::ui::{copy_text, enable, item, send, set_state, units};
@@ -264,11 +264,15 @@ impl Dlg<'_> {
         send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
         ui::columns(list, &COLUMNS);
         let combo = item(dlg, ID_ACTION);
+        // A themed list redraws for each item added (a few ms each): filled
+        // unseen, as the dialog is not shown yet.
+        send(combo, WM_SETREDRAW, 0, 0);
         for label in std::iter::once("All actions").chain(Action::ALL.iter().map(|a| a.label())) {
             let text = wz(label);
             send(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
         }
         send(combo, CB_SETCURSEL, 0, 0);
+        send(combo, WM_SETREDRAW, 1, 0);
         // SAFETY: subclasses this thread's search box; the list outlives
         // it (both go with the dialog), and the subclass removes itself.
         unsafe { SetWindowSubclass(item(dlg, ID_SEARCH), Some(filter_proc), 1, list as usize) };
