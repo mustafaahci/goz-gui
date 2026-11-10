@@ -205,7 +205,9 @@ impl App {
             }
             menu::NEXT_SELECTED => self.jump_selected(true),
             menu::PREV_SELECTED => self.jump_selected(false),
-            menu::REFRESH => self.start_search(true),
+            // Text typed and not searched yet (search as you type off, or
+            // its delay running) is searched as a new search.
+            menu::REFRESH => self.start_search(!self.search_is_dirty()),
             menu::SIZE_ALL_COLUMNS_TO_FIT => self.size_all_columns_to_fit(),
             menu::SORT_NAME | menu::SORT_PATH | menu::SORT_SIZE | menu::SORT_DATE => {
                 self.sort_by_key(sort_key(id));
@@ -418,9 +420,29 @@ impl App {
                 },
             }
         } else {
-            SortSpec::default_for(key)
+            self.first_sort(key)
         };
         self.set_sort(sort);
+    }
+
+    /// A new sort by `key`: names and paths A to Z; dates and sizes newest
+    /// and largest first, unless Options > Results' "Sort date descending
+    /// first" or "Sort size descending first" is off.
+    pub(super) fn first_sort(&self, key: SortKey) -> SortSpec {
+        let ui = self.ui();
+        let descending = match key {
+            SortKey::Name | SortKey::Path => false,
+            SortKey::Size => ui.size_descending.on(),
+            SortKey::DateModified => ui.date_descending.on(),
+        };
+        SortSpec {
+            key,
+            dir: if descending {
+                SortDir::Desc
+            } else {
+                SortDir::Asc
+            },
+        }
     }
 
     /// F4 / Shift+F4: moves the focus to the next or previous selected row,

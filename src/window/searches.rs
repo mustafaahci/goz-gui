@@ -231,10 +231,12 @@ impl App {
     }
 
     /// While a search is typed: the dropdown lists the searches containing
-    /// it (`search_history_always_suggest`), without taking the keyboard;
-    /// it closes when none does.
+    /// it (`search_history_always_suggest`, and always while search as you
+    /// type is off, as in Everything: nothing else answers the typing),
+    /// without taking the keyboard; it closes when none does.
     pub(super) fn suggest(&self) {
-        if !self.searches.suggest.get() {
+        let always = self.searches.enabled && !self.ui().search_as_you_type;
+        if !self.searches.suggest.get() && !always {
             dropdown::close(self);
             return;
         }

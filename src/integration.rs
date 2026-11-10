@@ -1,22 +1,42 @@
-//! What goz-gui puts in the user's registry when asked in Options: starting
-//! with Windows (a `Run` value) and the "Search goz..." item on folders in
-//! Explorer, both under HKEY_CURRENT_USER and both removed again when
-//! turned off.
+//! What goz-gui puts in the user's registry and folders when asked in
+//! Options > General: starting with Windows (a `Run` value), the "Search
+//! goz..." item on folders in Explorer, the `goz:` URL protocol, and the
+//! Start menu and Desktop shortcuts; all for the current user, and each
+//! removed again when turned off.
 //!
-//! `GOZ_GUI_REG_ROOT` (tests) moves both under `HKCU\<root>` so a test never
-//! touches the real keys.
+//! `GOZ_GUI_REG_ROOT` (tests) moves the registry's under `HKCU\<root>`, and
+//! `GOZ_GUI_SHORTCUT_DIR` the shortcuts under `<dir>\Programs` and
+//! `<dir>\Desktop`, so a test never touches the real ones.
 
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
+
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
+use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+use windows::core::{Interface, PCWSTR};
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegGetValueW,
     RegSetValueExW,
 };
+use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs, SHGetKnownFolderPath};
+use windows_sys::core::GUID;
 
 use crate::wide::wz;
 
 /// The test override of where the keys go.
 pub const REG_ROOT_VAR: &str = "GOZ_GUI_REG_ROOT";
+/// The test override of where the shortcuts go.
+pub const SHORTCUT_DIR_VAR: &str = "GOZ_GUI_SHORTCUT_DIR";
+
+/// The URL scheme goz-gui answers: `goz:<search>?<options>` (`crate::url`).
+const PROTOCOL: &str = "goz";
+/// The shortcuts' file name, and the tip Explorer shows for them.
+const SHORTCUT_NAME: &str = "goz-gui.lnk";
+const SHORTCUT_TIP: &str = "Search files and folders by name with goz";
 
 const RUN_VALUE: &str = "goz-gui";
 /// The folder item's key name under each `...\shell`.
@@ -173,6 +193,152 @@ pub fn set_folder_item(on: bool) -> bool {
     ok && has_folder_item() == on
 }
 
+/// `HKCU\Software\Classes\goz`, as Everything's `es:` is under `ES`.
+fn protocol_key() -> String {
+    format!(r"{}\{PROTOCOL}", classes())
+}
+
+/// The command Windows runs for a `goz:` link.
+fn url_command() -> Option<String> {
+    Some(format!("{} -url \"%1\"", exe()?))
+}
+
+/// Whether a protocol's command is goz-gui's (this copy's or another's, as
+/// [`url_command`] writes it): another program's `goz:` is neither shown
+/// as on nor removed.
+fn is_url_command(cmd: &str) -> bool {
+    cmd.starts_with('"') && cmd.ends_with("\" -url \"%1\"")
+}
+
+/// Whether `goz:` links open goz-gui.
+pub fn has_url_protocol() -> bool {
+    get(&format!(r"{}\shell\open\command", protocol_key()), None)
+        .is_some_and(|c| is_url_command(&c))
+}
+
+/// Registers the `goz:` URL protocol for this goz-gui, or removes it (only
+/// when it is goz-gui's).
+pub fn set_url_protocol(on: bool) -> bool {
+    let key = protocol_key();
+    if on {
+        let Some(cmd) = url_command() else {
+            return false;
+        };
+        let icon = std::env::current_exe()
+            .map(|p| format!("{},0", p.display()))
+            .unwrap_or_default();
+        set(&key, None, "URL:goz Protocol")
+            && set(&key, Some("URL Protocol"), "")
+            && set(&format!(r"{key}\DefaultIcon"), None, &icon)
+            && set(&format!(r"{key}\shell\open\command"), None, &cmd)
+            && has_url_protocol()
+    } else {
+        if has_url_protocol() {
+            let k = wz(&key);
+            // SAFETY: NUL-terminated paths under HKCU: the protocol's
+            // subkeys and values, then its key.
+            unsafe {
+                RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr());
+                RegDeleteKeyW(HKEY_CURRENT_USER, k.as_ptr());
+            }
+        }
+        !has_url_protocol()
+    }
+}
+
+/// The shortcuts Options > General makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shortcut {
+    /// In the user's Start menu (its Programs folder).
+    StartMenu,
+    /// On the user's desktop.
+    Desktop,
+}
+
+/// A known folder's path (`FOLDERID_*`).
+fn known_folder(id: &GUID) -> Option<PathBuf> {
+    let mut raw: *mut u16 = core::ptr::null_mut();
+    // SAFETY: the shell allocates the string, which is read up to its NUL
+    // and freed with CoTaskMemFree as documented (also on failure).
+    unsafe {
+        let hr = SHGetKnownFolderPath(id, 0, core::ptr::null_mut(), &mut raw);
+        let path = if hr >= 0 && !raw.is_null() {
+            let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
+            Some(PathBuf::from(OsString::from_wide(
+                core::slice::from_raw_parts(raw, len),
+            )))
+        } else {
+            None
+        };
+        CoTaskMemFree(raw.cast());
+        path
+    }
+}
+
+/// Where shortcut `which` goes.
+fn shortcut_path(which: Shortcut) -> Option<PathBuf> {
+    let test = std::env::var(SHORTCUT_DIR_VAR)
+        .ok()
+        .filter(|v| !v.is_empty());
+    let folder = match (test, which) {
+        (Some(dir), Shortcut::StartMenu) => PathBuf::from(dir).join("Programs"),
+        (Some(dir), Shortcut::Desktop) => PathBuf::from(dir).join("Desktop"),
+        (None, Shortcut::StartMenu) => known_folder(&FOLDERID_Programs)?,
+        (None, Shortcut::Desktop) => known_folder(&FOLDERID_Desktop)?,
+    };
+    Some(folder.join(SHORTCUT_NAME))
+}
+
+/// Whether shortcut `which` is there.
+pub fn has_shortcut(which: Shortcut) -> bool {
+    shortcut_path(which).is_some_and(|p| p.is_file())
+}
+
+/// Makes shortcut `which` to this goz-gui, or deletes it. The thread has
+/// COM (the window's does).
+pub fn set_shortcut(which: Shortcut, on: bool) -> bool {
+    let Some(path) = shortcut_path(which) else {
+        return false;
+    };
+    if !on {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    if let Some(folder) = path.parent()
+        && std::fs::create_dir_all(folder).is_err()
+    {
+        return false;
+    }
+    write_link(&exe, &path).is_ok() && path.is_file()
+}
+
+/// Writes a shortcut at `link` that starts `exe` in its own folder.
+fn write_link(exe: &std::path::Path, link: &std::path::Path) -> windows::core::Result<()> {
+    let target = wz(&exe.to_string_lossy());
+    let dir = wz(&exe
+        .parent()
+        .map_or(String::new(), |d| d.to_string_lossy().into_owned()));
+    let tip = wz(SHORTCUT_TIP);
+    let file = wz(&link.to_string_lossy());
+    // SAFETY: COM is ready on this thread; every string is NUL-terminated
+    // and outlives the calls that read it.
+    unsafe {
+        let shell_link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+        shell_link.SetPath(PCWSTR(target.as_ptr()))?;
+        shell_link.SetWorkingDirectory(PCWSTR(dir.as_ptr()))?;
+        shell_link.SetDescription(PCWSTR(tip.as_ptr()))?;
+        shell_link.SetIconLocation(PCWSTR(target.as_ptr()), 0)?;
+        shell_link
+            .cast::<IPersistFile>()?
+            .Save(PCWSTR(file.as_ptr()), true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,19 +351,86 @@ mod tests {
         // SAFETY: only this module reads the variable, and only this test
         // sets it.
         unsafe { std::env::set_var(REG_ROOT_VAR, &root) };
-        assert!(!starts_with_windows() && !has_folder_item());
+        assert!(!starts_with_windows() && !has_folder_item() && !has_url_protocol());
         assert!(set_starts_with_windows(true) && starts_with_windows());
         assert!(set_folder_item(true) && has_folder_item());
         let cmd = get(&format!(r"{}\command", verb_keys()[1].0), None).unwrap();
         assert!(cmd.ends_with(" -path \"%V\""), "{cmd}");
+        assert!(set_url_protocol(true) && has_url_protocol());
+        let key = protocol_key();
+        assert!(key.ends_with(r"\Classes\goz"), "{key}");
+        assert_eq!(get(&key, None).as_deref(), Some("URL:goz Protocol"));
+        assert_eq!(get(&key, Some("URL Protocol")).as_deref(), Some(""));
+        let open = get(&format!(r"{key}\shell\open\command"), None).unwrap();
+        assert!(
+            open.starts_with('"') && open.ends_with("\" -url \"%1\""),
+            "{open}"
+        );
         assert!(set_starts_with_windows(false) && !starts_with_windows());
         assert!(set_folder_item(false) && !has_folder_item());
+        assert!(set_url_protocol(false) && !has_url_protocol());
+        assert_eq!(get(&key, None), None, "the whole key goes");
+        // Another program's goz: is neither taken for goz-gui's nor removed.
+        assert!(set(
+            &format!(r"{key}\shell\open\command"),
+            None,
+            "other.exe \"%1\""
+        ));
+        assert!(!has_url_protocol());
+        assert!(set_url_protocol(false));
+        assert!(get(&format!(r"{key}\shell\open\command"), None).is_some());
         let k = wz(&root);
         // SAFETY: deletes the throwaway key made above.
         unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr()) };
         unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, k.as_ptr()) };
         // SAFETY: as above.
         unsafe { std::env::remove_var(REG_ROOT_VAR) };
+    }
+
+    /// Makes and deletes both shortcuts under a throwaway folder, never the
+    /// user's own Start menu or desktop.
+    #[test]
+    fn shortcuts_round_trip_under_a_test_folder() {
+        use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        // SAFETY: COM for this test thread (the window's thread has it).
+        unsafe { CoInitializeEx(core::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        let dir = std::env::temp_dir().join(format!("goz-gui-shortcuts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: only this test sets the variable, and only this module
+        // reads it.
+        unsafe { std::env::set_var(SHORTCUT_DIR_VAR, &dir) };
+        for which in [Shortcut::StartMenu, Shortcut::Desktop] {
+            assert!(!has_shortcut(which));
+            assert!(
+                set_shortcut(which, true) && has_shortcut(which),
+                "{which:?}"
+            );
+            let path = shortcut_path(which).unwrap();
+            assert!(path.starts_with(&dir) && path.ends_with(SHORTCUT_NAME));
+            // It is a real shortcut to this exe.
+            let w: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+            let target = crate::shell::link_target(&w).map(|t| String::from_utf16_lossy(&t));
+            let exe = std::env::current_exe().unwrap();
+            assert_eq!(target.as_deref(), Some(&*exe.to_string_lossy()));
+            assert!(set_shortcut(which, false) && !has_shortcut(which));
+            // Deleting one that is gone is fine.
+            assert!(set_shortcut(which, false));
+        }
+        assert!(dir.join("Programs").is_dir() && dir.join("Desktop").is_dir());
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(SHORTCUT_DIR_VAR) };
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_goz_guis_command_is_its_url_protocol() {
+        assert!(is_url_command(r#""C:\x\goz-gui.exe" -url "%1""#));
+        assert!(is_url_command(
+            r#""D:\Tools\GOZ GUI\goz-gui.exe" -url "%1""#
+        ));
+        assert!(!is_url_command(r#"C:\x\other.exe "%1""#));
+        assert!(!is_url_command(r#""C:\x\goz-gui.exe" "%1""#));
+        assert!(url_command().unwrap().ends_with("\" -url \"%1\""));
     }
 
     #[test]

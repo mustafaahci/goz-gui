@@ -70,6 +70,11 @@ impl App {
     /// its text (an empty one never), and makes it a navigation entry; the
     /// search counts as made.
     pub(super) fn record_search(&self) {
+        // Text typed and not searched yet (Options > Search) is not the
+        // search on screen: it counts once it is searched.
+        if self.search_is_dirty() {
+            return;
+        }
         if !self.recorded.replace(true) {
             self.record_in_history(&window_text(self.edit));
         }
@@ -164,6 +169,12 @@ impl App {
                 sort: h.sort.unwrap_or(o.sort),
             },
         );
+        // Options > Home's View: Details, or thumbnails at a size.
+        if let Some(view) = home.view
+            && view != self.view()
+        {
+            self.set_view(view);
+        }
     }
 
     /// Shows `text` with `opts` as a new navigation entry after the search on

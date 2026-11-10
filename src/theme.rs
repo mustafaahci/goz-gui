@@ -59,6 +59,13 @@ pub struct Palette {
     /// The row under the mouse, and its sorted cell.
     pub hover: u32,
     pub hover_sort: u32,
+    /// Every other row, and its sorted cell, with Options > View's
+    /// "Alternate row color" (Everything's Alternate Row and Current Sort
+    /// Alternate Row).
+    pub alt_bg: u32,
+    pub alt_sort_bg: u32,
+    /// The lines between rows and columns (`grid_lines`).
+    pub grid: u32,
     /// Menu bar, search band and status bar.
     pub chrome: u32,
     /// The list header; its sorted item, which also gets an edge; items
@@ -102,6 +109,9 @@ impl Palette {
                 sel_inactive: rgb(0x4a, 0x4a, 0x4a),
                 hover: rgb(0x1e, 0x1e, 0x1e),
                 hover_sort: rgb(0x2a, 0x2a, 0x2a),
+                alt_bg: rgb(0x0f, 0x0f, 0x0f),
+                alt_sort_bg: rgb(0x22, 0x22, 0x22),
+                grid: rgb(0x2b, 0x2b, 0x2b),
                 chrome: rgb(0x20, 0x20, 0x20),
                 header: rgb(0x20, 0x20, 0x20),
                 header_sort: rgb(0x39, 0x39, 0x39),
@@ -133,6 +143,9 @@ impl Palette {
                 sel_inactive: rgb(0xd9, 0xd9, 0xd9),
                 hover: rgb(0xe5, 0xf3, 0xff),
                 hover_sort: rgb(0xdc, 0xed, 0xfc),
+                alt_bg: rgb(0xf4, 0xf4, 0xf4),
+                alt_sort_bg: rgb(0xec, 0xec, 0xec),
+                grid: rgb(0xe5, 0xe5, 0xe5),
                 chrome: rgb(0xf0, 0xf0, 0xf0),
                 header: rgb(0xff, 0xff, 0xff),
                 header_sort: rgb(0xe8, 0xe8, 0xe8),

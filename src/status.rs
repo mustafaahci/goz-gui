@@ -244,14 +244,17 @@ pub fn paint(app: &App, hdc: HDC) {
         return;
     }
     let pal = app.pal.get();
+    // Options > View: one selected item's size, date and folder, and the
+    // size at the right.
+    let ui = app.ui();
     let sel_count = send(app, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
-    let first_selected = if sel_count == 1 {
+    let first_selected = if sel_count == 1 && ui.selected_in_status {
         app.selected(1).first().copied()
     } else {
         None
     };
     let total = app.model.borrow().total;
-    let held = if sel_count > 0 && sel_count < total {
+    let held = if ui.size_in_status && sel_count > 0 && sel_count < total {
         app.selected_held()
     } else {
         Vec::new()
@@ -287,7 +290,10 @@ pub fn paint(app: &App, hdc: HDC) {
             left.push(text.clone());
         } else {
             let selection = match (sel_count, first_selected.and_then(|i| m.row(i))) {
-                (0, _) | (1, None) => Selection::None,
+                (0, _) => Selection::None,
+                // Not shown (Options > View), or not loaded yet: counted.
+                (1, None) if !ui.selected_in_status => Selection::Many(1),
+                (1, None) => Selection::None,
                 (1, Some(row)) => Selection::One {
                     size: row.size.filter(|_| !row.is_dir),
                     date: row.mtime.map(|ft| {
@@ -313,7 +319,12 @@ pub fn paint(app: &App, hdc: HDC) {
                 .filter_map(|&i| m.row(i))
                 .map(|r| r.size.filter(|_| !r.is_dir));
             let whole = m.total_size.or_else(|| m.held_total_size());
-            if let Some(size) = total_size(m.total, whole, sel_count, sizes) {
+            let size = if ui.size_in_status {
+                total_size(m.total, whole, sel_count, sizes)
+            } else {
+                None
+            };
+            if let Some(size) = size {
                 right.push(Part {
                     text: format::size_auto(size),
                     colour: pal.fg,

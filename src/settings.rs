@@ -10,13 +10,17 @@
 //!
 //! **Home** (`home_*`) works as Everything's does: `0` uses the last value,
 //! `1` a fixed ("custom") one. The fixed value is the plain key's
-//! (`home_match_case=1` with `match_case=1` makes Home match case), so
-//! goz-gui does not write that key while it is fixed. `home_match_case` and
+//! (`home_match_case=1` with `match_case=1` makes Home match case), so the
+//! window does not write that key while it is fixed (Options > Home does,
+//! from the settings read: see `window/prefs.rs`). `home_match_case` and
 //! `home_match_path` also take Everything's `2` (always on) and `3` (always
-//! off), which fix the option without the plain key: that one still holds
-//! the last value and is written as it changes. Any other number uses the
-//! last value. A window starts from the plain keys either way; History >
-//! Home sets the fixed values and leaves the others as they are.
+//! off), Options > Home's "Enabled" and "Disabled", which fix the option
+//! without the plain key: that one still holds the last value and is
+//! written as it changes. Any other number uses the last value. A window
+//! that does not start from a session starts from Home: the plain keys,
+//! with `2` and `3` applied ([`Settings::home_start`]); History > Home sets
+//! the fixed values and leaves the others as they are. `home_view` fixes
+//! the view (`view`, `thumbnail_size`) the same way.
 
 use goz_core::types::{SortDir, SortKey, SortSpec};
 
@@ -28,6 +32,7 @@ use crate::menu;
 use crate::places::Places;
 use crate::store::ini::Ini;
 use crate::theme::ThemeMode;
+use crate::ui_options::UiOptions;
 use crate::view::View;
 
 /// View > On Top (`ontop`).
@@ -193,6 +198,8 @@ impl EnterAction {
 pub struct Home {
     pub search: Option<String>,
     pub options: bookmarks::Settings,
+    /// Details, or thumbnails at a size (`home_view=1`).
+    pub view: Option<View>,
 }
 
 /// What `home_match_case` or `home_match_path` says Home does with the
@@ -250,6 +257,7 @@ pub struct HomeFixed {
     pub search: bool,
     pub filter: bool,
     pub sort: bool,
+    pub view: bool,
 }
 
 impl Default for HomeFixed {
@@ -262,6 +270,7 @@ impl Default for HomeFixed {
             search: true,
             filter: false,
             sort: false,
+            view: false,
         }
     }
 }
@@ -334,6 +343,10 @@ pub struct Settings {
     // F5 (file tools).
 
     // F6 (integration and the Options pages).
+    /// What Options' UI, Search, Results and View pages set
+    /// (`allow_multiple_windows`, `search_as_you_type`, `size_format`, ...;
+    /// see `crate::ui_options`).
+    pub ui: UiOptions,
 }
 
 /// Running in the background, the tray icon and the global hotkeys, under
@@ -415,6 +428,7 @@ impl Default for Settings {
             // F5 (file tools).
 
             // F6 (integration and the Options pages).
+            ui: UiOptions::default(),
         }
     }
 }
@@ -455,15 +469,16 @@ const SESSION_SAVE_DELAY_MIN: u32 = 1000;
 pub const LIVE_UPDATE_MS: u32 = 2000;
 /// The shortest interval taken from the file (0 aside, which is off), so a
 /// typo cannot make goz-gui search many times a second.
-const LIVE_UPDATE_MIN: u32 = 500;
+pub const LIVE_UPDATE_MIN: u32 = 500;
 
 /// The keys Home can fix, each with the plain key(s) holding its value.
-const HOME_KEYS: [(&str, &[&str]); 5] = [
+const HOME_KEYS: [(&str, &[&str]); 6] = [
     ("home_match_case", &["match_case"]),
     ("home_match_path", &["match_path"]),
     ("home_search", &["search"]),
     ("home_filter", &["filter"]),
     ("home_sort", &["sort", "sort_ascending"]),
+    ("home_view", &["view", "thumbnail_size"]),
 ];
 
 impl Settings {
@@ -566,6 +581,7 @@ impl Settings {
                 search: fixed("home_search", d.home.search),
                 filter: fixed("home_filter", d.home.filter),
                 sort: fixed("home_sort", d.home.sort),
+                view: fixed("home_view", d.home.view),
             },
             bookmark_remember: bookmarks::Remember {
                 case: remember("bookmark_remember_case", r.case),
@@ -616,6 +632,7 @@ impl Settings {
             // F5 (file tools).
 
             // F6 (integration and the Options pages).
+            ui: UiOptions::from_keys(|k| ini.get(k)),
         }
     }
 
@@ -688,6 +705,7 @@ impl Settings {
         put("home_search", bit(f.search));
         put("home_filter", bit(f.filter));
         put("home_sort", bit(f.sort));
+        put("home_view", bit(f.view));
         // Everything's order.
         let r = &self.bookmark_remember;
         put("bookmark_remember_case", bit(r.case));
@@ -725,6 +743,7 @@ impl Settings {
         // F5 (file tools).
 
         // F6 (integration and the Options pages).
+        out.extend(self.ui.to_keys());
 
         out
     }
@@ -741,6 +760,7 @@ impl Settings {
             f.search,
             f.filter,
             f.sort,
+            f.view,
         ];
         HOME_KEYS
             .iter()
@@ -759,6 +779,25 @@ impl Settings {
                 filter: f.filter.then_some(self.filter),
                 sort: f.sort.then_some(self.sort),
             },
+            view: f.view.then_some(self.view),
+        }
+    }
+
+    /// The settings a window starts with when it starts from Home rather
+    /// than a session: the plain keys (which hold Home's fixed values),
+    /// with the match options Home holds always on or off.
+    pub fn home_start(&self) -> Settings {
+        let f = &self.home;
+        Settings {
+            match_case: f
+                .match_case
+                .value(self.match_case)
+                .unwrap_or(self.match_case),
+            match_path: f
+                .match_path
+                .value(self.match_path)
+                .unwrap_or(self.match_path),
+            ..self.clone()
         }
     }
 }
@@ -859,6 +898,7 @@ mod tests {
                 search: false,
                 filter: true,
                 sort: true,
+                view: true,
             },
             bookmark_remember: bookmarks::Remember {
                 case: false,
@@ -914,6 +954,12 @@ mod tests {
                 d
             },
             options_page: "History".into(),
+            ui: UiOptions {
+                alternate_rows: true,
+                size_format: crate::ui_options::SizeFormat::Auto,
+                rename_stem: crate::ui_options::Tri::Off,
+                ..UiOptions::default()
+            },
         };
         let mut ini = Ini::default();
         for (k, v) in s.to_pairs() {
@@ -958,6 +1004,11 @@ mod tests {
             "pane_title=1",
             "pane_min_wide=32",
             "options_last_page=History",
+            "home_view=1",
+            "alternate_row_color=1",
+            "size_format=0",
+            "rename_select_filepart_only=2",
+            "show_mouseover=1",
         ] {
             assert!(text.contains(&format!("{line}\r\n")), "{line} in\n{text}");
         }
@@ -1037,6 +1088,7 @@ mod tests {
             Home {
                 search: Some(String::new()),
                 options: bookmarks::Settings::default(),
+                view: None,
             }
         );
         assert!(s.is_fixed("search"));
@@ -1101,5 +1153,43 @@ mod tests {
             assert_eq!(s.home().options.match_case, home, "{text}");
             assert_eq!(s.is_fixed("match_case"), fixed, "{text}");
         }
+    }
+
+    #[test]
+    fn a_window_starts_from_home() {
+        // Always on and always off apply at the start; the last value and a
+        // fixed one are the plain key's already.
+        for (text, case, path) in [
+            (
+                "home_match_case=2\r\nmatch_case=0\r\nhome_match_path=3\r\nmatch_path=1\r\n",
+                true,
+                false,
+            ),
+            (
+                "home_match_case=0\r\nmatch_case=1\r\nhome_match_path=1\r\nmatch_path=1\r\n",
+                true,
+                true,
+            ),
+            ("match_case=0\r\nmatch_path=0\r\n", false, false),
+        ] {
+            let s = Settings::from_ini(&Ini::from_text(text)).home_start();
+            assert_eq!((s.match_case, s.match_path), (case, path), "{text}");
+        }
+        // The rest is as read.
+        let s = Settings::from_ini(&Ini::from_text("search=x\r\nhome_search=0\r\n"));
+        assert_eq!(s.home_start().search, "x");
+    }
+
+    #[test]
+    fn home_can_fix_the_view() {
+        let s = Settings::from_ini(&Ini::from_text(
+            "home_view=1\r\nview=1\r\nthumbnail_size=64\r\n",
+        ));
+        assert_eq!(s.home().view, Some(View::thumbnails(crate::view::MEDIUM)));
+        assert!(s.is_fixed("view") && s.is_fixed("thumbnail_size"));
+        assert!(!s.is_fixed("statusbar_view_thumbnail_size"));
+        let s = Settings::from_ini(&Ini::from_text("view=1\r\n"));
+        assert_eq!(s.home().view, None);
+        assert!(!s.is_fixed("view"));
     }
 }

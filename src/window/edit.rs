@@ -16,7 +16,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::DefSubclassProc;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, SendMessageW, SetWindowTextW, WM_CHAR, WM_CLEAR, WM_CUT, WM_DROPFILES,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_PASTE, WM_SYSKEYDOWN, WM_UNDO,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEWHEEL, WM_PASTE, WM_SYSKEYDOWN,
+    WM_UNDO,
 };
 
 use super::{App, key_down, send};
@@ -126,6 +127,11 @@ impl App {
     /// `search_edit_enter_action` says; `runs.rs`), the keyboard staying
     /// here, and the next opens the selection.
     fn edit_enter(&self) {
+        // Text typed and not searched yet (search as you type off, or its
+        // delay running) is searched now; its results take Enter's pick.
+        if self.search_is_dirty() {
+            self.start_search(false);
+        }
         self.record_search();
         let searching = self
             .model
@@ -234,7 +240,34 @@ unsafe fn edit_message(app: &App, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 delete_word(hwnd, true);
                 return 0;
             }
-            WM_KILLFOCUS => dropdown::close(app),
+            WM_KILLFOCUS => {
+                app.click_select.set(false);
+                dropdown::close(app);
+            }
+            // Options > Search's "Select search on mouse click": a click
+            // that puts the keyboard here selects all of the text once the
+            // button is up, unless it dragged over some of it.
+            WM_LBUTTONDOWN => {
+                if app.ui().select_on_click && GetFocus() != hwnd {
+                    app.click_select.set(true);
+                }
+            }
+            WM_LBUTTONUP => {
+                let r = DefSubclassProc(hwnd, msg, w, l);
+                if app.click_select.replace(false) {
+                    let (mut start, mut end) = (0u32, 0u32);
+                    send(
+                        hwnd,
+                        EM_GETSEL,
+                        (&raw mut start) as usize,
+                        (&raw mut end) as isize,
+                    );
+                    if start == end {
+                        send(hwnd, EM_SETSEL, 0, -1);
+                    }
+                }
+                return r;
+            }
             // A drop on the box is a drop on the window.
             WM_DROPFILES => {
                 app.drop_files(w as _);

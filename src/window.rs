@@ -45,7 +45,7 @@ use crate::copytext::{self, Field};
 use crate::dropdown::Dropdown;
 use crate::fileops::{self, FileOps};
 use crate::filter::{self, Filter};
-use crate::highlight::{Highlight, Span};
+use crate::highlight::Span;
 use crate::history::{NavHistory, SearchHistory};
 use crate::icons::{GENERIC, IconReply, Icons};
 use crate::layout::Regions;
@@ -105,6 +105,7 @@ mod typing;
 // F5 (file tools).
 
 // F6 (integration and the Options pages).
+mod uiopts;
 
 pub const WM_REPLY: u32 = WM_APP + 1;
 pub const WM_ICON: u32 = WM_APP + 2;
@@ -420,6 +421,20 @@ pub struct App {
     // F5 (file tools).
 
     // F6 (integration and the Options pages).
+    /// Options' UI, Search, Results and View settings in force (the
+    /// settings file's copy is `prefs.base.ui`; see `uiopts.rs`).
+    ui: Cell<crate::ui_options::UiOptions>,
+    /// The search box holds text typed and not searched yet (search as you
+    /// type is off, or its delay runs).
+    search_dirty: Cell<bool>,
+    /// One click on a result opens it (`single_click_open`, resolved).
+    single_click: Cell<bool>,
+    /// A click is putting the keyboard in the search box: its text is
+    /// selected once the button is up (`select_search_on_mouse_click`).
+    click_select: Cell<bool>,
+    /// Started with `-new-window`: the tray icon, the hotkeys and running
+    /// in the background belong to the first goz-gui.
+    secondary: Cell<bool>,
 }
 
 /// How the program that started goz-gui asked for its window to be shown
@@ -490,6 +505,28 @@ fn prefs_background(app: &App) -> crate::settings::Background {
     app.prefs.borrow().base.background
 }
 
+/// Whether this start, with another goz-gui running on the data folder,
+/// opens a window of its own (Options > UI's "Create a new window when
+/// running goz-gui", `allow_multiple_windows`) rather than showing that
+/// one. Never for a start that closes, toggles or hides goz-gui, nor with
+/// `-no-new-window`. The settings file is only read here: the running
+/// goz-gui owns it.
+fn new_window_on_start(l: &crate::cmdline::Launch) -> bool {
+    if l.exit || l.toggle_window || l.startup || l.new_window == Some(false) {
+        return false;
+    }
+    let Some(path) = crate::store::location::data_file(crate::store::location::SETTINGS_FILE)
+    else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    crate::store::ini::Ini::parse(&bytes).is_ok_and(|ini| {
+        crate::ui_options::UiOptions::from_keys(|k| ini.get(k)).new_window_on_start
+    })
+}
+
 pub fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let launch = match crate::cmdline::parse(&args) {
@@ -509,10 +546,14 @@ See Help > Search Syntax and the README for goz-gui's switches."
         }
     };
     // One goz-gui per data folder (and -instance name): a second start
-    // hands its command line over and ends.
+    // hands its command line over and ends, unless it is to be a window of
+    // its own (`-new-window`, or Options > UI's "Create a new window when
+    // running goz-gui", `crate::newwin`).
     let key = crate::instance::key(launch.instance.as_deref());
+    let first = crate::instance::claim(&key);
+    let secondary = !first && (launch.new_window == Some(true) || new_window_on_start(&launch));
     // If the one holding the instance does not answer, start anyway.
-    if !crate::instance::claim(&key) && crate::instance::forward(&key, &args) {
+    if !first && !secondary && crate::instance::forward(&key, &args) {
         return 0;
     }
     if launch.exit {
@@ -529,9 +570,16 @@ See Help > Search Syntax and the README for goz-gui's switches."
     let restored = sessions.at_start();
     let mut settings = match &restored {
         Some(s) => session::start_settings(&prefs.base, s),
-        None => prefs.base.clone(),
+        // Home's match options that are always on or off apply too.
+        None => prefs.base.home_start(),
     };
     apply_launch_settings(&mut settings, &launch);
+    if secondary && let Some(w) = settings.window.as_mut() {
+        // A new window opens down and right of the first one's place.
+        let off = crate::newwin::OFFSET * w.dpi.unwrap_or(96) as i32 / 96;
+        w.x += off;
+        w.y += off;
+    }
     // Popup menus follow the theme from the first one on.
     theme::set_app_mode(settings.theme);
     // Where the window was, on the monitors there are now.
@@ -592,12 +640,18 @@ See Help > Search Syntax and the README for goz-gui's switches."
         ));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as *const App as isize);
         APP.set(Some(app));
+        app.secondary.set(secondary);
         app.init(start.is_none());
-        crate::instance::listen(&key, hwnd, WM_LAUNCH);
+        // A new window leaves the starts handed over, the tray icon and
+        // the hotkeys to the first goz-gui.
+        if !secondary {
+            crate::instance::listen(&key, hwnd, WM_LAUNCH);
+        }
         let taken = app.apply_background(prefs_background(app));
         // -startup (signing in to Windows) starts in the background, with
-        // no window.
-        let asked = if launch.startup {
+        // no window; not a new window, which has no tray icon to come back
+        // from.
+        let asked = if launch.startup && !secondary {
             SW_HIDE
         } else {
             startup_show()
@@ -687,8 +741,11 @@ See Help > Search Syntax and the README for goz-gui's switches."
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        // A copy or move still running finishes first.
+        // A copy or move still running finishes first, and so do the
+        // opens handed to the shell (Close window on execute closes right
+        // after one).
         app.fileops.finish();
+        crate::actions::wait_for_launches(Duration::from_secs(10));
         shell::ole_done();
         msg.wParam as i32
     }
@@ -939,6 +996,11 @@ impl App {
                 // F5 (file tools).
 
                 // F6 (integration and the Options pages).
+                ui: Cell::new(s.ui),
+                search_dirty: Cell::new(false),
+                single_click: Cell::new(false),
+                click_select: Cell::new(false),
+                secondary: Cell::new(false),
             })
         }
     }
@@ -964,6 +1026,10 @@ impl App {
             ex as usize,
             ex as isize,
         );
+        // Full row select and one-click opening as Options > Results says,
+        // sizes as Options > View says.
+        self.apply_list_style();
+        crate::format::set_size_format(self.ui.get().size_format);
         self.apply_columns(self.layout.get());
         // The dialogs open where they were; one that moved asks for the
         // settings to be written.
@@ -1390,8 +1456,13 @@ impl App {
                     } else if !searchbox::button_down(self, pt)
                         && in_rect(&self.search_rc.get(), pt)
                     {
-                        // The frame round the text is the search box too.
+                        // The frame round the text is the search box too,
+                        // its text selected as a click in it would.
+                        let had = GetFocus() == self.edit;
                         self.focus_box();
+                        if !had && self.ui.get().select_on_click && GetFocus() == self.edit {
+                            send(self.edit, EM_SETSEL, 0, -1);
+                        }
                     }
                     0
                 }
@@ -1628,6 +1699,14 @@ impl App {
                     0
                 }
                 WM_ACTIVATE => {
+                    // Options > Search's "Focus search on activate": the
+                    // keyboard goes to the search box, its text selected,
+                    // once the activation is done (Windows gives the
+                    // keyboard back to where it was as it ends). Not for
+                    // a click, whose control takes it where it lands.
+                    let to_search = u32::from(loword(w)) == WA_ACTIVE
+                        && hiword(w) == 0
+                        && self.ui.get().focus_on_activate;
                     if u32::from(loword(w)) == WA_INACTIVE {
                         dropdown::close(self);
                         let focus = GetFocus();
@@ -1637,6 +1716,21 @@ impl App {
                             self.last_focus.set(focus);
                         }
                     } else {
+                        if to_search {
+                            self.last_focus.set(self.edit);
+                            PostMessageW(self.hwnd, uiopts::WM_FOCUS_SEARCH, 0, 0);
+                        }
+                        // A click on the search box that activates the
+                        // window selects its text too (select search on
+                        // mouse click), though the box had the keyboard.
+                        let mut pt = POINT::default();
+                        if u32::from(loword(w)) == WA_CLICKACTIVE
+                            && self.ui.get().select_on_click
+                            && GetCursorPos(&mut pt) != 0
+                            && WindowFromPoint(pt) == self.edit
+                        {
+                            self.click_select.set(true);
+                        }
                         self.refresh_if_idle();
                         self.arm_live();
                     }
@@ -1680,7 +1774,9 @@ impl App {
                     paint::menubar_line(self);
                     r
                 }
-                WM_CLOSE if self.background().run_in_background => {
+                // A new window (`-new-window`) ends when closed: running in
+                // the background and the tray are the first goz-gui's.
+                WM_CLOSE if self.background().run_in_background && !self.is_secondary() => {
                     // goz-gui keeps running in the background.
                     self.hide_to_background();
                     0
@@ -1688,7 +1784,8 @@ impl App {
                 WM_SYSCOMMAND
                     if (w & 0xfff0) == SC_MINIMIZE as usize
                         && self.background().minimize_to_tray
-                        && self.background().tray_icon() =>
+                        && self.background().tray_icon()
+                        && !self.is_secondary() =>
                 {
                     self.hide_to_background();
                     0
@@ -1771,9 +1868,20 @@ impl App {
                         self.sort_by_column(id);
                     }
                 }
-                NM_DBLCLK => {
+                // With one-click opening (Options > Results) the click
+                // opens, and the double-click that may follow does not
+                // again.
+                NM_DBLCLK if !self.single_click_open() => {
                     let nm = &*(l as *const NMITEMACTIVATE);
                     if nm.iItem >= 0 {
+                        self.double_click(nm.ptAction);
+                    }
+                }
+                NM_CLICK if self.single_click_open() => {
+                    let nm = &*(l as *const NMITEMACTIVATE);
+                    // Ctrl and Shift pick rows; a plain click opens.
+                    let keys = LVKF_ALT | LVKF_CONTROL | LVKF_SHIFT;
+                    if nm.iItem >= 0 && nm.uKeyFlags & keys == 0 {
                         self.double_click(nm.ptAction);
                     }
                 }
@@ -1898,6 +2006,12 @@ impl App {
         {
             return;
         }
+        // Nor while the box holds text typed and not searched yet (search
+        // as you type is off, or its delay runs): a refresh would search it
+        // as if it were the search on screen.
+        if keep_place && self.search_is_dirty() {
+            return;
+        }
         // Nor while a row is being renamed: the refreshed rows could put
         // another file under its box. It runs once the box is closed. Nor
         // while an action waits for its rows, which are this search's.
@@ -1924,8 +2038,13 @@ impl App {
             self.enter_pending.set(false);
             self.cancel_fetch();
             self.clear_note();
-            self.forget_selection();
+            // Files still to be selected again stay sought when a new
+            // search keeps the selection (Options > Results).
+            if self.ui.get().clear_selection {
+                self.forget_selection();
+            }
             self.drop_view();
+            self.search_started();
             self.settled.set(false);
             self.beeped.set(false);
             // Its options (and its text, when Home keeps the last search)
@@ -1944,16 +2063,41 @@ impl App {
         self.model.borrow_mut().pending = Some(Pending {
             epoch,
             search: Arc::clone(&search),
-            highlight: Highlight::new(&text, o.match_case, o.match_path),
+            highlight: self.highlight_for(&text, o.match_case, o.match_path),
             keep_place,
         });
         self.worker.begin(epoch);
-        self.worker.push(Job::Block {
-            epoch,
-            block: 0,
-            search: Arc::clone(&search),
-        });
-        if keep_place {
+        let hidden = self.ui.get().hide_empty && text.trim().is_empty();
+        if hidden {
+            // Options > Results' "Hide results when the search is empty":
+            // gozd is not asked; the empty answer comes as its would, so
+            // the window takes it as any other.
+            let empty = Box::into_raw(Box::new(Reply::Block {
+                epoch,
+                block: 0,
+                rows: Vec::new(),
+                total: 0,
+                incomplete: false,
+                metadata_pending: false,
+                total_size: None,
+                elapsed: Duration::ZERO,
+            }));
+            // SAFETY: posts to this thread's window, which owns the box
+            // once the message is queued; if posting fails it is taken
+            // back.
+            unsafe {
+                if PostMessageW(self.hwnd, WM_REPLY, 0, empty as isize) == 0 {
+                    drop(Box::from_raw(empty));
+                }
+            }
+        } else {
+            self.worker.push(Job::Block {
+                epoch,
+                block: 0,
+                search: Arc::clone(&search),
+            });
+        }
+        if keep_place && !hidden {
             // Fetch where the user is looking too, so a refresh repaints in
             // place instead of row by row.
             let top = self.top_index() as u32;
@@ -1990,17 +2134,21 @@ impl App {
 
     /// The search box's text changed: a new search, not yet in the history;
     /// the clear button may become a magnifier or back. Typed, it may bring
-    /// suggestions; set by goz-gui (a history entry chosen, Back), the
-    /// dropdown closes.
+    /// suggestions, and it is searched at once, after the search delay or
+    /// on Enter (Options > Search); set by goz-gui (a history entry chosen,
+    /// Back), the dropdown closes and it is searched at once.
     fn text_changed(&self) {
         self.recorded.set(false);
-        if self.typing.get() {
+        let typed = self.typing.get();
+        if typed {
             self.suggest();
         } else {
             dropdown::close(self);
         }
         searchbox::invalidate(self);
-        self.start_search(false);
+        if self.search_now_or_later(typed) {
+            self.start_search(false);
+        }
     }
 
     /// A click on a search box button.
@@ -2075,15 +2223,19 @@ impl App {
                 total_size,
                 elapsed,
             } => {
-                let refresh = self
-                    .model
-                    .borrow()
-                    .pending
-                    .as_ref()
-                    .is_some_and(|p| p.epoch == epoch && p.keep_place);
+                let (refresh, fresh) = {
+                    let m = self.model.borrow();
+                    let p = m.pending.as_ref().filter(|p| p.epoch == epoch);
+                    (
+                        p.is_some_and(|p| p.keep_place),
+                        p.is_some_and(|p| !p.keep_place),
+                    )
+                };
                 // What is selected, by path, while the rows it is on are
-                // still the ones held.
-                let kept = refresh.then(|| self.note_selection());
+                // still the ones held: for a refresh, and for a new search
+                // when Options > Results keeps the selection.
+                let keep_selection = fresh && !self.ui.get().clear_selection;
+                let kept = (refresh || keep_selection).then(|| self.note_selection());
                 let on_screen = self.view_blocks();
                 let mut m = self.model.borrow_mut();
                 let mut adopted = None;
@@ -2122,16 +2274,28 @@ impl App {
                         // must not drop it.
                         let view = self.take_view(epoch);
                         self.set_count(total, keep);
+                        let (kept_refresh, kept_search) = match kept {
+                            Some(k) if keep => (Some(k), None),
+                            k => (None, k),
+                        };
                         if let Some(view) = view {
                             // A restored session's search: its place and
                             // selection.
                             self.apply_view(view, total);
-                        } else if let Some(kept) = kept {
+                        } else if let Some(kept) = kept_refresh {
                             // The list's selection is by row number, which
                             // now may be another file's.
                             self.restore_selection(kept, total);
                         } else if self.enter_pending.take() {
                             self.enter_select();
+                        } else if let Some(kept) = kept_search {
+                            // Another search: the files selected are
+                            // selected again where they are in it, from
+                            // its top.
+                            self.restore_selection(kept.for_new_search(), total);
+                            if total > 0 {
+                                send(self.list, LVM_ENSUREVISIBLE, 0, 0);
+                            }
                         } else {
                             self.clear_selection();
                             if total > 0 {

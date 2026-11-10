@@ -7,8 +7,10 @@
 //! `-sort <name>` with `-sort-ascending`/`-sort-descending`,
 //! `-case`/`-nocase`, `-matchpath`/`-nomatchpath`, `-startup` (start in the
 //! background, no window), `-toggle-window`, `-exit` (close the running
-//! goz-gui), `-instance <name>`. Anything else is search text, as if after
-//! `-s`.
+//! goz-gui), `-instance <name>`, `-url <goz:link>` (a `goz:` link, see
+//! `crate::url`; it takes the rest of the line), `-new-window` and
+//! `-no-new-window` (a window of its own, or the running one whatever
+//! Options > UI says). Anything else is search text, as if after `-s`.
 
 use goz_core::types::{SortDir, SortKey};
 
@@ -33,6 +35,10 @@ pub struct Launch {
     pub exit: bool,
     /// A named instance: its own single-instance key.
     pub instance: Option<String>,
+    /// `-new-window` (`Some(true)`): a window of its own, not handed to
+    /// the one running; `-no-new-window` (`Some(false)`): handed over even
+    /// when Options > UI says a start opens another window.
+    pub new_window: Option<bool>,
 }
 
 impl Launch {
@@ -123,6 +129,25 @@ pub fn parse(args: &[String]) -> Result<Launch, String> {
             "toggle-window" => l.toggle_window = true,
             "exit" | "quit" => l.exit = true,
             "instance" => l.instance = Some(value("an instance name")?),
+            "new-window" => l.new_window = Some(true),
+            "no-new-window" => l.new_window = Some(false),
+            // A link Windows hands over as `-url "%1"`: all that follows
+            // the switch is the link, so a link holding quotes and spaces
+            // never becomes switches of its own.
+            "url" | "uri" => {
+                if i >= args.len() {
+                    return Err(format!("{arg} needs a goz: link"));
+                }
+                let link = args[i..].join(" ");
+                i = args.len();
+                let u = crate::url::parse(&link)?;
+                l.search = Some(u.search);
+                l.match_case = u.match_case.or(l.match_case);
+                l.match_path = u.match_path.or(l.match_path);
+                l.filter = u.filter.or(l.filter);
+                l.sort = u.sort.or(l.sort);
+                l.dir = u.dir.or(l.dir);
+            }
             _ => return Err(format!("unknown switch: {arg}")),
         }
     }
@@ -134,7 +159,7 @@ pub fn parse(args: &[String]) -> Result<Launch, String> {
 
 /// A sort by Everything's name for it (`Name`, `Path`, `Size`,
 /// `Date Modified`, also written `date-modified` or `dm`), any case.
-fn sort_by_name(name: &str) -> Option<SortKey> {
+pub(crate) fn sort_by_name(name: &str) -> Option<SortKey> {
     let n = name.trim().to_ascii_lowercase().replace(['-', '_'], " ");
     match n.as_str() {
         "dm" | "date modified" | "datemodified" => Some(SortKey::DateModified),
@@ -212,6 +237,33 @@ mod tests {
         assert_eq!(p(&["-bogus"]).unwrap_err(), "unknown switch: -bogus");
         assert!(p(&["-sort", "bogus"]).is_err());
         assert!(p(&["-filter", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn a_goz_link_sets_the_search_and_its_options() {
+        let l = p(&["-url", "goz:*.mp3%20live?case&filter=Audio&sort=size"]).unwrap();
+        assert_eq!(l.search.as_deref(), Some("*.mp3 live"));
+        assert_eq!(l.match_case, Some(true));
+        assert_eq!(l.filter, Some(Filter::Audio));
+        assert_eq!(l.sort, Some(SortKey::Size));
+        assert!(l.changes_search());
+        // Whatever follows is the link's, never a switch: a link broken up
+        // at its quotes and spaces is searched for as it was.
+        let l = p(&["-url", "goz:a", "-exit", "b"]).unwrap();
+        assert!(!l.exit);
+        assert_eq!(l.search.as_deref(), Some("a -exit b"));
+        assert_eq!(p(&["-url"]).unwrap_err(), "-url needs a goz: link");
+        assert!(p(&["-url", "goz:x?regex"]).unwrap_err().contains("regex"));
+        // Switches before it still count.
+        let l = p(&["-new-window", "/URI", "es:x"]).unwrap();
+        assert_eq!((l.new_window, l.search.as_deref()), (Some(true), Some("x")));
+    }
+
+    #[test]
+    fn new_window_switches() {
+        assert_eq!(p(&["-new-window"]).unwrap().new_window, Some(true));
+        assert_eq!(p(&["-no-new-window"]).unwrap().new_window, Some(false));
+        assert_eq!(p(&["x"]).unwrap().new_window, None);
     }
 
     #[test]

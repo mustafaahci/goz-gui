@@ -58,6 +58,11 @@ impl App {
     /// that another program holds already, by name, for the user.
     pub(super) fn apply_background(&self, b: Background) -> Vec<&'static str> {
         self.background.set(b);
+        // A new window (`-new-window`) leaves the tray icon and the
+        // hotkeys to the first goz-gui.
+        if self.is_secondary() {
+            return Vec::new();
+        }
         if b.tray_icon() {
             if !self.tray_on.get() {
                 let icon = self.window_icons.get()[0];
@@ -170,10 +175,24 @@ impl App {
                 self.tray_menu(pt);
             }
             NIN_SELECT | NIN_KEYSELECT if self.background.get().single_click_tray => {
-                self.toggle_window()
+                self.tray_open(true)
             }
-            WM_LBUTTONDBLCLK if !self.background.get().single_click_tray => self.show_window(),
+            WM_LBUTTONDBLCLK if !self.background.get().single_click_tray => self.tray_open(false),
             _ => {}
+        }
+    }
+
+    /// The tray icon was clicked to open goz-gui (`toggle`: a single click,
+    /// which puts a window in front away again): another window with
+    /// Options > UI's "Create a new window from the system tray", else
+    /// this one.
+    fn tray_open(&self, toggle: bool) {
+        if self.ui().new_window_from_tray {
+            self.new_window(&[]);
+        } else if toggle {
+            self.toggle_window();
+        } else {
+            self.show_window();
         }
     }
 

@@ -665,6 +665,9 @@ impl App {
             self.record_runs(paths.iter().map(|p| &p[..]), true);
             actions::reveal(paths);
             self.note_partial(Act::OpenPath, done, selected);
+            if done > 0 {
+                self.executed();
+            }
         } else {
             let (targets, selected) = self.picked_targets();
             if !self.confirm_open(targets.len()) {
@@ -674,6 +677,9 @@ impl App {
             self.record_runs(targets.iter().map(|t| &t.path[..]), false);
             actions::open(self.hwnd, targets);
             self.note_partial(Act::Open, done, selected);
+            if done > 0 {
+                self.executed();
+            }
         }
     }
 
@@ -689,6 +695,9 @@ impl App {
         let done = paths.len();
         actions::run_as(self.hwnd, paths);
         self.note_partial(Act::RunAs, done, selected);
+        if done > 0 {
+            self.executed();
+        }
     }
 
     /// The shell's Properties for the selection, in one sheet (off this
@@ -706,6 +715,11 @@ impl App {
     /// Copies `field` of each selected row, as the list shows it, one row
     /// per line.
     pub(super) fn copy(&self, field: Field) {
+        // Options > Results' "Double quote copy as path".
+        let field = match field {
+            Field::FullPath if self.ui().quote_copy_path => Field::QuotedFullPath,
+            f => f,
+        };
         if self.fetch_first(Then::Copy(field)) {
             return;
         }
@@ -765,11 +779,14 @@ impl App {
         self.column_id(hit.iSubItem as usize)
     }
 
-    /// A double-click on a row at `pt`: opens the selection, or its path
-    /// when the click was in the Path column or Ctrl was down.
+    /// A double-click (or with one-click opening, a click) on a row at
+    /// `pt`: opens the selection, or its path when Ctrl was down or the
+    /// click was in the Path column (unless Options > Results' "Open path
+    /// with double click in path column" is off).
     pub(super) fn double_click(&self, pt: POINT) {
         self.record_search();
-        let reveal = key_down(VK_CONTROL) || self.column_at(pt) == Some(COL_PATH);
+        let in_path = self.ui().double_click_path && self.column_at(pt) == Some(COL_PATH);
+        let reveal = key_down(VK_CONTROL) || in_path;
         self.open_selected(reveal);
     }
 }
