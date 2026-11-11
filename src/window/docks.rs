@@ -129,6 +129,12 @@ fn side_index(side: Side) -> usize {
     }
 }
 
+/// Pane `id`'s least height in `least` (`App::least_heights`); 0 for one
+/// opened since.
+fn least_of(least: &[(PaneId, i32)], id: PaneId) -> i32 {
+    least.iter().find(|(p, _)| *p == id).map_or(0, |&(_, h)| h)
+}
+
 fn slot_index(slot: StripSlot) -> usize {
     match slot {
         StripSlot::Tabs => 0,
@@ -591,10 +597,32 @@ impl App {
         )
     }
 
+    /// The least height of each open pane on `side`, its title row
+    /// included: its spec's `min_high`, or what its content needs at the
+    /// fonts now if that is more. Nothing of the docks is borrowed while
+    /// the contents are asked.
+    fn least_heights(&self, side: Side) -> Vec<(PaneId, i32)> {
+        let title = pane::title_height(self);
+        let open: Vec<(PaneId, i32, Rc<dyn PaneContent>)> = self
+            .docks
+            .borrow()
+            .open_on(side)
+            .iter()
+            .filter_map(|p| Some((p.id, p.min_high, p.open.as_ref()?.content.clone())))
+            .collect();
+        open.into_iter()
+            .map(|(id, min, content)| (id, title + self.scale(min).max(content.least_high(self))))
+            .collect()
+    }
+
     /// Places the open panes in `r`'s docks (into `defer`), and notes where
     /// they and their dividers went.
     pub(super) fn place_panes(&self, r: &Regions, defer: &mut Defer) {
-        let title = pane::title_height(self);
+        // Measured before the docks are borrowed: the contents are asked.
+        let least = [
+            self.least_heights(Side::Left),
+            self.least_heights(Side::Right),
+        ];
         let divider = self.scale(dock::DIVIDER);
         let dpi = self.dpi.get();
         let mut placed = Placed::default();
@@ -615,7 +643,7 @@ impl App {
                     .collect();
                 let mins: Vec<i32> = open
                     .iter()
-                    .map(|p| title + self.scale(p.min_high))
+                    .map(|p| least_of(&least[side_index(side)], p.id))
                     .collect();
                 let (panes, splits) = dock::stack(rc, &wanted, &mins, divider);
                 for (p, prc) in open.iter().zip(&panes) {
@@ -769,7 +797,10 @@ impl App {
         let r = self.regions.get();
         let (min_dock, min_center) = self.dock_limits();
         let divider_w = self.scale(dock::DIVIDER);
-        let title = pane::title_height(self);
+        let least = [
+            self.least_heights(Side::Left),
+            self.least_heights(Side::Right),
+        ];
         let changed = {
             let mut d = self.docks.borrow_mut();
             let Some(drag) = d.drag.as_ref() else {
@@ -811,7 +842,7 @@ impl App {
                     let open: Vec<(PaneId, i32)> = d
                         .open_on(side)
                         .iter()
-                        .map(|p| (p.id, title + self.scale(p.min_high)))
+                        .map(|p| (p.id, least_of(&least[side_index(side)], p.id)))
                         .collect();
                     if open.len() != heights.len() {
                         // A pane came or went meanwhile: nothing to follow.

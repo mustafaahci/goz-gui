@@ -252,14 +252,8 @@ fn item(app: &App, cd: &NMCUSTOMDRAW) {
     } else {
         State::Normal
     };
-    let font = {
-        let fonts = app.fonts.borrow();
-        if pal.is_bold(Item::Header, state) {
-            fonts.bold
-        } else {
-            fonts.normal
-        }
-    };
+    // Fonts and Colors' Header font.
+    let font = app.part_font(Item::Header, pal.is_bold(Item::Header, state));
     // SAFETY: draws into the header's DC; the old font is put back.
     unsafe {
         let old = SelectObject(hdc, font);

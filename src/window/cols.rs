@@ -233,7 +233,8 @@ impl App {
     fn fit_px(&self, index: usize) -> Option<i32> {
         let id = self.column_id(index)?;
         let title: Vec<u16> = columns::title(id).encode_utf16().collect();
-        let font = self.fonts.borrow().normal;
+        // The title in the header's font.
+        let font = self.part_font(crate::colors::Item::Header, false);
         // SAFETY: a DC of this thread's list, measured in and given back;
         // the old font is put back first.
         let title_w = unsafe {

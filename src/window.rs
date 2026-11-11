@@ -77,6 +77,7 @@ mod context;
 // Wave 4 (G2): customization, and accessibility of the painted parts.
 mod access;
 mod custom;
+mod fonts;
 pub use access::pane_object;
 mod docks;
 mod edit;
@@ -215,11 +216,6 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    /// The message font at `dpi`, `zoom` % its size (View > Zoom).
-    fn new(dpi: u32, zoom: u32) -> Fonts {
-        Fonts::make(dpi, zoom, |_| {})
-    }
-
     /// The message font at `dpi` as `adjust` changes it (a face and size
     /// of Options > Fonts and Colors), then `zoom` % its size.
     fn make(
@@ -288,11 +284,13 @@ pub struct App {
     pub list: HWND,
     pub header: HWND,
     pub dpi: Cell<u32>,
-    /// The result list's fonts, at View > Zoom's size: its rows, header,
-    /// rename box and the status bar.
+    /// The result list's fonts, at View > Zoom's size: its rows, rename
+    /// box and tips, and the header and the status bar while they have no
+    /// font of their own (`fonts.rs`).
     pub fonts: RefCell<Fonts>,
-    /// The rest of the window's: the search box, its dropdown, the filter
-    /// bar, which Zoom leaves as they are.
+    /// The window's own: Fonts and Colors' (Default), which Zoom leaves as
+    /// it is; the search box's dropdown, and every other part while it has
+    /// no font of its own.
     pub ui_fonts: RefCell<Fonts>,
     /// View > Zoom, in percent.
     zoom: Cell<u32>,
@@ -1047,8 +1045,18 @@ impl App {
                 list,
                 header,
                 dpi: Cell::new(dpi),
-                fonts: RefCell::new(Fonts::with(dpi, s.zoom, &s.custom.colors.result_list_font)),
-                ui_fonts: RefCell::new(Fonts::new(dpi, crate::zoom::DEFAULT)),
+                fonts: RefCell::new(Fonts::with(
+                    dpi,
+                    s.zoom,
+                    &s.custom
+                        .colors
+                        .resolved_font(crate::colors::Item::ResultList),
+                )),
+                ui_fonts: RefCell::new(Fonts::with(
+                    dpi,
+                    crate::zoom::DEFAULT,
+                    &s.custom.colors.resolved_font(crate::colors::Item::Default),
+                )),
                 zoom: Cell::new(s.zoom),
                 wheel: Cell::new(0),
                 filter_bar: Cell::new(s.filter_bar),
@@ -1209,6 +1217,8 @@ impl App {
         dropdown::create(self);
         self.tooltip.set(searchbox::create_tooltip(self));
         celltip::create(self);
+        // Wave 6: the parts with a font of their own (`fonts.rs`).
+        self.make_part_fonts();
         self.apply_fonts();
         theme::set_app_mode(self.theme_mode.get());
         self.apply_theme();
@@ -1220,9 +1230,8 @@ impl App {
         // The panes this build has (and the test hook's), opened as the
         // settings left them.
         self.register_panes();
-        // Wave 4 (G2): the search box's own font, the keys in force, the
-        // double-Ctrl hook, the taskbar.
-        self.make_search_fonts();
+        // Wave 4 (G2): the keys in force, the double-Ctrl hook, the
+        // taskbar.
         self.start_custom();
         if default_size {
             // SAFETY: sizes the window for its monitor's DPI before it shows.
@@ -1262,16 +1271,11 @@ impl App {
         crate::zoom::scale(v, self.dpi.get(), self.zoom.get())
     }
 
-    /// The search box's font (Zoom leaves it as it is).
+    /// The window's own font: Fonts and Colors' (Default) (Zoom leaves it
+    /// as it is). A part with an item of its own draws in
+    /// [`App::part_font`].
     pub fn ui_font(&self) -> HFONT {
         self.ui_fonts.borrow().normal
-    }
-
-    /// The window's own font, or its bold (a part whose Fonts and Colors
-    /// style is Bold).
-    pub fn ui_font_of(&self, bold: bool) -> HFONT {
-        let f = self.ui_fonts.borrow();
-        if bold { f.bold } else { f.normal }
     }
 
     /// A result row: 19 px at 100 % with the usual 9 pt message font, as
@@ -1283,9 +1287,10 @@ impl App {
         text.max(self.zscale(19)).max(icon + self.scale(1))
     }
 
-    /// The header, its top and bottom lines included: 27 px at 100 %.
+    /// The header, its top and bottom lines included: 27 px at 100 % (its
+    /// font's height and 12 px).
     pub fn header_height(&self) -> i32 {
-        self.fonts.borrow().height + self.zscale(12)
+        self.part_height(crate::colors::Item::Header) + self.zscale(12)
     }
 
     fn apply_fonts(&self) {
@@ -1440,11 +1445,17 @@ impl App {
         // the strip does when it is there (`tabstrip.rs`).
         let above = self.scale(if tabs_h > 0 { 3 } else { 5 });
         let (side, below) = (self.scale(3), self.scale(3));
-        let fh = self.ui_fonts.borrow().height.max(self.search_font_height());
+        // The search row holds the search box's text and the filter bar's,
+        // each in its own font, and is never lower than the window font's.
+        let edit_h = self.search_font_height();
+        let mut fh = self.ui_fonts.borrow().height.max(edit_h);
+        if self.filter_bar.get() {
+            fh = fh.max(self.part_height(crate::colors::Item::FilterBar));
+        }
         let search_h = fh + self.scale(8);
-        // The status bar is the result list's: it zooms with it.
+        // The status bar in its own font, which zooms with the list's.
         let status_h = if self.status_visible.get() {
-            self.fonts.borrow().height + self.zscale(8)
+            self.part_height(crate::colors::Item::StatusBar) + self.zscale(8)
         } else {
             0
         };
@@ -1509,14 +1520,15 @@ impl App {
         // dragging a divider repaints them once and in step.
         let mut moves = docks::Defer::new();
         let edit_left = search.left + inset;
-        let edit_top = search.top + (search_h - fh) / 2;
+        // The box as high as its own text, in the middle of the row.
+        let edit_top = search.top + (search_h - edit_h) / 2;
         moves.put(
             self.edit,
             RECT {
                 left: edit_left,
                 top: edit_top,
                 right: edit_left + (edit_right - edit_left).max(0),
-                bottom: edit_top + fh,
+                bottom: edit_top + edit_h,
             },
         );
         moves.put(self.list, r.list);
@@ -2939,10 +2951,10 @@ impl App {
         // The user's last widths first, at the old DPI.
         self.sync_columns();
         self.dpi.set(dpi);
-        *self.fonts.borrow_mut() = self.list_fonts(dpi, self.zoom.get());
-        *self.ui_fonts.borrow_mut() = Fonts::new(dpi, crate::zoom::DEFAULT);
+        // Every part's font at the new DPI; the old ones go once the panes
+        // and strips have theirs (`docks_dpi`).
+        let old_fonts = self.remake_fonts();
         self.apply_fonts();
-        self.make_search_fonts();
         self.remeasure_rows();
         self.rescale_columns();
         // SAFETY: moves this thread's window to the rectangle Windows chose.
@@ -2963,6 +2975,7 @@ impl App {
         // A pane's title row follows the font: its content is placed again
         // even where the pane kept its size.
         self.docks_place_all();
+        drop(old_fonts);
         if self.view.get().thumbnails {
             // The thumbnails' size and spacing follow the DPI.
             self.put_view();

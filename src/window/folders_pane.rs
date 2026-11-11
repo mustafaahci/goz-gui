@@ -52,8 +52,8 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CreatePen, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    DeleteObject, DrawTextW, HDC, InvalidateRect, LineTo, MoveToEx, PS_SOLID, ScreenToClient,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DeleteObject, DrawTextW, GetDC, HDC, InvalidateRect, LineTo, MoveToEx, PS_SOLID, ReleaseDC,
+    ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -275,19 +275,41 @@ impl FoldersPane {
         r
     }
 
+    /// The Subfolders bar's height: 22 px at 100 % with the usual 15 px
+    /// font, taller with a taller sidebar font.
+    fn bar_high(app: &App) -> i32 {
+        let fh = app.part_height(crate::colors::Item::FoldersSidebar);
+        app.scale(BAR_HIGH).max(fh + app.scale(7))
+    }
+
     /// The Subfolders bar's place in the content `rc`.
     fn bar(app: &App, rc: &RECT) -> RECT {
         RECT {
-            top: (rc.bottom - app.scale(BAR_HIGH)).max(rc.top),
+            top: (rc.bottom - Self::bar_high(app)).max(rc.top),
             ..*rc
         }
     }
 
-    /// The Subfolders box and its label in the bar: where the tooltip is.
+    /// The Subfolders box and its label in the bar: where the tooltip is;
+    /// 96 px at 100 %, or as far as the label goes in a wider font.
     fn subfolders_rect(app: &App, bar: &RECT) -> RECT {
+        let label: Vec<u16> = "Subfolders".encode_utf16().collect();
+        let font = app.part_font(crate::colors::Item::FoldersSidebar, false);
+        // SAFETY: the screen's DC, measured in with the font and given back
+        // with its old one.
+        let w = unsafe {
+            let dc = GetDC(core::ptr::null_mut());
+            let old = SelectObject(dc, font);
+            let w = crate::paint::width(dc, &label);
+            SelectObject(dc, old);
+            ReleaseDC(core::ptr::null_mut(), dc);
+            w
+        };
+        // The label starts past the box (`paint_bar`).
+        let right = app.scale(96).max(app.scale(22) + w + app.scale(4));
         RECT {
             left: bar.left + app.scale(2),
-            right: (bar.left + app.scale(96)).min(bar.right),
+            right: (bar.left + right).min(bar.right),
             top: bar.top + 1,
             bottom: bar.bottom,
         }
@@ -894,7 +916,7 @@ impl FoldersPane {
                 l,
                 &app.pal.get(),
                 crate::colors::Item::FoldersSidebar,
-                app.ui_font_of(true),
+                app.part_font(crate::colors::Item::FoldersSidebar, true),
             )),
             TVN_ITEMEXPANDINGW => {
                 // SAFETY: as above.
@@ -1178,7 +1200,10 @@ impl FoldersPane {
         };
         // SAFETY: draws into the paint buffer; the old font is put back.
         unsafe {
-            let old = SelectObject(hdc, app.ui_font());
+            let old = SelectObject(
+                hdc,
+                app.part_font(crate::colors::Item::FoldersSidebar, false),
+            );
             SetBkMode(hdc, TRANSPARENT as i32);
             SetTextColor(hdc, colour);
             DrawTextW(
@@ -1231,8 +1256,9 @@ impl FoldersPane {
             // The old list goes once the tree has the new one.
             *self.images.borrow_mut() = Some(new);
         }
-        let fh = app.ui_fonts.borrow().height;
-        treeview::set_font(tree, app.ui_font() as isize, fh, icon, |v| app.scale(v));
+        let fh = app.part_height(crate::colors::Item::FoldersSidebar);
+        let font = app.part_font(crate::colors::Item::FoldersSidebar, false);
+        treeview::set_font(tree, font as isize, fh, icon, |v| app.scale(v));
     }
 }
 
@@ -1650,6 +1676,12 @@ impl crate::pane::PaneContent for FoldersPane {
 
     fn dpi(&self, app: &App, _dpi: u32) {
         self.fit_dpi(app);
+    }
+
+    /// One tree row and the Subfolders bar, in the sidebar's font.
+    fn least_high(&self, app: &App) -> i32 {
+        let fh = app.part_height(crate::colors::Item::FoldersSidebar);
+        Self::bar_high(app) + fh + app.scale(4)
     }
 
     fn as_any(&self) -> &dyn Any {

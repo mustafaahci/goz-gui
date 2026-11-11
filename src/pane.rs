@@ -138,9 +138,18 @@ pub trait PaneContent: Any {
     /// the content made need their colours or visual style set again.
     fn theme(&self, _app: &App, _dark: bool) {}
 
-    /// The window's DPI changed: fonts and sizes are remade, then `place`
+    /// The window's DPI, or a font of Options > Fonts and Colors, changed:
+    /// fonts and sizes are remade (the content's controls given the fonts
+    /// now: the fonts they held are deleted after this), then `place`
     /// follows.
     fn dpi(&self, _app: &App, _dpi: u32) {}
+
+    /// The least height of the content (below the title row) in pixels at
+    /// the fonts now, besides its `PaneSpec::min_high`: a divider stops
+    /// where the larger of the two is reached.
+    fn least_high(&self, _app: &App) -> i32 {
+        0
+    }
 
     /// Something happened that the content may follow.
     fn event(&self, _app: &App, _event: PaneEvent) {}
@@ -281,11 +290,11 @@ pub fn create_window(
 }
 
 /// The title row's height (0 with `pane_title=0`): the header's at 100 %
-/// (the UI font's height and 12 px), so a pane's title row lines up with
-/// the results' header beside it.
+/// (its font's height (Fonts and Colors' Pane) and 12 px), so a pane's
+/// title row lines up with the results' header beside it.
 pub fn title_height(app: &App) -> i32 {
     if app.pane_titles() {
-        app.ui_fonts.borrow().height + app.scale(12)
+        app.part_height(Item::Pane) + app.scale(12)
     } else {
         0
     }
@@ -470,7 +479,7 @@ fn paint_title(app: &App, hwnd: HWND, p: &PaneWindow, hdc: HDC, rc: &RECT) {
     let mut text: Vec<u16> = p.title.encode_utf16().collect();
     // SAFETY: draws into the paint buffer; the old font is put back.
     unsafe {
-        let font = app.ui_font_of(pal.is_bold(Item::Pane, State::Normal));
+        let font = app.part_font(Item::Pane, pal.is_bold(Item::Pane, State::Normal));
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT as i32);
         SetTextColor(hdc, ink.fg);

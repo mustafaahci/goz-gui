@@ -14,10 +14,10 @@ use windows_sys::Win32::Foundation::{LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{HFONT, InvalidateRect};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetMenuItemCount, GetMenuItemInfoW, GetWindowRect, HMENU, MENUITEMINFOW, MFT_SEPARATOR,
-    MIIM_FTYPE, MIIM_ID, MIIM_STRING, MIIM_SUBMENU, SetMenuItemInfoW, SetTimer, WM_APP, WM_SETFONT,
+    MIIM_FTYPE, MIIM_ID, MIIM_STRING, MIIM_SUBMENU, SetMenuItemInfoW, SetTimer, WM_APP,
 };
 
-use super::{App, Fonts, send};
+use super::{App, Fonts};
 use crate::a11y::Server;
 use crate::colorfilter::{ColorFilter, Matcher};
 use crate::colors::{Colors, FontSpec};
@@ -46,9 +46,9 @@ pub(super) fn is_timer(id: usize) -> bool {
 
 /// G2's state in the window.
 pub(super) struct Custom {
-    /// The search box's font, when Fonts and Colors gives it one of its
-    /// own (`search_edit_font`, `_size`).
-    search_fonts: RefCell<Option<Fonts>>,
+    /// The fonts of the parts Fonts and Colors gives a font of their own
+    /// (`fonts.rs`).
+    pub(super) part_fonts: RefCell<Vec<(crate::colors::Item, Fonts)>>,
     /// The color filters, ready to match rows as they are drawn.
     filters: RefCell<Matcher>,
     /// The monitor's DPI as Windows gives it: the window's `dpi` is it
@@ -77,7 +77,7 @@ impl Custom {
 
     pub(super) fn new(c: &crate::custom::Custom, system_dpi: u32) -> Custom {
         Custom {
-            search_fonts: RefCell::new(None),
+            part_fonts: RefCell::new(Vec::new()),
             filters: RefCell::new(Matcher::new(&c.color_filters)),
             system_dpi: Cell::new(system_dpi),
             hooked: Cell::new(false),
@@ -123,85 +123,37 @@ impl App {
             .apply(Palette::new(dark), &crate::theme::system_accent)
     }
 
-    /// The result list's fonts at `dpi` and `zoom` %, in Fonts and Colors'
-    /// face and size.
-    pub(super) fn list_fonts(&self, dpi: u32, zoom: u32) -> Fonts {
-        let spec = self
-            .prefs
-            .borrow()
-            .base
-            .custom
-            .colors
-            .result_list_font
-            .clone();
-        Fonts::with(dpi, zoom, &spec)
-    }
-
-    /// Makes the search box's font again (at a new DPI, or a new choice).
-    pub(super) fn make_search_fonts(&self) {
-        let spec = self
-            .prefs
-            .borrow()
-            .base
-            .custom
-            .colors
-            .search_edit_font
-            .clone();
-        let fonts = (spec != FontSpec::default())
-            .then(|| Fonts::with(self.dpi.get(), crate::zoom::DEFAULT, &spec));
-        // The old font stays until the box has the new one (`apply_fonts`).
-        let old = self.custom.search_fonts.replace(fonts);
-        send(self.edit, WM_SETFONT, self.search_font() as usize, 1);
-        drop(old);
-    }
-
-    /// The search box's font.
+    /// The search box's font: Fonts and Colors' Search Edit, bold when its
+    /// style says so.
     pub(super) fn search_font(&self) -> HFONT {
-        // Bold when Fonts and Colors' Search Edit says so.
         let bold = self.pal.get().is_bold(
             crate::colors::Item::SearchEdit,
             crate::colors::State::Normal,
         );
-        match &*self.custom.search_fonts.borrow() {
-            Some(f) if bold => f.bold,
-            Some(f) => f.normal,
-            None => self.ui_font_of(bold),
-        }
+        self.part_font(crate::colors::Item::SearchEdit, bold)
     }
 
     /// The search box's text height.
     pub(super) fn search_font_height(&self) -> i32 {
-        match &*self.custom.search_fonts.borrow() {
-            Some(f) => f.height,
-            None => self.ui_fonts.borrow().height,
-        }
+        self.part_height(crate::colors::Item::SearchEdit)
     }
 
-    /// Options > Fonts and Colors applied: the fonts and the colours in
-    /// place, the rows measured again.
+    /// Options > Fonts and Colors applied: the colours in place, and with
+    /// another font for any part, every part in its font, measured and
+    /// laid out again (`fonts.rs`).
     pub(super) fn set_colors(&self, colors: Colors) {
         let fonts_changed = {
             let mut prefs = self.prefs.borrow_mut();
             let old = &prefs.base.custom.colors;
-            let changed = old.result_list_font != colors.result_list_font
-                || old.search_edit_font != colors.search_edit_font;
             if *old == colors {
                 return;
             }
+            let changed = old.fonts_differ(&colors);
             prefs.base.custom.colors = colors;
             changed
         };
         if fonts_changed {
-            let old = self
-                .fonts
-                .replace(self.list_fonts(self.dpi.get(), self.zoom.get()));
-            let font = self.fonts.borrow().normal;
-            send(self.list, WM_SETFONT, font as usize, 0);
-            crate::celltip::set_font(self);
-            drop(old);
-            self.make_search_fonts();
-            self.remeasure_rows();
-            self.layout();
+            self.refont();
         }
         self.apply_theme();
         self.settings_changed();

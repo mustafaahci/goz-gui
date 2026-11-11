@@ -174,7 +174,7 @@ impl BookmarksPane {
     /// The box's frame in the content `rc`: Everything's, 3 px in from the
     /// sides, as tall as the search box (23 px at 100 %).
     fn frame(app: &App, rc: &RECT) -> RECT {
-        let high = app.ui_fonts.borrow().height + app.scale(8);
+        let high = app.part_height(crate::colors::Item::BookmarksSidebar) + app.scale(8);
         let top = rc.top + app.scale(2);
         RECT {
             left: rc.left + app.scale(3),
@@ -575,7 +575,7 @@ impl BookmarksPane {
                 l,
                 &app.pal.get(),
                 crate::colors::Item::BookmarksSidebar,
-                app.ui_font_of(true),
+                app.part_font(crate::colors::Item::BookmarksSidebar, true),
             )),
             NM_CLICK => {
                 // A click on a bookmark opens it, whichever part of its row
@@ -681,8 +681,8 @@ impl BookmarksPane {
             treeview::set_images(tree, Some(&new));
             *self.images.borrow_mut() = Some(new);
         }
-        let font = app.ui_font();
-        let fh = app.ui_fonts.borrow().height;
+        let font = app.part_font(crate::colors::Item::BookmarksSidebar, false);
+        let fh = app.part_height(crate::colors::Item::BookmarksSidebar);
         treeview::set_font(tree, font as isize, fh, icon, |v| app.scale(v));
         // SAFETY: a message to this pane's box.
         unsafe { SendMessageW(self.edit.get(), WM_SETFONT, font as usize, 1) };
@@ -819,7 +819,7 @@ impl PaneContent for BookmarksPane {
         let frame = Self::frame(app, &rc);
         let bar = Self::bar(app, &rc);
         let button = Self::button(&frame);
-        let fh = app.ui_fonts.borrow().height;
+        let fh = app.part_height(crate::colors::Item::BookmarksSidebar);
         let left = frame.left + app.scale(4);
         let top = frame.top + (frame.bottom - frame.top - fh) / 2;
         // SAFETY: moves this pane's children and repaints its bar.
@@ -1100,6 +1100,18 @@ impl PaneContent for BookmarksPane {
 
     fn dpi(&self, app: &App, _dpi: u32) {
         self.fit_dpi(app);
+    }
+
+    /// The search bar and one tree row, in the sidebar's font.
+    fn least_high(&self, app: &App) -> i32 {
+        let bar = Self::bar(
+            app,
+            &RECT {
+                bottom: i32::MAX / 2,
+                ..RECT::default()
+            },
+        );
+        bar.bottom + app.part_height(crate::colors::Item::BookmarksSidebar) + app.scale(4)
     }
 
     fn as_any(&self) -> &dyn Any {

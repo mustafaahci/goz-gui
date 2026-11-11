@@ -400,7 +400,8 @@ pub fn paint(app: &App, hdc: HDC) {
         }
     }
 
-    let fonts = app.fonts.borrow();
+    // Fonts and Colors' Status Bar font; each part is measured in it.
+    let fonts = app.part_fonts(Item::StatusBar);
     let pad = app.scale(8);
     let mut found = Vec::new();
     fill(hdc, &rc, ink.bg);

@@ -3,10 +3,11 @@
 //! (every part of the window goz-gui draws: (Default), the sidebars, the
 //! filter and find bars, the header, the menu bar, the panes' title rows,
 //! the preview, the result list, the search box, the status bar and the
-//! tabs) with its font and size (the result list's and the search box's)
-//! and its accent colour (where it tints a selection), and its item
-//! states, each with a foreground colour, a background colour and a font
-//! style (Default, or Custom with Bold), with a sample. The keys are
+//! tabs) with its font and size (every item's but the menu bar's, whose
+//! items Windows lays out in its menu font) and its accent colour (where
+//! it tints a selection), and its item states, each with a foreground
+//! colour, a background colour and a font style (Default, or Custom with
+//! Bold), with a sample in the item's font. The keys are
 //! Everything's (`crate::colors`). Color Filters... edits the colours rows
 //! take from their names (`color_filters`).
 
@@ -139,21 +140,15 @@ impl FontsColors {
     }
 
     fn font(&self) -> FontSpec {
-        let c = self.colors.borrow();
-        match self.item() {
-            Item::ResultList => c.result_list_font.clone(),
-            Item::SearchEdit => c.search_edit_font.clone(),
-            _ => FontSpec::default(),
-        }
+        self.colors.borrow().font(self.item())
     }
 
-    fn set_font(&self, f: impl FnOnce(&mut FontSpec)) {
-        let mut c = self.colors.borrow_mut();
-        match self.item() {
-            Item::ResultList => f(&mut c.result_list_font),
-            Item::SearchEdit => f(&mut c.search_edit_font),
-            _ => {}
-        }
+    fn set_font(&self, page: HWND, f: impl FnOnce(&mut FontSpec)) {
+        let item = self.item();
+        let mut font = self.font();
+        f(&mut font);
+        self.colors.borrow_mut().set_font(item, font);
+        self.repaint(page);
     }
 
     /// The item's states in the list, the first chosen.
@@ -336,11 +331,14 @@ impl FontsColors {
                 fill(hdc, &rc, bg);
                 let item = self.item();
                 let list = item == Item::ResultList;
-                let fonts = if list {
-                    app.fonts.borrow()
+                // The item's font as chosen on the page (the menu bar's is
+                // Windows'), at the window's DPI.
+                let spec = if item.has_font() {
+                    self.colors.borrow().resolved_font(item)
                 } else {
-                    app.ui_fonts.borrow()
+                    FontSpec::default()
                 };
+                let fonts = crate::window::Fonts::with(app.dpi.get(), crate::zoom::DEFAULT, &spec);
                 let state = self.state();
                 let bold_row = pal.is_bold(item, state)
                     || state == State::Highlighted && pal.is_bold(item, State::Normal);
@@ -783,20 +781,20 @@ impl Page for FontsColors {
             }
             (FONT, CBN_SELCHANGE) => {
                 let face = combo_text(page, FONT);
-                self.set_font(|f| {
+                self.set_font(page, |f| {
                     f.face = if face == DEFAULT { String::new() } else { face };
                 });
                 None
             }
             (SIZE, CBN_SELCHANGE) => {
                 if let Some(n) = size_of_text(&combo_text(page, SIZE)) {
-                    self.set_font(|f| f.size = n);
+                    self.set_font(page, |f| f.size = n);
                 }
                 None
             }
             (SIZE, CBN_EDITCHANGE) => {
                 if let Some(n) = size_of_text(&text(page, SIZE)) {
-                    self.set_font(|f| f.size = n);
+                    self.set_font(page, |f| f.size = n);
                 }
                 None
             }
