@@ -950,9 +950,9 @@ mod tests {
     #[test]
     fn everythings_columns_and_views_are_read() {
         let doc = "[{\"tab_cursel\":0,\"tabs\":[{\"search\":\"x\",\"view\":1,\"thumbnail_size\":999,\
-                   \"columns\":[{\"name\":\"Path\",\"width\":120},{\"name\":\"Date Created\",\"width\":80},\
+                   \"columns\":[{\"name\":\"Path\",\"width\":120},{\"name\":\"Run Count\",\"width\":80},\
                    {\"name\":\"name\",\"width\":-4},{\"name\":\"Size\"}]},\
-                   {\"search\":\"y\",\"view\":0,\"columns\":[{\"name\":\"Attributes\"}]}]}]";
+                   {\"search\":\"y\",\"view\":0,\"columns\":[{\"name\":\"Date Run\"}]}]}]";
         let s = parse(doc.as_bytes()).expect("valid").expect("window");
         let v = s.view();
         assert_eq!(v.display, Some(crate::view::View::thumbnails(256)));
@@ -977,6 +977,24 @@ mod tests {
             Some(crate::view::View::thumbnails(crate::view::LARGE).details())
         );
         assert_eq!(y.columns, None);
+        // Wave 9: Date Created, Date Accessed, Attributes and Date Recently
+        // Changed are goz-gui's too now.
+        let doc = "[{\"tab_cursel\":0,\"tabs\":[{\"search\":\"x\",\"columns\":[\
+                   {\"name\":\"Attributes\",\"width\":50},{\"name\":\"Date Created\"},\
+                   {\"name\":\"Date Recently Changed\"},{\"name\":\"Date Accessed\"}]}]}]";
+        let s = parse(doc.as_bytes()).expect("valid").expect("window");
+        let l = s.view().columns.expect("columns");
+        assert_eq!(
+            l.shown(),
+            [
+                columns::COL_NAME,
+                columns::COL_ATTRIB,
+                columns::COL_CREATED,
+                columns::COL_RECENT,
+                columns::COL_ACCESSED
+            ]
+        );
+        assert_eq!(l.width(columns::COL_ATTRIB), 50);
     }
 
     /// Everything 1.5.0.1424b's own `Session.json`, cut down: two tabs, the

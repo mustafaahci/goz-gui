@@ -2,8 +2,8 @@
 //! shows them, one row per line.
 
 use crate::client::Row;
-use crate::columns::COL_CREATED;
 use crate::columns::Layout;
+use crate::columns::{COL_ACCESSED, COL_ATTRIB, COL_CREATED, COL_RECENT};
 use crate::window::{COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE};
 use crate::{filetype, format};
 
@@ -22,8 +22,15 @@ pub enum Field {
     /// The shell's name for the kind of file.
     Type,
     DateModified,
-    /// A file list's date created (wave 5).
+    /// A file list's date created (wave 5); wave 9: any row's, its
+    /// source's or the disk's.
     DateCreated,
+    /// Wave 9: the disk's (or, stream B2, gozd's) date accessed.
+    DateAccessed,
+    /// Wave 9: Everything's attribute letters.
+    Attributes,
+    /// Wave 9: gozd's date recently changed (blank without it).
+    DateRecentlyChanged,
     /// The layout's shown columns, left to right, tab-separated.
     Tsv(Layout),
 }
@@ -38,6 +45,9 @@ impl Field {
             COL_EXT => Field::Extension,
             COL_TYPE => Field::Type,
             COL_CREATED => Field::DateCreated,
+            COL_ACCESSED => Field::DateAccessed,
+            COL_ATTRIB => Field::Attributes,
+            COL_RECENT => Field::DateRecentlyChanged,
             _ => Field::DateModified,
         }
     }
@@ -67,7 +77,22 @@ pub fn push(row: &Row, field: Field, out: &mut Vec<u16>) {
             }
         }
         Field::DateCreated => {
-            if let Some(ft) = row.ctime {
+            if let Some(ft) = row.created() {
+                format::date(ft, out);
+            }
+        }
+        Field::DateAccessed => {
+            if let Some(ft) = row.accessed() {
+                format::date(ft, out);
+            }
+        }
+        Field::Attributes => {
+            if let Some(a) = row.attributes() {
+                crate::props::attribute_letters(a, out);
+            }
+        }
+        Field::DateRecentlyChanged => {
+            if let Some(ft) = row.recently_changed() {
                 format::date(ft, out);
             }
         }
@@ -111,6 +136,7 @@ mod tests {
             ctime: None,
             is_dir,
             icon: Cell::new(0),
+            more: Default::default(),
         }
     }
 
@@ -171,5 +197,35 @@ mod tests {
         assert_eq!(Field::of_column(COL_EXT), Field::Extension);
         assert_eq!(Field::of_column(COL_TYPE), Field::Type);
         assert_eq!(Field::of_column(COL_DATE), Field::DateModified);
+        assert_eq!(Field::of_column(COL_CREATED), Field::DateCreated);
+        assert_eq!(Field::of_column(COL_ACCESSED), Field::DateAccessed);
+        assert_eq!(Field::of_column(COL_ATTRIB), Field::Attributes);
+        assert_eq!(Field::of_column(COL_RECENT), Field::DateRecentlyChanged);
+    }
+
+    /// Wave 9: the new columns' text, from the row's source or the disk.
+    #[test]
+    fn the_wave_9_fields() {
+        use crate::props::{Disk, More};
+        let mut r = row(r"C:\a\b.txt", Some(1), false);
+        let empty = |r: &Row, f| text(&lines(std::slice::from_ref(r), f));
+        assert_eq!(empty(&r, Field::Attributes), "");
+        assert_eq!(empty(&r, Field::DateRecentlyChanged), "");
+        r.more.set(More::default().read(Some(Disk {
+            attrib: 0x21,
+            ctime: 132_000_000_000_000_000,
+            atime: 132_000_000_000_000_000,
+        })));
+        assert_eq!(empty(&r, Field::Attributes), "RA");
+        let mut date = Vec::new();
+        format::date(132_000_000_000_000_000, &mut date);
+        assert_eq!(empty(&r, Field::DateAccessed), text(&date));
+        assert_eq!(empty(&r, Field::DateCreated), text(&date));
+        // A file list's own date created comes first.
+        r.ctime = Some(0);
+        assert_ne!(empty(&r, Field::DateCreated), text(&date));
+        r.more
+            .set(More::given(None, None, None, Some(132_000_000_000_000_000)));
+        assert_eq!(empty(&r, Field::DateRecentlyChanged), text(&date));
     }
 }

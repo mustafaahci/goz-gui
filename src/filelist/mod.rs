@@ -57,15 +57,18 @@ const STALE_EVERY: usize = 1 << 14;
 
 const NO_SIZE: u64 = u64::MAX;
 const NO_DATE: i64 = i64::MIN;
+const NO_ATTRIB: u32 = u32::MAX;
 
 /// Rows read from the list: their paths end to end, and each row's end in
-/// them, size, date modified, date created and whether it is a folder.
+/// them, size, date modified, date created, attributes (W9) and whether it
+/// is a folder.
 struct Chunk {
     text: Vec<u8>,
     ends: Vec<u32>,
     size: Vec<u64>,
     mtime: Vec<i64>,
     ctime: Vec<i64>,
+    attrib: Vec<u32>,
     dir: Vec<bool>,
 }
 
@@ -77,6 +80,7 @@ impl Chunk {
             size: Vec::with_capacity(CHUNK_ROWS),
             mtime: Vec::with_capacity(CHUNK_ROWS),
             ctime: Vec::with_capacity(CHUNK_ROWS),
+            attrib: Vec::with_capacity(CHUNK_ROWS),
             dir: Vec::with_capacity(CHUNK_ROWS),
         }
     }
@@ -102,9 +106,20 @@ impl Chunk {
         Some(self.ctime[i]).filter(|&t| t != NO_DATE)
     }
 
+    fn attrib(&self, i: usize) -> Option<u32> {
+        Some(self.attrib[i]).filter(|&a| a != NO_ATTRIB)
+    }
+
     /// Adds a row; false when its path does not fit (a chunk's text stays
     /// under 4 GB, far beyond any real list).
-    fn push(&mut self, path: &str, size: Option<u64>, dates: Dates, dir: bool) -> bool {
+    fn push(
+        &mut self,
+        path: &str,
+        size: Option<u64>,
+        dates: Dates,
+        attrib: Option<u32>,
+        dir: bool,
+    ) -> bool {
         let Ok(end) = u32::try_from(self.text.len() + path.len()) else {
             return false;
         };
@@ -113,6 +128,7 @@ impl Chunk {
         self.size.push(size.unwrap_or(NO_SIZE));
         self.mtime.push(dates.modified.unwrap_or(NO_DATE));
         self.ctime.push(dates.created.unwrap_or(NO_DATE));
+        self.attrib.push(attrib.unwrap_or(NO_ATTRIB));
         self.dir.push(dir);
         true
     }
@@ -321,6 +337,7 @@ impl FileList {
                     modified,
                     created: c,
                 },
+                None,
                 d,
             );
         }
@@ -563,6 +580,9 @@ impl FileList {
                     .collect();
                 let mut row = Row::new(path, chunk.size(i), chunk.mtime(i), chunk.dir[i]);
                 row.ctime = chunk.ctime(i);
+                // W9: its Attributes, the list's own (the disk is not asked).
+                row.more
+                    .set(crate::props::More::given(chunk.attrib(i), None, None, None));
                 Some(row)
             })
             .collect()
@@ -661,8 +681,8 @@ fn read_list(list: &FileList, file: File, base: &str) -> Result<(), String> {
         base,
         &to_utc,
         &list.stop,
-        |path, size, dates, _, dir| {
-            if path.is_empty() || !chunk.push(path, size, dates, dir) {
+        |path, size, dates, attrib, dir| {
+            if path.is_empty() || !chunk.push(path, size, dates, attrib, dir) {
                 skipped += 1;
             } else if dates.created.is_some() && !list.created.load(Ordering::Relaxed) {
                 list.created.store(true, Ordering::Relaxed);
@@ -1205,6 +1225,9 @@ mod tests {
         let a = rows.iter().find(|r| r.size == Some(5)).expect("a.txt");
         assert_eq!(a.mtime, Some(133_000_000_000_000_000));
         assert_eq!(a.ctime, Some(132_000_000_000_000_000));
+        // W9: the list's Attributes, its own: the disk is never asked.
+        assert_eq!((a.attributes(), sub.attributes()), (Some(32), Some(16)));
+        assert!(!a.more.get().wants_disk());
         assert!(list.has_created());
         assert!(FileList::open(&dir.join("missing.efu"), None).is_err());
         let _ = std::fs::remove_dir_all(&dir);

@@ -312,18 +312,23 @@ pub fn paint(app: &App, hdc: HDC) {
     let mut right: Vec<Part> = Vec::new();
     {
         let m = app.model.borrow();
-        let state = if m.incomplete && m.search.filelist.is_some() {
-            Some("Loading file list…")
+        // W9: a content search's progress (or that it was cancelled), as
+        // Everything's "Searching content".
+        let content = m.search.content.as_ref().and_then(|run| run.status());
+        let state = if let Some(text) = content {
+            Some(text)
+        } else if m.incomplete && m.search.filelist.is_some() {
+            Some("Loading file list…".to_owned())
         } else if m.incomplete {
-            Some("Indexing…")
+            Some("Indexing…".to_owned())
         } else if m.metadata_pending {
-            Some("Reading sizes and dates…")
+            Some("Reading sizes and dates…".to_owned())
         } else {
             None
         };
         if let Some(text) = state {
             right.push(Part {
-                text: text.into(),
+                text,
                 colour: pal.dim,
                 indicator: None,
             });

@@ -273,6 +273,8 @@ impl App {
                     filelist: s.filelist.clone(),
                     created_sort: s.created_sort,
                     slots: Arc::clone(&s.slots),
+                    want: s.want,
+                    content: s.content.clone(),
                 },
                 saves,
             )

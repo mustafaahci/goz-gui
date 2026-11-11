@@ -10,10 +10,11 @@
 //! array. `list_cols` maps a list column's index to its id for everything
 //! that gets an index from the list (custom draw, hit tests, clicks).
 //!
-//! Wave 5: while a file list with dates created is open, the list has one
-//! more column after the layout's, Date Created (`COL_CREATED`). It is not
-//! in the layout (the settings never keep it); its width lasts while the
-//! window does.
+//! Wave 5: while a file list with dates created is open, the list has
+//! Date Created (`COL_CREATED`) after the layout's columns. Wave 9 made Date
+//! Created a column of the layout: the list brings it only while the
+//! layout hides it, and its place then is not kept (its width is, as any
+//! hidden column's).
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{GetDC, InvalidateRect, ReleaseDC, SelectObject};
@@ -70,12 +71,13 @@ impl App {
 
     /// A column's width at the window's DPI.
     fn column_px(&self, id: usize) -> i32 {
-        let width = if id == COL_CREATED {
-            self.created_width()
-        } else {
-            self.layout.get().width(id)
-        };
-        columns::scale(width, self.dpi.get())
+        columns::scale(self.layout.get().width(id), self.dpi.get())
+    }
+
+    /// Whether the list brings Date Created though the layout hides it: a
+    /// file list with dates created is shown (wave 5).
+    pub(super) fn created_brought(&self, layout: &Layout) -> bool {
+        !layout.is_shown(COL_CREATED) && self.created_column_wanted()
     }
 
     /// Puts `layout` on the list: Name stays column 0; the others are
@@ -94,7 +96,7 @@ impl App {
         let mut wanted = vec![COL_NAME];
         wanted.extend(layout.shown().iter().copied().filter(|&id| id != COL_NAME));
         // A file list's dates created: after the layout's columns.
-        if self.created_column_wanted() {
+        if self.created_brought(&layout) {
             wanted.push(COL_CREATED);
         }
         for &id in &wanted[cols.len..] {
@@ -126,10 +128,11 @@ impl App {
             0,
             self.column_px(COL_NAME) as isize,
         );
+        let brought = self.created_brought(&layout).then_some(&COL_CREATED);
         let order: Vec<i32> = layout
             .shown()
             .iter()
-            .chain(Some(&COL_CREATED))
+            .chain(brought)
             .filter_map(|&id| cols.index_of(id))
             .map(|i| i as i32)
             .collect();
@@ -169,11 +172,13 @@ impl App {
         );
         let old = self.layout.get();
         let mut layout = old;
-        // Date Created is no column of the layout's: its place is not kept.
+        // Date Created brought by a file list is no column of the layout's:
+        // its place is not kept.
+        let brought = !old.is_shown(COL_CREATED);
         let shown: Vec<usize> = order[..cols.len]
             .iter()
             .filter_map(|&i| cols.ids().get(i.max(0) as usize).copied())
-            .filter(|&id| id != COL_CREATED)
+            .filter(|&id| !(brought && id == COL_CREATED))
             .collect();
         layout.set_order(&shown);
         for (index, &id) in cols.ids().iter().enumerate() {
@@ -183,12 +188,7 @@ impl App {
             // that cannot say (0: not in report view, or between rebuilding
             // its columns) changes nothing.
             if px > 0 && px != self.column_px(id) {
-                let width = columns::unscale(px, self.dpi.get());
-                if id == COL_CREATED {
-                    self.set_created_width(width);
-                } else {
-                    layout.set_width(id, width);
-                }
+                layout.set_width(id, columns::unscale(px, self.dpi.get()));
             }
         }
         if layout != old {
@@ -207,6 +207,20 @@ impl App {
                 index,
                 self.column_px(id) as isize,
             );
+        }
+    }
+
+    /// The header menu's Organize Columns... (wave 9): Everything's dialog
+    /// over the layout; OK puts what it shows on the list.
+    pub(super) fn organize_columns(&self) {
+        self.sync_columns();
+        let layout = self.layout.get();
+        let _quiet = crate::dialog::Quiet::begin();
+        if let Some(new) = crate::organize_columns::show(self.hwnd, layout, self.dialog_look())
+            && new != layout
+        {
+            self.apply_columns(new);
+            self.settings_changed();
         }
     }
 
@@ -305,6 +319,8 @@ impl App {
             if let Some(index) = on {
                 self.remove_column(index);
             }
+        } else if cmd == menu::ORGANIZE_COLUMNS {
+            self.organize_columns();
         } else if cmd == menu::RESET_COLUMNS {
             self.change_columns(|l| {
                 let reset = Layout::default();

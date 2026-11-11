@@ -5,34 +5,57 @@
 //! to the window's DPI when shown.
 //!
 //! Name is always shown (Everything has no `name_column_visible`); the
-//! others can be removed and shown again. Extension and Type start hidden,
-//! as in Everything.
+//! others can be removed and shown again. Extension, Type and wave 9's
+//! Date Created, Date Accessed, Attributes and Date Recently Changed start
+//! hidden, as in Everything.
 
 /// The columns, by id. An id is also the column's place in Everything's
-/// default order.
+/// default order (its `*_column_pos` when nothing was moved).
 pub const COL_NAME: usize = 0;
 pub const COL_PATH: usize = 1;
 pub const COL_SIZE: usize = 2;
 pub const COL_EXT: usize = 3;
 pub const COL_TYPE: usize = 4;
 pub const COL_DATE: usize = 5;
-pub const COLS: usize = 6;
-/// Wave 5: Date Created, shown only while a file list with dates created
-/// is open (its EFU's `Date Created` column). It is no part of the layout
-/// the settings keep: the list gets it after the layout's columns.
-pub const COL_CREATED: usize = COLS;
-/// The most columns the list has: the layout's and Date Created.
-pub const LIST_COLS: usize = COLS + 1;
+/// Wave 9: Date Created (Everything's `creation_time` column). Wave 5
+/// showed it only for a file list with dates created; it is a column of
+/// the layout now, for the index's results too. A file list with dates
+/// created still brings it while it is open and the layout hides it.
+pub const COL_CREATED: usize = 6;
+/// Wave 9: Date Accessed, Attributes and Date Recently Changed.
+pub const COL_ACCESSED: usize = 7;
+pub const COL_ATTRIB: usize = 8;
+pub const COL_RECENT: usize = 9;
+pub const COLS: usize = 10;
+/// The most columns the list has.
+pub const LIST_COLS: usize = COLS;
 
-pub const TITLES: [&str; COLS] = ["Name", "Path", "Size", "Extension", "Type", "Date Modified"];
+pub const TITLES: [&str; COLS] = [
+    "Name",
+    "Path",
+    "Size",
+    "Extension",
+    "Type",
+    "Date Modified",
+    "Date Created",
+    "Date Accessed",
+    "Attributes",
+    "Date Recently Changed",
+];
 
-/// A list column's title, Date Created's too.
+/// A list column's title.
 pub fn title(id: usize) -> &'static str {
-    TITLES.get(id).copied().unwrap_or("Date Created")
+    TITLES.get(id).copied().unwrap_or("")
+}
+
+/// Whether column `id` shows a date (drawn and sorted as one).
+pub fn is_date(id: usize) -> bool {
+    matches!(id, COL_DATE | COL_CREATED | COL_ACCESSED | COL_RECENT)
 }
 
 /// The settings file's name for each column: `<key>_column_width` and so on.
-/// Date Modified is Everything's `last_write_time`.
+/// Date Modified is Everything's `last_write_time`, Date Created its
+/// `creation_time`, Attributes its `attribute`.
 const KEYS: [&str; COLS] = [
     "name",
     "path",
@@ -40,13 +63,19 @@ const KEYS: [&str; COLS] = [
     "extension",
     "type",
     "last_write_time",
+    "creation_time",
+    "date_accessed",
+    "attribute",
+    "date_recently_changed",
 ];
 
 /// Everything's default widths, at 96 DPI.
-pub const DEFAULT_WIDTHS: [i32; COLS] = [256, 256, 96, 96, 153, 153];
+pub const DEFAULT_WIDTHS: [i32; COLS] = [256, 256, 96, 96, 153, 153, 153, 153, 70, 153];
 
 /// Whether each column is shown when the file does not say.
-const DEFAULT_SHOWN: [bool; COLS] = [true, true, true, false, false, true];
+const DEFAULT_SHOWN: [bool; COLS] = [
+    true, true, true, false, false, true, false, false, false, false,
+];
 
 /// The widest a column is kept; wider values in the file are taken as this.
 const MAX_WIDTH: i32 = 8192;
@@ -88,7 +117,18 @@ impl Default for Layout {
     fn default() -> Layout {
         Layout {
             widths: DEFAULT_WIDTHS,
-            order: [COL_NAME, COL_PATH, COL_SIZE, COL_DATE, COL_EXT, COL_TYPE],
+            order: [
+                COL_NAME,
+                COL_PATH,
+                COL_SIZE,
+                COL_DATE,
+                COL_EXT,
+                COL_TYPE,
+                COL_CREATED,
+                COL_ACCESSED,
+                COL_ATTRIB,
+                COL_RECENT,
+            ],
             shown: 4,
         }
     }
@@ -388,7 +428,7 @@ mod tests {
         assert_eq!(get("size_column_visible"), Some("0"));
         assert_eq!(get("size_column_pos"), Some("3"));
         assert_eq!(get("name_column_visible"), None, "Everything has none");
-        assert_eq!(keys.len(), 17);
+        assert_eq!(keys.len(), 3 * COLS - 1);
     }
 
     #[test]
@@ -498,5 +538,67 @@ mod tests {
         let mut l = Layout::default();
         l.set_width(COL_SIZE, 0);
         assert_eq!(l.width(COL_SIZE), MIN_WIDTH);
+    }
+
+    /// Wave 9: Everything 1.5's keys and defaults for Date Created, Date
+    /// Accessed, Attributes and Date Recently Changed, as its own file has
+    /// them (`creation_time_column_pos=6`, `attribute_column_width=70`).
+    #[test]
+    fn wave_9_columns_use_everythings_keys_and_defaults() {
+        let defaults = read(&[
+            ("creation_time_column_visible", "0"),
+            ("creation_time_column_pos", "6"),
+            ("creation_time_column_width", "153"),
+            ("date_accessed_column_visible", "0"),
+            ("date_accessed_column_pos", "7"),
+            ("date_accessed_column_width", "153"),
+            ("attribute_column_visible", "0"),
+            ("attribute_column_pos", "8"),
+            ("attribute_column_width", "70"),
+            ("date_recently_changed_column_visible", "0"),
+            ("date_recently_changed_column_pos", "9"),
+            ("date_recently_changed_column_width", "153"),
+        ]);
+        assert_eq!(defaults, Layout::default());
+        assert_eq!(Layout::default().width(COL_ATTRIB), 70);
+        let shown = read(&[
+            ("attribute_column_visible", "1"),
+            ("creation_time_column_visible", "1"),
+            ("date_recently_changed_column_visible", "1"),
+            ("date_accessed_column_visible", "1"),
+        ]);
+        assert_eq!(
+            shown.shown(),
+            [
+                COL_NAME,
+                COL_PATH,
+                COL_SIZE,
+                COL_DATE,
+                COL_CREATED,
+                COL_ACCESSED,
+                COL_ATTRIB,
+                COL_RECENT
+            ]
+        );
+        let keys = shown.to_keys();
+        let pairs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert!(pairs.contains(&("attribute_column_visible", "1")));
+        assert!(pairs.contains(&("creation_time_column_pos", "4")));
+        assert_eq!(read(&pairs), shown);
+        let mut l = Layout::default();
+        assert!(l.show(COL_RECENT) && l.show(COL_CREATED));
+        assert_eq!(
+            l.shown(),
+            [
+                COL_NAME,
+                COL_PATH,
+                COL_SIZE,
+                COL_DATE,
+                COL_CREATED,
+                COL_RECENT
+            ]
+        );
+        assert_eq!(title(COL_RECENT), "Date Recently Changed");
+        assert!(is_date(COL_ACCESSED) && !is_date(COL_ATTRIB));
     }
 }
