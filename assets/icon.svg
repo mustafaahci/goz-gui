@@ -1,4 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#4f46e5"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="26" font-weight="600" fill="#ffffff">GG</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="a" gradientUnits="userSpaceOnUse" x1="0" y1="14" x2="0" y2="242">
+      <stop offset="0" stop-color="#52f0b4"/>
+      <stop offset="1" stop-color="#0a8a5e"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke-linecap="round">
+    <path d="M128 44V212M55.3 86L200.7 170M55.3 170L200.7 86" stroke="#063f2c" stroke-width="60"/>
+    <path d="M128 44V212M55.3 86L200.7 170M55.3 170L200.7 86" stroke="url(#a)" stroke-width="44"/>
+  </g>
 </svg>
