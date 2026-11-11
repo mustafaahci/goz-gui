@@ -219,12 +219,18 @@ impl App {
                 self.sort_by_key(sort_key(id));
             }
             menu::SORT_ASC | menu::SORT_DESC => {
-                o.sort.dir = if id == menu::SORT_ASC {
+                let dir = if id == menu::SORT_ASC {
                     SortDir::Asc
                 } else {
                     SortDir::Desc
                 };
-                self.set_sort(o.sort);
+                // W5: a file list sorted by its Date Created turns round.
+                if self.created_sort().is_some() {
+                    self.set_created_sort(dir);
+                } else {
+                    o.sort.dir = dir;
+                    self.set_sort(o.sort);
+                }
             }
             menu::STATUS_BAR => self.set_status_bar_visible(!self.status_bar_visible()),
             menu::FILTER_BAR => self.set_filter_bar_visible(!self.filter_bar_visible()),
@@ -364,8 +370,13 @@ impl App {
             match_case: o.match_case,
             match_path: o.match_path,
             filter: o.filter,
-            sort: sort_id(o.sort.key),
-            ascending: o.sort.dir == SortDir::Asc,
+            // A file list's Date Created (W5) is none of View > Sort By's.
+            sort: if self.created_sort().is_some() {
+                0
+            } else {
+                sort_id(o.sort.key)
+            },
+            ascending: self.sort_ascending(),
             status_bar: self.status_bar_visible(),
             filter_bar: self.filter_bar_visible(),
             theme: match self.theme_mode() {
@@ -417,7 +428,8 @@ impl App {
     /// it already, as a click on its column header does.
     pub(super) fn sort_by_key(&self, key: SortKey) {
         let cur = self.opts.get().sort;
-        let sort = if cur.key == key {
+        // Sorted by a file list's Date Created (W5): any key is a new sort.
+        let sort = if cur.key == key && self.created_sort().is_none() {
             SortSpec {
                 key,
                 dir: match cur.dir {

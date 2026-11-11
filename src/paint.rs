@@ -1,7 +1,7 @@
 //! Drawing: result rows with their matches in bold, the search band, the
 //! main window's own surface, and the dark menu bar.
 
-use windows_sys::Win32::Foundation::{RECT, SIZE};
+use windows_sys::Win32::Foundation::{HWND, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DC_BRUSH, DT_CENTER,
     DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC, DeleteObject, DrawFocusRect,
@@ -303,8 +303,13 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                         runs_hl(hdc, &inner, &name, &[], &fonts, false, hl);
                     }
                 }
-                COL_DATE => {
-                    if let Some(ft) = row.mtime {
+                COL_DATE | crate::columns::COL_CREATED => {
+                    let date = if col == COL_DATE {
+                        row.mtime
+                    } else {
+                        row.ctime
+                    };
+                    if let Some(ft) = date {
                         scratch.text.clear();
                         format::date(ft, &mut scratch.text);
                         runs_hl(hdc, &inner, &scratch.text, &[], &fonts, false, hl);
@@ -766,14 +771,14 @@ pub struct UahDrawMenuItem {
 }
 
 /// The menu bar's rectangle in window coordinates.
-fn menubar_rect(app: &App) -> RECT {
+fn menubar_rect(hwnd: HWND) -> RECT {
     // SAFETY: plain out-structs for this thread's window.
     unsafe {
         let mut mbi: MENUBARINFO = core::mem::zeroed();
         mbi.cbSize = size_of::<MENUBARINFO>() as u32;
-        GetMenuBarInfo(app.hwnd, OBJID_MENU, 0, &mut mbi);
+        GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mut mbi);
         let mut wr = RECT::default();
-        GetWindowRect(app.hwnd, &mut wr);
+        GetWindowRect(hwnd, &mut wr);
         let mut rc = mbi.rcBar;
         OffsetRect(&mut rc, -wr.left, -wr.top);
         rc
@@ -793,12 +798,23 @@ pub fn draws_menubar(pal: &Palette) -> bool {
 }
 
 pub fn menubar(app: &App, um: &UahMenu) {
-    let mut rc = menubar_rect(app);
+    menubar_of(app.hwnd, &app.pal.get(), um);
+}
+
+/// Paints window `hwnd`'s menu bar in `pal`'s colours (the File List
+/// Editor's too, wave 5).
+pub fn menubar_of(hwnd: HWND, pal: &Palette, um: &UahMenu) {
+    let mut rc = menubar_rect(hwnd);
     rc.top -= 1;
-    fill(um.hdc, &rc, menu_ink(&app.pal.get()).bg);
+    fill(um.hdc, &rc, menu_ink(pal).bg);
 }
 
 pub fn menubar_item(app: &App, item: &UahDrawMenuItem) {
+    menubar_item_of(&app.pal.get(), item);
+}
+
+/// Paints one item of a menu bar in `pal`'s colours.
+pub fn menubar_item_of(pal: &Palette, item: &UahDrawMenuItem) {
     let mut buf = [0u16; 256];
     // SAFETY: reads the item's text into `buf`, whose length is passed; then
     // paints into the DC Windows handed over.
@@ -810,10 +826,9 @@ pub fn menubar_item(app: &App, item: &UahDrawMenuItem) {
         mii.cch = buf.len() as u32 - 1;
         GetMenuItemInfoW(item.um.hmenu, item.umi.position as u32, 1, &mut mii);
         let state = item.dis.itemState;
-        let pal = app.pal.get();
         let hot = state & (ODS_HOTLIGHT | ODS_SELECTED) != 0;
         let mut rc = item.dis.rcItem;
-        let ink = menu_ink(&pal);
+        let ink = menu_ink(pal);
         fill(item.um.hdc, &rc, if hot { pal.hot } else { ink.bg });
         let dim = state & (ODS_INACTIVE | ODS_GRAYED | ODS_DISABLED) != 0;
         SetBkMode(item.um.hdc, TRANSPARENT as i32);
@@ -828,22 +843,27 @@ pub fn menubar_item(app: &App, item: &UahDrawMenuItem) {
 
 /// Covers the light line Windows draws under the menu bar.
 pub fn menubar_line(app: &App) {
+    menubar_line_of(app.hwnd, &app.pal.get());
+}
+
+/// [`menubar_line`] for window `hwnd`, in `pal`'s colours.
+pub fn menubar_line_of(hwnd: HWND, pal: &Palette) {
     // SAFETY: paints one line of this window's frame; the DC is released.
     unsafe {
         let mut client = RECT::default();
-        GetClientRect(app.hwnd, &mut client);
-        MapWindowPoints(app.hwnd, core::ptr::null_mut(), (&raw mut client).cast(), 2);
+        GetClientRect(hwnd, &mut client);
+        MapWindowPoints(hwnd, core::ptr::null_mut(), (&raw mut client).cast(), 2);
         let mut wr = RECT::default();
-        GetWindowRect(app.hwnd, &mut wr);
+        GetWindowRect(hwnd, &mut wr);
         OffsetRect(&mut client, -wr.left, -wr.top);
         let line = RECT {
             top: client.top - 1,
             bottom: client.top,
             ..client
         };
-        let hdc = GetWindowDC(app.hwnd);
-        fill(hdc, &line, menu_ink(&app.pal.get()).bg);
-        ReleaseDC(app.hwnd, hdc);
+        let hdc = GetWindowDC(hwnd);
+        fill(hdc, &line, menu_ink(pal).bg);
+        ReleaseDC(hwnd, hdc);
     }
 }
 

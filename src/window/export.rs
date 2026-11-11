@@ -63,6 +63,7 @@ impl App {
                 sort: m.search.sort,
                 match_case: m.search.match_case,
                 filelist: m.search.filelist.clone(),
+                created_sort: m.search.created_sort,
             }
         };
         let bom = self.prefs.borrow().base.utf8_bom;

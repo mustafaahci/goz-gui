@@ -147,6 +147,7 @@ mod tests {
             name_start: name_start as u32,
             size: None,
             mtime: None,
+            ctime: None,
             is_dir,
             icon: std::cell::Cell::new(0),
         }

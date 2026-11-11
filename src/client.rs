@@ -18,7 +18,7 @@ use goz_core::proto::{
     DaemonStatus, FrameDecoder, MAX_SERVER_FRAME, PIPE_NAME, PROTO_VERSION, QueryRequest, Request,
     Response, ResultItem, decode_response_frame, encode_request,
 };
-use goz_core::types::SortSpec;
+use goz_core::types::{SortDir, SortSpec};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND,
     ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE,
@@ -98,6 +98,19 @@ pub struct Search {
     /// List..., wave 4): its rows answer every block and stream of the
     /// search, from the thread that asks.
     pub filelist: Option<Arc<crate::filelist::FileList>>,
+    /// Wave 5: a file list's matches sorted by its Date Created this way
+    /// instead of by `sort` (gozd has no such key; only a list can).
+    pub created_sort: Option<SortDir>,
+}
+
+impl Search {
+    /// The order a file list answers this search in.
+    pub fn list_order(&self) -> crate::filelist::Order {
+        match self.created_sort {
+            Some(dir) => crate::filelist::Order::Created(dir),
+            None => crate::filelist::Order::Gozd(self.sort),
+        }
+    }
 }
 
 /// One result row, kept as UTF-16 because that is what every draw wants.
@@ -107,6 +120,8 @@ pub struct Row {
     pub name_start: u32,
     pub size: Option<u64>,
     pub mtime: Option<i64>,
+    /// Date created (a file list's, wave 5; gozd sends none).
+    pub ctime: Option<i64>,
     pub is_dir: bool,
     /// Index into the system image list, or one of the `icons::` states.
     pub icon: Cell<i32>,
@@ -147,6 +162,7 @@ impl Row {
             name_start: name_start as u32,
             size,
             mtime,
+            ctime: None,
             is_dir,
             icon: Cell::new(crate::icons::UNSET),
         }
@@ -642,7 +658,12 @@ fn list_block(
 ) -> Option<Reply> {
     let started = Instant::now();
     let stale = || shared.is_stale(Some(epoch));
-    match list.answer(&search.query, search.sort, search.match_case, &stale) {
+    match list.answer(
+        &search.query,
+        search.list_order(),
+        search.match_case,
+        &stale,
+    ) {
         Ok(None) => None,
         Err(why) => Some(Reply::Failed {
             epoch,
@@ -678,7 +699,12 @@ fn list_stream(
 ) -> Streamed {
     const PAGE: usize = 4096;
     let stale = || stop.stopped();
-    let m = match list.answer(&search.query, search.sort, search.match_case, &stale) {
+    let m = match list.answer(
+        &search.query,
+        search.list_order(),
+        search.match_case,
+        &stale,
+    ) {
         Ok(Some(m)) => m,
         Ok(None) => return Streamed::Stopped,
         Err(why) => return Streamed::Failed(Failure::Refused(why)),
@@ -1063,6 +1089,7 @@ mod tests {
                 sort: SortSpec::default(),
                 match_case: false,
                 filelist: None,
+                created_sort: None,
             }),
         }
     }

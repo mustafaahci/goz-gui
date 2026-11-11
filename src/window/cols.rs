@@ -9,6 +9,11 @@
 //! hidden and shown. Where each one is on screen is the header's order
 //! array. `list_cols` maps a list column's index to its id for everything
 //! that gets an index from the list (custom draw, hit tests, clicks).
+//!
+//! Wave 5: while a file list with dates created is open, the list has one
+//! more column after the layout's, Date Created (`COL_CREATED`). It is not
+//! in the layout (the settings never keep it); its width lasts while the
+//! window does.
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{GetDC, InvalidateRect, ReleaseDC, SelectObject};
@@ -20,14 +25,14 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyMenu, PostMessageW};
 
 use super::{App, WM_COLUMNS, send};
-use crate::columns::{self, COL_NAME, COL_SIZE, COLS, Layout, TITLES};
+use crate::columns::{self, COL_CREATED, COL_NAME, COL_SIZE, LIST_COLS, Layout};
 use crate::wide::wz;
 use crate::{header, menu, paint};
 
 /// The list's columns by index: each one's id, `len` of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ListCols {
-    ids: [usize; COLS],
+    ids: [usize; LIST_COLS],
     len: usize,
 }
 
@@ -37,7 +42,7 @@ impl ListCols {
     }
 
     fn push(&mut self, id: usize) {
-        if self.len < COLS {
+        if self.len < LIST_COLS {
             self.ids[self.len] = id;
             self.len += 1;
         }
@@ -50,6 +55,11 @@ impl ListCols {
     fn index_of(&self, id: usize) -> Option<usize> {
         self.ids().iter().position(|&c| c == id)
     }
+
+    /// Whether the list has the Date Created column.
+    pub fn has_created(&self) -> bool {
+        self.index_of(COL_CREATED).is_some()
+    }
 }
 
 impl App {
@@ -60,7 +70,12 @@ impl App {
 
     /// A column's width at the window's DPI.
     fn column_px(&self, id: usize) -> i32 {
-        columns::scale(self.layout.get().width(id), self.dpi.get())
+        let width = if id == COL_CREATED {
+            self.created_width()
+        } else {
+            self.layout.get().width(id)
+        };
+        columns::scale(width, self.dpi.get())
     }
 
     /// Puts `layout` on the list: Name stays column 0; the others are
@@ -78,8 +93,12 @@ impl App {
         }
         let mut wanted = vec![COL_NAME];
         wanted.extend(layout.shown().iter().copied().filter(|&id| id != COL_NAME));
+        // A file list's dates created: after the layout's columns.
+        if self.created_column_wanted() {
+            wanted.push(COL_CREATED);
+        }
         for &id in &wanted[cols.len..] {
-            let mut text = wz(TITLES[id]);
+            let mut text = wz(columns::title(id));
             let col = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT,
                 fmt: if id == COL_SIZE {
@@ -110,6 +129,7 @@ impl App {
         let order: Vec<i32> = layout
             .shown()
             .iter()
+            .chain(Some(&COL_CREATED))
             .filter_map(|&id| cols.index_of(id))
             .map(|i| i as i32)
             .collect();
@@ -140,7 +160,7 @@ impl App {
     pub(super) fn sync_columns(&self) {
         self.columns_posted.set(false);
         let cols = self.list_cols.get();
-        let mut order = [0i32; COLS];
+        let mut order = [0i32; LIST_COLS];
         send(
             self.list,
             LVM_GETCOLUMNORDERARRAY,
@@ -149,9 +169,11 @@ impl App {
         );
         let old = self.layout.get();
         let mut layout = old;
+        // Date Created is no column of the layout's: its place is not kept.
         let shown: Vec<usize> = order[..cols.len]
             .iter()
             .filter_map(|&i| cols.ids().get(i.max(0) as usize).copied())
+            .filter(|&id| id != COL_CREATED)
             .collect();
         layout.set_order(&shown);
         for (index, &id) in cols.ids().iter().enumerate() {
@@ -161,7 +183,12 @@ impl App {
             // that cannot say (0: not in report view, or between rebuilding
             // its columns) changes nothing.
             if px > 0 && px != self.column_px(id) {
-                layout.set_width(id, columns::unscale(px, self.dpi.get()));
+                let width = columns::unscale(px, self.dpi.get());
+                if id == COL_CREATED {
+                    self.set_created_width(width);
+                } else {
+                    layout.set_width(id, width);
+                }
             }
         }
         if layout != old {
@@ -205,7 +232,7 @@ impl App {
     /// drawn: Name with its icon, matches in bold.
     fn fit_px(&self, index: usize) -> Option<i32> {
         let id = self.column_id(index)?;
-        let title: Vec<u16> = TITLES[id].encode_utf16().collect();
+        let title: Vec<u16> = columns::title(id).encode_utf16().collect();
         let font = self.fonts.borrow().normal;
         // SAFETY: a DC of this thread's list, measured in and given back;
         // the old font is put back first.
@@ -257,7 +284,7 @@ impl App {
     /// on), the other columns to show or hide, and Reset Columns.
     pub fn header_menu(&self, pt: POINT, on: Option<usize>) {
         let layout = self.layout.get();
-        let shown: [bool; COLS] = core::array::from_fn(|id| layout.is_shown(id));
+        let shown: [bool; columns::COLS] = core::array::from_fn(|id| layout.is_shown(id));
         let on_id = on.and_then(|i| self.column_id(i));
         let on = on.filter(|_| on_id.is_some());
         let popup = menu::header_menu(&shown, on_id);
@@ -310,9 +337,13 @@ mod tests {
         assert_eq!(cols.index_of(COL_SIZE), None);
         cols.truncate(1);
         assert_eq!(cols.ids(), [COL_NAME]);
-        for id in 0..10 {
+        assert!(!cols.has_created());
+        for id in 1..10 {
             cols.push(id);
         }
-        assert_eq!(cols.ids().len(), COLS, "never more than there are");
+        assert_eq!(cols.ids().len(), LIST_COLS, "never more than there are");
+        assert!(cols.has_created());
+        assert_eq!(columns::title(COL_CREATED), "Date Created");
+        assert_eq!(columns::title(COL_DATE), "Date Modified");
     }
 }

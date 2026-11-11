@@ -241,6 +241,8 @@ impl App {
             nav_index,
             display: Some(self.view()),
             columns: Some(self.layout.get()),
+            // W5: the file list the tab searches.
+            file_list: self.filelist_path(),
         }
     }
 
@@ -381,6 +383,8 @@ impl App {
             self.settings_changed();
             self.invalidate_status();
         }
+        // W5: the tab's file list (or the index) before its search runs.
+        self.tab_file_list(view.file_list.as_deref());
         self.restore(&NavState::from_search(&view.search));
         self.begin_view(view);
     }

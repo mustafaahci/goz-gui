@@ -374,6 +374,36 @@ pub fn same_path(a: &[u16], b: &[u16]) -> bool {
     }
 }
 
+/// Whether `inner` is inside the folder `outer` (at any depth; not the
+/// same path), as Windows compares paths.
+pub fn is_inside(inner: &[u16], outer: &[u16]) -> bool {
+    let mut outer = outer;
+    while let [rest @ .., BACKSLASH] = outer {
+        outer = rest;
+    }
+    inner.len() > outer.len() + 1
+        && inner[outer.len()] == BACKSLASH
+        && same_path(&inner[..outer.len()], outer)
+}
+
+/// Which of `paths` are inside another of them (wave 5): a move of both
+/// a folder and an item in it moves the item with the folder, so the
+/// item's own move is left out. Moving it first instead would leave it
+/// out of its folder, and Undo, which checks each step before any runs,
+/// could not put it back in a folder that is not back yet.
+pub fn inside_another(paths: &[&[u16]]) -> Vec<bool> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            paths
+                .iter()
+                .enumerate()
+                .any(|(j, q)| i != j && is_inside(p, q))
+        })
+        .collect()
+}
+
 /// The name in `path` (after its last backslash).
 pub fn name_of(path: &[u16]) -> &[u16] {
     let start = path
@@ -1223,6 +1253,32 @@ mod tests {
             Some(file.display().to_string())
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn items_inside_other_items_are_found() {
+        let p: Vec<Vec<u16>> = [
+            r"C:\x\F",
+            r"C:\x\F\a.txt",
+            r"c:\X\f\deep\b.txt",
+            r"C:\x\Fa.txt",
+            r"C:\y\other.txt",
+            r"D:\",
+            r"D:\z.txt",
+        ]
+        .iter()
+        .map(|s| ws(s))
+        .collect();
+        let refs: Vec<&[u16]> = p.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            inside_another(&refs),
+            [false, true, true, false, false, false, true]
+        );
+        // A folder with its trailing backslash; the same path is not inside.
+        assert!(is_inside(&ws(r"C:\x\F\a"), &ws(r"C:\x\F\")));
+        assert!(!is_inside(&ws(r"C:\x\F"), &ws(r"C:\x\F")));
+        assert!(!is_inside(&ws(r"C:\x\F\"), &ws(r"C:\x\F")));
+        assert_eq!(inside_another(&[]), Vec::<bool>::new());
     }
 
     #[test]

@@ -20,7 +20,10 @@
 //!   `listview_select_all` (1 when Select All had every row selected:
 //!   written only then, and every row of the result is selected again),
 //!   `nav_history` (Back and Forward's entries, oldest first, each with
-//!   the search keys above) and `nav_history_index` (the current one).
+//!   the search keys above) and `nav_history_index` (the current one);
+//!   and (wave 5) Everything's `index` (0 the index, 1 a file list) with
+//!   `index_file_list`, the file list the tab searches (File > Open File
+//!   List...), opened again when the tab shows.
 //!   The open tabs come first, left to right; the tabs closed (Reopen
 //!   Closed Tab's, oldest first) follow with `"is_closed":1`, as
 //!   Everything keeps its own.
@@ -92,6 +95,9 @@ pub struct View {
     /// The columns shown, their order and widths; `None` keeps the
     /// window's.
     pub columns: Option<Layout>,
+    /// The file list the tab searches instead of gozd's index (its full
+    /// path), if it searches one.
+    pub file_list: Option<String>,
 }
 
 /// A window as it was.
@@ -288,6 +294,13 @@ fn read_view(tab: &Json) -> View {
     }
     let nav_index = nav_index.min(nav.len().saturating_sub(1));
     let path = |v: &Json| v.as_wide().filter(|p| !p.is_empty()).map(<[u16]>::to_vec);
+    // Everything's `index`: 1 a file list (0 the index, 2 an ETP server);
+    // a session without the key names its list alone.
+    let file_list = tab
+        .get("index_file_list")
+        .and_then(Json::as_text)
+        .filter(|p| !p.trim().is_empty())
+        .filter(|_| int(tab, "index").is_none_or(|i| i == 1));
     View {
         search: read_search(tab),
         top: int(tab, "listview_top_index")
@@ -307,6 +320,7 @@ fn read_view(tab: &Json) -> View {
         nav_index,
         display: read_display(tab),
         columns: read_columns(tab),
+        file_list,
     }
 }
 
@@ -318,6 +332,11 @@ fn tab_members(v: &View, closed: bool) -> Vec<(String, Json)> {
         tab.push(("view".into(), Json::bit(d.thumbnails)));
         tab.push(("thumbnail_size".into(), Json::int(d.size.into())));
     }
+    tab.push(("index".into(), Json::int(i64::from(v.file_list.is_some()))));
+    tab.push((
+        "index_file_list".into(),
+        Json::str(v.file_list.as_deref().unwrap_or_default()),
+    ));
     tab.push((
         "listview_top_index".into(),
         Json::int(i64::try_from(v.top).unwrap_or(i64::MAX)),
@@ -682,10 +701,58 @@ mod tests {
                 nav_index: 1,
                 display: None,
                 columns: None,
+                file_list: None,
             }],
             current: 0,
             closed: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_tabs_file_list_reads_back_and_everythings_index_is_read() {
+        let s = Session {
+            tabs: vec![
+                View {
+                    file_list: Some(r"C:\lists\a b.efu".into()),
+                    ..search_view("in the list")
+                },
+                search_view("in the index"),
+            ],
+            closed: vec![View {
+                file_list: Some(r"D:\x.efu".into()),
+                ..search_view("closed")
+            }],
+            ..Session::default()
+        };
+        let text = s.to_text();
+        assert_eq!(parse(text.as_bytes()), Ok(Some(s.clone())));
+        // Everything's keys, in its order, on every tab.
+        assert!(text.contains(concat!(
+            "\t\t\t\t\"index\":1,\r\n",
+            "\t\t\t\t\"index_file_list\":\"C:\\\\lists\\\\a b.efu\",\r\n"
+        )));
+        assert!(text.contains("\"index\":0,\r\n\t\t\t\t\"index_file_list\":\"\",\r\n"));
+        // Everything's tab searching its index, or an ETP server, has none;
+        // one naming a list without `index` has it.
+        let tab = |keys: &str| {
+            let doc = format!("[{{\"tabs\":[{{\"search\":\"x\",{keys}}}]}}]");
+            parse(doc.as_bytes())
+                .unwrap()
+                .unwrap()
+                .view()
+                .file_list
+                .clone()
+        };
+        assert_eq!(tab("\"index\":0,\"index_file_list\":\"\""), None);
+        assert_eq!(tab("\"index\":2,\"index_file_list\":\"C:\\\\a.efu\""), None);
+        assert_eq!(
+            tab("\"index\":1,\"index_file_list\":\"C:\\\\a.efu\""),
+            Some(r"C:\a.efu".into())
+        );
+        assert_eq!(
+            tab("\"index_file_list\":\"C:\\\\a.efu\""),
+            Some(r"C:\a.efu".into())
+        );
     }
 
     #[test]

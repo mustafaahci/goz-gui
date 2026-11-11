@@ -326,6 +326,7 @@ mod tests {
             name_start: name_start as u32,
             size,
             mtime,
+            ctime: None,
             is_dir,
             icon: Cell::new(0),
         }

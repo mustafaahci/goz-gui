@@ -136,6 +136,9 @@ impl App {
             // W4 (G1): 4600..=4699.
             4600..=4699 => self.data_tools_command(id),
 
+            // W5 (C, the File List Editor): 4750..=4799.
+            4750..=4799 => self.list_editor_command(id),
+
             _ => false,
         }
     }
@@ -403,6 +406,7 @@ mod tests {
             crate::datatools::cmd::ADVANCED_MOVE_TO,
             crate::datatools::cmd::IMPORT_EXPORT_SETTINGS,
             crate::datatools::cmd::TROUBLESHOOTING,
+            crate::listedit::cmd::FILE_LIST_EDITOR,
         ]
     }
 
@@ -473,6 +477,9 @@ mod tests {
             } else if name.starts_with("crate::datatools::") {
                 // W4 (G1): 4600..=4699.
                 Some(crate::datatools::cmd::FIRST)
+            } else if name.starts_with("crate::listedit::") {
+                // W5 (C): 4750..=4799.
+                Some(crate::listedit::cmd::FIRST)
             } else {
                 None
             };

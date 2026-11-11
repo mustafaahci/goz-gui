@@ -17,8 +17,19 @@ pub const COL_EXT: usize = 3;
 pub const COL_TYPE: usize = 4;
 pub const COL_DATE: usize = 5;
 pub const COLS: usize = 6;
+/// Wave 5: Date Created, shown only while a file list with dates created
+/// is open (its EFU's `Date Created` column). It is no part of the layout
+/// the settings keep: the list gets it after the layout's columns.
+pub const COL_CREATED: usize = COLS;
+/// The most columns the list has: the layout's and Date Created.
+pub const LIST_COLS: usize = COLS + 1;
 
 pub const TITLES: [&str; COLS] = ["Name", "Path", "Size", "Extension", "Type", "Date Modified"];
+
+/// A list column's title, Date Created's too.
+pub fn title(id: usize) -> &'static str {
+    TITLES.get(id).copied().unwrap_or("Date Created")
+}
 
 /// The settings file's name for each column: `<key>_column_width` and so on.
 /// Date Modified is Everything's `last_write_time`.

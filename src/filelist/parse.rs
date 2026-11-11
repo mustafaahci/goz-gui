@@ -6,6 +6,9 @@
 //! no allocation a row.
 
 use std::io::{self, BufRead};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::Dates;
 
 /// One CSV record at a time from `reader`, quoted fields (with `""` for a
 /// quote, and line breaks inside quotes) as Everything writes them. In
@@ -330,6 +333,58 @@ pub fn path(field: &[u8], base: &str) -> (String, bool) {
         p = joined;
     }
     (p, marked)
+}
+
+/// Reads every row of a list from `reader` and hands each to `row`: its
+/// path (as [`path`] makes it, relative ones under `base`; empty for a row
+/// without one), size, dates (`to_utc` turns a local time into UTC),
+/// attributes and whether it is a folder. A list whose first line names a
+/// `Filename` column is read by its columns, any other as one path a line.
+/// Stops early, as if at the end, once `stop` is set.
+pub fn each_row(
+    reader: impl BufRead,
+    base: &str,
+    to_utc: &dyn Fn(i64) -> Option<i64>,
+    stop: &AtomicBool,
+    mut row: impl FnMut(&str, Option<u64>, Dates, Option<u32>, bool),
+) -> io::Result<()> {
+    let mut records = Records::new(reader);
+    if !records.read()? {
+        return Ok(());
+    }
+    let columns = Columns::of_header(records.fields());
+    if columns.is_none() {
+        // No header: a plain list of paths, this line the first.
+        records.lines_only();
+        let (p, marked) = path(plain_line(records.raw()), base);
+        row(&p, None, Dates::default(), None, marked);
+    }
+    let mut n = 0usize;
+    while records.read()? {
+        n += 1;
+        if n.is_multiple_of(4096) && stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match columns {
+            Some(c) => {
+                let (p, marked) = path(records.field(c.filename), base);
+                let attrs = c.attributes.and_then(|i| attributes(records.field(i)));
+                let dir = marked || is_folder_attribute(attrs);
+                let bytes = c.size.and_then(|i| size(records.field(i)));
+                let when = |col: Option<usize>| col.and_then(|i| date(records.field(i), to_utc));
+                let dates = Dates {
+                    modified: when(c.modified),
+                    created: when(c.created),
+                };
+                row(&p, bytes, dates, attrs, dir);
+            }
+            None => {
+                let (p, marked) = path(plain_line(records.raw()), base);
+                row(&p, None, Dates::default(), None, marked);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A plain list's line as a path: surrounding quotes taken off.

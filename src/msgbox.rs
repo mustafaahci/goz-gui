@@ -42,11 +42,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, HICON, IDCANCEL, IDI_ERROR, IDI_INFORMATION, IDI_QUESTION, IDI_WARNING, IDNO,
     IDOK, IDYES, MB_DEFBUTTON2, MB_DEFBUTTON3, MB_DEFBUTTON4, MB_DEFMASK, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONMASK, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_OKCANCEL,
-    MB_TYPEMASK, MB_YESNO, MF_BYCOMMAND, MF_GRAYED, MapDialogRect, MessageBoxW, MoveWindow,
-    SC_CLOSE, SM_CXICON, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetWindowLongPtrW,
-    SetWindowPos, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG,
-    WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_GETFONT, WM_INITDIALOG, WM_KEYDOWN,
-    WM_NCDESTROY, WM_NEXTDLGCTL, WM_SETTINGCHANGE, WS_GROUP, WS_TABSTOP,
+    MB_TYPEMASK, MB_YESNO, MB_YESNOCANCEL, MF_BYCOMMAND, MF_GRAYED, MapDialogRect, MessageBoxW,
+    MoveWindow, SC_CLOSE, SM_CXICON, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW,
+    SetWindowLongPtrW, SetWindowPos, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_COMMAND, WM_CTLCOLORBTN,
+    WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_GETFONT, WM_INITDIALOG,
+    WM_KEYDOWN, WM_NCDESTROY, WM_NEXTDLGCTL, WM_SETTINGCHANGE, WS_GROUP, WS_TABSTOP,
 };
 
 use crate::clipboard;
@@ -83,6 +83,8 @@ fn buttons(style: u32) -> Option<Buttons> {
         MB_OK => &[(IDOK, "OK")],
         MB_OKCANCEL => &[(IDOK, "OK"), (IDCANCEL, "Cancel")],
         MB_YESNO => &[(IDYES, "&Yes"), (IDNO, "&No")],
+        // The File List Editor's "Save changes?" (wave 5).
+        MB_YESNOCANCEL => &[(IDYES, "&Yes"), (IDNO, "&No"), (IDCANCEL, "Cancel")],
         _ => return None,
     };
     let default = match style & MB_DEFMASK {
@@ -649,8 +651,12 @@ mod tests {
         assert_eq!((yn.default, yn.cancel), (1, None));
         // A default past the last button is the first.
         assert_eq!(buttons(MB_OK | MB_DEFBUTTON3).unwrap().default, 0);
-        // Others (Yes / No / Cancel here) are Windows' own box's.
-        assert_eq!(buttons(3), None);
+        // Yes / No / Cancel: Esc is Cancel.
+        let ync = buttons(MB_YESNOCANCEL | MB_ICONQUESTION).unwrap();
+        assert_eq!(ync.set.len(), 3);
+        assert_eq!((ync.default, ync.cancel), (0, Some(IDCANCEL)));
+        // Others (Retry / Cancel here) are Windows' own box's.
+        assert_eq!(buttons(5), None);
     }
 
     #[test]

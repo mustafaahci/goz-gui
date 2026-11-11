@@ -378,6 +378,7 @@ impl App {
         let Some(folder) = folder else { return };
         s.last_folder = text(&folder);
         self.set_tool_settings(s);
+        let targets = self.moved_with_folders(moving, targets, |t| &t.path);
         let steps = targets
             .into_iter()
             // A move into the folder the item is in already is nothing to
@@ -520,8 +521,8 @@ impl App {
         s.last_folder = text(&chosen.folder);
         self.set_tool_settings(s);
         let folder = chosen.folder;
-        let steps = chosen
-            .renames
+        let renames = self.moved_with_folders(moving, chosen.renames, |(path, _)| path);
+        let steps = renames
             .into_iter()
             .map(|(path, name)| {
                 // Its own name, as Copy and Move to Folder give it (the
@@ -545,6 +546,42 @@ impl App {
             .collect();
         let action = if moving { Action::Move } else { Action::Copy };
         self.run_task(steps, false, Purpose::Do(action));
+    }
+
+    /// W5: of the items a move takes, those inside another of them (a
+    /// folder selected with an item in it) go with that folder, as they
+    /// are, and are left out (their own move would fail: the item is gone
+    /// by then); the status bar says how many. A copy takes them all.
+    fn moved_with_folders<T>(
+        &self,
+        moving: bool,
+        items: Vec<T>,
+        path: impl Fn(&T) -> &Vec<u16>,
+    ) -> Vec<T> {
+        if !moving {
+            return items;
+        }
+        let inside = {
+            let paths: Vec<&[u16]> = items.iter().map(|t| path(t).as_slice()).collect();
+            crate::filetools::inside_another(&paths)
+        };
+        let n = inside.iter().filter(|&&i| i).count();
+        if n == 0 {
+            return items;
+        }
+        self.show_note(if n == 1 {
+            "1 item inside a selected folder moves with its folder".into()
+        } else {
+            format!(
+                "{} items inside selected folders move with their folders",
+                crate::format::grouped(n as u64)
+            )
+        });
+        items
+            .into_iter()
+            .zip(inside)
+            .filter_map(|(t, inside)| (!inside).then_some(t))
+            .collect()
     }
 
     /// Edit > Advanced > Set File Time...: asks what each time becomes,
