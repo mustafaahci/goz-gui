@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_VSCROLL,
 };
 
-use crate::dialog::Class;
+use crate::dialog::{Class, LIST_BOX};
 use crate::keymap::{self, Bindings, COMMANDS, Scope};
 use crate::options::{
     LABEL, Page, Rows, combo_value, enable, fill_combo, item, order, send, set_text, text,
@@ -314,7 +314,11 @@ impl Page for Keyboard {
             Class::Named("LISTBOX"),
             "",
             COMMAND_LIST,
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
+            WS_TABSTOP
+                | WS_VSCROLL
+                | WS_BORDER
+                | LIST_BOX
+                | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
             0,
             (0, 0, w, 72),
         )
@@ -333,7 +337,11 @@ impl Page for Keyboard {
             Class::Named("LISTBOX"),
             "",
             SHORTCUTS,
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
+            WS_TABSTOP
+                | WS_VSCROLL
+                | WS_BORDER
+                | LIST_BOX
+                | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
             0,
             (0, 0, inner - 60, 34),
         )
