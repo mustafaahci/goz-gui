@@ -310,6 +310,14 @@ impl Parser<'_> {
     }
 }
 
+/// `value` on one line with no spaces, as Everything writes JSON in an INI
+/// value (`rename_presets`).
+pub fn to_line(value: &Json) -> String {
+    let mut out = String::new();
+    write_inline(&mut out, value);
+    out
+}
+
 /// `value` as text, laid out as Everything lays out its session.
 pub fn to_text(value: &Json) -> String {
     let mut out = String::new();

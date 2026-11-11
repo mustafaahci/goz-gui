@@ -19,7 +19,14 @@
 //! - while one goz-gui reads, merges and writes a file, the others wait
 //!   (a named mutex per file), so two windows never interleave; a write
 //!   that cannot get the file within [`WRITE_WAIT`] is not made unlocked
-//!   but tried again later.
+//!   but tried again later;
+//! - a step another program refused for a moment is tried again, briefly
+//!   ([`retrying`]): an antivirus or the search indexer opens a file just
+//!   written to read it, and while any handle is open on it, a rename onto
+//!   it fails with "Access is denied" (ERROR_ACCESS_DENIED, even when the
+//!   handle shares deletion), and a rename or delete of it with a sharing
+//!   violation when the handle does not. These run on the store's thread,
+//!   never the window's.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -28,9 +35,13 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, HANDLE,
+    WAIT_ABANDONED, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_NORMAL, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, GetFileAttributesW,
+    INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     SetFileAttributesW,
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
@@ -89,29 +100,97 @@ fn name_of(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Renames `from` over `to` in one step, through to the disk.
-pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
-    let (from, to) = (wide(from), wide(to));
-    // SAFETY: two NUL-terminated paths that live across the call.
-    let ok = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+/// The waits between the tries of a step another program refused for a
+/// moment ([`retrying`]): nine tries more, over about 0.6 s in all. An
+/// antivirus scan of a small file just written takes milliseconds; one
+/// that holds it longer is not waited for, and the write fails as before
+/// (the store tries it again later).
+const RETRY_WAITS_MS: [u64; 9] = [1, 2, 5, 10, 20, 40, 80, 160, 280];
+
+/// Whether `e` is what a file another program holds open for a moment
+/// gives: "Access is denied" for a rename onto it (or a file being
+/// deleted), a sharing or lock violation for a rename, delete or write of
+/// it.
+fn held_by_another(e: &io::Error) -> bool {
+    e.raw_os_error().is_some_and(|code| {
+        [
+            ERROR_ACCESS_DENIED,
+            ERROR_SHARING_VIOLATION,
+            ERROR_LOCK_VIOLATION,
+        ]
+        .iter()
+        .any(|&c| i64::from(code) == i64::from(c))
+    })
+}
+
+/// Runs `step`, and again after each of `waits` (milliseconds) while it
+/// fails as a file held open for a moment does ([`held_by_another`]),
+/// unless `lasting` says the failure will not pass (a folder in the file's
+/// place, a read-only file). The last failure is returned.
+fn retrying<T>(
+    waits: &[u64],
+    mut step: impl FnMut() -> io::Result<T>,
+    lasting: impl Fn() -> bool,
+) -> io::Result<T> {
+    let mut waits = waits.iter();
+    loop {
+        match step() {
+            Err(e) if held_by_another(&e) && !lasting() => match waits.next() {
+                Some(&ms) => std::thread::sleep(Duration::from_millis(ms)),
+                None => return Err(e),
+            },
+            done => return done,
+        }
     }
 }
 
+/// Whether `path` is a folder or a read-only file: "Access is denied" for
+/// a rename onto it is no passing hold, and is not tried again.
+fn refuses_for_good(path: &[u16]) -> bool {
+    // SAFETY: a NUL-terminated path; a missing file gives
+    // INVALID_FILE_ATTRIBUTES.
+    let attributes = unsafe { GetFileAttributesW(path.as_ptr()) };
+    attributes != INVALID_FILE_ATTRIBUTES
+        && attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY) != 0
+}
+
+/// Renames `from` over `to` in one step, through to the disk; tried again
+/// for a moment while another program holds either file ([`retrying`]).
+pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to) = (wide(from), wide(to));
+    retrying(
+        &RETRY_WAITS_MS,
+        || {
+            // SAFETY: two NUL-terminated paths that live across the call.
+            let ok = unsafe {
+                MoveFileExW(
+                    from.as_ptr(),
+                    to.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if ok == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+        || refuses_for_good(&to),
+    )
+}
+
 /// Writes `bytes` to this process's tmp file for `path`, flushed to the
-/// disk; the tmp file is removed again on failure.
+/// disk; the tmp file is removed again on failure. A tmp file left by an
+/// earlier write that another program still holds is waited for a moment.
 fn write_tmp(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let tmp = tmp_path(path);
-    let result = File::create(&tmp).and_then(|mut file| {
+    let wide_tmp = wide(&tmp);
+    let created = retrying(
+        &RETRY_WAITS_MS,
+        || File::create(&tmp),
+        || refuses_for_good(&wide_tmp),
+    );
+    let result = created.and_then(|mut file| {
         file.write_all(bytes)?;
         // FlushFileBuffers: the bytes are on the disk before the rename
         // makes them the file.
@@ -302,12 +381,26 @@ fn move_aside(path: &Path) -> io::Result<PathBuf> {
             continue;
         }
         let (from, dest) = (wide(path), wide(&to));
-        // SAFETY: two NUL-terminated paths; no flags, so a name taken
-        // meanwhile fails rather than being replaced.
-        if unsafe { MoveFileExW(from.as_ptr(), dest.as_ptr(), MOVEFILE_WRITE_THROUGH) } != 0 {
-            return Ok(to);
-        }
-        let e = io::Error::last_os_error();
+        // No flags, so a name taken meanwhile fails rather than being
+        // replaced; tried again for a moment while another program holds
+        // the file (a scan of the file just found damaged).
+        let moved = retrying(
+            &RETRY_WAITS_MS,
+            || {
+                // SAFETY: two NUL-terminated paths that live across the call.
+                if unsafe { MoveFileExW(from.as_ptr(), dest.as_ptr(), MOVEFILE_WRITE_THROUGH) } != 0
+                {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            },
+            || to.exists() || refuses_for_good(&from),
+        );
+        let e = match moved {
+            Ok(()) => return Ok(to),
+            Err(e) => e,
+        };
         if !to.exists() {
             return Err(e);
         }
@@ -410,16 +503,31 @@ impl Drop for Lock {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, GetFileAttributesW,
-    };
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+    /// A new folder in the temp folder, `<prefix>-<name>-` and a name no
+    /// other test run uses: this process's id, the time and a count. A
+    /// folder of an earlier run (whose process had the same id) may still
+    /// be held by an antivirus scan of its files, or be on its way out, and
+    /// is never reused.
+    pub fn fresh_dir(prefix: &str, name: &str) -> PathBuf {
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{name}-{}-{nanos:x}-{}",
+            std::process::id(),
+            COUNT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("test folder");
+        dir
+    }
 
     /// A fresh folder for one test.
     pub fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("goz-gui-test-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("test folder");
-        dir
+        fresh_dir("goz-gui-test", name)
     }
 
     fn attributes(path: &Path) -> u32 {
@@ -612,6 +720,130 @@ pub mod tests {
         assert!(
             matches!(load_checked(&path, parse_digits, cut), Loaded::Read(ref v, _) if v == "7")
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_step_refused_for_a_moment_is_tried_again_and_others_are_not() {
+        let os = |code: u32| io::Error::from_raw_os_error(code as i32);
+        // Refused twice as a held file is, then done: three tries.
+        let mut tries = 0;
+        let done = retrying(
+            &[0, 0, 0],
+            || {
+                tries += 1;
+                if tries < 3 {
+                    Err(os(ERROR_ACCESS_DENIED))
+                } else {
+                    Ok(tries)
+                }
+            },
+            || false,
+        );
+        assert_eq!(done.expect("done"), 3);
+        // Held all the time: one try and one more a wait, then the error.
+        for code in [
+            ERROR_ACCESS_DENIED,
+            ERROR_SHARING_VIOLATION,
+            ERROR_LOCK_VIOLATION,
+        ] {
+            let mut tries = 0;
+            let e = retrying(
+                &[0, 0],
+                || -> io::Result<()> {
+                    tries += 1;
+                    Err(os(code))
+                },
+                || false,
+            )
+            .expect_err("still held");
+            assert_eq!((tries, e.raw_os_error()), (3, Some(code as i32)));
+        }
+        // Other failures, and a refusal that will not pass (a folder in the
+        // file's place), are not tried again.
+        let mut tries = 0;
+        let e = retrying(
+            &[0, 0],
+            || -> io::Result<()> {
+                tries += 1;
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            },
+            || false,
+        )
+        .expect_err("missing");
+        assert_eq!((tries, e.kind()), (1, io::ErrorKind::NotFound));
+        let mut tries = 0;
+        retrying(
+            &[0, 0],
+            || -> io::Result<()> {
+                tries += 1;
+                Err(os(ERROR_ACCESS_DENIED))
+            },
+            || true,
+        )
+        .expect_err("for good");
+        assert_eq!(tries, 1);
+        // The waits come to well under a second.
+        assert!(RETRY_WAITS_MS.iter().sum::<u64>() < 1000);
+    }
+
+    #[test]
+    fn a_file_another_program_holds_for_a_moment_is_still_replaced() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let dir = scratch("held");
+        let path = dir.join("Bookmarks.csv");
+        fs::write(&path, b"one").expect("file");
+        // As an antivirus or the indexer opens a file just written: sharing
+        // everything, deletion too. A rename onto it is still refused while
+        // it is open ("Access is denied").
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .expect("held");
+        let tmp = dir.join("other.tmp");
+        fs::write(&tmp, b"x").expect("tmp");
+        let (from, to) = (wide(&tmp), wide(&path));
+        // SAFETY: two NUL-terminated paths.
+        let once = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        let refused = io::Error::last_os_error();
+        assert_eq!(
+            (once, refused.raw_os_error()),
+            (0, Some(ERROR_ACCESS_DENIED as i32))
+        );
+        // Let go of after a moment: the write waits for it.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(held);
+        });
+        assert_eq!(write(&path, b"two", Some(b"one")).expect("written"), None);
+        release.join().expect("thread");
+        assert_eq!(fs::read(&path).expect("read"), b"two");
+        assert_eq!(fs::read(backup_path(&path)).expect("backup"), b"one");
+        assert!(!tmp_path(&path).exists());
+        // A folder or a read-only file in its place refuses for good: not
+        // waited for. A file, or none, may be held for a moment.
+        let folder = dir.join("folder.ini");
+        fs::create_dir(&folder).expect("folder");
+        assert!(refuses_for_good(&wide(&folder)));
+        assert!(write(&folder, b"x", None).is_err());
+        assert!(folder.is_dir() && !tmp_path(&folder).exists());
+        let read_only = dir.join("read-only.ini");
+        fs::write(&read_only, b"x").expect("file");
+        set_attributes(&read_only, FILE_ATTRIBUTE_READONLY);
+        assert!(refuses_for_good(&wide(&read_only)));
+        set_attributes(&read_only, FILE_ATTRIBUTE_NORMAL);
+        assert!(!refuses_for_good(&wide(&read_only)));
+        assert!(!refuses_for_good(&wide(&dir.join("missing.ini"))));
         let _ = fs::remove_dir_all(&dir);
     }
 

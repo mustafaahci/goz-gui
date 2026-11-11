@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn lists_folders_as_asked_and_reads_back() {
-        let dir = std::env::temp_dir().join(format!("goz-gui-create-{}", std::process::id()));
+        let dir = crate::store::file::tests::fresh_dir("goz-gui-create", "");
         let tree = dir.join("tree");
         fs::create_dir_all(tree.join("sub")).unwrap();
         fs::write(tree.join("a.txt"), "hello").unwrap();

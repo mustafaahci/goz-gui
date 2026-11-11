@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn the_stream_reads_seeks_and_lets_the_file_be_renamed() {
-        let dir = std::env::temp_dir().join(format!("goz-gui-stream-{}", std::process::id()));
+        let dir = crate::store::file::tests::fresh_dir("goz-gui-stream", "");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.txt");
         std::fs::File::create(&path)

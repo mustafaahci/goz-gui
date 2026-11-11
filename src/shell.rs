@@ -1063,7 +1063,7 @@ mod tests {
     fn drag_data_of_scratch_files() {
         // SAFETY: COM for this test thread, which ends with the test.
         let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        let dir = std::env::temp_dir().join(format!("goz-gui-drag-{}", std::process::id()));
+        let dir = crate::store::file::tests::fresh_dir("goz-gui-drag", "");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         let files = [
@@ -1101,7 +1101,7 @@ mod tests {
     #[test]
     fn shortcuts_resolve_to_their_targets() {
         assert!(ole_ready());
-        let dir = std::env::temp_dir().join(format!("goz-gui-lnk-{}", std::process::id()));
+        let dir = crate::store::file::tests::fresh_dir("goz-gui-lnk", "");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("target folder");

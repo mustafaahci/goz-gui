@@ -92,6 +92,8 @@ mod reselect;
 mod results;
 mod runs;
 mod searches;
+// W6: rows selected one by one, a slice at a time.
+mod selecting;
 mod session;
 pub mod slots;
 mod thumbview;
@@ -369,6 +371,9 @@ pub struct App {
     /// The list's selection as ranges, kept from its notifications
     /// (`selection.rs`): Invert Selection sets the smaller side.
     sel: RefCell<crate::selection::Selection>,
+    /// Rows still to select or deselect one by one, a slice at a time
+    /// (`selecting.rs`).
+    selecting: RefCell<selecting::Selecting>,
     /// The search on screen counts as made (Enter, an action, the list
     /// taking the keyboard, or the text staying put for a moment), and
     /// whether its refusal by gozd has been beeped for.
@@ -446,8 +451,9 @@ pub struct App {
     view: Cell<View>,
     /// The thumbnails made, and the thread making them.
     pub thumbs: Thumbs,
-    /// The system's 48 px and 256 px icon lists (HIMAGELIST), once asked.
-    big_icons: Cell<[usize; 2]>,
+    /// The system's icon lists (HIMAGELIST) by `SHIL_*`: 32, 16, 48 and
+    /// 256 px (and 16 again, by the system's metrics), once asked.
+    big_icons: Cell<[usize; 5]>,
     /// Their icons not loaded yet, loaded on a thread (`bigicons.rs`).
     big_loads: crate::bigicons::BigIcons,
     /// The icon view's layout while the list paints (taken as it starts).
@@ -1124,6 +1130,7 @@ impl App {
                 bulk: Cell::new(false),
                 bulk_changed: Cell::new(false),
                 sel: RefCell::default(),
+                selecting: RefCell::default(),
                 settled: Cell::new(false),
                 beeped: Cell::new(false),
                 bookmarks: marks,
@@ -1162,7 +1169,7 @@ impl App {
                 taskbar_created: crate::tray::taskbar_created(),
                 view: Cell::new(s.view),
                 thumbs: Thumbs::new(hwnd, WM_THUMB),
-                big_icons: Cell::new([0; 2]),
+                big_icons: Cell::new([0; 5]),
                 big_loads: crate::bigicons::BigIcons::new(hwnd, thumbview::WM_BIG_ICONS),
                 thumb_grid: Cell::new(None),
                 view_hot: Cell::new(None),
@@ -1816,6 +1823,10 @@ impl App {
                     self.fetch_done();
                     0
                 }
+                selecting::WM_SELECTING => {
+                    self.selecting_due();
+                    0
+                }
                 // W4 (G1): the data tools' messages.
                 m if (crate::datatools::MSG_FIRST..crate::datatools::MSG_END).contains(&m) => {
                     self.data_tools_message(m, w, l);
@@ -1867,6 +1878,8 @@ impl App {
                         self.live_tick();
                     } else if w == TIMER_REST {
                         self.memory_rested();
+                    } else if w == selecting::TIMER_SELECTING {
+                        self.selecting_due();
                     } else if slots::is_feature_timer(w) {
                         self.feature_timer(w);
                     } else if custom::is_timer(w) {
@@ -2842,6 +2855,8 @@ impl App {
     /// No row selected or focused, and no anchor for Shift+click: all three
     /// are row numbers, which a new set of rows gives to other files.
     fn clear_selection(&self) {
+        // Rows still to be set one by one belong to the selection replaced.
+        self.drop_selecting();
         self.set_state(usize::MAX, 0, LVIS_SELECTED | LVIS_FOCUSED);
         send(self.list, LVM_SETSELECTIONMARK, 0, -1);
     }
@@ -3159,9 +3174,15 @@ unsafe extern "system" fn list_proc(
             WM_MOUSELEAVE => hover::left(app),
             WM_LBUTTONDOWN => {
                 celltip::hide(app);
+                app.finish_selecting();
                 app.last_click.set(point(l));
             }
-            WM_RBUTTONDOWN | WM_MBUTTONDOWN => celltip::hide(app),
+            WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+                celltip::hide(app);
+                app.finish_selecting();
+            }
+            // A click acts on the selection as it is to be (`selecting.rs`).
+            WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK => app.finish_selecting(),
             // Rename's box, the list's child, in the list's colours.
             WM_CTLCOLOREDIT => {
                 let pal = app.pal.get();
@@ -3180,6 +3201,8 @@ unsafe extern "system" fn list_proc(
             }
             WM_KEYDOWN => {
                 celltip::hide(app);
+                // A key acts on the selection as it is to be.
+                app.finish_selecting();
                 let cmd = keys::list_command(
                     w as u16,
                     key_down(VK_CONTROL),
@@ -3199,6 +3222,7 @@ unsafe extern "system" fn list_proc(
             // it for its history); Alt+Backspace is Everything's Undo (F5),
             // and its character is no menu's access key: no beep for it.
             WM_SYSKEYDOWN => {
+                app.finish_selecting();
                 if w == usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_UP)
                     && app.up_one_folder()
                 {
@@ -3219,6 +3243,7 @@ unsafe extern "system" fn list_proc(
             // list's, which would ask for rows it cannot search
             // (LVN_ODFINDITEMW).
             WM_CHAR => {
+                app.finish_selecting();
                 app.type_ahead(w as u16);
                 return 0;
             }

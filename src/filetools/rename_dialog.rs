@@ -1172,6 +1172,12 @@ impl Dlg {
                     // SAFETY: NUL-terminated text for this thread's box.
                     unsafe { SetWindowTextW(item(dlg, id), z.as_ptr()) };
                 }
+                // And its switches, as Everything's presets keep them.
+                let o = p.options;
+                set_check(dlg, ID_CASE, o.match_case);
+                set_check(dlg, ID_DIACRITICS, o.match_diacritics);
+                set_check(dlg, ID_REGEX, o.regex);
+                set_check(dlg, ID_EXTENSION, o.ignore_extension);
                 self.recompute(dlg);
             }
         }
@@ -1198,6 +1204,7 @@ impl Dlg {
             name,
             old_format: Dlg::format(dlg, ID_OLD),
             new_format: Dlg::format(dlg, ID_NEW),
+            options: Dlg::options(dlg),
         };
         let mut list = self.presets.borrow_mut();
         let at = list

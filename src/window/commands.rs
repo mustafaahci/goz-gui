@@ -157,6 +157,9 @@ impl App {
 
     /// Runs a menu command or shortcut.
     pub fn command(&self, id: u16) {
+        // Every command finds the selection as it is to be, rows still
+        // being set one by one included (`selecting.rs`).
+        self.finish_selecting();
         if ACTIONS.contains(&id) && !self.selected(1).is_empty() {
             self.record_search();
         }
@@ -309,6 +312,7 @@ impl App {
     /// moment (the File menu's selection items, the history entries, the
     /// bookmarks), then sets its checks and greyed items.
     pub(super) fn init_menu_popup(&self, popup: HMENU) {
+        self.finish_selecting();
         let selection = !self.selected(1).is_empty();
         // Only the menu bar's Edit menu acts on a text box's text while it
         // has the keyboard (`menu_command`); the row menu's Cut and Copy are

@@ -1194,11 +1194,7 @@ mod tests {
 
     /// A fresh folder of the test's own under the temporary folder.
     fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("goz-gui-filetools-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::store::file::tests::fresh_dir("goz-gui-filetools", name)
     }
 
     fn task(steps: Vec<Step>, checked: bool) -> Task {

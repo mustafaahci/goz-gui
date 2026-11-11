@@ -77,6 +77,7 @@ impl App {
     /// On a row (or from the keyboard with rows selected) the row menu;
     /// on the empty space (or with nothing selected) the background menu.
     pub(super) fn list_menu(&self, l: LPARAM) {
+        self.finish_selecting();
         if l == -1 {
             if self.selected(1).is_empty() {
                 let mut pt = POINT {

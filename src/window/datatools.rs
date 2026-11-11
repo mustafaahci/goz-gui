@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn a_list_is_known_by_its_path_in_any_case() {
-        let dir = std::env::temp_dir().join(format!("goz-gui-islist-{}", std::process::id()));
+        let dir = crate::store::file::tests::fresh_dir("goz-gui-islist", "");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("List.efu");
         std::fs::write(&file, "Filename\r\nC:\\a.txt\r\n").unwrap();

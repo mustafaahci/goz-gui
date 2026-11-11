@@ -529,6 +529,8 @@ mod tests {
             datatools::WM_OTHERS_ENDED,
             // Wave 4 (G2).
             super::super::custom::WM_DOUBLE_CTRL,
+            // W6: rows selected a slice at a time.
+            super::super::selecting::WM_SELECTING,
         ];
         for (i, &(a, m)) in messages.iter().enumerate() {
             for &(b, other) in &messages[i + 1..] {
@@ -576,6 +578,8 @@ mod tests {
             uiopts::TIMER_SEARCH_DELAY,
             // Wave 4 (G2).
             super::super::custom::TIMER_JUMP_LIST,
+            // W6.
+            super::super::selecting::TIMER_SELECTING,
         ];
         for (i, &(a, t)) in timers.iter().enumerate() {
             for &(b, other) in &timers[i + 1..] {

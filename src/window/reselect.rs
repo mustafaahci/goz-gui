@@ -41,6 +41,7 @@ use windows_sys::Win32::UI::Controls::{
     LVM_SETSELECTIONMARK, LVNI_FOCUSED,
 };
 
+use super::selecting::Step;
 use super::{App, send};
 use crate::pane::PaneEvent;
 
@@ -257,6 +258,8 @@ impl App {
     /// Notes what is selected, by path, before a refresh's rows (`refresh`,
     /// `new_total` of them) or another search's replace the rows on screen.
     pub(super) fn note_selection(&self, refresh: bool, new_total: u64) -> Kept {
+        // The selection as it is to be, rows still being set included.
+        self.finish_selecting();
         let count = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
         let again = if refresh {
             let total = self.model.borrow().total;
@@ -366,13 +369,9 @@ impl App {
         if found.is_empty() {
             return;
         }
-        if !found.selected.is_empty() {
-            self.in_bulk(|| {
-                for &i in &found.selected {
-                    self.set_state(i, LVIS_SELECTED, LVIS_SELECTED);
-                }
-            });
-        }
+        // A slice at a time (`selecting.rs`): a block holds up to 1,024
+        // of them, and four blocks are held.
+        self.select_rows(found.selected.iter().map(|&i| Step::Rows(i..i + 1, true)));
         self.quietly(|| {
             if let Some(i) = found.focus {
                 self.set_state(i, LVIS_FOCUSED, LVIS_FOCUSED);
