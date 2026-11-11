@@ -5,11 +5,14 @@
 //! Time's choices (`set_file_time_date_created_type`, ..._modified_type,
 //! ..._accessed_type: 0 No change, 1 and 2 the other two dates, 3 Now,
 //! 4 Custom) and Custom dates (`set_file_time_date_created`, ...); the
-//! Undo History's sort (`undo_history_sort`, `_ascending`); and the folder
+//! Undo History's sort (`undo_history_sort`, `_ascending`); the folder
 //! Copy and Move to Folder last went to (`rename_last_browse_path`, the
-//! key Everything's copy and move dialogs keep their Browse folder in).
+//! key Everything's copy and move dialogs keep their Browse folder in); and
+//! the renamer's presets (`rename_presets`, as Everything 1.5 writes it: a
+//! JSON array on one line).
 
 use crate::csv::{self, Field};
+use crate::json::{self, Json};
 
 /// Everything's `max_undo`.
 pub const MAX_UNDO: usize = 256;
@@ -86,23 +89,35 @@ impl Formats {
     }
 }
 
-/// A named Old format and New format.
+/// A named Old format and New format, and the renamer's switches with
+/// them (Everything's New Preset dialog keeps those too).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preset {
     pub name: String,
     pub old_format: String,
     pub new_format: String,
+    pub options: super::rename::Options,
 }
 
 /// The most presets kept.
 pub const PRESETS: usize = 100;
 
-/// The presets as `rename_presets` holds them: one CSV record of name, old
-/// format and new format, preset after preset.
+/// The presets as `rename_presets` holds them. Everything 1.5 writes a JSON
+/// array on one line (seen live with 1.5.0.1424b):
+///
+/// `[{"name":"Dates","old_format":"%1-%2","new_format":"%2 %1","case":0,`
+/// `"diacritics":0,"regex":0,"ignore_extension":0},...]`
+///
+/// Before, goz-gui wrote one CSV record of name, old format and new format,
+/// preset after preset: still read (with the switches off), and written
+/// again as Everything's.
 fn presets_of(value: Option<&str>) -> Vec<Preset> {
-    let Some(value) = value.filter(|v| !v.is_empty()) else {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
         return Vec::new();
     };
+    if value.starts_with('[') {
+        return everythings_presets(value);
+    }
     let fields: Vec<String> = csv::parse(value)
         .into_iter()
         .next()
@@ -119,23 +134,62 @@ fn presets_of(value: Option<&str>) -> Vec<Preset> {
             name: c[0].clone(),
             old_format: c[1].clone(),
             new_format: c[2].clone(),
+            options: super::rename::Options::default(),
         })
         .take(PRESETS)
         .collect()
 }
 
+/// Everything's JSON presets: the objects with a name; a missing format is
+/// empty and a missing switch off. Text that is not such an array gives
+/// none (the key is left for Everything's to write again).
+fn everythings_presets(value: &str) -> Vec<Preset> {
+    let Ok(parsed) = json::parse(value.as_bytes()) else {
+        return Vec::new();
+    };
+    let text = |p: &Json, key: &str| p.get(key).and_then(Json::as_text).unwrap_or_default();
+    let flag = |p: &Json, key: &str| p.get(key).and_then(Json::as_flag).unwrap_or(false);
+    parsed
+        .as_array()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| Preset {
+            name: text(p, "name"),
+            old_format: text(p, "old_format"),
+            new_format: text(p, "new_format"),
+            options: super::rename::Options {
+                match_case: flag(p, "case"),
+                match_diacritics: flag(p, "diacritics"),
+                regex: flag(p, "regex"),
+                ignore_extension: flag(p, "ignore_extension"),
+            },
+        })
+        .filter(|p| !p.name.is_empty())
+        .take(PRESETS)
+        .collect()
+}
+
+/// `rename_presets` as Everything writes it; empty for none.
 fn presets_value(list: &[Preset]) -> String {
     if list.is_empty() {
         return String::new();
     }
-    let fields: Vec<Field> = list
+    let items = list
         .iter()
-        .flat_map(|p| [&p.name, &p.old_format, &p.new_format])
-        .map(|t| Field::quoted(t.clone()))
+        .map(|p| {
+            let o = p.options;
+            Json::Object(vec![
+                ("name".to_owned(), Json::str(&p.name)),
+                ("old_format".to_owned(), Json::str(&p.old_format)),
+                ("new_format".to_owned(), Json::str(&p.new_format)),
+                ("case".to_owned(), Json::bit(o.match_case)),
+                ("diacritics".to_owned(), Json::bit(o.match_diacritics)),
+                ("regex".to_owned(), Json::bit(o.regex)),
+                ("ignore_extension".to_owned(), Json::bit(o.ignore_extension)),
+            ])
+        })
         .collect();
-    let mut out = String::new();
-    csv::write_record(&fields, &mut out);
-    out.trim_end_matches(['\r', '\n']).to_owned()
+    json::to_line(&Json::Array(items))
 }
 
 impl Default for ToolSettings {
@@ -349,6 +403,52 @@ mod tests {
         // A record cut short keeps the whole presets in it.
         assert_eq!(presets_of(Some(r#""a","b","c","d""#)).len(), 1);
         assert_eq!(presets_value(&[]), "");
+    }
+
+    #[test]
+    fn presets_are_read_and_written_as_everything_writes_them() {
+        // Written by Everything 1.5.0.1424b's New Preset dialog (a portable
+        // copy driven by posted messages; quotes, a backslash, a comma, a
+        // colon and non-ASCII text, and two switches on).
+        let everything = concat!(
+            r#"[{"name":"W6 one, \"two\"","old_format":"w6\"old,1;a:b|c\\%1","#,
+            r#""new_format":"w6new_%1 \"x\",y","case":0,"diacritics":0,"regex":0,"#,
+            r#""ignore_extension":0},{"name":"Café 日本 /","old_format":"tü%1","#,
+            r#""new_format":"n<>&%1","case":0,"diacritics":0,"regex":0,"ignore_extension":0},"#,
+            r#"{"name":"W6 flags","old_format":"(.*)","new_format":"","case":1,"#,
+            r#""diacritics":0,"regex":1,"ignore_extension":0}]"#
+        );
+        let list = presets_of(Some(everything));
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].name, r#"W6 one, "two""#);
+        assert_eq!(list[0].old_format, r#"w6"old,1;a:b|c\%1"#);
+        assert_eq!(list[0].new_format, r#"w6new_%1 "x",y"#);
+        assert_eq!(list[1].name, "Café 日本 /");
+        assert_eq!(list[1].old_format, "tü%1");
+        let flags = list[2].options;
+        assert!(flags.match_case && flags.regex);
+        assert!(!flags.match_diacritics && !flags.ignore_extension);
+        assert_eq!(list[2].new_format, "");
+        // Written back byte for byte as Everything wrote it.
+        assert_eq!(presets_value(&list), everything);
+        // goz-gui's old value is still read, and written as Everything's.
+        let old = presets_of(Some(r#""Dates","%1-%2","%2 %1""#));
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].options, crate::filetools::rename::Options::default());
+        assert_eq!(
+            presets_value(&old),
+            r#"[{"name":"Dates","old_format":"%1-%2","new_format":"%2 %1","case":0,"diacritics":0,"regex":0,"ignore_extension":0}]"#
+        );
+        // Not an array of presets: none; a nameless one is left out; a
+        // missing switch is off.
+        assert!(presets_of(Some("[{")).is_empty());
+        assert!(presets_of(Some("[1,2]")).is_empty());
+        let partial = presets_of(Some(r#"[{"name":"","old_format":"x"},{"name":"n"}]"#));
+        assert_eq!(partial.len(), 1);
+        assert_eq!(
+            (partial[0].old_format.as_str(), partial[0].options.regex),
+            ("", false)
+        );
     }
 
     #[test]
