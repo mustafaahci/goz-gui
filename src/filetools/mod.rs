@@ -68,8 +68,8 @@ use windows_sys::Win32::Globalization::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, DeleteFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_WRITE_ATTRIBUTES, GetFileAttributesW, GetFileTime, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
-    SetFileTime,
+    FILE_WRITE_ATTRIBUTES, GetFileAttributesW, GetFileTime, GetLongPathNameW,
+    INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, SetFileTime,
 };
 use windows_sys::Win32::UI::Shell::COPYENGINE_S_USER_IGNORED;
 
@@ -358,6 +358,31 @@ fn item(path: &[u16]) -> Option<IShellItem> {
     let path = nul(path);
     // SAFETY: a NUL-terminated path that outlives the call.
     unsafe { SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None).ok() }
+}
+
+/// `path` with its 8.3 short names expanded, the form the shell reports
+/// items in (`C:\Users\RUNNER~1\x` comes back as `C:\Users\runneradmin\x`);
+/// `None` when it holds no short name or cannot be read.
+pub(crate) fn long_path(path: &[u16]) -> Option<Vec<u16>> {
+    // A short name always holds a tilde; most paths have none.
+    if !path.contains(&u16::from(b'~')) {
+        return None;
+    }
+    let path = nul(path);
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: a NUL-terminated path and a buffer of the length given.
+        let n =
+            unsafe { GetLongPathNameW(path.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            return Some(buf);
+        }
+        buf.resize(n, 0);
+    }
 }
 
 /// Whether `a` and `b` are the same path as Windows compares them.
@@ -881,8 +906,12 @@ fn shell_steps(
         let mut queued = 0;
         // Names kept alive until the operation has run.
         let mut names: Vec<Vec<u16>> = Vec::new();
+        // Each source's long form, read while it still exists: the
+        // operation reports its items that way.
+        let mut long: Vec<Option<Vec<u16>>> = vec![None; steps.len()];
         for &i in mine {
             let step = &steps[i];
+            long[i] = long_path(step.source());
             let Some(source) = item(step.source()) else {
                 results[i] = StepResult::Failed(hr_text(0x8007_0002_u32 as i32));
                 continue;
@@ -956,9 +985,11 @@ fn shell_steps(
             };
             // The operation reports the items inside a folder too: only
             // the one given counts.
-            let seen = log
-                .iter()
-                .find(|c| c.kind == want && same_path(&c.from, step.source()));
+            let seen = log.iter().find(|c| {
+                c.kind == want
+                    && (same_path(&c.from, step.source())
+                        || long[i].as_deref().is_some_and(|l| same_path(&c.from, l)))
+            });
             let done = |to: Vec<u16>| StepResult::Done {
                 to,
                 before: None,

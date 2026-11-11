@@ -547,7 +547,16 @@ pub mod tests {
             COUNT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&dir).expect("test folder");
-        dir
+        // In its long form: a %TEMP% given with 8.3 short names (as on CI
+        // runners, C:\Users\RUNNER~1) would otherwise differ from the paths
+        // the shell reports for the same files.
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+        match crate::filetools::long_path(&wide) {
+            Some(long) => PathBuf::from(
+                <OsString as std::os::windows::ffi::OsStringExt>::from_wide(&long),
+            ),
+            None => dir,
+        }
     }
 
     /// A fresh folder for one test.
