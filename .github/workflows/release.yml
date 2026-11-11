@@ -1,0 +1,118 @@
+name: Release
+
+# Fires only when a version tag is pushed (e.g. `git tag v0.1.0 && git push
+# origin v0.1.0`). It guards that the tag matches Cargo.toml, then builds
+# goz-gui, packages a portable zip and a per-user MSI, and publishes both as a
+# GitHub Release with their SHA-256 checksums.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege by default; the release job elevates to contents: write.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  WIX_VERSION: 5.0.2
+
+jobs:
+  version-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Compare the pushed tag (minus its leading `v`) against the package
+      # version in Cargo.toml. Fail loudly on any mismatch so the fix is to
+      # bump Cargo.toml (or retag), never to ship the two out of sync.
+      - name: Tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "tag:      $tag"
+          echo "manifest: $manifest"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::git tag v$tag does not match Cargo.toml version $manifest; bump Cargo.toml or retag"
+            exit 1
+          fi
+
+  release:
+    needs: version-guard
+    runs-on: windows-latest
+    permissions:
+      contents: write # required to create the release and upload assets
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup takes the channel and components from rust-toolchain.toml.
+      - name: Install the toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2 # after the toolchain: keyed off the rustc version
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      # WiX v5 as a .NET tool, and the UI extension for the license page.
+      - name: Install WiX
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tools = Join-Path $env:RUNNER_TEMP 'wix'
+          dotnet tool install wix --version $env:WIX_VERSION --tool-path $tools
+          & "$tools\wix.exe" extension add -g "WixToolset.UI.wixext/$env:WIX_VERSION"
+          & "$tools\wix.exe" --version
+          Add-Content -Path $env:GITHUB_PATH -Value $tools
+
+      # goz-gui-vX.Y.Z-windows-x86_64.zip (the exe with its license and
+      # readme) and goz-gui-vX.Y.Z-x64.msi (validated with the ICE suite),
+      # then SHA256SUMS.txt in `sha256sum -c` format.
+      - name: Package
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Force -DestinationPath "dist/goz-gui-$env:TAG-windows-x86_64.zip" -Path `
+            target/release/goz-gui.exe, `
+            LICENSE, `
+            README.md
+          ./installer/build-msi.ps1 -Exe target/release/goz-gui.exe -OutDir dist `
+            -Version ($env:TAG -replace '^v', '') -Validate | Out-Null
+          $sums = Get-ChildItem dist -File -Filter 'goz-gui-*' | Sort-Object Name | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant(), $_.Name
+          }
+          [IO.File]::WriteAllText((Join-Path $PWD 'dist/SHA256SUMS.txt'), ($sums -join "`n") + "`n")
+          Get-ChildItem dist | Format-Table Name, Length
+          Get-Content dist/SHA256SUMS.txt
+
+      # The release text: this version's section of CHANGELOG.md (if it has
+      # one), followed by GitHub's generated notes.
+      - name: Release notes from CHANGELOG.md
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          $notes = ''
+          if (Test-Path CHANGELOG.md) {
+            $text = (Get-Content -Raw -Encoding utf8 CHANGELOG.md) -replace "`r`n", "`n"
+            $pattern = '(?ms)^## \[' + [regex]::Escape($version) + '\][^\n]*\n(.*?)(?=^## |^\[[^\]]+\]:\s|\z)'
+            $m = [regex]::Match($text, $pattern)
+            if ($m.Success) { $notes = $m.Groups[1].Value.Trim() }
+          }
+          if (-not $notes) { Write-Host "CHANGELOG.md has no section for $version; generated notes only" }
+          [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'release-notes.md'), $notes)
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: ${{ runner.temp }}/release-notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/goz-gui-*-windows-x86_64.zip
+            dist/goz-gui-*-x64.msi
+            dist/SHA256SUMS.txt

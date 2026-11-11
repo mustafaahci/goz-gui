@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  goz-gui's Windows Installer package (WiX v5).
+
+  A per-user install: no UAC prompt; its files, shortcut and registry values
+  are all the current user's.
+  - goz-gui.exe and LICENSE.txt in %LocalAppData%\Programs\goz-gui
+  - goz-gui.lnk in the user's Start menu, the same shortcut Options > General
+    makes, so that page shows it ticked
+  - an entry in Settings > Apps (Add/Remove Programs) with the app's icon
+  - a newer package replaces an older one (MajorUpgrade)
+
+  Nothing runs code while installing or uninstalling: no custom actions of
+  its own (the only one is WixUI's, behind the license page's Print button),
+  no services. goz-gui's data folder (%APPDATA%\goz-gui) and what the app
+  registers itself from Options > General are the app's, not the package's,
+  and are kept on uninstall.
+
+  Built by installer/build-msi.ps1, which passes these variables:
+    Version     X.Y.Z (Cargo.toml's version, without a pre-release suffix)
+    ExeFile     the release goz-gui.exe
+    LicenseFile LICENSE
+    LicenseRtf  LICENSE as RTF, for the license page (made by the script)
+    IconFile    assets\goz.ico
+  and, optionally, AppUserModelId: the shortcut's System.AppUserModel.ID.
+  goz-gui takes an AppUserModelID per data folder (src/jumplist.rs,
+  src/instance.rs: a hash of the folder's path), which differs from user to
+  user, so the package can only carry a fixed one once goz-gui uses a fixed
+  one for its default instance. Until then the shortcut has none, like the
+  one Options > General makes, and a pin made from the running window is the
+  one that groups with it.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <?ifndef Version?><?error Pass -d Version=X.Y.Z ?><?endif?>
+  <?ifndef ExeFile?><?error Pass -d ExeFile=path\to\goz-gui.exe ?><?endif?>
+  <?ifndef LicenseFile?><?error Pass -d LicenseFile=path\to\LICENSE ?><?endif?>
+  <?ifndef LicenseRtf?><?error Pass -d LicenseRtf=path\to\License.rtf ?><?endif?>
+  <?ifndef IconFile?><?error Pass -d IconFile=path\to\goz.ico ?><?endif?>
+
+  <!-- Fixed for good: every goz-gui package upgrades every older one. -->
+  <?define UpgradeCode = "CF932115-9EE1-4512-B348-409C45594208" ?>
+  <?define RegKey = "Software\goz-gui" ?>
+
+  <Package Name="goz-gui"
+           Manufacturer="Mustafa Ahci"
+           Version="$(Version)"
+           UpgradeCode="$(UpgradeCode)"
+           Scope="perUser"
+           Language="1033"
+           Compressed="yes">
+
+    <SummaryInformation Description="goz-gui $(Version): a native Windows front end for goz" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Settings > Apps -->
+    <Icon Id="goz.ico" SourceFile="$(IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="goz.ico" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/mustafaahci/goz-gui" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/mustafaahci/goz-gui" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/mustafaahci/goz-gui/releases" />
+    <Property Id="ARPCONTACT" Value="Mustafa Ahci" />
+
+    <!-- Welcome and license, then Install. It also sets ARPNOMODIFY: with
+         one feature there is nothing to modify. -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LocalProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="goz-gui" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="goz-gui" AllowAbsent="no">
+      <ComponentRef Id="App" />
+      <ComponentRef Id="License" />
+    </Feature>
+
+    <!--
+      A per-user component's key path is an HKCU value, not a file (ICE38),
+      and each folder made in the profile is removed again on uninstall
+      (ICE64); Windows Installer removes a folder only once it is empty, so
+      a %LocalAppData%\Programs shared with other programs stays. A component
+      with a file and a registry key path needs a fixed GUID (WIX0230): keep
+      these as they are.
+
+      The shortcut is in the exe's component, as it targets that file (ICE69).
+    -->
+    <Component Id="App" Directory="INSTALLFOLDER" Guid="33A38A87-0A92-4873-906A-62DB435D116D">
+      <File Id="GozGuiExe" Name="goz-gui.exe" Source="$(ExeFile)" />
+      <Shortcut Id="StartMenuShortcut"
+                Directory="ProgramMenuFolder"
+                Name="goz-gui"
+                Description="Search files and folders by name with goz"
+                Target="[#GozGuiExe]"
+                WorkingDirectory="INSTALLFOLDER">
+        <?ifdef AppUserModelId?>
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="$(AppUserModelId)" />
+        <?endif?>
+      </Shortcut>
+      <RegistryValue Root="HKCU" Key="$(RegKey)" Name="InstallFolder" Type="string"
+                     Value="[INSTALLFOLDER]" KeyPath="yes" />
+      <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      <RemoveFolder Id="RemoveLocalProgramsFolder" Directory="LocalProgramsFolder" On="uninstall" />
+    </Component>
+
+    <Component Id="License" Directory="INSTALLFOLDER" Guid="9CCEC31A-2780-4BDB-8CBA-B6355364E24B">
+      <File Id="LicenseTxt" Name="LICENSE.txt" Source="$(LicenseFile)" />
+      <RegistryValue Root="HKCU" Key="$(RegKey)" Name="License" Type="integer"
+                     Value="1" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>
