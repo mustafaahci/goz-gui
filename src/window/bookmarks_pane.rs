@@ -33,9 +33,9 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM}
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, HDC, InvalidateRect, ScreenToClient};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
-    EM_SETCUEBANNER, EM_SETSEL, HTREEITEM, NM_CLICK, NM_DBLCLK, NM_SETFOCUS, NMHDR, NMTREEVIEWW,
-    NMTVGETINFOTIPW, TVE_COLLAPSE, TVE_EXPAND, TVHT_ONITEM, TVHT_ONITEMINDENT, TVHT_ONITEMRIGHT,
-    TVM_SETEXTENDEDSTYLE, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW, TVS_EX_AUTOHSCROLL,
+    EM_SETCUEBANNER, EM_SETSEL, HTREEITEM, NM_CLICK, NM_CUSTOMDRAW, NM_DBLCLK, NM_SETFOCUS, NMHDR,
+    NMTREEVIEWW, NMTVGETINFOTIPW, TVE_COLLAPSE, TVE_EXPAND, TVHT_ONITEM, TVHT_ONITEMINDENT,
+    TVHT_ONITEMRIGHT, TVM_SETEXTENDEDSTYLE, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW, TVS_EX_AUTOHSCROLL,
     TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_INFOTIP, TVS_LINESATROOT,
     TVS_NOHSCROLL, TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT, WC_TREEVIEWW,
     WM_MOUSELEAVE,
@@ -569,6 +569,14 @@ impl BookmarksPane {
         }
         let tree = self.tree.get();
         match hdr.code {
+            // Options > Fonts and Colors' Bookmarks Sidebar states.
+            NM_CUSTOMDRAW => Some(treeview::custom_draw(
+                tree,
+                l,
+                &app.pal.get(),
+                crate::colors::Item::BookmarksSidebar,
+                app.ui_font_of(true),
+            )),
             NM_CLICK => {
                 // A click on a bookmark opens it, whichever part of its row
                 // (not the button of a folder): where the button went down
@@ -682,7 +690,7 @@ impl BookmarksPane {
 
     fn apply_theme(&self, app: &App) {
         let pal = app.pal.get();
-        treeview::apply_theme(self.tree.get(), &pal);
+        treeview::apply_theme(self.tree.get(), &pal, crate::colors::Item::BookmarksSidebar);
         let edit = self.edit.get();
         theme::allow(edit, pal.dark);
         theme::set_class(edit, pal.dark.then_some("DarkMode_CFD"));
@@ -696,11 +704,11 @@ fn inside(r: &RECT, pt: POINT) -> bool {
 /// The box's × glyph and face colours: lit under the mouse (as the search
 /// box's is), darker while held there, else the box's own (painted inside
 /// the frame's line).
-fn clear_colours(pal: &crate::theme::Palette, hot: bool, pressed: bool) -> (u32, u32) {
+fn clear_colours(pal: &crate::theme::Palette, bg: u32, hot: bool, pressed: bool) -> (u32, u32) {
     match (hot, pressed) {
         (true, true) => (pal.glyph_hot, pal.header_pressed),
         (true, false) => (pal.glyph_hot, pal.glyph_hot_bg),
-        _ => (pal.glyph, pal.bg),
+        _ => (pal.glyph, bg),
     }
 }
 
@@ -729,6 +737,13 @@ unsafe extern "system" fn tree_proc(
 }
 
 impl PaneContent for BookmarksPane {
+    fn colours(&self, app: &App) -> crate::theme::Ink {
+        app.pal.get().ink(
+            crate::colors::Item::BookmarksSidebar,
+            crate::colors::State::Normal,
+        )
+    }
+
     fn create(&self, app: &App, pane: HWND) {
         self.pane.set(pane);
         // SAFETY: children of this thread's pane window.
@@ -1040,7 +1055,11 @@ impl PaneContent for BookmarksPane {
 
     fn paint(&self, app: &App, hdc: HDC, rc: &RECT) {
         let pal = app.pal.get();
-        fill(hdc, rc, pal.bg);
+        let ink = pal.ink(
+            crate::colors::Item::BookmarksSidebar,
+            crate::colors::State::Normal,
+        );
+        fill(hdc, rc, ink.bg);
         // `rc` is the content's place, below the title row.
         let frame = Self::frame(app, rc);
         fill(hdc, &frame, pal.border);
@@ -1050,13 +1069,13 @@ impl PaneContent for BookmarksPane {
             right: frame.right - 1,
             bottom: frame.bottom - 1,
         };
-        fill(hdc, &inner, pal.bg);
+        fill(hdc, &inner, ink.bg);
         let button = Self::button(&frame);
         let cx = (button.left + button.right) / 2;
         let cy = (button.top + button.bottom) / 2;
         let scale = app.dpi.get() as f32 / 96.0;
         if self.has_text() {
-            let (fg, bg) = clear_colours(&pal, self.hot.get(), self.pressed.get());
+            let (fg, bg) = clear_colours(&pal, ink.bg, self.hot.get(), self.pressed.get());
             let face = RECT {
                 top: button.top + 1,
                 right: button.right - 1,
@@ -1066,7 +1085,7 @@ impl PaneContent for BookmarksPane {
             fill(hdc, &face, bg);
             searchbox::paint_cross(hdc, cx, cy, 3.0, scale, fg, bg);
         } else {
-            searchbox::paint_magnifier(hdc, cx, cy, scale, pal.glyph, pal.bg);
+            searchbox::paint_magnifier(hdc, cx, cy, scale, pal.glyph, ink.bg);
         }
     }
 
@@ -1097,15 +1116,15 @@ mod tests {
     fn the_clear_button_lights_and_darkens() {
         for dark in [true, false] {
             let pal = Palette::new(dark);
-            let idle = clear_colours(&pal, false, false);
-            let hot = clear_colours(&pal, true, false);
-            let held = clear_colours(&pal, true, true);
+            let idle = clear_colours(&pal, pal.bg, false, false);
+            let hot = clear_colours(&pal, pal.bg, true, false);
+            let held = clear_colours(&pal, pal.bg, true, true);
             // Idle: the box's background; lit and held: each its own.
             assert_eq!(idle, (pal.glyph, pal.bg));
             assert_ne!(hot.1, idle.1);
             assert_ne!(held.1, hot.1);
             // Held but dragged off: as idle.
-            assert_eq!(clear_colours(&pal, false, true), idle);
+            assert_eq!(clear_colours(&pal, pal.bg, false, true), idle);
         }
     }
 }

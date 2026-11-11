@@ -1,10 +1,14 @@
 //! Options > Fonts and Colors, as Everything's page: a theme (whose colours
 //! are being chosen: each theme keeps its own, `dark_...` keys), an item
-//! (Result List or Search Edit) with its font and size, and for the result
-//! list its item states, each with a foreground colour, a background colour
-//! and a font style (Default, or Custom with Bold), with a sample. The keys
-//! are Everything's (`crate::colors`). Color Filters... edits the colours
-//! rows take from their names (`color_filters`).
+//! (every part of the window goz-gui draws: (Default), the sidebars, the
+//! filter and find bars, the header, the menu bar, the panes' title rows,
+//! the preview, the result list, the search box, the status bar and the
+//! tabs) with its font and size (the result list's and the search box's)
+//! and its accent colour (where it tints a selection), and its item
+//! states, each with a foreground colour, a background colour and a font
+//! style (Default, or Custom with Bold), with a sample. The keys are
+//! Everything's (`crate::colors`). Color Filters... edits the colours rows
+//! take from their names (`color_filters`).
 
 use std::cell::{Cell, RefCell};
 
@@ -20,15 +24,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_GROUPBOX,
     CB_ADDSTRING, CB_ERR, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_RESETCONTENT,
     CB_SELECTSTRING, CB_SETCURSEL, CBN_EDITCHANGE, CBN_SELCHANGE, CBS_DROPDOWN, CBS_DROPDOWNLIST,
-    CBS_SORT, LB_ADDSTRING, LB_GETCURSEL, LB_SETCURSEL, LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT,
-    LBS_NOTIFY, WM_COMMAND, WM_DRAWITEM, WS_BORDER, WS_GROUP, WS_TABSTOP, WS_VSCROLL,
+    CBS_SORT, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LBN_SELCHANGE,
+    LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, WM_COMMAND, WM_DRAWITEM, WS_BORDER, WS_GROUP, WS_TABSTOP,
+    WS_VSCROLL,
 };
 
-use crate::colors::{Colors, FontSpec, Look, SIZES, State, Weight};
+use crate::colors::{Accent, AccentMode, Colors, FontSpec, Item, Look, SIZES, State, Weight};
 use crate::dialog::Class;
 use crate::options::{Invalid, LABEL, Page, Rows, enable, item, order, send, set_text, text};
 use crate::paint::fill;
-use crate::theme::Palette;
+use crate::theme::{Ink, Palette};
 use crate::wide::wz;
 use crate::window::App;
 
@@ -37,6 +42,9 @@ const THEME: u16 = 1532;
 const ITEM: u16 = 1534;
 const FONT: u16 = 1142;
 const SIZE: u16 = 1143;
+const ACCENT_NONE: u16 = 1398;
+const ACCENT_DEFAULT: u16 = 1399;
+const ACCENT_CUSTOM: u16 = 1400;
 const STATES: u16 = 1666;
 const GROUP: u16 = 1145;
 const FG_DEFAULT: u16 = 1146;
@@ -53,16 +61,17 @@ const BG_PICK: u16 = 1181;
 const FG_SWATCH: u16 = 1182;
 const BG_SWATCH: u16 = 1183;
 const FILTERS: u16 = 1184;
+const ACCENT_PICK: u16 = 1185;
+const ACCENT_SWATCH: u16 = 1186;
 
 const THEMES: [(bool, &str); 2] = [(false, "Standard"), (true, "Dark")];
-const ITEMS: [&str; 2] = ["Result List", "Search Edit"];
 const DEFAULT: &str = "(Default)";
 
 /// The page's working copy, applied at OK or Apply.
 pub(super) struct FontsColors {
     colors: RefCell<Colors>,
     dark: Cell<bool>,
-    /// 0: the result list, 1: the search box.
+    /// The item chosen (`Item::ALL`) and its state chosen (`Item::states`).
     item: Cell<usize>,
     state: Cell<usize>,
     busy: Cell<bool>,
@@ -87,46 +96,89 @@ impl FontsColors {
         self.busy.set(was);
     }
 
+    fn item(&self) -> Item {
+        Item::ALL[self.item.get().min(Item::ALL.len() - 1)]
+    }
+
     fn state(&self) -> State {
-        State::ALL[self.state.get().min(State::ALL.len() - 1)]
+        let states = self.item().states();
+        states[self.state.get().min(states.len() - 1)]
     }
 
     fn look(&self) -> Look {
-        self.colors.borrow().look(self.dark.get(), self.state())
+        self.colors
+            .borrow()
+            .look(self.dark.get(), self.item(), self.state())
     }
 
     fn set_look(&self, page: HWND, look: Look) {
         self.colors
             .borrow_mut()
-            .set_look(self.dark.get(), self.state(), look);
+            .set_look(self.dark.get(), self.item(), self.state(), look);
         self.repaint(page);
+    }
+
+    fn accent(&self) -> Accent {
+        self.colors.borrow().accent(self.dark.get(), self.item())
+    }
+
+    fn set_accent(&self, accent: Accent) {
+        self.colors
+            .borrow_mut()
+            .set_accent(self.dark.get(), self.item(), accent);
+    }
+
+    /// The colour the accent's swatch shows, and Custom starts from: its
+    /// own, else the one in force, else Windows'.
+    fn accent_shown(&self) -> u32 {
+        let c = self.colors.borrow();
+        let a = c.accent(self.dark.get(), self.item());
+        a.color
+            .or_else(|| c.accent_colour(self.dark.get(), self.item(), &crate::theme::system_accent))
+            .unwrap_or_else(crate::theme::system_accent)
     }
 
     fn font(&self) -> FontSpec {
         let c = self.colors.borrow();
-        if self.item.get() == 0 {
-            c.result_list_font.clone()
-        } else {
-            c.search_edit_font.clone()
+        match self.item() {
+            Item::ResultList => c.result_list_font.clone(),
+            Item::SearchEdit => c.search_edit_font.clone(),
+            _ => FontSpec::default(),
         }
     }
 
     fn set_font(&self, f: impl FnOnce(&mut FontSpec)) {
         let mut c = self.colors.borrow_mut();
-        f(if self.item.get() == 0 {
-            &mut c.result_list_font
-        } else {
-            &mut c.search_edit_font
+        match self.item() {
+            Item::ResultList => f(&mut c.result_list_font),
+            Item::SearchEdit => f(&mut c.search_edit_font),
+            _ => {}
+        }
+    }
+
+    /// The item's states in the list, the first chosen.
+    fn fill_states(&self, page: HWND) {
+        self.state.set(0);
+        self.quietly(|| {
+            send(page, STATES, LB_RESETCONTENT, 0, 0);
+            for s in self.item().states() {
+                let w = wz(s.label());
+                send(page, STATES, LB_ADDSTRING, 0, w.as_ptr() as isize);
+            }
+            send(page, STATES, LB_SETCURSEL, 0, 0);
         });
     }
 
-    /// The controls from the working copy: the item's font, the state's
-    /// look.
+    /// The controls from the working copy: the item's font and accent, the
+    /// state's look.
     fn show(&self, page: HWND) {
+        let item = self.item();
         let font = self.font();
         let look = self.look();
         let state = self.state();
-        let list = self.item.get() == 0;
+        let accent = self.accent();
+        let has_accent = item.has_accent();
+        let has_bold = item.has_bold(state);
         self.quietly(|| {
             let face = if font.face.is_empty() {
                 DEFAULT.to_owned()
@@ -146,6 +198,14 @@ impl FontsColors {
                 font.size.to_string()
             };
             set_text(page, SIZE, &size);
+            for (id, mode) in [
+                (ACCENT_NONE, AccentMode::None),
+                (ACCENT_DEFAULT, AccentMode::Default),
+                (ACCENT_CUSTOM, AccentMode::Custom),
+            ] {
+                let on = has_accent && accent.mode == mode;
+                send(page, id, BM_SETCHECK, usize::from(on), 0);
+            }
             set_text(
                 page,
                 GROUP,
@@ -157,52 +217,62 @@ impl FontsColors {
             };
             radio(FG_DEFAULT, FG_CUSTOM, look.fg.is_some());
             radio(BG_DEFAULT, BG_CUSTOM, look.bg.is_some());
-            radio(STYLE_DEFAULT, STYLE_CUSTOM, look.bold != Weight::Default);
+            radio(
+                STYLE_DEFAULT,
+                STYLE_CUSTOM,
+                has_bold && look.bold != Weight::Default,
+            );
             send(
                 page,
                 BOLD,
                 BM_SETCHECK,
-                usize::from(look.bold == Weight::Bold),
+                usize::from(has_bold && look.bold == Weight::Bold),
                 0,
             );
         });
-        // The states are the result list's.
-        for id in [
-            STATES,
-            FG_DEFAULT,
-            FG_CUSTOM,
-            BG_DEFAULT,
-            BG_CUSTOM,
-            STYLE_DEFAULT,
-            STYLE_CUSTOM,
-        ] {
-            enable(page, id, list);
+        // Only what goz-gui draws can be chosen.
+        for id in [FONT, SIZE] {
+            enable(page, id, item.has_font());
         }
-        enable(page, FG_PICK, list && look.fg.is_some());
-        enable(page, BG_PICK, list && look.bg.is_some());
-        enable(page, BOLD, list && look.bold != Weight::Default);
+        for id in [ACCENT_NONE, ACCENT_DEFAULT, ACCENT_CUSTOM] {
+            enable(page, id, has_accent);
+        }
+        enable(
+            page,
+            ACCENT_PICK,
+            has_accent && accent.mode == AccentMode::Custom,
+        );
+        enable(page, FG_PICK, look.fg.is_some());
+        enable(page, BG_PICK, look.bg.is_some());
+        for id in [STYLE_DEFAULT, STYLE_CUSTOM] {
+            enable(page, id, has_bold);
+        }
+        enable(page, BOLD, has_bold && look.bold != Weight::Default);
         self.repaint(page);
     }
 
     fn repaint(&self, page: HWND) {
-        for id in [SAMPLE, FG_SWATCH, BG_SWATCH] {
+        for id in [SAMPLE, FG_SWATCH, BG_SWATCH, ACCENT_SWATCH] {
             // SAFETY: repaints a control of this thread's page.
             unsafe { InvalidateRect(item(page, id), core::ptr::null(), 0) };
         }
     }
 
-    /// The colours the sample and the swatches show: the state's own, or
-    /// the theme's.
-    fn shown_colours(&self) -> (u32, u32, Option<u32>, Option<u32>, bool) {
-        let pal = self.colors.borrow().apply(Palette::new(self.dark.get()));
-        let (fg, bg) = match self.state() {
-            State::Normal | State::Highlighted => (pal.list_fg, pal.list_bg),
-            State::Selected => (pal.sel_fg, pal.sel),
-            State::InactiveSelected => (pal.sel_inactive_fg, pal.sel_inactive),
-            State::Mouseover => (pal.hover_fg, pal.hover),
-            State::CurrentSort => (pal.sort_fg, pal.sort_bg),
-        };
-        (fg, bg, pal.hl_fg, pal.hl_bg, pal.hl_bold)
+    /// The palette the working copy makes of the theme chosen.
+    fn palette(&self) -> Palette {
+        self.colors
+            .borrow()
+            .apply(Palette::new(self.dark.get()), &crate::theme::system_accent)
+    }
+
+    /// The colours the sample and the swatches show: the state's (its own,
+    /// or what it takes).
+    fn shown_colours(&self) -> Ink {
+        let pal = self.palette();
+        match (self.item(), self.state()) {
+            (item, State::Highlighted) => pal.ink(item, State::Normal),
+            (item, state) => pal.ink(item, state),
+        }
     }
 
     fn pick(&self, page: HWND, foreground: bool) {
@@ -223,42 +293,71 @@ impl FontsColors {
         }
     }
 
+    fn pick_accent(&self, page: HWND) {
+        let mut custom = *self.custom.borrow();
+        let picked =
+            crate::colorfilter_dialog::pick_color(page, Some(self.accent_shown()), &mut custom);
+        *self.custom.borrow_mut() = custom;
+        if let Some(c) = picked {
+            self.set_accent(Accent {
+                mode: AccentMode::Custom,
+                color: Some(c),
+            });
+        }
+        self.show(page);
+    }
+
     fn draw(&self, app: &App, dis: &DRAWITEMSTRUCT) {
-        let (fg, bg, hl_fg, hl_bg, hl_bold) = self.shown_colours();
+        let pal = self.palette();
+        let Ink { fg, bg } = self.shown_colours();
         let rc = dis.rcItem;
         let hdc = dis.hDC;
+        let swatch = |c: u32| {
+            fill(hdc, &rc, 0x0080_8080);
+            let inner = RECT {
+                left: rc.left + 1,
+                top: rc.top + 1,
+                right: rc.right - 1,
+                bottom: rc.bottom - 1,
+            };
+            fill(hdc, &inner, c);
+        };
         match dis.CtlID as u16 {
-            FG_SWATCH | BG_SWATCH => {
-                let look = self.look();
-                let c = if dis.CtlID as u16 == FG_SWATCH {
-                    look.fg.unwrap_or(fg)
+            FG_SWATCH => swatch(self.look().fg.unwrap_or(fg)),
+            BG_SWATCH => swatch(self.look().bg.unwrap_or(bg)),
+            ACCENT_SWATCH => {
+                if self.item().has_accent() {
+                    swatch(self.accent_shown());
                 } else {
-                    look.bg.unwrap_or(bg)
-                };
-                fill(hdc, &rc, 0x0080_8080);
-                let inner = RECT {
-                    left: rc.left + 1,
-                    top: rc.top + 1,
-                    right: rc.right - 1,
-                    bottom: rc.bottom - 1,
-                };
-                fill(hdc, &inner, c);
+                    fill(hdc, &rc, 0x0080_8080);
+                }
             }
             SAMPLE => {
                 fill(hdc, &rc, bg);
-                let fonts = app.fonts.borrow();
-                let bold_row = self.look().bold == Weight::Bold;
+                let item = self.item();
+                let list = item == Item::ResultList;
+                let fonts = if list {
+                    app.fonts.borrow()
+                } else {
+                    app.ui_fonts.borrow()
+                };
+                let state = self.state();
+                let bold_row = pal.is_bold(item, state)
+                    || state == State::Highlighted && pal.is_bold(item, State::Normal);
                 let base = if bold_row { fonts.bold } else { fonts.normal };
-                let matched = if hl_bold { fonts.bold } else { base };
+                let matched = if pal.hl_bold { fonts.bold } else { base };
+                let parts: &[(&str, bool)] = if list {
+                    &[("Annual ", false), ("report", true), (" 2024.pdf", false)]
+                } else {
+                    &[("Annual report 2024.pdf", false)]
+                };
                 let mut x = rc.left + 4;
                 // SAFETY: draws on the control's own DC for this paint; the
                 // old font is put back.
                 unsafe {
                     let old = SelectObject(hdc, base);
                     SetBkMode(hdc, TRANSPARENT as i32);
-                    for (part, is_match) in
-                        [("Annual ", false), ("report", true), (" 2024.pdf", false)]
-                    {
+                    for &(part, is_match) in parts {
                         let mut w: Vec<u16> = part.encode_utf16().collect();
                         SelectObject(hdc, if is_match { matched } else { base });
                         let mut size = windows_sys::Win32::Foundation::SIZE::default();
@@ -273,10 +372,17 @@ impl FontsColors {
                             right: (x + size.cx).min(rc.right),
                             ..rc
                         };
-                        if is_match && let Some(b) = hl_bg {
+                        if is_match && let Some(b) = pal.hl_bg {
                             fill(hdc, &r, b);
                         }
-                        SetTextColor(hdc, if is_match { hl_fg.unwrap_or(fg) } else { fg });
+                        SetTextColor(
+                            hdc,
+                            if is_match {
+                                pal.hl_fg.unwrap_or(fg)
+                            } else {
+                                fg
+                            },
+                        );
                         DrawTextW(
                             hdc,
                             w.as_mut_ptr(),
@@ -378,6 +484,8 @@ impl Page for FontsColors {
 
     fn build(&self, rows: &mut Rows<'_>) {
         let w = rows.width();
+        let radio = WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON as u32;
+        let next = BS_AUTORADIOBUTTON as u32;
         rows.combo("&Theme:", THEME, 40, 110)
             .control(Class::Static, "Ite&m:", LABEL, SS_LEFT, 0, (0, 2, 40, 9))
             .control(
@@ -386,7 +494,7 @@ impl Page for FontsColors {
                 ITEM,
                 WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
                 0,
-                (40, 0, 110, 80),
+                (40, 0, 110, 160),
             )
             .skip(17)
             .control(Class::Static, "&Font:", LABEL, SS_LEFT, 0, (0, 2, 40, 9))
@@ -410,6 +518,55 @@ impl Page for FontsColors {
             .skip(17)
             .control(
                 Class::Static,
+                "Acce&nt color:",
+                LABEL,
+                SS_LEFT,
+                0,
+                (0, 2, 50, 9),
+            )
+            .control(
+                Class::Button,
+                "None",
+                ACCENT_NONE,
+                radio,
+                0,
+                (50, 1, 32, 10),
+            )
+            .control(
+                Class::Button,
+                "Default",
+                ACCENT_DEFAULT,
+                next,
+                0,
+                (84, 1, 40, 10),
+            )
+            .control(
+                Class::Button,
+                "Custom",
+                ACCENT_CUSTOM,
+                next,
+                0,
+                (126, 1, 38, 10),
+            )
+            .control(
+                Class::Button,
+                "...",
+                ACCENT_PICK,
+                WS_TABSTOP | WS_GROUP,
+                0,
+                (166, 0, 20, 12),
+            )
+            .control(
+                Class::Static,
+                "",
+                ACCENT_SWATCH,
+                SS_OWNERDRAW,
+                0,
+                (190, 1, 24, 10),
+            )
+            .skip(16)
+            .control(
+                Class::Static,
                 "&Item states:",
                 LABEL,
                 SS_LEFT,
@@ -423,9 +580,9 @@ impl Page for FontsColors {
                 STATES,
                 WS_TABSTOP | WS_VSCROLL | WS_BORDER | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
                 0,
-                (0, 0, w, 52),
+                (0, 0, w, 48),
             )
-            .skip(56)
+            .skip(52)
             .control(
                 Class::Button,
                 "Settings for Normal item state",
@@ -434,8 +591,6 @@ impl Page for FontsColors {
                 0,
                 (0, 0, w, 66),
             );
-        let radio = WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON as u32;
-        let next = BS_AUTORADIOBUTTON as u32;
         rows.indent(8).skip(12);
         for (label, default, custom, pick, swatch) in [
             (
@@ -525,11 +680,11 @@ impl Page for FontsColors {
         *self.colors.borrow_mut() = app.custom_settings().colors;
         self.dark.set(app.pal.get().dark);
         self.item.set(0);
-        self.state.set(0);
         self.quietly(|| {
             crate::options::fill_combo(page, THEME, &THEMES, self.dark.get());
-            for name in ITEMS {
-                let w = wz(name);
+            send(page, ITEM, CB_RESETCONTENT, 0, 0);
+            for i in Item::ALL {
+                let w = wz(i.label());
                 send(page, ITEM, CB_ADDSTRING, 0, w.as_ptr() as isize);
             }
             send(page, ITEM, CB_SETCURSEL, 0, 0);
@@ -540,17 +695,14 @@ impl Page for FontsColors {
                 let w = wz(&f);
                 send(page, FONT, CB_ADDSTRING, 0, w.as_ptr() as isize);
             }
+            send(page, SIZE, CB_RESETCONTENT, 0, 0);
             send(page, SIZE, CB_ADDSTRING, 0, d.as_ptr() as isize);
             for s in SIZES {
                 let w = wz(&s.to_string());
                 send(page, SIZE, CB_ADDSTRING, 0, w.as_ptr() as isize);
             }
-            for s in State::ALL {
-                let w = wz(s.label());
-                send(page, STATES, LB_ADDSTRING, 0, w.as_ptr() as isize);
-            }
-            send(page, STATES, LB_SETCURSEL, 0, 0);
         });
+        self.fill_states(page);
         self.show(page);
     }
 
@@ -568,7 +720,11 @@ impl Page for FontsColors {
                         | STYLE_CUSTOM
                         | BOLD
                         | FG_PICK
-                        | BG_PICK,
+                        | BG_PICK
+                        | ACCENT_NONE
+                        | ACCENT_DEFAULT
+                        | ACCENT_CUSTOM
+                        | ACCENT_PICK,
                     BN_CLICKED
                 )
         )
@@ -588,7 +744,10 @@ impl Page for FontsColors {
         if msg == WM_DRAWITEM {
             // SAFETY: WM_DRAWITEM's lParam is the item's DRAWITEMSTRUCT.
             let dis = unsafe { &*(l as *const DRAWITEMSTRUCT) };
-            if matches!(dis.CtlID as u16, SAMPLE | FG_SWATCH | BG_SWATCH) {
+            if matches!(
+                dis.CtlID as u16,
+                SAMPLE | FG_SWATCH | BG_SWATCH | ACCENT_SWATCH
+            ) {
                 self.draw(app, dis);
                 return Some(1);
             }
@@ -609,8 +768,10 @@ impl Page for FontsColors {
                 Some(0)
             }
             (ITEM, CBN_SELCHANGE) => {
+                let at = send(page, ITEM, CB_GETCURSEL, 0, 0);
                 self.item
-                    .set(send(page, ITEM, CB_GETCURSEL, 0, 0).clamp(0, 1) as usize);
+                    .set(usize::try_from(at).unwrap_or(0).min(Item::ALL.len() - 1));
+                self.fill_states(page);
                 self.show(page);
                 Some(0)
             }
@@ -639,6 +800,35 @@ impl Page for FontsColors {
                 }
                 None
             }
+            (ACCENT_NONE | ACCENT_DEFAULT, BN_CLICKED) => {
+                let mut a = self.accent();
+                a.mode = if id == ACCENT_NONE {
+                    AccentMode::None
+                } else {
+                    AccentMode::Default
+                };
+                self.set_accent(a);
+                self.show(page);
+                None
+            }
+            (ACCENT_CUSTOM, BN_CLICKED) => {
+                let a = self.accent();
+                if a.color.is_none() {
+                    // Custom starts from the colour shown now.
+                    self.pick_accent(page);
+                } else {
+                    self.set_accent(Accent {
+                        mode: AccentMode::Custom,
+                        ..a
+                    });
+                    self.show(page);
+                }
+                None
+            }
+            (ACCENT_PICK, BN_CLICKED) => {
+                self.pick_accent(page);
+                None
+            }
             (FG_DEFAULT | BG_DEFAULT, BN_CLICKED) => {
                 let mut look = self.look();
                 if id == FG_DEFAULT {
@@ -655,12 +845,12 @@ impl Page for FontsColors {
                 let look = self.look();
                 if (if fg { look.fg } else { look.bg }).is_none() {
                     // Custom starts from the colour shown now.
-                    let (f, b, ..) = self.shown_colours();
+                    let shown = self.shown_colours();
                     let mut look = look;
                     if fg {
-                        look.fg = Some(f);
+                        look.fg = Some(shown.fg);
                     } else {
-                        look.bg = Some(b);
+                        look.bg = Some(shown.bg);
                     }
                     self.set_look(page, look);
                     self.pick(page, fg);
@@ -697,7 +887,7 @@ impl Page for FontsColors {
         app.set_colors(self.colors.borrow().clone());
     }
 
-    /// Everything's: every font and colour the theme's.
+    /// Everything's: every font, colour and accent the theme's.
     fn defaults(&self, page: HWND) {
         *self.colors.borrow_mut() = Colors::default();
         self.show(page);

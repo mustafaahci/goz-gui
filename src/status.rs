@@ -14,6 +14,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
 
+use crate::colors::{Item, State};
 use crate::format;
 use crate::paint::{fill, width};
 use crate::window::App;
@@ -95,6 +96,7 @@ pub fn view_hover(app: &App, pt: Option<POINT>) {
 /// Thumbnails' four squares.
 fn paint_view_buttons(app: &App, hdc: HDC, buttons: &[(ViewButton, RECT)]) {
     let pal = app.pal.get();
+    let ink = pal.ink(Item::StatusBar, State::Normal);
     let thumbnails = app.view().thumbnails;
     let hot = app.view_hot.get();
     let px = app.scale(1).max(1);
@@ -105,9 +107,9 @@ fn paint_view_buttons(app: &App, hdc: HDC, buttons: &[(ViewButton, RECT)]) {
         } else if hot == Some(button) {
             pal.header_hot
         } else {
-            pal.chrome
+            ink.bg
         };
-        if bg != pal.chrome {
+        if bg != ink.bg {
             round_fill(hdc, &rc, bg, app.scale(4));
         }
         let fg = if active || hot == Some(button) {
@@ -287,6 +289,8 @@ pub fn paint(app: &App, hdc: HDC) {
         return;
     }
     let pal = app.pal.get();
+    // Options > Fonts and Colors' Status Bar.
+    let ink = pal.ink(Item::StatusBar, State::Normal);
     // Options > View: one selected item's size, date and folder, and the
     // size at the right.
     let ui = app.ui();
@@ -328,7 +332,7 @@ pub fn paint(app: &App, hdc: HDC) {
         if let Some(name) = app.filelist_indicator() {
             right.push(Part {
                 text: name,
-                colour: pal.fg,
+                colour: ink.fg,
                 indicator: Some(Indicator::FileList),
             });
         }
@@ -337,14 +341,14 @@ pub fn paint(app: &App, hdc: HDC) {
         if let Some(folder) = app.folder_indicator() {
             right.push(Part {
                 text: folder,
-                colour: pal.fg,
+                colour: ink.fg,
                 indicator: Some(Indicator::Folder),
             });
         }
         for (indicator, text) in app.indicators_on() {
             right.push(Part {
                 text: text.into(),
-                colour: pal.fg,
+                colour: ink.fg,
                 indicator: Some(indicator),
             });
         }
@@ -389,7 +393,7 @@ pub fn paint(app: &App, hdc: HDC) {
             if let Some(size) = size {
                 right.push(Part {
                     text: format::size_auto(size),
-                    colour: pal.fg,
+                    colour: ink.fg,
                     indicator: None,
                 });
             }
@@ -399,6 +403,7 @@ pub fn paint(app: &App, hdc: HDC) {
     let fonts = app.fonts.borrow();
     let pad = app.scale(8);
     let mut found = Vec::new();
+    fill(hdc, &rc, ink.bg);
     fill(
         hdc,
         &RECT {
@@ -411,7 +416,8 @@ pub fn paint(app: &App, hdc: HDC) {
     let mut spoken: Vec<(String, RECT)> = Vec::new();
     // SAFETY: draws into the paint buffer; the old font is put back.
     unsafe {
-        let old = SelectObject(hdc, fonts.normal);
+        let bold = pal.is_bold(Item::StatusBar, State::Normal);
+        let old = SelectObject(hdc, if bold { fonts.bold } else { fonts.normal });
         SetBkMode(hdc, TRANSPARENT as i32);
         let y = rc.top + 1 + (rc.bottom - rc.top - 1 - fonts.height) / 2;
         let sep = |x: i32| {
@@ -489,7 +495,7 @@ pub fn paint(app: &App, hdc: HDC) {
                 x += pad;
             }
             let t: Vec<u16> = text.encode_utf16().collect();
-            draw(x, &clip, &t, pal.fg);
+            draw(x, &clip, &t, ink.fg);
             let w = width(hdc, &t);
             spoken.insert(
                 i.min(spoken.len()),

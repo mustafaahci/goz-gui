@@ -22,12 +22,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetFocus}
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CheckMenuItem, DestroyMenu, EnableMenuItem, GWL_STYLE, GetCaretPos, GetClientRect,
     GetMenuItemCount, GetMenuItemID, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
-    GetWindowTextLengthW, HMENU, IsZoomed, MB_OK, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED,
-    MF_ENABLED, MF_GRAYED, MF_UNCHECKED, PostMessageW, SM_CXVSCROLL, SW_RESTORE, SW_SHOWMAXIMIZED,
-    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetMenu, SetWindowLongPtrW, SetWindowPlacement,
-    SetWindowPos, ShowWindow, WINDOWPLACEMENT, WM_CLEAR, WM_CONTEXTMENU, WM_COPY, WM_CUT, WM_PASTE,
-    WS_CAPTION, WS_THICKFRAME,
+    GetWindowTextLengthW, HMENU, IsIconic, IsZoomed, MB_OK, MF_BYCOMMAND, MF_BYPOSITION,
+    MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_UNCHECKED, PostMessageW, SM_CXVSCROLL, SW_RESTORE,
+    SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetMenu, SetWindowLongPtrW,
+    SetWindowPlacement, SetWindowPos, ShowWindow, WINDOWPLACEMENT, WM_CLEAR, WM_CONTEXTMENU,
+    WM_COPY, WM_CUT, WM_PASTE, WS_CAPTION, WS_THICKFRAME,
 };
 
 use super::findbar::{FindBar, Finding, Report, TIMER_TYPED, WM_FIND};
@@ -46,6 +46,10 @@ pub(super) const WM_FULLSCREEN_AT_START: u32 = slots::F4_MSG + 1;
 /// The window as it was before it went fullscreen.
 struct Full {
     placement: WINDOWPLACEMENT,
+    /// Its rectangle on the screen, if it was neither maximized nor
+    /// minimized: put back exactly, as `SetWindowPlacement` alone moves a
+    /// window that was partly or wholly off every monitor onto one.
+    rect: Option<RECT>,
     style: isize,
     /// The menu bar was taken away (`fullscreen_menu=0`).
     menu_hidden: bool,
@@ -494,9 +498,18 @@ impl App {
         if !ok {
             return;
         }
+        let mut rc = RECT::default();
+        // SAFETY: reads this thread's window's state and rectangle.
+        let rect = unsafe {
+            (IsZoomed(self.hwnd) == 0
+                && IsIconic(self.hwnd) == 0
+                && GetWindowRect(self.hwnd, &mut rc) != 0)
+                .then_some(rc)
+        };
         let keep_menu = self.prefs.borrow().base.search_tools.fullscreen_menu;
         *self.tools.full.borrow_mut() = Some(Full {
             placement,
+            rect,
             style,
             menu_hidden: !keep_menu,
         });
@@ -552,20 +565,29 @@ impl App {
                 SetMenu(self.hwnd, self.menus.bar);
             }
             SetWindowPlacement(self.hwnd, &placement);
-            SetWindowPos(
-                self.hwnd,
-                core::ptr::null_mut(),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE
-                    | SWP_NOSIZE
-                    | SWP_NOZORDER
-                    | SWP_NOOWNERZORDER
-                    | SWP_FRAMECHANGED
-                    | SWP_NOACTIVATE,
-            );
+            let flags = SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE;
+            match full.rect {
+                // Exactly where it was, on a monitor or not (the placement
+                // alone brings one that was off every monitor onto one).
+                Some(rc) => SetWindowPos(
+                    self.hwnd,
+                    core::ptr::null_mut(),
+                    rc.left,
+                    rc.top,
+                    rc.right - rc.left,
+                    rc.bottom - rc.top,
+                    flags,
+                ),
+                None => SetWindowPos(
+                    self.hwnd,
+                    core::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | flags,
+                ),
+            };
             if placement.showCmd == SW_SHOWMAXIMIZED as u32 && GetActiveWindow() != self.hwnd {
                 self.maximize_deferred.set(true);
             }

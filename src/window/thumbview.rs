@@ -330,7 +330,20 @@ impl App {
             hot: self.row_is_hot(index),
             alternate: false,
         };
-        let colour = paint::cell_colour(&pal, state, false);
+        // Options > Fonts and Colors' Thumbnail Mouseover for the cell
+        // under the mouse; else as the row would be.
+        let thumb = pal.ink(
+            crate::colors::Item::ResultList,
+            crate::colors::State::ThumbnailMouseover,
+        );
+        let (colour, text) = if state.hot && !state.selected {
+            (thumb.bg, thumb.fg)
+        } else {
+            (
+                paint::cell_colour(&pal, state, false),
+                paint::cell_text_colour(&pal, state, false).0,
+            )
+        };
         paint::fill(hdc, &geo.cell, colour);
         // The thumbnail is drawn while the row is borrowed (GDI only); the
         // icon after, as the shell's icon lists can take messages while
@@ -377,7 +390,7 @@ impl App {
             self.draw_big_icon(hdc, icon, &geo.thumb);
         }
         let fonts = self.fonts.borrow();
-        name_lines(hdc, &geo.text, &name, &spans, &fonts, pal.list_fg);
+        name_lines(hdc, &geo.text, &name, &spans, &fonts, text);
         if bits & LVIS_FOCUSED != 0 && list_focused {
             // SAFETY: draws into the list's paint DC.
             unsafe { DrawFocusRect(hdc, &geo.cell) };

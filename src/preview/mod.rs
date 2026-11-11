@@ -59,9 +59,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::client::Row;
+use crate::colors::{Item, State};
 use crate::dock::PaneId;
 use crate::paint::fill;
 use crate::pane::{PaneContent, PaneEvent, PaneSpec};
+use crate::theme::Ink;
 use crate::wide::wz;
 use crate::window::App;
 use crate::window::slots::F1_MSG;
@@ -556,7 +558,7 @@ impl PreviewPane {
             return false;
         }
         // SAFETY: the background the host paints, in its own data.
-        unsafe { SetWindowLongPtrW(host, GWLP_USERDATA, app.pal.get().bg as isize) };
+        unsafe { SetWindowLongPtrW(host, GWLP_USERDATA, preview_ink(app).bg as isize) };
         let worker = Worker::spawn(app.hwnd, WM_REPLIES, WM_RETIRE, host, self.settings);
         let Some(worker) = worker else {
             // SAFETY: the host just made, with nothing in it.
@@ -578,14 +580,14 @@ impl PreviewPane {
         let rc = self.rc.get();
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
-        let pal = app.pal.get();
+        let ink = preview_ink(app);
         let request = Request {
             generation,
             path: target.path.clone(),
             size: (width(&rc).max(1), height(&rc).max(1)),
             icon_side: app.scale(ICON_SIDE),
-            bg: pal.bg,
-            fg: pal.fg,
+            bg: ink.bg,
+            fg: ink.fg,
             font: logfont(app),
         };
         *self.target.borrow_mut() = Some(target);
@@ -863,6 +865,7 @@ impl PreviewPane {
     /// Paints the image, icon or message in `rc`.
     fn paint_view(&self, app: &App, hdc: HDC, rc: &RECT) {
         let pal = app.pal.get();
+        let ink = preview_ink(app);
         let target = self.target.borrow();
         let name: &[u16] = target.as_ref().map_or(&[], |t| &t.name);
         let view = self.view.borrow();
@@ -873,11 +876,11 @@ impl PreviewPane {
             }
             View::Loading => {
                 let note: Vec<u16> = LOADING.encode_utf16().collect();
-                caption(app, hdc, rc, None, &[(name, pal.fg), (&note, pal.dim)]);
+                caption(app, hdc, rc, None, &[(name, ink.fg), (&note, pal.dim)]);
             }
             View::Message(why) => {
                 let note: Vec<u16> = why.encode_utf16().collect();
-                caption(app, hdc, rc, None, &[(name, pal.fg), (&note, pal.dim)]);
+                caption(app, hdc, rc, None, &[(name, ink.fg), (&note, pal.dim)]);
             }
             View::Icon {
                 icon,
@@ -885,7 +888,7 @@ impl PreviewPane {
                 scaled,
             } => {
                 let details: &[u16] = target.as_ref().map_or(&[], |t| &t.details);
-                let mut lines = vec![(name, pal.fg), (details, pal.dim)];
+                let mut lines = vec![(name, ink.fg), (details, pal.dim)];
                 let online: Vec<u16> = ONLINE_ONLY.encode_utf16().collect();
                 if *online_only {
                     lines.push((&online, pal.dim));
@@ -901,7 +904,7 @@ impl PreviewPane {
                     right: rc.left + (width(rc) - shown.0) / 2 + shown.0,
                     bottom: rc.top + (height(rc) - shown.1) / 2 + shown.1,
                 };
-                draw_image(hdc, image, scaled, &at, pal.bg, &self.settings);
+                draw_image(hdc, image, scaled, &at, ink.bg, &self.settings);
             }
             View::Text | View::Handler | View::Nothing => {}
         }
@@ -1080,7 +1083,7 @@ fn caption(
                 right: left + iw,
                 bottom: y + ih,
             };
-            draw_image(hdc, img, cache, &at, app.pal.get().bg, settings);
+            draw_image(hdc, img, cache, &at, preview_ink(app).bg, settings);
             y += ih + gap;
         }
         for ((text, colour), h) in lines.iter().zip(heights) {
@@ -1107,7 +1110,16 @@ fn caption(
     }
 }
 
+/// The preview's colours: Options > Fonts and Colors' Preview.
+fn preview_ink(app: &App) -> Ink {
+    app.pal.get().ink(Item::Preview, State::Normal)
+}
+
 impl PaneContent for PreviewPane {
+    fn colours(&self, app: &App) -> Ink {
+        preview_ink(app)
+    }
+
     fn create(&self, app: &App, pane: HWND) {
         self.pane.set(pane);
         let font = mono_font(app);
@@ -1307,7 +1319,7 @@ impl PaneContent for PreviewPane {
     }
 
     fn paint(&self, app: &App, hdc: HDC, rc: &RECT) {
-        fill(hdc, rc, app.pal.get().bg);
+        fill(hdc, rc, preview_ink(app).bg);
         self.paint_view(app, hdc, rc);
         let pane = self.pane.get();
         let inner = matches!(*self.view.borrow(), View::Text | View::Handler);
@@ -1320,7 +1332,7 @@ impl PaneContent for PreviewPane {
                     right: rc.right - 2,
                     bottom: rc.bottom - 2,
                 };
-                SetTextColor(hdc, app.pal.get().fg);
+                SetTextColor(hdc, preview_ink(app).fg);
                 DrawFocusRect(hdc, &r);
             }
         }
@@ -1332,7 +1344,7 @@ impl PaneContent for PreviewPane {
         if !host.is_null() {
             // SAFETY: this thread's host's background, repainted.
             unsafe {
-                SetWindowLongPtrW(host, GWLP_USERDATA, app.pal.get().bg as isize);
+                SetWindowLongPtrW(host, GWLP_USERDATA, preview_ink(app).bg as isize);
                 InvalidateRect(host, core::ptr::null(), 1);
             }
         }

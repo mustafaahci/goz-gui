@@ -113,14 +113,14 @@ impl App {
         self.prefs.borrow().base.custom.clone()
     }
 
-    /// The palette of the theme with Fonts and Colors' result list colours.
+    /// The palette of the theme with Fonts and Colors' colours.
     pub(super) fn custom_palette(&self, dark: bool) -> Palette {
         self.prefs
             .borrow()
             .base
             .custom
             .colors
-            .apply(Palette::new(dark))
+            .apply(Palette::new(dark), &crate::theme::system_accent)
     }
 
     /// The result list's fonts at `dpi` and `zoom` %, in Fonts and Colors'
@@ -157,9 +157,15 @@ impl App {
 
     /// The search box's font.
     pub(super) fn search_font(&self) -> HFONT {
+        // Bold when Fonts and Colors' Search Edit says so.
+        let bold = self.pal.get().is_bold(
+            crate::colors::Item::SearchEdit,
+            crate::colors::State::Normal,
+        );
         match &*self.custom.search_fonts.borrow() {
+            Some(f) if bold => f.bold,
             Some(f) => f.normal,
-            None => self.ui_font(),
+            None => self.ui_font_of(bold),
         }
     }
 

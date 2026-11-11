@@ -83,15 +83,20 @@ pub fn cell_colour(pal: &Palette, state: RowState, sorted: bool) -> u32 {
 /// The text colour of one cell (Options > Fonts and Colors: each state's
 /// own, the normal text's otherwise), and whether its text is bold.
 pub fn cell_text_colour(pal: &Palette, state: RowState, sorted: bool) -> (u32, bool) {
-    use crate::colors::{BOLD_INACTIVE, BOLD_MOUSEOVER, BOLD_NORMAL, BOLD_SELECTED, BOLD_SORT};
-    let (fg, bit) = match (state.selected, state.focused, state.hot, sorted) {
-        (true, true, _, _) => (pal.sel_fg, BOLD_SELECTED),
-        (true, false, _, _) => (pal.sel_inactive_fg, BOLD_INACTIVE),
-        (false, _, true, _) => (pal.hover_fg, BOLD_MOUSEOVER),
-        (false, _, false, true) => (pal.sort_fg, BOLD_SORT),
-        (false, _, false, false) => (pal.list_fg, BOLD_NORMAL),
+    use crate::colors::{Item, State};
+    let (fg, s) = match (state.selected, state.focused, state.hot, sorted) {
+        (true, true, _, _) => (pal.sel_fg, State::Selected),
+        (true, false, _, _) => (pal.sel_inactive_fg, State::InactiveSelected),
+        (false, _, true, true) => (pal.hover_sort_fg, State::CurrentSortMouseover),
+        (false, _, true, false) => (pal.hover_fg, State::Mouseover),
+        (false, _, false, true) if state.alternate => {
+            (pal.alt_sort_fg, State::CurrentSortAlternateRow)
+        }
+        (false, _, false, true) => (pal.sort_fg, State::CurrentSort),
+        (false, _, false, false) if state.alternate => (pal.alt_fg, State::AlternateRow),
+        (false, _, false, false) => (pal.list_fg, State::Normal),
     };
-    (fg, pal.bold_rows & bit != 0)
+    (fg, pal.is_bold(Item::ResultList, s))
 }
 
 /// How matched text is drawn: its colour and background when chosen, and
@@ -617,7 +622,11 @@ pub fn window(app: &App) {
                 right: search.right - 1,
                 bottom: search.bottom - 1,
             };
-            fill(mem, &inner, pal.bg);
+            let search_ink = pal.ink(
+                crate::colors::Item::SearchEdit,
+                crate::colors::State::Normal,
+            );
+            fill(mem, &inner, search_ink.bg);
             searchbox::paint(app, mem);
         }
         if let Some((rc, name, open)) = app.filter_bar()
@@ -771,10 +780,22 @@ fn menubar_rect(app: &App) -> RECT {
     }
 }
 
+/// The menu bar's colours: Options > Fonts and Colors' Menu.
+fn menu_ink(pal: &Palette) -> crate::theme::Ink {
+    pal.ink(crate::colors::Item::Menu, crate::colors::State::Normal)
+}
+
+/// goz-gui draws the menu bar: always in the dark theme (Windows has no
+/// dark one), in the light theme once Fonts and Colors gives the Menu
+/// colours of its own.
+pub fn draws_menubar(pal: &Palette) -> bool {
+    pal.dark || pal.is_own(crate::colors::Item::Menu, crate::colors::State::Normal)
+}
+
 pub fn menubar(app: &App, um: &UahMenu) {
     let mut rc = menubar_rect(app);
     rc.top -= 1;
-    fill(um.hdc, &rc, app.pal.get().chrome);
+    fill(um.hdc, &rc, menu_ink(&app.pal.get()).bg);
 }
 
 pub fn menubar_item(app: &App, item: &UahDrawMenuItem) {
@@ -792,10 +813,11 @@ pub fn menubar_item(app: &App, item: &UahDrawMenuItem) {
         let pal = app.pal.get();
         let hot = state & (ODS_HOTLIGHT | ODS_SELECTED) != 0;
         let mut rc = item.dis.rcItem;
-        fill(item.um.hdc, &rc, if hot { pal.hot } else { pal.chrome });
+        let ink = menu_ink(&pal);
+        fill(item.um.hdc, &rc, if hot { pal.hot } else { ink.bg });
         let dim = state & (ODS_INACTIVE | ODS_GRAYED | ODS_DISABLED) != 0;
         SetBkMode(item.um.hdc, TRANSPARENT as i32);
-        SetTextColor(item.um.hdc, if dim { pal.dim } else { pal.fg });
+        SetTextColor(item.um.hdc, if dim { pal.dim } else { ink.fg });
         let mut flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
         if state & ODS_NOACCEL != 0 {
             flags |= DT_HIDEPREFIX;
@@ -820,7 +842,7 @@ pub fn menubar_line(app: &App) {
             ..client
         };
         let hdc = GetWindowDC(app.hwnd);
-        fill(hdc, &line, app.pal.get().chrome);
+        fill(hdc, &line, menu_ink(&app.pal.get()).bg);
         ReleaseDC(app.hwnd, hdc);
     }
 }

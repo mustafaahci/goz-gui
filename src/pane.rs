@@ -45,9 +45,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
 };
 
+use crate::colors::{Item, State};
 use crate::dock::{PaneId, Side};
 use crate::paint::fill;
 use crate::searchbox;
+use crate::theme::Ink;
 use crate::wide::wz;
 use crate::window::App;
 
@@ -118,7 +120,18 @@ pub trait PaneContent: Any {
     /// the pane window's coordinates, into `hdc` (a buffer the size of
     /// what is being repainted). By default the list's background.
     fn paint(&self, app: &App, hdc: HDC, rc: &RECT) {
-        fill(hdc, rc, app.pal.get().bg);
+        fill(hdc, rc, self.colours(app).bg);
+    }
+
+    /// The content's background and its controls' text and background
+    /// (WM_CTLCOLOR*): the window's own by default; a sidebar's or the
+    /// preview's from Options > Fonts and Colors.
+    fn colours(&self, app: &App) -> Ink {
+        let pal = app.pal.get();
+        Ink {
+            fg: pal.fg,
+            bg: pal.bg,
+        }
     }
 
     /// The theme changed (`dark` or light); the pane repaints. Controls
@@ -406,7 +419,7 @@ fn paint(app: &App, hwnd: HWND, p: &PaneWindow) {
 /// at once as the pane is shown or grows, while the paint (WM_PAINT) comes
 /// later. Left untouched, that part showed white until then: the whole
 /// pane as it opened, a band where it grew.
-fn erase(app: &App, hwnd: HWND, hdc: HDC) {
+fn erase(app: &App, hwnd: HWND, hdc: HDC, content_bg: u32) {
     let pal = app.pal.get();
     let rc = client(hwnd);
     let title = title_height(app).min(rc.bottom);
@@ -416,7 +429,7 @@ fn erase(app: &App, hwnd: HWND, hdc: HDC) {
             bottom: rc.top + title,
             ..rc
         },
-        pal.header,
+        pal.ink(Item::Pane, State::Normal).bg,
     );
     fill(
         hdc,
@@ -424,15 +437,16 @@ fn erase(app: &App, hwnd: HWND, hdc: HDC) {
             top: rc.top + title,
             ..rc
         },
-        pal.bg,
+        content_bg,
     );
 }
 
-/// The title row `rc`: the header's background and lines, the name, and
-/// the close button.
+/// The title row `rc`: the header's lines, Fonts and Colors' Pane colours
+/// and style, the name, and the close button.
 fn paint_title(app: &App, hwnd: HWND, p: &PaneWindow, hdc: HDC, rc: &RECT) {
     let pal = app.pal.get();
-    fill(hdc, rc, pal.header);
+    let ink = pal.ink(Item::Pane, State::Normal);
+    fill(hdc, rc, ink.bg);
     let line = |top: i32| {
         fill(
             hdc,
@@ -456,9 +470,10 @@ fn paint_title(app: &App, hwnd: HWND, p: &PaneWindow, hdc: HDC, rc: &RECT) {
     let mut text: Vec<u16> = p.title.encode_utf16().collect();
     // SAFETY: draws into the paint buffer; the old font is put back.
     unsafe {
-        let old = SelectObject(hdc, app.ui_font());
+        let font = app.ui_font_of(pal.is_bold(Item::Pane, State::Normal));
+        let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, pal.fg);
+        SetTextColor(hdc, ink.fg);
         DrawTextW(
             hdc,
             text.as_mut_ptr(),
@@ -475,7 +490,7 @@ fn paint_title(app: &App, hwnd: HWND, p: &PaneWindow, hdc: HDC, rc: &RECT) {
     let bg = match (hot, pressed) {
         (true, true) => pal.header_pressed,
         (true, false) => pal.header_hot,
-        _ => pal.header,
+        _ => ink.bg,
     };
     fill(hdc, &close, bg);
     let fg = if hot { pal.glyph_hot } else { pal.glyph };
@@ -553,7 +568,7 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 }
             }
             WM_ERASEBKGND => {
-                erase(app, hwnd, w as HDC);
+                erase(app, hwnd, w as HDC, content.colours(app).bg);
                 return 1;
             }
             WM_SIZE => {
@@ -640,13 +655,13 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             return answer;
         }
         match msg {
-            // The content's controls in the list's colours, unless it said
+            // The content's controls in its colours, unless it said
             // otherwise.
             WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-                let pal = app.pal.get();
-                SetTextColor(w as HDC, pal.fg);
-                SetBkColor(w as HDC, pal.bg);
-                SetDCBrushColor(w as HDC, pal.bg);
+                let ink = content.colours(app);
+                SetTextColor(w as HDC, ink.fg);
+                SetBkColor(w as HDC, ink.bg);
+                SetDCBrushColor(w as HDC, ink.bg);
                 GetStockObject(DC_BRUSH) as LRESULT
             }
             _ => DefWindowProcW(hwnd, msg, w, l),
