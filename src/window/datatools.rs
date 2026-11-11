@@ -132,6 +132,11 @@ pub(super) struct DataTools {
     /// `-filelist-editor`): it ends with the editor while its window was
     /// never shown.
     pub(super) editor_alone: Cell<bool>,
+    /// W7: a `save-filelistN:` search's results being read (`lists.rs`).
+    pub(super) saving: RefCell<Option<crate::client::Stop>>,
+    /// W7: the search shown was made, and its save-filelistN: terms save
+    /// its results once they are all there.
+    pub(super) save_due: Cell<bool>,
 }
 
 /// Whose a list whose reading ended is (its WM_FILELIST).
@@ -194,6 +199,8 @@ impl DataTools {
             replacing: RefCell::new(None),
             slots: RefCell::new(Arc::default()),
             editor_alone: Cell::new(false),
+            saving: RefCell::new(None),
+            save_due: Cell::new(false),
         }
     }
 }
@@ -275,6 +282,11 @@ impl App {
         }
         for list in self.data_tools.held.take() {
             list.close();
+        }
+        // W7: a save-filelistN: search's read stops; its thread posts
+        // nothing then.
+        if let Some(stop) = self.data_tools.saving.take() {
+            stop.stop();
         }
     }
 

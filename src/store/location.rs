@@ -49,6 +49,19 @@ pub const DESKTOP_DIR_VAR: &str = "GOZ_GUI_DESKTOP_DIR";
 /// Wave 5: the File List Editor's Open... and Save As... use this file
 /// without asking, and its "Save changes?" is answered No.
 pub const EDITOR_FILE_VAR: &str = "GOZ_GUI_EDITOR_FILE";
+/// W7: the File List Editor's and the Edit File List Slot dialog's Paste
+/// take this text (names separated by `|`) instead of the clipboard's, so
+/// a test never touches the user's clipboard.
+pub const PASTE_TEXT_VAR: &str = "GOZ_GUI_PASTE_TEXT";
+
+/// W7: the names a test pastes (`GOZ_GUI_PASTE_TEXT`, `|` between them), if
+/// set: one a line, as the clipboard's text would hold them.
+pub fn paste_text() -> Option<String> {
+    std::env::var(PASTE_TEXT_VAR)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.replace('|', "\r\n"))
+}
 
 /// Which rule chose the data folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

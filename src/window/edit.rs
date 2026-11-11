@@ -8,7 +8,10 @@
 //! Ctrl+Delete delete a word.
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::UI::Controls::{EM_GETSEL, EM_REPLACESEL, EM_SETSEL, EM_UNDO};
+use windows_sys::Win32::System::SystemServices::MK_CONTROL;
+use windows_sys::Win32::UI::Controls::{
+    EM_CHARFROMPOS, EM_GETSEL, EM_REPLACESEL, EM_SETSEL, EM_UNDO,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetActiveWindow, GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_NEXT,
     VK_PRIOR, VK_RETURN, VK_SHIFT, VK_UP,
@@ -222,6 +225,22 @@ unsafe fn edit_message(app: &App, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         if let Some(cmd) =
             crate::keys::search_box_command(w as u16, key_down(VK_CONTROL), key_down(VK_SHIFT), alt)
         {
+            // W7: F2 (Advanced Search...'s key) with the caret in a
+            // file-list term edits its slot, as in Everything.
+            if cmd == crate::searchtools::ADVANCED_SEARCH {
+                let (mut start, mut end) = (0u32, 0u32);
+                send(
+                    hwnd,
+                    EM_GETSEL,
+                    (&raw mut start) as usize,
+                    (&raw mut end) as isize,
+                );
+                let caret = end as usize;
+                if crate::filelist::slots::term_at(&window_text(hwnd), caret).is_some() {
+                    crate::slotedit::post_edit_at(app.hwnd, caret);
+                    return 0;
+                }
+            }
             app.command(cmd);
             return 0;
         }
@@ -270,6 +289,19 @@ unsafe fn edit_message(app: &App, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             }
             WM_LBUTTONUP => {
                 let r = DefSubclassProc(hwnd, msg, w, l);
+                // W7: Ctrl+click on a file-list term edits its slot (posted:
+                // the dialog runs outside the box's own message).
+                if w & MK_CONTROL as usize != 0 {
+                    let at = SendMessageW(hwnd, EM_CHARFROMPOS, 0, l);
+                    if at != -1 {
+                        let unit = (at as usize) & 0xffff;
+                        if crate::filelist::slots::term_at(&window_text(hwnd), unit).is_some() {
+                            crate::slotedit::post_edit_at(app.hwnd, unit);
+                            app.click_select.set(false);
+                            return r;
+                        }
+                    }
+                }
                 if app.click_select.replace(false) {
                     let (mut start, mut end) = (0u32, 0u32);
                     send(

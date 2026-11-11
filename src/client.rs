@@ -105,14 +105,42 @@ pub struct Search {
     pub slots: Arc<crate::filelist::slots::Slots>,
 }
 
+/// Why [`Search::gozd_query`] gave no search: a reason for the window, or
+/// the connection's own failure (cancelled or lost), as a request's.
+enum NotAsked {
+    Failed(Failure),
+    Io(Io),
+}
+
 impl Search {
-    /// W6: the search as gozd is asked it (`filelist:` terms as groups of
-    /// names when it reads OR, `boolean`), or why it cannot be asked (see
-    /// `crate::filelist::slots::for_gozd`).
-    fn gozd_query(&self, boolean: bool) -> Result<String, Failure> {
-        crate::filelist::slots::for_gozd(&self.query, &self.slots, boolean)
-            .map(std::borrow::Cow::into_owned)
-            .map_err(Failure::Refused)
+    /// W6: the search as gozd is asked it (file-list terms in gozd's own
+    /// words when it reads OR, `boolean`), or why it cannot be asked (see
+    /// `crate::filelist::slots::for_gozd`). W7: `child-`, `descendant-`,
+    /// `sibling-` and `size-filelistN:` look the slot's items up in gozd's
+    /// index first, on `pipe` (a request of their own, before the search's).
+    /// The second of the pair says whether one was looked up.
+    fn gozd_query(
+        &self,
+        pipe: &mut Pipe,
+        shared: &Shared,
+        epoch: Option<u64>,
+        boolean: bool,
+    ) -> Result<(String, bool), NotAsked> {
+        use crate::filelist::slots::{self, NotAsked as Why};
+        let mut looked = false;
+        let answer = {
+            let mut lookup = |query: &str| {
+                looked = true;
+                look_up(pipe, shared, epoch, query, self.match_case)
+            };
+            slots::for_gozd(&self.query, &self.slots, boolean, &mut lookup)
+                .map(std::borrow::Cow::into_owned)
+        };
+        match answer {
+            Ok(q) => Ok((q, looked)),
+            Err(Why::Refused(why)) => Err(NotAsked::Failed(Failure::Refused(why))),
+            Err(Why::Lookup(e)) => Err(e),
+        }
     }
 
     /// The order a file list answers this search in.
@@ -455,18 +483,21 @@ pub fn stream_range(
     if let Some(list) = &search.filelist {
         return list_stream(stop, search, range, list, page);
     }
-    // W6: what the window's probe learned of gozd's syntax (this
-    // connection is not probed).
-    let query = match search.gozd_query(boolean_syntax()) {
-        Ok(q) => q,
-        Err(f) => return Streamed::Failed(f),
-    };
     let shared = &*stop.0;
     let mut conn = None;
     let pipe = match connect(&mut conn, shared) {
         Ok(p) => p,
         Err(_) if stop.stopped() => return Streamed::Stopped,
         Err(f) => return Streamed::Failed(f),
+    };
+    // W6: what the window's probe learned of gozd's syntax (this
+    // connection is not probed).
+    let query = match search.gozd_query(pipe, shared, None, boolean_syntax()) {
+        Ok((q, _)) => q,
+        Err(NotAsked::Failed(f)) => return Streamed::Failed(f),
+        Err(NotAsked::Io(Io::Cancelled)) => return Streamed::Stopped,
+        Err(NotAsked::Io(Io::Lost(_))) if stop.stopped() => return Streamed::Stopped,
+        Err(NotAsked::Io(Io::Lost(m))) => return Streamed::Failed(Failure::Other(m)),
     };
     let request = Request::Query(QueryRequest {
         query,
@@ -519,6 +550,9 @@ pub fn stream_range(
 
 fn run(shared: &Shared) {
     let mut conn: Option<Pipe> = None;
+    // W7: the last search whose file-list terms looked something up in the
+    // index, and gozd's words for it: its other blocks ask no more.
+    let mut looked: Option<(u64, String)> = None;
     loop {
         let job = loop {
             {
@@ -560,9 +594,63 @@ fn run(shared: &Shared) {
                 block,
                 search,
             } => {
-                if let Some(reply) = fetch_block(&mut conn, shared, epoch, block, &search) {
+                if let Some(reply) =
+                    fetch_block(&mut conn, shared, epoch, block, &search, &mut looked)
+                {
                     shared.post(reply);
                 }
+            }
+        }
+    }
+}
+
+/// W7: looks `query` (a file-list slot's items in gozd's words) up in the
+/// index on `pipe`: at most `slots::LOOKUP_MAX` + 1 items with whether each
+/// is a folder and its size, and how many there are in all.
+fn look_up(
+    pipe: &mut Pipe,
+    shared: &Shared,
+    epoch: Option<u64>,
+    query: &str,
+    match_case: bool,
+) -> Result<crate::filelist::slots::Looked, NotAsked> {
+    use crate::filelist::slots::{FoundItem, LOOKUP_MAX, Looked};
+    let request = Request::Query(QueryRequest {
+        query: query.to_owned(),
+        scope: None,
+        sort: SortSpec::default(),
+        offset: 0,
+        limit: Some(LOOKUP_MAX as u32 + 1),
+        want_size: true,
+        want_mtime: false,
+        match_case,
+        want_total_size: false,
+    });
+    pipe.give_up_at.set(None);
+    pipe.send(&request).map_err(NotAsked::Io)?;
+    let mut out = Looked::default();
+    loop {
+        match pipe.response(shared, epoch).map_err(NotAsked::Io)? {
+            Response::Results(page) => {
+                out.total = page.total;
+                out.items
+                    .extend(page.items.into_iter().map(|item| FoundItem {
+                        path: match item.path_u16 {
+                            Some(units) => String::from_utf16_lossy(&units),
+                            None => item.path,
+                        },
+                        is_dir: item.is_dir,
+                        size: item.size,
+                    }));
+                if !page.more {
+                    return Ok(out);
+                }
+            }
+            Response::Error { message, .. } => {
+                return Err(NotAsked::Failed(Failure::Refused(message)));
+            }
+            _ => {
+                return Err(NotAsked::Io(Io::Lost("unexpected reply from gozd".into())));
             }
         }
     }
@@ -576,6 +664,7 @@ fn fetch_block(
     epoch: u64,
     block: u32,
     search: &Search,
+    looked: &mut Option<(u64, String)>,
 ) -> Option<Reply> {
     if let Some(list) = &search.filelist {
         return list_block(shared, epoch, block, search, list);
@@ -618,9 +707,32 @@ fn fetch_block(
             1 => false,
             _ => boolean_syntax(),
         };
-        let request = match search.gozd_query(boolean) {
-            Ok(q) => request(q),
-            Err(f) => return failed(f),
+        let kept = looked
+            .as_ref()
+            .filter(|(e, _)| *e == epoch)
+            .map(|(_, q)| q.clone());
+        let request = match kept {
+            Some(q) => request(q),
+            None => match search.gozd_query(pipe, shared, Some(epoch), boolean) {
+                Ok((q, did_look)) => {
+                    if did_look {
+                        *looked = Some((epoch, q.clone()));
+                    }
+                    request(q)
+                }
+                Err(NotAsked::Failed(f)) => return failed(f),
+                Err(NotAsked::Io(Io::Cancelled)) => {
+                    *conn = None;
+                    return None;
+                }
+                Err(NotAsked::Io(Io::Lost(m))) => {
+                    *conn = None;
+                    if !(reused && attempt == 0) {
+                        return failed(Failure::Other(m));
+                    }
+                    continue;
+                }
+            },
         };
         pipe.give_up_at.set(None);
         let mut rows = Vec::new();

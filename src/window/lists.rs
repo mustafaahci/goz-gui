@@ -26,8 +26,30 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::App;
 use super::results::{Act, Then};
-use crate::filelist::slots::{self, Slots, cmd};
+use crate::filelist::slots::{self, Func, Slots, Term, cmd};
 use crate::places::{self, Which};
+use crate::slotedit;
+
+/// W7: the most results `save-filelistN:` puts in a slot (each is kept in
+/// `Session.json` too).
+pub const SAVE_MAX: usize = 100_000;
+
+/// W7: what a `save-filelistN:` search's save thread hands the window: the
+/// search, its slots, and its results' full paths (or why not).
+pub struct Saved {
+    query: String,
+    slots: Vec<usize>,
+    names: Result<Vec<String>, String>,
+}
+
+/// `save-filelist1:` (and `save-filelist2:` ...), as notes name them.
+fn slots_text(saves: &[usize]) -> String {
+    saves
+        .iter()
+        .map(|n| format!("save-filelist{n}:"))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
 
 fn beep() {
     // SAFETY: plays a system sound.
@@ -75,9 +97,7 @@ impl App {
         }
         let names: Vec<String> = paths.iter().map(|p| String::from_utf16_lossy(p)).collect();
         let count = names.len();
-        let mut now = (*self.file_list_slots()).clone();
-        now.set(n, names);
-        *self.data_tools.slots.borrow_mut() = Arc::new(now);
+        self.put_in_slot(n, names);
         if count < selected {
             self.note_partial(Act::Command, count, selected);
         } else {
@@ -86,12 +106,225 @@ impl App {
                 crate::listedit::items_text(count)
             ));
         }
+    }
+
+    /// Slot `n` of the shown tab holds `names` from now on: a search that
+    /// reads it runs again (not one that only saves to it), and the
+    /// session keeps it.
+    fn put_in_slot(&self, n: usize, names: Vec<String>) {
+        let mut now = (*self.file_list_slots()).clone();
+        now.set(n, names);
+        *self.data_tools.slots.borrow_mut() = Arc::new(now);
         // A search that reads the slot finds what it holds now.
         let text = crate::wide::window_text(self.edit);
-        if slots::terms(&text).iter().any(|t| t.slot == Some(n)) {
+        if slots::terms(&text)
+            .iter()
+            .any(|t| t.slot == Some(n) && t.func != Func::Save)
+        {
             self.start_search(true);
         }
         self.session_timer();
+    }
+
+    /// W7's WM_APP messages (`WM_APP + 380..390`).
+    pub(super) fn w7_message(&self, msg: u32, w: WPARAM, l: LPARAM) {
+        match msg {
+            slotedit::WM_EDIT_TERM_AT => {
+                let text = crate::wide::window_text(self.edit);
+                if let Some(term) = slots::term_at(&text, w) {
+                    self.edit_file_list_term(term);
+                }
+            }
+            slotedit::WM_SLOT_SAVED if l != 0 => {
+                // SAFETY: the box the save thread posted, ours once
+                // delivered.
+                let saved = unsafe { Box::from_raw(l as *mut Saved) };
+                self.slots_saved(*saved);
+            }
+            _ => {}
+        }
+    }
+
+    /// W7: Edit File List Slot... (the search box's menu, Ctrl+click or F2
+    /// on a file-list term): the slot's names, or the term's own, edited;
+    /// on OK they go in the slot, or in the search.
+    pub(super) fn edit_file_list_term(&self, term: Term) {
+        let text = crate::wide::window_text(self.edit);
+        let (title, names) = match term.slot {
+            Some(n) => (
+                format!("Edit File List {n}"),
+                self.file_list_slots().get(n).to_vec(),
+            ),
+            None => (
+                "Edit File List".to_owned(),
+                slots::names(&term, &Slots::default()).unwrap_or_default(),
+            ),
+        };
+        let kept = self.prefs.borrow().base.file_lists.slot.clone();
+        let outcome = {
+            let _quiet = crate::dialog::Quiet::begin();
+            slotedit::edit(
+                self.hwnd,
+                slotedit::Start {
+                    title,
+                    names: names.clone(),
+                    look: self.dialog_look(),
+                    kept: kept.clone(),
+                },
+            )
+        };
+        if outcome.kept != kept {
+            self.prefs.borrow_mut().base.file_lists.slot = outcome.kept;
+            self.settings_changed();
+        }
+        let Some(now) = outcome.names else {
+            return;
+        };
+        if now == names {
+            return;
+        }
+        match term.slot {
+            Some(n) => {
+                let count = now.len();
+                self.put_in_slot(n, now);
+                self.show_note(format!(
+                    "File list slot {n} holds {}",
+                    crate::listedit::items_text(count)
+                ));
+            }
+            None => match slots::with_names(&text, &term, &now) {
+                Some(new) => self.set_search_text(&new),
+                None => {
+                    beep();
+                    self.show_note(format!(
+                        "A name holding ; or \" cannot be written after {}; put the names in \
+                         a file list slot instead (filelist1:)",
+                        term.name
+                    ));
+                }
+            },
+        }
+    }
+
+    /// W7: a search was made (not a refresh of it) and its first rows came:
+    /// its `save-filelistN:` terms put all its results in those slots, read
+    /// on a thread of its own (a search refused for reading a slot it saves
+    /// never gets here).
+    pub(super) fn save_to_slots(&self, total: u64) {
+        let (search, saves) = {
+            let m = self.model.borrow();
+            let Ok(saves) = slots::saves(&m.search.query) else {
+                return;
+            };
+            if saves.is_empty() {
+                return;
+            }
+            let s = &m.search;
+            (
+                crate::client::Search {
+                    query: s.query.clone(),
+                    sort: s.sort,
+                    match_case: s.match_case,
+                    filelist: s.filelist.clone(),
+                    created_sort: s.created_sort,
+                    slots: Arc::clone(&s.slots),
+                },
+                saves,
+            )
+        };
+        let names = slots_text(&saves);
+        if total > SAVE_MAX as u64 {
+            beep();
+            self.show_note(format!(
+                "{names} saves at most {} results, and this search has {}: the slot is as it was",
+                crate::format::grouped(SAVE_MAX as u64),
+                crate::format::grouped(total)
+            ));
+            return;
+        }
+        // One save at a time: a newer search's replaces an older one's.
+        if let Some(stop) = self.data_tools.saving.borrow_mut().take() {
+            stop.stop();
+        }
+        let stop = crate::client::Stop::new();
+        *self.data_tools.saving.borrow_mut() = Some(stop.clone());
+        let hwnd = self.hwnd as usize;
+        let spawned = std::thread::Builder::new()
+            .name("goz-save-filelist".into())
+            .spawn(move || {
+                let mut paths = Vec::new();
+                let range = crate::client::RowRange {
+                    offset: 0,
+                    limit: None,
+                    details: false,
+                };
+                let streamed = crate::client::stream_range(&stop, &search, range, |rows, _| {
+                    paths.extend(rows.iter().map(|r| String::from_utf16_lossy(&r.path)));
+                    Ok(paths.len() <= SAVE_MAX)
+                });
+                let names = match streamed {
+                    crate::client::Streamed::Done(_) if paths.len() <= SAVE_MAX => Ok(paths),
+                    crate::client::Streamed::Done(_) => Err(format!(
+                        "it has more than {} results",
+                        crate::format::grouped(SAVE_MAX as u64)
+                    )),
+                    crate::client::Streamed::Stopped => return,
+                    crate::client::Streamed::Failed(f) => Err(match f {
+                        crate::client::Failure::NotRunning => crate::client::not_running_text(),
+                        crate::client::Failure::Untrusted => "gozd could not be verified".into(),
+                        crate::client::Failure::Refused(m) | crate::client::Failure::Other(m) => m,
+                    }),
+                };
+                let raw = Box::into_raw(Box::new(Saved {
+                    query: search.query.clone(),
+                    slots: saves,
+                    names,
+                }));
+                // SAFETY: posts to the window, which takes the box; if it is
+                // gone the box is taken back.
+                unsafe {
+                    if PostMessageW(hwnd as _, slotedit::WM_SLOT_SAVED, 0, raw as isize) == 0 {
+                        drop(Box::from_raw(raw));
+                    }
+                }
+            });
+        if spawned.is_err() {
+            self.data_tools.saving.borrow_mut().take();
+        }
+    }
+
+    /// W7: a `save-filelistN:` search's results were read: they go in its
+    /// slots while that search is still the one shown.
+    fn slots_saved(&self, saved: Saved) {
+        self.data_tools.saving.borrow_mut().take();
+        let shown = self.model.borrow().search.query == saved.query;
+        if !shown {
+            return;
+        }
+        let what = slots_text(&saved.slots);
+        match saved.names {
+            Ok(names) => {
+                let count = names.len();
+                for &n in &saved.slots {
+                    self.put_in_slot(n, names.clone());
+                }
+                self.show_note(format!(
+                    "{what} saved {} in file list slot{} {}",
+                    crate::listedit::items_text(count),
+                    if saved.slots.len() == 1 { "" } else { "s" },
+                    saved
+                        .slots
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            Err(why) => {
+                beep();
+                self.show_note(format!("{what} could not save the results: {why}"));
+            }
+        }
     }
 
     /// Wave 6's WM_APP messages (`WM_APP + 360..370`).

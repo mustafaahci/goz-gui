@@ -65,6 +65,9 @@ pub enum Which {
     /// its own thread: it is handed its place as it opens and hands it back
     /// (`restore_at`, `measured`, `put_place`).
     FileListEditor,
+    /// W7: the Edit File List Slot dialog (Everything's
+    /// `file_list_slot_edit_*`, its one column `..._filename_wide`).
+    FileListSlotEdit,
 }
 
 /// What Everything keeps for a dialog, under which keys.
@@ -86,7 +89,7 @@ struct Keys {
 }
 
 impl Which {
-    pub const ALL: [Which; 14] = [
+    pub const ALL: [Which; 15] = [
         Which::SearchHistory,
         Which::SearchHistorySelect,
         Which::RunHistory,
@@ -101,6 +104,7 @@ impl Which {
         Which::AdvancedCopyTo,
         Which::AdvancedMoveTo,
         Which::FileListEditor,
+        Which::FileListSlotEdit,
     ];
 
     fn keys(self) -> Keys {
@@ -177,6 +181,14 @@ impl Which {
             Which::AdvancedCopyTo => k("advanced_copy_to", true, true, "", &[], false),
             Which::AdvancedMoveTo => k("advanced_move_to", true, true, "", &[], false),
             Which::FileListEditor => k("editor", true, true, "", &[], false),
+            Which::FileListSlotEdit => k(
+                "file_list_slot_edit",
+                true,
+                true,
+                "file_list_slot_edit_",
+                &["filename"],
+                false,
+            ),
             Which::UndoHistory => k(
                 "undo_history",
                 true,
@@ -797,6 +809,41 @@ mod tests {
         ] {
             assert!(keys.iter().any(|have| have == k), "{k}");
         }
+    }
+
+    /// W7: the Edit File List Slot dialog, under Everything's keys.
+    #[test]
+    fn the_slot_editor_keeps_everythings_keys() {
+        let p = read(&[
+            ("file_list_slot_edit_x", "300"),
+            ("file_list_slot_edit_y", "200"),
+            ("file_list_slot_edit_wide", "640"),
+            ("file_list_slot_edit_high", "480"),
+            ("file_list_slot_edit_maximized", "0"),
+            ("file_list_slot_edit_filename_wide", "512"),
+        ]);
+        let s = p.get(Which::FileListSlotEdit);
+        assert_eq!((s.x, s.y, s.width, s.height), (300, 200, 640, 480));
+        assert_eq!(
+            s.columns,
+            [Column {
+                width: 512,
+                order: 0
+            }]
+        );
+        let keys: Vec<String> = p.to_keys().into_iter().map(|(k, _)| k).collect();
+        for k in [
+            "file_list_slot_edit_x",
+            "file_list_slot_edit_maximized",
+            "file_list_slot_edit_filename_wide",
+        ] {
+            assert!(keys.iter().any(|have| have == k), "{k}");
+        }
+        assert!(
+            !keys
+                .iter()
+                .any(|k| k == "file_list_slot_edit_filename_order")
+        );
     }
 
     #[test]
