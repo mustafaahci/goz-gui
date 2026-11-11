@@ -404,6 +404,7 @@ fn focused(app: &App) -> Focus {
                 ctime: r.ctime,
                 is_dir: r.is_dir,
                 icon: Cell::new(r.icon.get()),
+                more: Cell::new(r.more.get()),
             })
     };
     match row {

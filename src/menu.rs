@@ -81,8 +81,11 @@ pub const VIEW_LARGE: u16 = 1281;
 pub const VIEW_MEDIUM: u16 = 1282;
 pub const VIEW_DETAILS: u16 = 1283;
 
-// The header's menu; each column is COLUMN_FIRST + its id.
-pub const COLUMN_FIRST: u16 = 1250;
+// The header's menu; each column is COLUMN_FIRST + its id (wave 9: in
+// its range, 5150..5199, as the columns grew from six to ten).
+pub const COLUMN_FIRST: u16 = 5150;
+/// Wave 9: the header menu's Organize Columns...
+pub const ORGANIZE_COLUMNS: u16 = 5160;
 pub const RESET_COLUMNS: u16 = 1259;
 /// The column right-clicked, as wide as its text in view.
 pub const SIZE_COLUMN_TO_FIT: u16 = 1260;
@@ -844,14 +847,22 @@ pub fn header_menu(shown: &[bool; COLS], on: Option<usize>) -> HMENU {
         Sep,
     ]);
     enable(menu, SIZE_COLUMN_TO_FIT, on.is_some());
-    // Date Created (a file list's, outside the layout) comes and goes with
-    // the list.
+    // A column the layout shows (W9: not a file list's Date Created brought
+    // while the layout hides it, which comes and goes with the list).
     enable(
         menu,
         REMOVE_COLUMN,
-        on.is_some_and(|id| id != COL_NAME && id < COLS),
+        on.is_some_and(|id| id != COL_NAME && id < COLS && shown[id]),
     );
+    // Wave 9: Everything's Organize Columns..., which also reaches Date
+    // Recently Changed (its header menu does not list that one unless it
+    // is shown, so it can be taken off here too).
+    append(menu, &Cmd(ORGANIZE_COLUMNS, "&Organize Columns..."));
+    append(menu, &Sep);
     for (id, title) in columns::TITLES.iter().enumerate() {
+        if id == columns::COL_RECENT && !shown[id] {
+            continue;
+        }
         let cmd = COLUMN_FIRST + id as u16;
         append(menu, &Cmd(cmd, title));
         check(menu, cmd, shown[id] || id == COL_NAME);
@@ -859,6 +870,16 @@ pub fn header_menu(shown: &[bool; COLS], on: Option<usize>) -> HMENU {
     enable(menu, COLUMN_FIRST + COL_NAME as u16, false);
     append(menu, &Sep);
     append(menu, &Cmd(RESET_COLUMNS, "&Reset Columns"));
+    menu
+}
+
+/// Wave 9: Organize Columns' Add... menu: the columns `ids`, each as the
+/// header menu's command for it.
+pub fn columns_menu(ids: &[usize]) -> HMENU {
+    let menu = popup(&[]);
+    for &id in ids {
+        append(menu, &Cmd(COLUMN_FIRST + id as u16, columns::title(id)));
+    }
     menu
 }
 
@@ -870,8 +891,8 @@ pub fn column_of(cmd: u16) -> Option<usize> {
 
 // The id ranges run into nothing else.
 const _: () = {
-    assert!(ON_TOP_SEARCHING < COLUMN_FIRST);
-    assert!(COLUMN_FIRST + COLS as u16 <= RESET_COLUMNS);
+    assert!(COLUMN_FIRST + COLS as u16 <= ORGANIZE_COLUMNS);
+    assert!(COLUMN_FIRST >= 5150 && ORGANIZE_COLUMNS < 5200);
     assert!(RESET_COLUMNS < SIZE_COLUMN_TO_FIT);
     assert!(REMOVE_COLUMN < MATCH_CASE);
     assert!(DELETE_PERMANENT < COPY_EXT && COPY_TYPE < SELECT_ALL);

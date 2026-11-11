@@ -67,6 +67,7 @@ use crate::{
 };
 
 pub use crate::columns::{COL_DATE, COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE};
+pub use w9a::WM_INDEX_SET;
 
 mod background;
 mod bar;
@@ -131,6 +132,9 @@ mod datatools;
 
 // W6 (C: file-list slots, the File List Editor's start).
 mod lists;
+
+// W9 (B1): the wave 9 columns' values, Options > Indexes, content:.
+mod w9a;
 
 pub const WM_REPLY: u32 = WM_APP + 1;
 pub const WM_ICON: u32 = WM_APP + 2;
@@ -314,6 +318,9 @@ pub struct App {
     theme_mode: Cell<ThemeMode>,
     pub model: RefCell<Model>,
     pub icons: Icons,
+    /// W9 (B1): the disk reader of the wave 9 columns, and the content
+    /// search running.
+    pub(crate) w9: w9a::W9,
     pub scratch: RefCell<Scratch>,
     pub search_rc: Cell<RECT>,
     pub status_rc: Cell<RECT>,
@@ -888,11 +895,12 @@ See Help > Search Syntax and the README for goz-gui's switches."
             // Shortcuts are the main window's; another window of the thread
             // (Help > Search Syntax) keeps its keys.
             let ours = msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd) != 0;
-            // Esc stops an export first, wherever the keyboard is.
+            // Esc stops an export first, wherever the keyboard is; W9: then
+            // a content search reading.
             if ours
                 && msg.message == WM_KEYDOWN
                 && msg.wParam == usize::from(VK_ESCAPE)
-                && app.cancel_export()
+                && (app.cancel_export() || app.cancel_content())
             {
                 continue;
             }
@@ -1104,8 +1112,11 @@ impl App {
                     filelist: None,
                     created_sort: None,
                     slots: Default::default(),
+                    want: Default::default(),
+                    content: None,
                 }))),
                 icons: Icons::new(hwnd, WM_ICON, WM_TYPES, WM_TYPES_ASK),
+                w9: w9a::W9::new(hwnd),
                 scratch: RefCell::new(Scratch::default()),
                 search_rc: Cell::new(RECT::default()),
                 status_rc: Cell::new(RECT::default()),
@@ -1847,6 +1858,11 @@ impl App {
                     self.w7_message(m, w, l);
                     0
                 }
+                // W9 (B1): the disk's column values, the content search.
+                m if w9a::is_message(m) => {
+                    self.w9_message(m, w, l);
+                    0
+                }
                 WM_SERVICE => {
                     if w != 0 {
                         // gozd stopped or (re)started: search again, which
@@ -1892,6 +1908,8 @@ impl App {
                         self.feature_timer(w);
                     } else if custom::is_timer(w) {
                         self.custom_timer(w);
+                    } else if w9a::is_timer(w) {
+                        self.w9_timer(w);
                     }
                     0
                 }
@@ -2413,16 +2431,30 @@ impl App {
         // front of each part `new-search:` starts, with the filter and Match
         // Path, as each is a search of its own.
         let scoped = self.scoped_search(&text);
-        let query = crate::filelist::slots::each_part(&text, |part| {
-            filter::query(o.filter, o.match_path, &self.scoped_search(part))
-        });
+        let to_gozd = |text: &str| {
+            crate::filelist::slots::each_part(text, |part| {
+                filter::query(o.filter, o.match_path, &self.scoped_search(part))
+            })
+        };
+        // W9: `content:` terms are read by goz-gui, not gozd: gozd is asked
+        // the search without them (or it is refused, and why).
+        let planned = self.plan_content(&text, o.match_case);
+        let query = match &planned {
+            crate::content::plan::Planned::Content(p) => {
+                to_gozd(p.queries.first().map_or("", String::as_str))
+            }
+            _ => to_gozd(&text),
+        };
         // W8: an `open-filelist:` term's list is searched for this search
         // instead of the index or the tab's list (or why it cannot be).
-        let (filelist, refused) = match self.search_file_list(&text) {
+        let (filelist, mut refused) = match self.search_file_list(&text) {
             Ok(list) => (list, None),
             Err(why) => (self.filelist(), Some(why)),
         };
-        let search = Arc::new(Search {
+        if let crate::content::plan::Planned::Refused(why) = &planned {
+            refused.get_or_insert_with(|| why.clone());
+        }
+        let base = Search {
             query,
             sort: o.sort,
             match_case: o.match_case,
@@ -2432,7 +2464,20 @@ impl App {
             created_sort: self.created_sort(),
             // W6: the tab's file-list slots, for filelistN:.
             slots: self.file_list_slots(),
-        });
+            // W9: the wave 9 columns shown (stream B2 asks gozd for them).
+            want: crate::props::Want::of_columns(self.layout.get().shown()),
+            content: None,
+        };
+        let content = match &planned {
+            crate::content::plan::Planned::Content(p) if refused.is_none() => {
+                Some(self.content_run(p, &base, keep_place, &to_gozd))
+            }
+            _ => {
+                self.end_content();
+                None
+            }
+        };
+        let search = Arc::new(Search { content, ..base });
         let epoch = self.next_epoch.get() + 1;
         self.next_epoch.set(epoch);
         self.model.borrow_mut().pending = Some(Pending {
@@ -2680,6 +2725,8 @@ impl App {
                 match adopted {
                     Some(keep) => {
                         self.icons.reset(epoch);
+                        // W9: the disk reads asked for the rows before.
+                        self.w9.props.reset(epoch);
                         if !keep {
                             // Other files: their thumbnails are not wanted,
                             // and Select All was of the rows before.
@@ -2960,14 +3007,13 @@ impl App {
             COL_SIZE => SortKey::Size,
             COL_DATE => SortKey::DateModified,
             // W5: a file list's Date Created, sorted by the list itself.
-            crate::columns::COL_CREATED => return self.sort_by_created(),
-            // gozd sorts by these four only: the sort stays, and the status
-            // bar says why for a moment.
-            _ => {
-                let title = crate::columns::title(col);
-                self.show_note(format!("goz can't sort by {title} yet"));
-                return;
+            crate::columns::COL_CREATED if self.created_column_wanted() => {
+                return self.sort_by_created();
             }
+            // gozd sorts by these four only: the sort stays, and the status
+            // bar says why for a moment. W9: the seam where stream B2 sorts
+            // by gozd's new keys.
+            _ => return self.sort_by_new_column(col),
         });
     }
 

@@ -84,6 +84,9 @@ impl App {
 
         // W4 (G1: data and file tools).
         self.data_tools_exit();
+
+        // W9 (B1): a content search stops reading.
+        self.w9_exit();
     }
 
     /// A menu of the bar (or a submenu) is about to open, after the
@@ -580,6 +583,11 @@ mod tests {
             // W7 (C): a file-list term to edit, a slot's saved results.
             crate::slotedit::WM_EDIT_TERM_AT,
             crate::slotedit::WM_SLOT_SAVED,
+            // W9 (B1): the disk's column values, the content search, the
+            // Indexes page's answer.
+            super::super::w9a::WM_PROPS,
+            super::super::w9a::WM_CONTENT,
+            super::super::w9a::WM_INDEX_SET,
         ];
         for (i, &(a, m)) in messages.iter().enumerate() {
             for &(b, other) in &messages[i + 1..] {
@@ -620,6 +628,12 @@ mod tests {
                 "{a} and W7 C's range"
             );
             assert!(!is_feature_message(m) || !in_w7c);
+            // W9 (B1) routes WM_APP + 420..430 to `w9_message`.
+            assert_eq!(
+                super::super::w9a::is_message(m),
+                a.starts_with("super::super::w9a::"),
+                "{a} and W9 B1's range"
+            );
         }
         assert!(!is_feature_message(crate::datatools::MSG_FIRST));
         assert!(!is_feature_message(crate::datatools::MSG_END - 1));
@@ -647,6 +661,8 @@ mod tests {
             super::super::custom::TIMER_JUMP_LIST,
             // W6.
             super::super::selecting::TIMER_SELECTING,
+            // W9 (B1).
+            super::super::w9a::TIMER_CONTENT,
         ];
         for (i, &(a, t)) in timers.iter().enumerate() {
             for &(b, other) in &timers[i + 1..] {
@@ -671,6 +687,11 @@ mod tests {
             assert!(
                 !in_g2 || !is_feature_timer(t),
                 "{a} is in the features' timers"
+            );
+            assert_eq!(
+                super::super::w9a::is_timer(t),
+                a.starts_with("super::super::w9a::"),
+                "{a} and W9 B1's timers"
             );
         }
     }

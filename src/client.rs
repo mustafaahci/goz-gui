@@ -103,6 +103,12 @@ pub struct Search {
     pub created_sort: Option<SortDir>,
     /// Wave 6: the tab's file-list slots, which `filelistN:` reads.
     pub slots: Arc<crate::filelist::slots::Slots>,
+    /// Wave 9: the wave 9 columns the rows are drawn with (stream B2 asks
+    /// gozd for them when it lists the "columns" feature).
+    pub want: crate::props::Want,
+    /// Wave 9: a search with `content:` terms: its rows are the files of
+    /// gozd's answer whose content matched, as the run reads them.
+    pub content: Option<Arc<crate::content::Run>>,
 }
 
 /// Why [`Search::gozd_query`] gave no search: a reason for the window, or
@@ -206,9 +212,33 @@ pub struct Row {
     pub is_dir: bool,
     /// Index into the system image list, or one of the `icons::` states.
     pub icon: Cell<i32>,
+    /// Wave 9: its attributes, date accessed, date recently changed and
+    /// (when `ctime` has none) date created, as its source gave them or the
+    /// disk said (`crate::props`).
+    pub more: Cell<crate::props::More>,
 }
 
 impl Row {
+    /// Wave 9: its date created: its source's, else the disk's.
+    pub fn created(&self) -> Option<i64> {
+        self.ctime.or_else(|| self.more.get().ctime())
+    }
+
+    /// Wave 9: its date accessed.
+    pub fn accessed(&self) -> Option<i64> {
+        self.more.get().atime()
+    }
+
+    /// Wave 9: its `FILE_ATTRIBUTE_*` bits.
+    pub fn attributes(&self) -> Option<u32> {
+        self.more.get().attrib()
+    }
+
+    /// Wave 9: its date recently changed (only gozd's index has one).
+    pub fn recently_changed(&self) -> Option<i64> {
+        self.more.get().rtime()
+    }
+
     pub fn name(&self) -> &[u16] {
         &self.path[self.name_start as usize..]
     }
@@ -223,6 +253,10 @@ impl Row {
             Some(units) => units.into(),
             None => item.path.encode_utf16().collect(),
         };
+        // Wave 9 seam (stream B2): once gozd lists the "columns" feature
+        // and the search asked (`Search::want`), its `ctime_ft`, `atime_ft`,
+        // `attrib` and `rtime_ft` go in here, as `ctime` and
+        // `more = More::given(..)`, so the disk is not asked for them.
         Row::new(path, item.size, item.mtime_ft, item.is_dir)
     }
 
@@ -246,6 +280,7 @@ impl Row {
             ctime: None,
             is_dir,
             icon: Cell::new(crate::icons::UNSET),
+            more: Cell::new(crate::props::More::default()),
         }
     }
 }
@@ -528,6 +563,10 @@ pub fn stream_range(
     range: RowRange,
     mut page: impl FnMut(Vec<Row>, u64) -> Result<bool, String>,
 ) -> Streamed {
+    // W9: a content search's rows are the run's matches so far.
+    if let Some(run) = &search.content {
+        return run.stream(stop, range, page);
+    }
     if let Some(list) = &search.filelist {
         return list_stream(stop, search, range, list, page);
     }
@@ -784,6 +823,10 @@ fn fetch_block(
     search: &Search,
     looked: &mut Option<Asked>,
 ) -> Option<Reply> {
+    // W9: a content search answers from what its run found so far.
+    if let Some(run) = &search.content {
+        return Some(run.block(epoch, block));
+    }
     if let Some(list) = &search.filelist {
         return list_block(shared, epoch, block, search, list);
     }
@@ -1362,6 +1405,8 @@ mod tests {
                 filelist: None,
                 created_sort: None,
                 slots: Default::default(),
+                want: Default::default(),
+                content: None,
             }),
         }
     }

@@ -329,6 +329,7 @@ mod tests {
             ctime: None,
             is_dir,
             icon: Cell::new(0),
+            more: Default::default(),
         }
     }
 

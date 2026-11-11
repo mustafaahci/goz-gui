@@ -65,6 +65,9 @@ impl App {
                 filelist: m.search.filelist.clone(),
                 created_sort: m.search.created_sort,
                 slots: std::sync::Arc::clone(&m.search.slots),
+                want: m.search.want,
+                // W9: a content search exports the matches its run found.
+                content: m.search.content.clone(),
             }
         };
         let bom = self.prefs.borrow().base.utf8_bom;

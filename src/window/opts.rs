@@ -18,6 +18,8 @@ mod view;
 // Wave 4 (G2): Fonts and Colors, Advanced.
 mod advanced;
 mod fonts_colors;
+// Wave 9 (B1): Indexes, over gozd's settings.
+mod indexes;
 
 /// The pages, in any order: the dialog puts them in Everything's
 /// (`Page::order`, `Page::parent`).
@@ -50,6 +52,9 @@ fn pages() -> Vec<Box<dyn Page>> {
     // Wave 4 (G2: customization).
     pages.push(Box::new(fonts_colors::FontsColors::new()));
     pages.push(Box::new(advanced::Advanced::new()));
+
+    // Wave 9 (B1): Indexes.
+    pages.push(Box::new(indexes::Indexes::new()));
 
     pages
 }

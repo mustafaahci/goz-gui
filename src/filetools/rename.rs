@@ -109,7 +109,7 @@ fn fold_char(c: char, case: bool, diacritics: bool) -> char {
 /// `c` without its diacritics: the first character of its canonical
 /// decomposition (Windows' Unicode normalization form D), é → e. Each
 /// character is asked of Windows once.
-fn base_letter(c: char) -> char {
+pub(crate) fn base_letter(c: char) -> char {
     thread_local! {
         static SEEN: RefCell<HashMap<char, char>> = RefCell::new(HashMap::new());
     }

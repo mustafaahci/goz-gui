@@ -122,6 +122,13 @@ mod slotedit;
 // W8 (P: the dialogs' opening time): the GOZ_GUI_TRACE test hook.
 mod trace;
 
+// W9 (B1): the wave 9 columns' values, Organize Columns, Options > Indexes'
+// daemon settings, and `content:`.
+mod content;
+mod indexes;
+mod organize_columns;
+mod props;
+
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };

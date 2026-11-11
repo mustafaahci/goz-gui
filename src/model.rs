@@ -323,8 +323,15 @@ impl Model {
         // again, it would show its type's icon for a moment.
         if let Some(old) = self.previous.remove(&block) {
             for (new, old) in rows.iter().zip(&old.rows) {
-                if old.icon.get() >= 0 && new.path == old.path {
+                if new.path != old.path {
+                    continue;
+                }
+                if old.icon.get() >= 0 {
                     new.icon.set(old.icon.get());
+                }
+                // W9: the disk's values show until they are read again.
+                if new.more.get() == crate::props::More::default() {
+                    new.more.set(old.more.get().carried());
                 }
             }
         }
@@ -381,6 +388,8 @@ mod tests {
             filelist: None,
             created_sort: None,
             slots: Default::default(),
+            want: Default::default(),
+            content: None,
         }))
     }
 
@@ -393,6 +402,7 @@ mod tests {
             ctime: None,
             is_dir,
             icon: Cell::new(0),
+            more: Default::default(),
         }
     }
 

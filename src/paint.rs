@@ -26,7 +26,7 @@ use crate::format;
 use crate::highlight::Span;
 use crate::icons::{PENDING, UNSET};
 use crate::theme::Palette;
-use crate::window::{App, COL_DATE, COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE, Fonts};
+use crate::window::{App, COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE, Fonts};
 use crate::{copytext, filetype, searchbox, status};
 
 /// The space inside a cell before and after its text, at 96 DPI.
@@ -335,15 +335,14 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                         runs_hl(hdc, &inner, &name, &[], &fonts, false, hl);
                     }
                 }
-                COL_DATE | crate::columns::COL_CREATED => {
-                    let date = if col == COL_DATE {
-                        row.mtime
-                    } else {
-                        row.ctime
-                    };
-                    if let Some(ft) = date {
-                        scratch.text.clear();
-                        format::date(ft, &mut scratch.text);
+                // W9: Date Created, Date Accessed, Attributes and Date
+                // Recently Changed, as the row's source gave them or (rows
+                // of the index) as the disk says, read off this thread.
+                c if crate::columns::is_date(c) || c == crate::columns::COL_ATTRIB => {
+                    app.wanted_props(&m, row, c, index);
+                    scratch.text.clear();
+                    copytext::push(row, copytext::Field::of_column(c), &mut scratch.text);
+                    if !scratch.text.is_empty() {
                         runs_hl(hdc, &inner, &scratch.text, &[], &fonts, false, hl);
                     }
                 }

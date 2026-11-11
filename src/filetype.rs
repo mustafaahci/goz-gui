@@ -150,6 +150,7 @@ mod tests {
             ctime: None,
             is_dir,
             icon: std::cell::Cell::new(0),
+            more: Default::default(),
         }
     }
 

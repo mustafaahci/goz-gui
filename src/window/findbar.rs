@@ -1620,6 +1620,8 @@ mod tests {
             filelist: None,
             created_sort: None,
             slots: Default::default(),
+            want: Default::default(),
+            content: None,
         };
         assert!(same_search(&s("a"), &s("a")));
         assert!(!same_search(&s("a"), &s("b")));

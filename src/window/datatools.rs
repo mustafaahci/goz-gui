@@ -120,8 +120,6 @@ pub(super) struct DataTools {
     unsaid: RefCell<Vec<u64>>,
     /// The shown list's matches are sorted by its Date Created (W5).
     created_sort: Cell<Option<SortDir>>,
-    /// The Date Created column's width at 96 DPI, while the window lasts.
-    created_width: Cell<i32>,
     /// One of their dialogs is open.
     dialog: Cell<bool>,
     /// Import or Reset Settings waits for the other windows to end.
@@ -202,7 +200,6 @@ impl DataTools {
             held: RefCell::new(Vec::new()),
             unsaid: RefCell::new(Vec::new()),
             created_sort: Cell::new(None),
-            created_width: Cell::new(crate::columns::DEFAULT_WIDTHS[crate::columns::COL_DATE]),
             dialog: Cell::new(false),
             replacing: RefCell::new(None),
             slots: RefCell::new(Arc::default()),
@@ -530,25 +527,17 @@ impl App {
     /// ends with it.
     pub(super) fn refresh_created_column(&self) {
         let wanted = self.created_column_wanted();
-        if wanted == self.list_cols.get().has_created() {
-            return;
-        }
         if !wanted && self.data_tools.created_sort.take().is_some() {
             self.show_sort();
+        }
+        // W9: the layout may show Date Created itself (for any results).
+        let should = wanted || self.layout.get().is_shown(crate::columns::COL_CREATED);
+        if should == self.list_cols.get().has_created() {
+            return;
         }
         // The user's last widths and order first.
         self.sync_columns();
         self.apply_columns(self.layout.get());
-    }
-
-    pub(super) fn created_width(&self) -> i32 {
-        self.data_tools.created_width.get()
-    }
-
-    pub(super) fn set_created_width(&self, width: i32) {
-        self.data_tools
-            .created_width
-            .set(width.clamp(crate::columns::MIN_WIDTH, 8192));
     }
 
     /// The Date Created sort in force: only while the shown list has the
