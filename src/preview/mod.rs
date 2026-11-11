@@ -405,6 +405,7 @@ fn focused(app: &App) -> Focus {
                 is_dir: r.is_dir,
                 icon: Cell::new(r.icon.get()),
                 more: Cell::new(r.more.get()),
+                asked: r.asked,
             })
     };
     match row {

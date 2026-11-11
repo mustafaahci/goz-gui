@@ -135,6 +135,7 @@ mod lists;
 
 // W9 (B1): the wave 9 columns' values, Options > Indexes, content:.
 mod w9a;
+mod w9b;
 
 pub const WM_REPLY: u32 = WM_APP + 1;
 pub const WM_ICON: u32 = WM_APP + 2;
@@ -2895,6 +2896,7 @@ impl App {
                 }
             }
             Reply::Syntax(on) => self.syntax_learned(on),
+            Reply::Features(features) => self.features_learned(features),
             Reply::Saved { epoch, saves } => self.parts_saved(epoch, saves),
         }
     }
@@ -3010,9 +3012,8 @@ impl App {
             crate::columns::COL_CREATED if self.created_column_wanted() => {
                 return self.sort_by_created();
             }
-            // gozd sorts by these four only: the sort stays, and the status
-            // bar says why for a moment. W9: the seam where stream B2 sorts
-            // by gozd's new keys.
+            // W9: gozd's newer keys, when it lists them (`w9b.rs`); the sort
+            // stays otherwise, and the status bar says why for a moment.
             _ => return self.sort_by_new_column(col),
         });
     }
@@ -3048,6 +3049,11 @@ impl App {
             SortKey::Path => COL_PATH,
             SortKey::Size => COL_SIZE,
             SortKey::DateModified => COL_DATE,
+            SortKey::Extension => crate::columns::COL_EXT,
+            SortKey::DateCreated => crate::columns::COL_CREATED,
+            SortKey::DateAccessed => crate::columns::COL_ACCESSED,
+            SortKey::Attributes => crate::columns::COL_ATTRIB,
+            SortKey::DateRecentlyChanged => crate::columns::COL_RECENT,
         }
     }
 

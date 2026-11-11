@@ -3,11 +3,11 @@
 //!
 //! The list of search terms is goz's own help text (goz-core renders it from
 //! the same tables its tests run through the parser), so it describes
-//! exactly what gozd accepts; goz-gui adds what its menus do to a search.
-//! A gozd that reads Everything 1.5's syntax (`client::boolean_syntax`)
-//! gets its operators, modifiers and functions listed too (from the
-//! query-language branch's own help); an older one, a line saying a newer
-//! gozd adds them.
+//! exactly what the parser goz-gui is built with accepts: Everything 1.5's
+//! syntax, which gozd 0.7 reads, and which goz-gui reads itself for an open
+//! file list. goz-gui adds what its menus do to a search; a gozd that does
+//! not read the new syntax yet (`client::boolean_syntax`) gets lines
+//! saying what its searches of the index refuse.
 
 use std::cell::Cell;
 
@@ -44,93 +44,50 @@ thread_local! {
 
 /// goz-gui's own rows: what to type or choose, and what it does, a line of
 /// text each.
-const NOT_SUPPORTED: &[(&str, &[&str])] = &[(
-    "|  !",
-    &[
-        "OR and NOT are refused; quote them to search",
-        "for them as text, as in \"a|b\"",
-        "A newer gozd adds OR, NOT and < > grouping",
-    ],
-)];
-/// What a gozd that reads Everything 1.5's syntax adds, from the
-/// query-language branch's help (`escompat/help.rs`).
-const NEW_SYNTAX: &[(&str, &[&str])] = &[
-    ("a b", &["AND: names that contain both, in any order"]),
+///
+/// W9: goz's own table above is the new query language's (goz-gui is built
+/// with goz-core's parser, which reads it all); a gozd that does not read
+/// it yet (v0.6.0) gets these lines too, as its searches of the index
+/// refuse what it lacks.
+const OLDER_GOZD: &[(&str, &[&str])] = &[
     (
-        "a|b",
+        "|  !  < >",
         &[
-            "OR: either; it binds tighter than AND, so",
-            "a b|c is a and (b or c); or: is the word",
+            "This gozd refuses OR, NOT, groups, modifiers",
+            "and the newer functions in a search of its",
+            "index; quote | ! < > to search for them as",
+            "text, as in \"a|b\". An open file list reads",
+            "them all; a newer gozd (goz 0.7) does too",
         ],
     ),
     (
-        "!a",
+        "content:",
         &[
-            "NOT: names without a, where a term starts",
-            "(wow!.txt is a name); not: is the word",
+            "With this gozd, only content terms joined",
+            "to the search with spaces (AND)",
         ],
-    ),
-    ("<a b>|c", &["A group: a and b, or c; !<a|b> is neither"]),
-    ("\"a|b\"", &["In quotes | ! < > are text"]),
-    (
-        r"src\*.rs",
-        &[
-            "With a \\, * and ? stay inside one folder: the",
-            ".rs files right in a folder named src",
-        ],
-    ),
-    (
-        r"src\**\*.rs",
-        &["** crosses folders: any folder below src"],
-    ),
-    (
-        "case:, nocase:",
-        &["Match case, or not, for one term or <group>"],
-    ),
-    (
-        "path:, nopath:",
-        &["Match the full path, or the name alone"],
-    ),
-    (
-        "ww:, prefix:, suffix:",
-        &["Whole words; at a word's start or end"],
-    ),
-    (
-        "startwith:, endwith:",
-        &["The name starts or ends with the text"],
-    ),
-    ("whole:, exact:", &["The text is the whole name"]),
-    (
-        "file:, folder:",
-        &["Only files, or only folders; files:, folders:"],
-    ),
-    (r"parent:C:\src", &[r"Entries right in C:\src (infolder:)"]),
-    ("len:>40", &["Names longer than 40 characters"]),
-    (
-        "ext:mp?;doc*",
-        &["Files whose extension matches one in the list"],
-    ),
-    (
-        "size:<1kb|2kb>",
-        &["A function's value may be a ; list or a <group>"],
-    ),
-    (
-        "audio:, doc:, exe:",
-        &[
-            "Everything's filters by extension, as are",
-            "image:, video: and zip:",
-        ],
-    ),
-    (
-        "dm:lastweek",
-        &["The last 7 days; also dm:prevweek, dm:<30days"],
-    ),
-    (
-        "?case:",
-        &["A leading ? applies a modifier to every later term"],
     ),
 ];
 const IN_GOZ_GUI: &[(&str, &[&str])] = &[
+    (
+        "File > Open File List...",
+        &[
+            "Searches the list instead of the index, with",
+            "the syntax above but child:, descendant:,",
+            "sibling: and their kin, the counts of related",
+            "entries and total-child-size: (a list has no",
+            "folder tree); dc: and attrib: read the list's",
+            "Date Created and Attributes",
+        ],
+    ),
+    (
+        "content:abc",
+        &[
+            "Read by goz-gui under your account, not by",
+            "gozd; up to 3 content terms in any place of",
+            "the search (in an OR, after !), Esc stops it",
+        ],
+    ),
     ("Search > Match Case", &["Matches case, as case: does"]),
     (
         "Search > Match Path",
@@ -260,12 +217,12 @@ pub fn text_for(boolean: bool) -> String {
          \n",
     );
     out.push_str(terms);
-    let first = if boolean {
-        ("Operators, modifiers and functions (this gozd)", NEW_SYNTAX)
-    } else {
-        ("Not supported", NOT_SUPPORTED)
-    };
-    for (title, rows) in [first, ("In goz-gui", IN_GOZ_GUI)] {
+    let mut tables = Vec::new();
+    if !boolean {
+        tables.push(("This gozd", OLDER_GOZD));
+    }
+    tables.push(("In goz-gui", IN_GOZ_GUI));
+    for (title, rows) in tables {
         out.push('\n');
         out.push_str(title);
         out.push('\n');
@@ -636,28 +593,26 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_gozd_gets_its_syntax_listed() {
-        let old = text_for(false);
-        assert!(old.contains("A newer gozd adds OR, NOT and < > grouping"));
-        assert!(!old.contains("ww:"));
-        let new = text_for(true);
-        assert!(!new.contains("Not supported"));
-        for usage in [
-            "a|b",
-            "!a",
-            "<a b>|c",
-            r"src\**\*.rs",
-            "ww:",
-            "parent:",
-            "len:",
-        ] {
-            assert!(new.contains(usage), "{usage}");
+    fn the_new_syntax_is_listed_and_an_older_gozd_says_what_it_lacks() {
+        // goz's own table is the new query language's, whatever the gozd.
+        for boolean in [false, true] {
+            let text = text_for(boolean);
+            for usage in ["report|pdf", "!draft", "<a b>|c", "ww:TEXT", "len:>40"] {
+                assert!(text.contains(usage), "{boolean}: {usage}");
+            }
+            assert!(text.contains("File > Open File List..."));
         }
+        let old = text_for(false);
+        assert!(old.contains("This gozd refuses OR, NOT, groups"));
+        let new = text_for(true);
+        assert!(!new.contains("This gozd"));
     }
 
     #[test]
     fn the_quoted_example_is_searchable() {
+        // goz-core's parser, goz-gui's for open file lists, reads both; in
+        // quotes the | is text.
         assert!(goz_core::query::parse_query("\"a|b\"").is_ok());
-        assert!(goz_core::query::parse_query("a|b").is_err());
+        assert!(goz_core::query::parse_query("a|b").is_ok());
     }
 }

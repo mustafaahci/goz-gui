@@ -440,8 +440,37 @@ mod tests {
     use super::*;
     use goz_core::query::{Kind, parse_query};
 
+    /// `q` as gozd v0.6.0 reads its functions: a later `ext:` or `size:`
+    /// replaces an earlier one, so the reconciled term goz-gui appends is
+    /// the one that counts. (The new parser, goz-core's now, ANDs them all,
+    /// which the appended intersection leaves the same.) Each word that
+    /// starts a function is kept only as the last of its name.
+    fn v060(q: &str) -> String {
+        let words: Vec<&str> = q.split_whitespace().collect();
+        let func = |w: &str| {
+            let w = w.to_ascii_lowercase();
+            ["ext:", "size:"]
+                .into_iter()
+                .find(|f| w.starts_with(f))
+                .map(str::to_owned)
+        };
+        let kept: Vec<&str> = words
+            .iter()
+            .enumerate()
+            .filter(|&(i, w)| match func(w) {
+                Some(f) => !words[i + 1..]
+                    .iter()
+                    .any(|later| func(later).as_ref() == Some(&f)),
+                None => true,
+            })
+            .map(|(_, w)| *w)
+            .collect();
+        kept.join(" ")
+    }
+
     fn exts(q: &str) -> Option<Vec<String>> {
-        let parsed = parse_query(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let q = v060(q);
+        let parsed = parse_query(&q).unwrap_or_else(|e| panic!("{q}: {e}"));
         parsed.filters.ext.map(|v| {
             v.into_iter()
                 .map(|e| String::from_utf8(e).expect("ascii"))
@@ -551,7 +580,7 @@ mod tests {
             }
             q
         };
-        let parse = |s: &str| parse_query(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+        let parse = |s: &str| parse_query(&v060(s)).unwrap_or_else(|e| panic!("{s}: {e}"));
         // Sizes: what both allow.
         let p = parse(&q("size:>1mb", "size:<10mb"));
         let size = p.filters.size.expect("size");
@@ -594,6 +623,9 @@ mod tests {
             fn week_start(&self) -> u8 {
                 0
             }
+            fn date_order(&self) -> goz_core::query::DateOrder {
+                goz_core::query::DateOrder::MonthDayYear
+            }
         }
         for text in [
             "",
@@ -604,12 +636,11 @@ mod tests {
             "\"ext:pdf\" a",
             "file: size:>1mb",
             "folder:x dir:y",
-            "size:tiny",
             "size:1kb..2MB",
             "size:..500",
             "size:=12",
             "size:<10kb size:>=3gb",
-            "size:huge dm:lastweek case: path:x matchpath:",
+            "size:>1mb dm:lastweek case: path:x matchpath:",
             "a|b",
             "!x",
             "\"a|b\" ext:txt",
@@ -618,20 +649,51 @@ mod tests {
             r"C:\Windows 12:30 *.rs",
         ] {
             let ours = parsed(text);
-            let goz = parse_query_at(text, false, &Clock).ok().map(|q| Parts {
-                ext: q.filters.ext.map(|v| {
-                    v.into_iter()
-                        .map(|e| String::from_utf8(e).expect("ascii"))
-                        .collect()
-                }),
-                kind: q.filters.kind.map(|k| match k {
-                    goz_core::query::Kind::File => super::Kind::File,
-                    goz_core::query::Kind::Folder => super::Kind::Folder,
-                }),
-                size: q.filters.size.map(|s| (s.min, s.max)),
-            });
+            // What goz-gui does not read (an operator, a function gozd
+            // v0.6.0 lacks, a value it refuses) is left to gozd as it is;
+            // the new parser may read more of it.
+            if ours.is_none() {
+                continue;
+            }
+            let goz = parse_query_at(&v060(text), false, &Clock)
+                .ok()
+                .map(|q| Parts {
+                    ext: q.filters.ext.map(|v| {
+                        v.into_iter()
+                            .map(|e| String::from_utf8(e).expect("ascii"))
+                            .collect()
+                    }),
+                    kind: q.filters.kind.map(|k| match k {
+                        goz_core::query::Kind::File => super::Kind::File,
+                        goz_core::query::Kind::Folder => super::Kind::Folder,
+                    }),
+                    size: q.filters.size.map(|s| (s.min, s.max)),
+                });
             assert_eq!(ours, goz, "{text}");
         }
+    }
+
+    /// Where the readings of the size words part: v0.6.0's took their lower
+    /// bound in (tiny took empty files), the new parser's (Everything's)
+    /// leaves it out. The range goz-gui appends for v0.6.0 is ANDed with
+    /// the words themselves by the new parser, so its answer is the new
+    /// parser's.
+    #[test]
+    fn size_words_are_read_as_each_gozd_reads_them() {
+        let new = |q: &str| {
+            parse_query(q)
+                .expect("parses")
+                .filters
+                .size
+                .map(|s| (s.min, s.max))
+        };
+        assert_eq!(parsed("size:tiny").and_then(|p| p.size), Some((0, 10240)));
+        assert_eq!(new("size:tiny"), Some((1, 10240)));
+        assert_eq!(
+            parsed("size:huge").and_then(|p| p.size),
+            Some((16 << 20, 128 << 20))
+        );
+        assert_eq!(new("size:huge"), Some(((16 << 20) + 1, 128 << 20)));
     }
 
     #[test]

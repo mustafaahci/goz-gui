@@ -65,7 +65,8 @@ pub fn push(row: &Row, field: Field, out: &mut Vec<u16>) {
             out.push(u16::from(b'"'));
         }
         Field::Size => {
-            if let (false, Some(size)) = (row.is_dir, row.size) {
+            // W9: a folder's too, when it has one (folder sizes).
+            if let Some(size) = row.size {
                 out.extend(format::size_cell(size).encode_utf16());
             }
         }
@@ -137,6 +138,7 @@ mod tests {
             is_dir,
             icon: Cell::new(0),
             more: Default::default(),
+            asked: Default::default(),
         }
     }
 
@@ -163,7 +165,8 @@ mod tests {
             "\"C:\\Windows\\notepad.exe\"\r\n\"C:\\Windows\\System32\""
         );
         // Folders show no size, as in the list.
-        assert_eq!(text(&lines(&rows, Field::Size)), "352 KB\r\n");
+        // W9: a folder's size too, when it has one (folder sizes).
+        assert_eq!(text(&lines(&rows, Field::Size)), "352 KB\r\n4 KB");
         // Nor an extension.
         assert_eq!(text(&lines(&rows, Field::Extension)), "exe\r\n");
         assert_eq!(text(&lines(&rows, Field::DateModified)), "\r\n");

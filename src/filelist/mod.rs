@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use goz_core::fold::fold_into;
-use goz_core::query::{LocalClock, mtime_key, parse_query_at, size_key};
+use goz_core::query::{DateOrder, LocalClock, mtime_key, parse_query_at, size_key};
 use goz_core::types::{SortDir, SortKey, SortSpec};
 use goz_winfs::TimeZone;
 
@@ -139,6 +139,8 @@ impl Chunk {
             is_dir: self.dir[i],
             size: self.size(i),
             mtime: self.mtime(i),
+            ctime: self.ctime(i),
+            attrib: self.attrib(i),
         }
     }
 }
@@ -536,7 +538,7 @@ impl FileList {
                 }
             }
         }
-        let mut matcher = Matcher::new(parsed);
+        let mut matcher = Matcher::new(parsed)?;
         let mut order = Vec::new();
         let mut total_size = 0u64;
         for (c, chunk) in chunks.iter().enumerate() {
@@ -617,6 +619,7 @@ pub struct MachineClock {
     now: i64,
     zone: Option<TimeZone>,
     week_start: u8,
+    date_order: DateOrder,
 }
 
 impl MachineClock {
@@ -625,6 +628,13 @@ impl MachineClock {
             now: crate::history::filetime_now() as i64,
             zone: TimeZone::current().ok(),
             week_start: goz_winfs::first_day_of_week(),
+            // W9: how `dm:11/4/2026` reads, as gozd reads it (the short
+            // date's order, `LOCALE_IDATE`).
+            date_order: match goz_winfs::short_date_order() {
+                1 => DateOrder::DayMonthYear,
+                2 => DateOrder::YearMonthDay,
+                _ => DateOrder::MonthDayYear,
+            },
         }
     }
 }
@@ -641,6 +651,9 @@ impl LocalClock for MachineClock {
     }
     fn week_start(&self) -> u8 {
         self.week_start
+    }
+    fn date_order(&self) -> DateOrder {
+        self.date_order
     }
 }
 
@@ -742,7 +755,11 @@ fn path_key(path: &[u8]) -> Vec<u8> {
 /// Sorts `order` as gozd sorts its matches: by the sort's key (unknown
 /// sizes and dates last), then the folded name, then the row; a
 /// descending sort is that order reversed. Date Created sorts as Date
-/// Modified does, by the other date.
+/// Modified does, by the other date. W9: a folder's size (a list made with
+/// folder sizes) sorts as gozd sorts folder sizes; Extension as gozd's
+/// (folders, then files without one, then by extension); Attributes by
+/// the list's own; Date Accessed and Date Recently Changed, which no list
+/// holds, leave the name order.
 fn sort_rows(chunks: &[Arc<Chunk>], ranks: Option<&Ranks>, order: &mut [u32], sort: Order) {
     let at = |g: u32| {
         let (c, i) = split(g);
@@ -755,12 +772,45 @@ fn sort_rows(chunks: &[Arc<Chunk>], ranks: Option<&Ranks>, order: &mut [u32], so
     let primary = |g: u32| -> u64 {
         let (chunk, i) = at(g);
         match key {
-            SortKey::Size => size_key(chunk.size(i).filter(|_| !chunk.dir[i]), dir),
+            SortKey::Size => size_key(chunk.size(i), dir),
             SortKey::DateModified if created => mtime_key(chunk.ctime(i), dir),
             SortKey::DateModified => mtime_key(chunk.mtime(i), dir),
-            SortKey::Name | SortKey::Path => 0,
+            SortKey::DateCreated => mtime_key(chunk.ctime(i), dir),
+            SortKey::Attributes => size_key(
+                chunk.attrib(i).map(goz_core::output::attribute_sort_key),
+                dir,
+            ),
+            SortKey::Name
+            | SortKey::Path
+            | SortKey::Extension
+            | SortKey::DateAccessed
+            | SortKey::DateRecentlyChanged => 0,
         }
     };
+    if key == SortKey::Extension {
+        // The group (folder, no extension, one), the folded extension in
+        // full, then the folded name.
+        order.sort_by_cached_key(|&g| {
+            let (chunk, i) = at(g);
+            let mut name = Vec::new();
+            folded_name(chunk.path(i), &mut name);
+            let dir = chunk.dir[i];
+            let ext = goz_core::query::sort_extension(&name, dir).to_vec();
+            let group = if dir {
+                0u8
+            } else if ext.is_empty() {
+                1
+            } else {
+                2
+            };
+            let rank = ranks.map_or(0, |r| r.name[g as usize]);
+            (group, ext, rank, name, g)
+        });
+        if dir == SortDir::Desc {
+            order.reverse();
+        }
+        return;
+    }
     match (ranks, key) {
         (Some(r), SortKey::Name) => order.sort_unstable_by_key(|&g| r.name[g as usize]),
         (Some(r), SortKey::Path) => order.sort_unstable_by_key(|&g| r.path[g as usize]),
@@ -935,8 +985,9 @@ mod tests {
         // The same search, other slots: not the answer kept.
         assert!(found("filelist2:", &none).unwrap().is_empty());
         assert!(found("filelist2:x", &s).is_err());
-        // `|` outside quotes is goz's, which v0.6.0 refuses.
-        assert!(found("filelist:a|b", &none).is_err());
+        // W9: `|` outside quotes is the new parser's OR, which a list reads
+        // as gozd does.
+        assert!(found("filelist:a|b", &none).is_ok());
     }
 
     /// W8: a search in parts over a list is one answer: its earlier parts'

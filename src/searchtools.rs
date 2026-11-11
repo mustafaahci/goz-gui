@@ -494,6 +494,9 @@ mod tests {
             fn week_start(&self) -> u8 {
                 0
             }
+            fn date_order(&self) -> goz_core::query::DateOrder {
+                goz_core::query::DateOrder::MonthDayYear
+            }
         }
         // Each item at the end of a search, then a value typed after a
         // prefix: the search parses.

@@ -151,6 +151,7 @@ mod tests {
             is_dir,
             icon: std::cell::Cell::new(0),
             more: Default::default(),
+            asked: Default::default(),
         }
     }
 

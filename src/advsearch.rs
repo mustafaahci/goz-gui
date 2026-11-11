@@ -1052,6 +1052,9 @@ mod tests {
         fn week_start(&self) -> u8 {
             0
         }
+        fn date_order(&self) -> goz_core::query::DateOrder {
+            goz_core::query::DateOrder::MonthDayYear
+        }
     }
 
     fn parse(q: &str) -> goz_core::query::ParsedQuery {

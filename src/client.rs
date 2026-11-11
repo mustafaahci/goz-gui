@@ -36,6 +36,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::wide::wz;
 
+mod w9;
+use w9::{Ask, query_request};
+pub use w9::{
+    WATCH_CHANGED, WATCH_OFF, WATCH_ON, Watcher, features, get_config, has_feature, set_config,
+    sort_feature,
+};
+
 /// Rows per request. A screen shows a few dozen, so one block covers a lot of
 /// scrolling while keeping each answer small enough to arrive in one frame.
 pub const BLOCK_ROWS: u32 = 1024;
@@ -103,8 +110,8 @@ pub struct Search {
     pub created_sort: Option<SortDir>,
     /// Wave 6: the tab's file-list slots, which `filelistN:` reads.
     pub slots: Arc<crate::filelist::slots::Slots>,
-    /// Wave 9: the wave 9 columns the rows are drawn with (stream B2 asks
-    /// gozd for them when it lists the "columns" feature).
+    /// Wave 9: the wave 9 columns the rows are drawn with (gozd is asked
+    /// for them when it lists the "columns" feature).
     pub want: crate::props::Want,
     /// Wave 9: a search with `content:` terms: its rows are the files of
     /// gozd's answer whose content matched, as the run reads them.
@@ -216,6 +223,9 @@ pub struct Row {
     /// (when `ctime` has none) date created, as its source gave them or the
     /// disk said (`crate::props`).
     pub more: Cell<crate::props::More>,
+    /// W9: the wave 9 columns gozd gave with the row (`Search::want`, when
+    /// gozd lists "columns"); a column shown since is not in it.
+    pub asked: crate::props::Want,
 }
 
 impl Row {
@@ -248,16 +258,27 @@ impl Row {
         &self.path[..(self.name_start as usize).saturating_sub(1)]
     }
 
-    fn from_item(item: ResultItem) -> Row {
+    /// A row of gozd's answer. W9: when the search asked gozd for the
+    /// wave 9 columns (`asked`, only while gozd lists "columns"), their
+    /// values come with it and the disk is not asked; otherwise the disk is
+    /// read for the rows drawn, as before (`crate::props`).
+    fn from_item(item: ResultItem, asked: crate::props::Want) -> Row {
         let path: Box<[u16]> = match item.path_u16 {
             Some(units) => units.into(),
             None => item.path.encode_utf16().collect(),
         };
-        // Wave 9 seam (stream B2): once gozd lists the "columns" feature
-        // and the search asked (`Search::want`), its `ctime_ft`, `atime_ft`,
-        // `attrib` and `rtime_ft` go in here, as `ctime` and
-        // `more = More::given(..)`, so the disk is not asked for them.
-        Row::new(path, item.size, item.mtime_ft, item.is_dir)
+        let mut row = Row::new(path, item.size, item.mtime_ft, item.is_dir);
+        if asked != crate::props::Want::default() {
+            row.ctime = item.ctime_ft.filter(|_| asked.ctime);
+            row.more.set(crate::props::More::given(
+                item.attrib.filter(|_| asked.attrib),
+                item.ctime_ft.filter(|_| asked.ctime),
+                item.atime_ft.filter(|_| asked.atime),
+                item.rtime_ft.filter(|_| asked.rtime),
+            ));
+            row.asked = asked;
+        }
+        row
     }
 
     /// A row for the full path `path` (a file list's, wave 4).
@@ -281,6 +302,7 @@ impl Row {
             is_dir,
             icon: Cell::new(crate::icons::UNSET),
             more: Cell::new(crate::props::More::default()),
+            asked: crate::props::Want::default(),
         }
     }
 }
@@ -329,6 +351,10 @@ pub enum Reply {
     /// gozd was restarted as another build): whether it reads OR, NOT and
     /// groups.
     Syntax(bool),
+    /// W9: what a new connection's gozd lists in `Hello.features`, posted
+    /// when it differs from what the last one listed (the first time, and
+    /// when gozd was restarted as another build).
+    Features(Vec<String>),
     /// W8: the parts of search `epoch` before its `new-search:` saved their
     /// results to these slots (posted before its block 0).
     Saved {
@@ -586,17 +612,19 @@ pub fn stream_range(
         Err(NotAsked::Io(Io::Lost(_))) if stop.stopped() => return Streamed::Stopped,
         Err(NotAsked::Io(Io::Lost(m))) => return Streamed::Failed(Failure::Other(m)),
     };
-    let request = Request::Query(QueryRequest {
-        query,
-        scope: None,
+    let ask = Ask {
         sort: search.sort,
         offset: range.offset,
         limit: range.limit,
-        want_size: range.details,
-        want_mtime: range.details,
+        details: range.details,
         match_case: search.match_case,
-        want_total_size: false,
-    });
+        total_size: false,
+        want: search.want,
+    };
+    // W9: as the gozd greeted last lists.
+    let features = features();
+    let asked = w9::wire_want(search.want, range.details, &features);
+    let request = query_request(query, &ask, &features);
     if let Err(e) = pipe.send(&request) {
         return match e {
             Io::Cancelled => Streamed::Stopped,
@@ -612,7 +640,11 @@ pub fn stream_range(
             Ok(Response::Results(p)) => {
                 let more = p.more;
                 rows += p.items.len() as u64;
-                let items = p.items.into_iter().map(Row::from_item).collect();
+                let items = p
+                    .items
+                    .into_iter()
+                    .map(|item| Row::from_item(item, asked))
+                    .collect();
                 match page(items, p.total) {
                     Err(why) => return Streamed::Failed(Failure::Other(why)),
                     Ok(false) => return Streamed::Done(rows),
@@ -709,9 +741,8 @@ fn look_up(
         offset: 0,
         limit: Some(LOOKUP_MAX as u32 + 1),
         want_size: true,
-        want_mtime: false,
         match_case,
-        want_total_size: false,
+        ..QueryRequest::default()
     });
     pipe.give_up_at.set(None);
     pipe.send(&request).map_err(NotAsked::Io)?;
@@ -784,10 +815,8 @@ fn all_paths(
         sort: SortSpec::default(),
         offset: 0,
         limit: Some(SAVE_MAX as u32 + 1),
-        want_size: false,
-        want_mtime: false,
         match_case,
-        want_total_size: false,
+        ..QueryRequest::default()
     });
     pipe.give_up_at.set(None);
     pipe.send(&request).map_err(NotAsked::Io)?;
@@ -831,21 +860,19 @@ fn fetch_block(
         return list_block(shared, epoch, block, search, list);
     }
     let started = Instant::now();
-    let request = |query: String| {
-        Request::Query(QueryRequest {
-            query,
-            scope: None,
-            sort: search.sort,
-            offset: block * BLOCK_ROWS,
-            limit: Some(BLOCK_ROWS),
-            want_size: true,
-            want_mtime: true,
-            match_case: search.match_case,
-            // Summing every match costs gozd a pass over them, so only the
-            // first block of a search asks; the status bar shows it.
-            want_total_size: block == 0,
-        })
+    let ask = Ask {
+        sort: search.sort,
+        offset: block * BLOCK_ROWS,
+        limit: Some(BLOCK_ROWS),
+        details: true,
+        match_case: search.match_case,
+        // Summing every match costs gozd a pass over them, so only the
+        // first block of a search asks; the status bar shows it.
+        total_size: block == 0,
+        want: search.want,
     };
+    // W9: as the gozd greeted last lists (this connection's, once open).
+    let request = |query: String| query_request(query, &ask, &features());
     let failed = |failure| {
         Some(Reply::Failed {
             epoch,
@@ -904,6 +931,7 @@ fn fetch_block(
             },
         };
         pipe.give_up_at.set(None);
+        let asked = w9::wire_want(search.want, true, &features());
         let mut rows = Vec::new();
         let (mut total, mut incomplete, mut pending) = (0, false, false);
         let mut total_size = None;
@@ -915,7 +943,11 @@ fn fetch_block(
                         incomplete |= page.volumes_incomplete;
                         pending |= page.metadata_pending;
                         total_size = page.total_size.or(total_size);
-                        rows.extend(page.items.into_iter().map(Row::from_item));
+                        rows.extend(
+                            page.items
+                                .into_iter()
+                                .map(|item| Row::from_item(item, asked)),
+                        );
                         if !page.more {
                             break Ok(None);
                         }
@@ -1093,8 +1125,17 @@ fn connect<'a>(conn: &'a mut Option<Pipe>, shared: &Shared) -> Result<&'a mut Pi
         })
         .map_err(Io::into_failure)?;
         match pipe.response(shared, None).map_err(Io::into_failure)? {
-            Response::Hello { proto, server, .. } => {
+            Response::Hello {
+                proto,
+                server,
+                features,
+                ..
+            } => {
                 *SERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some((server, proto));
+                // W9: what it supports; the window hears when that changed.
+                if w9::set_features(features.clone()) && shared.msg != 0 {
+                    shared.post(Reply::Features(features));
+                }
             }
             Response::Error { message, .. } => {
                 return Err(Failure::Other(format!(
@@ -1121,10 +1162,7 @@ fn probe(pipe: &mut Pipe, shared: &Shared) -> Result<(), Io> {
         sort: SortSpec::default(),
         offset: 0,
         limit: Some(0),
-        want_size: false,
-        want_mtime: false,
-        match_case: false,
-        want_total_size: false,
+        ..QueryRequest::default()
     }))?;
     let verdict = loop {
         match pipe.response(shared, None)? {
@@ -1165,6 +1203,9 @@ struct Pipe {
     buf: Vec<u8>,
     /// Set once the request in flight went stale: when to stop waiting.
     give_up_at: Cell<Option<Instant>>,
+    /// How long gozd may stay silent mid-answer ([`SILENCE_MS`]); a watch,
+    /// quiet while nothing changes, waits for ever (W9).
+    silence_ms: u32,
 }
 
 impl Drop for Pipe {
@@ -1230,6 +1271,7 @@ impl Pipe {
             decoder: FrameDecoder::new(MAX_SERVER_FRAME),
             buf: vec![0; 256 * 1024],
             give_up_at: Cell::new(None),
+            silence_ms: SILENCE_MS,
         })
     }
 
@@ -1335,7 +1377,7 @@ impl Pipe {
                 return Err(Io::Cancelled);
             }
             // SAFETY: both handles are live events.
-            let w = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, SILENCE_MS) };
+            let w = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, self.silence_ms) };
             if w == WAIT_OBJECT_0 {
                 return Ok(());
             }
@@ -1461,11 +1503,12 @@ mod tests {
             proto: PROTO_VERSION,
             server: "gozd".into(),
             ready: true,
+            features: vec![],
         };
         assert_eq!(probe_verdict(&hello), None);
-        // The probe is what an older gozd refuses: goz-core v0.6.0's parser,
-        // the one an old gozd runs, rejects it.
-        assert!(goz_core::query::parse_query(PROBE_QUERY).is_err());
+        // The probe is what the new parser reads (goz-core's, which goz-gui
+        // now builds with); v0.6.0's refused its `|`.
+        assert!(goz_core::query::parse_query(PROBE_QUERY).is_ok());
         // Learning the same thing twice is no news.
         let before = boolean_syntax();
         assert!(set_boolean_syntax(!before));

@@ -38,6 +38,10 @@ use crate::wide::wz;
 pub struct Facts {
     pub gozd: Option<(String, u16)>,
     pub boolean_syntax: bool,
+    /// W9: what gozd lists in `Hello.features`, and whether its watch
+    /// replaces the polling now.
+    pub features: Vec<String>,
+    pub watching: bool,
     pub command_line: String,
     pub exe: String,
     pub data_dir: Option<String>,
@@ -150,6 +154,22 @@ pub fn text(f: &Facts, os: &str, memory: Option<(u64, u64)>) -> String {
             "OR, NOT and groups (Everything 1.5's)"
         } else {
             "goz's first syntax (no OR, NOT or groups)"
+        }
+    ));
+    lines.push(format!(
+        "gozd features:\t{}",
+        if f.features.is_empty() {
+            "none listed (a gozd before goz 0.7)".to_owned()
+        } else {
+            f.features.join(", ")
+        }
+    ));
+    lines.push(format!(
+        "Live updates:\t{}",
+        if f.watching {
+            "gozd's watch (pushed)"
+        } else {
+            "polling"
         }
     ));
     lines.push(format!("Command line:\t{}", f.command_line));
@@ -334,6 +354,8 @@ mod tests {
         let f = Facts {
             gozd: Some(("gozd 0.6.0".into(), 1)),
             boolean_syntax: true,
+            features: vec!["watch".into(), "columns".into()],
+            watching: true,
             command_line: "-s x".into(),
             exe: r"C:\goz-gui.exe".into(),
             data_dir: Some(r"C:\data".into()),

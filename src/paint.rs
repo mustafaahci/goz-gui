@@ -322,7 +322,9 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                     hl,
                 ),
                 COL_SIZE => {
-                    if let (false, Some(size)) = (row.is_dir, row.size) {
+                    // W9: a folder's too, when gozd sums folder sizes or the
+                    // list has one.
+                    if let Some(size) = row.size {
                         let text: Vec<u16> = format::size_cell(size).encode_utf16().collect();
                         runs_hl(hdc, &inner, &text, &[], &fonts, true, hl);
                     }

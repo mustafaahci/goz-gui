@@ -3,9 +3,9 @@
 //!
 //! A row gets them from its source when the source has them: a file list's
 //! own columns (its `Date Created`, its `Attributes`), or gozd's answer
-//! once gozd lists them (the "columns" feature; stream B2 fills them in
-//! [`crate::client::Row`]'s `from_item`, and asks for them with the
-//! [`Want`] a search carries). A row of the index's results without them
+//! while gozd lists them (the "columns" feature: [`crate::client::Row`]'s
+//! `from_item` takes them, asked for with the [`Want`] a search carries).
+//! A row of the index's results without them
 //! has them read from the disk, under the user's own token, for the rows
 //! drawn only: the first draw of such a cell asks this module's thread,
 //! which reads the file's attributes and dates with one
@@ -40,8 +40,8 @@ use crate::wide::nul;
 const MAX_QUEUED: usize = 256;
 
 /// The columns a search's rows are drawn with, of those a source may or
-/// may not have: what stream B2 asks gozd for (`want_ctime`, ...) when
-/// gozd lists the "columns" feature.
+/// may not have: what goz-gui asks gozd for (`want_ctime`, ...) when gozd
+/// lists the "columns" feature.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Want {
     pub ctime: bool,

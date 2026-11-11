@@ -55,6 +55,12 @@ fn sort_id(key: SortKey) -> u16 {
         SortKey::Path => menu::SORT_PATH,
         SortKey::Size => menu::SORT_SIZE,
         SortKey::DateModified => menu::SORT_DATE,
+        // W9: sorted by a header click; none of View > Sort By's.
+        SortKey::Extension
+        | SortKey::DateCreated
+        | SortKey::DateAccessed
+        | SortKey::Attributes
+        | SortKey::DateRecentlyChanged => 0,
     }
 }
 
@@ -458,9 +464,12 @@ impl App {
     pub(super) fn first_sort(&self, key: SortKey) -> SortSpec {
         let ui = self.ui();
         let descending = match key {
-            SortKey::Name | SortKey::Path => false,
+            SortKey::Name | SortKey::Path | SortKey::Extension | SortKey::Attributes => false,
             SortKey::Size => ui.size_descending.on(),
-            SortKey::DateModified => ui.date_descending.on(),
+            SortKey::DateModified
+            | SortKey::DateCreated
+            | SortKey::DateAccessed
+            | SortKey::DateRecentlyChanged => ui.date_descending.on(),
         };
         SortSpec {
             key,

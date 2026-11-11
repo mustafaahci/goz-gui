@@ -2,9 +2,13 @@
 //! file's content).
 //!
 //! A search with content terms is planned (`plan`): gozd is asked the
-//! search without them, and a [`Run`] reads the files of its answer on a
+//! search without them (W9 B2: with a gozd that reads the new query
+//! language, the 2^n searches of goz-core's exact helper, each term taken
+//! as true or false), and a [`Run`] reads the files of its answer on a
 //! thread of its own, under the user's own token, with Everything's
-//! encodings and modifiers (`scan`). The files whose content matches are
+//! encodings and modifiers (`scan`, or goz-core's own reading of each term
+//! for the exact plan, as the goz CLI reads). The files whose content
+//! matches are
 //! the search's results, in gozd's order, as they are found: the run
 //! answers the search's blocks (`client::fetch_block`) from what it has
 //! found so far, says it is still reading (the blocks' `incomplete`), and
@@ -15,8 +19,25 @@
 //! search that leaves millions of candidates never holds them all, and
 //! gozd is never kept waiting on a pipe while files are read.
 
+mod exact;
 pub mod plan;
 pub mod scan;
+
+/// How a run reads its files: the older plan's terms in one pass
+/// (`scan`), or goz-core's exact terms one at a time.
+enum Reader {
+    Plain(Scanner),
+    Exact(Arc<goz_core::query::ContentQuery>, exact::Env),
+}
+
+impl Reader {
+    fn of(plan: &Plan) -> Reader {
+        match &plan.exact {
+            Some((split, _, _)) => Reader::Exact(Arc::clone(split), exact::Env::new()),
+            None => Reader::Plain(Scanner::new(plan.terms.clone())),
+        }
+    }
+}
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +56,11 @@ use scan::{Scanner, Unread};
 const BATCH: u32 = 4096;
 /// Progress is told the window at most this often.
 const TELL_EVERY_MS: u64 = 100;
+/// The most candidates a plan of several searches gathers before it reads
+/// (each is held with the searches that found it): a NOT of a content term
+/// with nothing else (`!content:x`) names every file of every volume, and
+/// is refused past this with the reason rather than held.
+const MANY_MAX: usize = 1_000_000;
 
 /// What a run answers: the same key, the same run (a refresh of the search
 /// keeps reading where it is).
@@ -49,6 +75,8 @@ pub struct Key {
     /// The file list searched instead of the index, by address.
     pub list: usize,
     pub terms: Vec<scan::Term>,
+    /// The exact plan's search text and case (`plan::plan_exact`).
+    pub exact: Option<(String, bool)>,
 }
 
 /// A file whose content matched.
@@ -111,12 +139,12 @@ impl Run {
             msg,
         });
         let thread = Arc::clone(&run);
-        let scanner = Scanner::new(plan.terms.clone());
+        let reader = Reader::of(plan);
         let combine = Arc::clone(&plan.combine);
         let spawned = std::thread::Builder::new()
             .name("goz-content".into())
             .spawn(move || {
-                let state = thread.read_all(&searches, &scanner, &combine);
+                let state = thread.read_all(&searches, &reader, &combine);
                 *thread.ended.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(thread.started.elapsed());
                 thread.state.store(state, Ordering::Release);
@@ -203,7 +231,7 @@ impl Run {
     }
 
     /// Reads every candidate of `searches`; the state it ended in.
-    fn read_all(&self, searches: &[Search], scanner: &Scanner, combine: &Combine) -> u8 {
+    fn read_all(&self, searches: &[Search], scanner: &Reader, combine: &Combine) -> u8 {
         let stopped = || self.stop.stopped();
         match searches {
             [] => DONE,
@@ -264,11 +292,23 @@ impl Run {
                                 }
                             }
                         }
+                        if order.len() > MANY_MAX {
+                            return Err(format!(
+                                "The content search would read more than {} files: narrow it \
+                                 with a name, a folder or an extension",
+                                crate::format::grouped(MANY_MAX as u64)
+                            ));
+                        }
                         Ok(true)
                     });
                     match streamed {
                         Streamed::Done(_) => {}
                         Streamed::Stopped => return STOPPED,
+                        // Refused, not failed: trying again would gather
+                        // as many again.
+                        Streamed::Failed(Failure::Other(why)) if order.len() > MANY_MAX => {
+                            return self.fail(Failure::Refused(why));
+                        }
                         Streamed::Failed(f) => return self.fail(f),
                     }
                 }
@@ -291,30 +331,60 @@ impl Run {
     }
 
     /// Tests one candidate, found by the searches `found` says.
-    fn test(&self, row: Row, found: u32, scanner: &Scanner, combine: &Combine) {
+    fn test(&self, row: Row, found: u32, reader: &Reader, combine: &Combine) {
         self.seen.fetch_add(1, Ordering::Relaxed);
         // Content is a file's: a folder never matches.
         if row.is_dir {
             return;
         }
         let path = std::path::PathBuf::from(String::from_utf16_lossy(&row.path));
-        let mut answers: Option<u32> = None;
         let stop = || self.stop.stopped();
-        let verdict = combine(found, &mut |j| {
-            let a = *answers.get_or_insert_with(|| match scanner.scan_file(&path, &stop) {
-                Ok(bits) => bits,
-                Err(Unread::Offline) => {
-                    self.offline.fetch_add(1, Ordering::Relaxed);
-                    0
-                }
-                Err(Unread::Failed) => {
-                    self.unread.fetch_add(1, Ordering::Relaxed);
-                    0
-                }
-                Err(Unread::Stopped) => 0,
-            });
-            a & (1 << j) != 0
-        });
+        // What the file could not give: counted once, every answer false.
+        let mut unread: Option<Unread> = None;
+        let mut note = |why: Unread| {
+            if unread.is_none() {
+                match why {
+                    Unread::Offline => self.offline.fetch_add(1, Ordering::Relaxed),
+                    Unread::Failed => self.unread.fetch_add(1, Ordering::Relaxed),
+                    Unread::Stopped => 0,
+                };
+                unread = Some(why);
+            }
+        };
+        let verdict = match reader {
+            Reader::Plain(scanner) => {
+                let mut answers: Option<u32> = None;
+                combine(found, &mut |j| {
+                    let a = *answers.get_or_insert_with(|| {
+                        scanner.scan_file(&path, &stop).unwrap_or_else(|why| {
+                            note(why);
+                            0
+                        })
+                    });
+                    a & (1 << j) != 0
+                })
+            }
+            Reader::Exact(split, env) => {
+                let name = String::from_utf16_lossy(row.name());
+                let mut answers = [None::<bool>; 8];
+                let mut failed = false;
+                combine(found, &mut |j| {
+                    if failed {
+                        return false;
+                    }
+                    *answers[j].get_or_insert_with(|| {
+                        match exact::search(&split.terms()[j], &path, &name, env, &stop) {
+                            Ok(found) => found,
+                            Err(why) => {
+                                failed = true;
+                                note(why);
+                                false
+                            }
+                        }
+                    })
+                })
+            }
+        };
         if verdict && !self.stop.stopped() {
             self.found
                 .lock()
@@ -473,6 +543,7 @@ mod tests {
                 match_case: false,
                 list: 0,
                 terms: plan.terms.clone(),
+                exact: None,
             },
             stop: Stop::new(),
             found: Mutex::new(Vec::new()),
@@ -489,7 +560,7 @@ mod tests {
             hwnd: 0,
             msg: 0,
         };
-        let scanner = Scanner::new(plan.terms.clone());
+        let scanner = Reader::of(&plan);
         let missing = dir.join("gone.txt");
         for (r, found) in [
             (row(&a, false), 1),

@@ -24,7 +24,7 @@
 
 use goz_core::types::{SortDir, SortKey, SortSpec};
 
-use crate::bookmarks::{self, sort_key, sort_name};
+use crate::bookmarks::{self, any_sort_key as sort_key, sort_name};
 use crate::columns::Layout;
 use crate::dock::DockSettings;
 use crate::filter::Filter;
@@ -1117,7 +1117,7 @@ mod tests {
     #[test]
     fn unreadable_values_are_the_defaults() {
         let ini = Ini::from_text(
-            "[goz-gui]\r\ntheme=7\r\nontop=x\r\nfilter=Pictures\r\nsort=Extension\r\n\
+            "[goz-gui]\r\ntheme=7\r\nontop=x\r\nfilter=Pictures\r\nsort=Run Count\r\n\
              sort_ascending=0\r\nmatch_case=yes\r\nwindow_x=1\r\nwindow_y=2\r\nwindow_wide=0\r\n\
              window_high=10\r\nsearch_history_days_to_keep=-3\r\n",
         );

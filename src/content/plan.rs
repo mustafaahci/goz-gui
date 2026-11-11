@@ -6,19 +6,28 @@
 //! ask gozd, the content terms, and how a file's answers combine into the
 //! verdict.
 //!
-//! Wave 9 stream B1 plans one shape: content terms ANDed at the top level
-//! of the search (`*.txt content:"chicken noodle" utf16content:abc`); the
-//! file must be found by gozd's search and hold every term. Any other
-//! place for a content term (after `!` or NOT, in an OR, inside `< >`,
-//! `content:<a|b>`) is refused with the reason. **Seam for stream B2:**
-//! `plan` gives way to goz-core's exact helper, which turns n ≤ 3 content
-//! terms anywhere in the search into the 2^n gozd searches (each content
-//! term replaced by always-true or always-false) and a combine function
-//! that is exact for any boolean structure; [`Plan`] already carries those
-//! (`queries`, `combine`), and `super::Run` already reads a plan of
-//! several searches.
+//! Two planners, by what gozd reads:
+//!
+//! - [`plan_exact`] (W9 stream B2), for a gozd that reads the new query
+//!   language: goz-core's exact helper (`ContentQuery`) turns n ≤ 3
+//!   content terms anywhere in the search (after NOT, in an OR, in groups,
+//!   a value that is itself a group or a `regex:`) into the 2^n gozd
+//!   searches, each content term replaced by always-true or always-false,
+//!   and gives the exact verdict for a file from which of them found it
+//!   and, only while they disagree, its content, read term by term with
+//!   goz-core's own reading (Everything's encodings and filters, as the
+//!   goz CLI reads). More than 3 is refused with the reason.
+//! - [`plan`] (W9 stream B1), for an older gozd (v0.6.0), which reads no
+//!   OR, NOT or group and so can be asked no constant: content terms ANDed
+//!   at the top level of the search (`*.txt content:"chicken noodle"
+//!   utf16content:abc`); the file must be found by gozd's search and hold
+//!   every term, read by `super::scan`. Any other place for a content term
+//!   (after `!` or NOT, in an OR, inside `< >`, `content:<a|b>`) is refused
+//!   with the reason.
 
 use std::sync::Arc;
+
+use goz_core::query::{ContentQuery, MAX_CONTENT_TERMS, QueryError};
 
 use super::scan::{Encoding, Term};
 
@@ -34,7 +43,12 @@ pub struct Plan {
     /// adds the filter and the folder to each, as to any search). A file is
     /// a candidate when one of them finds it.
     pub queries: Vec<String>,
+    /// [`plan`]'s terms, read by `super::scan` in one pass; empty for
+    /// [`plan_exact`]'s.
     pub terms: Vec<Term>,
+    /// [`plan_exact`]'s: goz-core's split of the search, whose terms read a
+    /// file one at a time; and the search's text and case it was made of.
+    pub exact: Option<(Arc<ContentQuery>, String, bool)>,
     pub combine: Combine,
 }
 
@@ -43,8 +57,43 @@ impl std::fmt::Debug for Plan {
         f.debug_struct("Plan")
             .field("queries", &self.queries)
             .field("terms", &self.terms)
+            .field("exact", &self.exact.as_ref().map(|e| (&e.1, e.2)))
             .finish_non_exhaustive()
     }
+}
+
+/// Plans `text` with goz-core's exact helper, for a gozd that reads the new
+/// query language (`client::boolean_syntax`): any boolean shape of up to
+/// [`MAX_CONTENT_TERMS`] content terms. A search goz-core cannot read is
+/// planned as an older gozd's ([`plan`]: goz-gui's own terms in it, such
+/// as `filelist0:`, are no goz-core function), and gozd says what is wrong
+/// with it.
+pub fn plan_exact(text: &str, match_case: bool) -> Planned {
+    let split = match ContentQuery::new(text, match_case) {
+        Ok(split) => split,
+        Err(QueryError::TooManyContentTerms(n)) => {
+            return Planned::Refused(format!(
+                "A search can have at most {MAX_CONTENT_TERMS} content terms, and this one has \
+                 {n}: each doubles the searches gozd is asked"
+            ));
+        }
+        Err(_) => return plan(text, match_case),
+    };
+    if split.is_plain() {
+        return Planned::None;
+    }
+    let split = Arc::new(split);
+    let verdicts = Arc::clone(&split);
+    let combine: Combine = Arc::new(move |found, content| {
+        // `found` has a bit for each of the 2^n (at most 8) searches.
+        verdicts.verdict(found as u8, &mut *content)
+    });
+    Planned::Content(Plan {
+        queries: split.queries().to_vec(),
+        terms: Vec::new(),
+        exact: Some((split, text.to_owned(), match_case)),
+        combine,
+    })
 }
 
 /// What the planner made of a search.
@@ -293,8 +342,9 @@ fn find_content(text: &str) -> Vec<Found> {
 /// The reasons a content term cannot be answered where it stands.
 fn not_yet(func: &str, place: &str) -> String {
     format!(
-        "{func} {place} is not supported yet: goz-gui reads content for {func} terms joined \
-         with spaces (AND) at the search's top level only"
+        "{func} {place} is not supported by this gozd: with it goz-gui reads content for \
+         {func} terms joined with spaces (AND) at the search's top level only (a gozd that \
+         reads OR, goz 0.7, takes any)"
     )
 }
 
@@ -374,6 +424,7 @@ pub fn plan(text: &str, match_case: bool) -> Planned {
     Planned::Content(Plan {
         queries: vec![rest.split_whitespace().collect::<Vec<_>>().join(" ")],
         terms,
+        exact: None,
         combine,
     })
 }
@@ -474,6 +525,65 @@ mod tests {
         let p = content("C:\\Users\\x\\w9b1fx\\ content:chicken");
         assert_eq!(p.queries, ["C:\\Users\\x\\w9b1fx\\"]);
         assert_eq!(p.terms[0].text, "chicken");
+    }
+
+    fn exact(text: &str) -> Plan {
+        match plan_exact(text, false) {
+            Planned::Content(p) => p,
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+
+    /// The verdict of `p` for a file the searches `found`, its content
+    /// answers `answers`, and how many answers were asked.
+    fn verdict(p: &Plan, found: u32, answers: &[bool]) -> (bool, usize) {
+        let mut asked = 0;
+        let v = (p.combine)(found, &mut |j| {
+            asked += 1;
+            answers[j]
+        });
+        (v, asked)
+    }
+
+    #[test]
+    fn a_newer_gozd_gets_every_shape_exactly() {
+        assert!(matches!(plan_exact("abc *.txt", false), Planned::None));
+        // NOT: gozd is asked the search with the term false, then true.
+        let p = exact("*.txt !content:soup");
+        assert_eq!(p.queries.len(), 2);
+        assert!(p.terms.is_empty() && p.exact.is_some());
+        // Found by the "false" search alone (it is a .txt): soup decides.
+        assert_eq!(verdict(&p, 0b01, &[false]), (true, 1));
+        assert_eq!(verdict(&p, 0b01, &[true]), (false, 1));
+        // Found by neither (not a .txt): no read.
+        assert_eq!(verdict(&p, 0b00, &[true]), (false, 0));
+        // OR with a name term: a file named so needs no read.
+        let p = exact("report | content:chicken");
+        assert_eq!(p.queries.len(), 2);
+        assert_eq!(verdict(&p, 0b11, &[false]), (true, 0));
+        assert_eq!(verdict(&p, 0b10, &[true]), (true, 1));
+        assert_eq!(verdict(&p, 0b10, &[false]), (false, 1));
+        // Three terms in groups: eight searches.
+        let p = exact("<content:a | content:b> !utf8content:c");
+        assert_eq!(p.queries.len(), 8);
+        // A value that is a group, or a regex: one term each.
+        assert_eq!(exact("content:<abc|123>").queries.len(), 2);
+        assert_eq!(exact("regex:content:a.c").queries.len(), 2);
+    }
+
+    #[test]
+    fn more_than_three_are_refused_and_goz_guis_own_terms_planned_as_before() {
+        let Planned::Refused(why) = plan_exact("content:a content:b content:c content:d", false)
+        else {
+            panic!("refused");
+        };
+        assert!(why.contains("at most 3") && why.contains("has 4"), "{why}");
+        // `filelist0:` is goz-gui's, left in every search for the window to
+        // put in gozd's words, as in any search.
+        let Planned::Content(p) = plan_exact("filelist0: content:abc", false) else {
+            panic!("planned");
+        };
+        assert!(p.queries.iter().all(|q| q.starts_with("filelist0: ")));
     }
 
     #[test]

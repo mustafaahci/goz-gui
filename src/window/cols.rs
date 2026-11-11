@@ -147,6 +147,8 @@ impl App {
             InvalidateRect(self.header, core::ptr::null(), 0);
             InvalidateRect(self.list, core::ptr::null(), 0);
         }
+        // W9: a column gozd gives, shown since the search.
+        self.w9_columns_changed();
     }
 
     /// The header's drag or resize changed the columns: notes it once the

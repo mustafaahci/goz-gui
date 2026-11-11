@@ -219,11 +219,7 @@ mod tests {
             parse("goz:x?regex").unwrap_err(),
             "goz: URL option regex is not one goz-gui knows"
         );
-        assert!(
-            parse("goz:x?sort=extension")
-                .unwrap_err()
-                .contains("extension")
-        );
+        assert!(parse("goz:x?sort=type").unwrap_err().contains("type"));
         assert!(
             parse("goz:x?filter=pictures")
                 .unwrap_err()

@@ -214,7 +214,36 @@ pub fn sort_name(key: SortKey) -> &'static str {
         SortKey::Path => "Path",
         SortKey::Size => "Size",
         SortKey::DateModified => "Date Modified",
+        // W9: the keys gozd sorts by once it lists them (Everything's
+        // titles for them).
+        SortKey::Extension => "Extension",
+        SortKey::DateCreated => "Date Created",
+        SortKey::DateAccessed => "Date Accessed",
+        SortKey::Attributes => "Attributes",
+        SortKey::DateRecentlyChanged => "Date Recently Changed",
     }
+}
+
+/// W9: every sort key, the menu's four and the keys a newer gozd sorts by,
+/// which the settings file and the session keep as they were chosen.
+pub const ALL_SORT_KEYS: [SortKey; 9] = [
+    SortKey::Name,
+    SortKey::Path,
+    SortKey::Size,
+    SortKey::DateModified,
+    SortKey::Extension,
+    SortKey::DateCreated,
+    SortKey::DateAccessed,
+    SortKey::Attributes,
+    SortKey::DateRecentlyChanged,
+];
+
+/// W9: the sort key named `name`, in any case, of [`ALL_SORT_KEYS`].
+pub fn any_sort_key(name: &str) -> Option<SortKey> {
+    let name = name.trim();
+    ALL_SORT_KEYS
+        .into_iter()
+        .find(|&key| sort_name(key).eq_ignore_ascii_case(name))
 }
 
 /// The sort keys, in the menu's order.

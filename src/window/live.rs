@@ -1,9 +1,13 @@
-//! Live updates: the results follow the files as they change. gozd says
-//! nothing when files change, so while the window is on screen the search
-//! on it runs again every `live_update_interval_ms` (2 s; 0 turns it off),
-//! as F5's refresh does: the scroll position and the selected files stay,
-//! the rows not come yet are drawn as they were (`Model::previous_row`),
-//! and nothing goes into the search or navigation history.
+//! Live updates: the results follow the files as they change. A gozd that
+//! lists "watch" says when they change (W9, `w9b.rs`): the search on the
+//! window runs again then, a quarter of a second after the first change it
+//! has not shown, and not otherwise. Any other gozd says nothing, and any
+//! failure of the watch ends it, so then, while the window is on screen,
+//! the search runs again every `live_update_interval_ms` (2 s), as before.
+//! 0 turns both off. Either refresh is F5's: the scroll position and the
+//! selected files stay, the rows not come yet are drawn as they were
+//! (`Model::previous_row`), and nothing goes into the search or navigation
+//! history.
 //!
 //! It waits while the user is in the middle of something (a menu, a
 //! dialog, a rename, a drag, a mouse button held, an action waiting for its
@@ -19,6 +23,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SetTimer;
 
+use super::w9b::{LiveStep, WATCH_MIN_MS};
 use super::{App, TIMER_LIVE};
 
 /// The longest wait a slow search stretches the interval to (ms).
@@ -45,7 +50,19 @@ impl App {
         if interval == 0 {
             return;
         }
-        let delay = live_delay(interval, self.model.borrow().elapsed);
+        // W9: watched, a refresh only for a change gozd told of.
+        let wait = match self.live_step() {
+            LiveStep::Poll => interval,
+            LiveStep::Refresh => WATCH_MIN_MS,
+            LiveStep::Wait => return,
+        };
+        self.arm_live_in(wait);
+    }
+
+    /// Sets the live update's timer for `wait` ms (stretched for a slow
+    /// search, `live_delay`).
+    fn arm_live_in(&self, wait: u32) {
+        let delay = live_delay(wait, self.model.borrow().elapsed);
         // SAFETY: a timer of this window; setting it again restarts it.
         unsafe { SetTimer(self.hwnd, TIMER_LIVE, delay, None) };
     }
@@ -57,14 +74,34 @@ impl App {
             // Set again when the window shows (WM_SHOWWINDOW, WM_SIZE).
             return;
         }
-        if self.live_idle() {
-            self.start_search(true);
+        match self.live_step() {
+            LiveStep::Poll => {
+                if self.live_idle(true) {
+                    self.start_search(true);
+                }
+                self.arm_live();
+            }
+            // W9: gozd told of a change the results do not show yet.
+            LiveStep::Refresh => {
+                if self.live_idle(false) {
+                    self.change_shown();
+                    self.start_search(true);
+                } else {
+                    // Busy (or a file list, which gozd's changes do not
+                    // touch): looked at again as polling would, not every
+                    // quarter second while it lasts.
+                    self.arm_live_in(self.live_interval());
+                }
+            }
+            // A search since shows it; nothing to do till gozd says more.
+            LiveStep::Wait => self.change_shown(),
         }
-        self.arm_live();
     }
 
-    /// Whether a live update may run now.
-    fn live_idle(&self) -> bool {
+    /// Whether a live update may run now. `fresh`: results newer than half
+    /// the interval wait too (polling: the user is typing); a change gozd
+    /// told of is shown however fresh they are.
+    fn live_idle(&self, fresh: bool) -> bool {
         // An open file list does not change: nothing to update (wave 4; W8:
         // nor one an `open-filelist:` term opened). W8: nor a search run in
         // parts (`new-search:`), as Everything's "New results are not added
@@ -85,10 +122,11 @@ impl App {
         }
         // Results this fresh need no update yet (the user is typing).
         let interval = Duration::from_millis(u64::from(self.live_interval()));
-        if self
-            .last_search
-            .get()
-            .is_some_and(|t| t.elapsed() < interval / 2)
+        if fresh
+            && self
+                .last_search
+                .get()
+                .is_some_and(|t| t.elapsed() < interval / 2)
         {
             return false;
         }

@@ -839,6 +839,8 @@ impl App {
         let facts = Facts {
             gozd: crate::client::server(),
             boolean_syntax: crate::client::boolean_syntax(),
+            features: crate::client::features(),
+            watching: self.w9.push.on(),
             command_line: std::env::args().skip(1).collect::<Vec<_>>().join(" "),
             exe: std::env::current_exe()
                 .map(|p| p.display().to_string())

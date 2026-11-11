@@ -86,7 +86,8 @@ impl Format {
                 }
                 push_quoted(&path, out);
                 out.push(',');
-                if let (false, Some(size)) = (row.is_dir, row.size) {
+                // W9: a folder's too, when it has one (folder sizes).
+                if let Some(size) = row.size {
                     out.push_str(&size.to_string());
                 }
                 out.push(',');
@@ -330,6 +331,7 @@ mod tests {
             is_dir,
             icon: Cell::new(0),
             more: Default::default(),
+            asked: Default::default(),
         }
     }
 
@@ -357,7 +359,7 @@ mod tests {
         assert_eq!(
             out,
             "\"C:\\Windows\\cmd.exe\",289792,133000000000000000,,\r\n\
-             \"C:\\Windows\\\",,1,,\r\n\
+             \"C:\\Windows\\\",5,1,,\r\n\
              \"C:\\\",,,,\r\n\
              \"C:\\a \"\"b\"\".txt\",,,,\r\n"
         );

@@ -1,6 +1,7 @@
 //! Wave 9, stream B1, from the window's side: the disk reader of the wave 9
-//! columns (`crate::props`), the content search running (`crate::content`),
-//! and the seams stream B2 fills from gozd (sort keys, Options > Indexes).
+//! columns (`crate::props`), the content search running (`crate::content`).
+//! What stream B2 adds over gozd's new protocol (push, sort keys, columns
+//! from gozd) is `w9b.rs`.
 //!
 //! Its WM_APP messages are `WM_APP + 420..430`, its timers `420..430`, its
 //! commands `5150..5200` (the header menu's columns and Organize Columns).
@@ -38,6 +39,8 @@ const CONTENT_REFRESH_MS: u32 = 250;
 /// The window's wave 9 state.
 pub(crate) struct W9 {
     pub props: props::Reader,
+    /// Stream B2: gozd's watch (`w9b.rs`).
+    pub push: super::w9b::Push,
     /// The content search started last (stopped when another starts).
     content: RefCell<Option<Arc<Run>>>,
     /// TIMER_CONTENT is set.
@@ -48,6 +51,7 @@ impl W9 {
     pub fn new(hwnd: HWND) -> W9 {
         W9 {
             props: props::Reader::new(hwnd, WM_PROPS),
+            push: Default::default(),
             content: RefCell::new(None),
             refresh_due: Cell::new(false),
         }
@@ -79,10 +83,12 @@ pub(super) fn sort_feature(id: usize) -> Option<&'static str> {
 
 impl App {
     /// Wave 9's WM_APP messages.
-    pub(super) fn w9_message(&self, msg: u32, _w: WPARAM, l: LPARAM) {
+    pub(super) fn w9_message(&self, msg: u32, w: WPARAM, l: LPARAM) {
         match msg {
             WM_PROPS => self.props_answered(),
             WM_CONTENT => self.content_news(),
+            super::w9b::WM_WATCH => self.watch_news(w),
+            super::w9b::WM_REFETCH => self.refetch(),
             WM_INDEX_SET => {
                 // SAFETY: the box the Indexes page's thread posted; owned
                 // here once the message came.
@@ -95,6 +101,9 @@ impl App {
 
     /// Wave 9's timers.
     pub(super) fn w9_timer(&self, id: usize) {
+        if id == super::w9b::TIMER_WATCH_RETRY {
+            self.watch_retry();
+        }
         if id == TIMER_CONTENT {
             self.w9.refresh_due.set(false);
             if self.model.borrow().search.content.is_some() {
@@ -108,6 +117,8 @@ impl App {
         if let Some(run) = self.w9.content.take() {
             run.stop();
         }
+        // Closing the watch's pipe ends it in gozd.
+        self.end_watch();
     }
 
     // ---- The wave 9 columns' values ----
@@ -162,30 +173,19 @@ impl App {
         }
     }
 
-    // ---- Sorting by the new columns: the seam for stream B2 ----
-
-    /// A click on the header of column `col`, which gozd 0.6 cannot sort
-    /// by. Stream B2 sorts by its `SortKey` when gozd lists the feature
-    /// (`sort_feature`); until then the sort stays and the status bar says
-    /// why for a moment.
-    pub(super) fn sort_by_new_column(&self, col: usize) {
-        let title = columns::title(col);
-        let why = match (sort_feature(col), crate::client::server()) {
-            (Some(feature), Some((server, _))) => {
-                format!("goz can't sort by {title} yet: {server} does not list \"{feature}\"")
-            }
-            _ => format!("goz can't sort by {title} yet"),
-        };
-        self.show_note(why);
-    }
-
     // ---- content: ----
 
     /// The search's content terms planned (`content::plan`): none, the
-    /// plan, or why it cannot be searched. Seam for stream B2: goz-core's
-    /// exact helper takes `plan`'s place.
+    /// plan, or why it cannot be searched. W9 B2: goz-core's exact helper
+    /// (any boolean shape, `plan_exact`) for a gozd that reads the new
+    /// query language, which the always-true and always-false searches it
+    /// makes need; an older gozd, B1's top-level AND as before.
     pub(super) fn plan_content(&self, text: &str, match_case: bool) -> Planned {
-        crate::content::plan::plan(text, match_case)
+        if crate::client::boolean_syntax() {
+            crate::content::plan::plan_exact(text, match_case)
+        } else {
+            crate::content::plan::plan(text, match_case)
+        }
     }
 
     /// The content run for `plan`, whose searches gozd is asked as
@@ -210,6 +210,7 @@ impl App {
                 .as_ref()
                 .map_or(0, |l| Arc::as_ptr(l) as usize),
             terms: plan.terms.clone(),
+            exact: plan.exact.as_ref().map(|e| (e.1.clone(), e.2)),
         };
         if keep_place
             && let Some(run) = self.w9.content.borrow().as_ref()

@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use goz_core::types::{SortDir, SortSpec};
 
-use crate::bookmarks::{sort_key, sort_name};
+use crate::bookmarks::{any_sort_key as sort_key, sort_name};
 use crate::columns::{self, Layout};
 use crate::filter::Filter;
 use crate::history::NavHistory;
@@ -1095,7 +1095,7 @@ mod tests {
     fn what_cannot_be_read_is_the_default_and_what_is_not_json_is_refused() {
         let s = parse(
             b"[{\"window_x\":1,\"window_y\":2,\"window_wide\":0,\"window_high\":5,\"ontop\":7,\
-              \"theme\":\"dark\",\"maximized\":\"yes\",\"tabs\":[{\"sort\":\"Extension\",\
+              \"theme\":\"dark\",\"maximized\":\"yes\",\"tabs\":[{\"sort\":\"Run Count\",\
               \"sort_ascending\":0,\"filter\":\"Pictures\",\"listview_top_index\":-5,\
               \"listview_item_focus\":7,\"listview_selection\":[\"\",3,\"C:\\\\x\"],\
               \"nav_history\":[1,{\"search\":\"n\"}],\"nav_history_index\":99}]}]",

@@ -29,7 +29,7 @@
 
 use goz_core::types::{SortDir, SortKey};
 
-use crate::bookmarks::sort_key;
+use crate::bookmarks::any_sort_key as sort_key;
 use crate::filter::Filter;
 
 /// What a command line asks for. Fields left `None` keep the window's.

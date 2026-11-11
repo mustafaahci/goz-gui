@@ -403,6 +403,7 @@ mod tests {
             is_dir,
             icon: Cell::new(0),
             more: Default::default(),
+            asked: Default::default(),
         }
     }
 
