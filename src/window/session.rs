@@ -5,8 +5,8 @@
 //! - **Saved**: the window's place, theme, On Top and status bar; and each
 //!   tab (`tabs.rs`): the search with its options and sort, the view and
 //!   columns, the row at the top of the list, the selected and focused
-//!   files by path (or that every row was selected), Back and Forward's
-//!   entries; and the tabs closed. The
+//!   files by path (or that Select All had every row selected), Back and
+//!   Forward's entries; and the tabs closed. The
 //!   store thread writes it at most every `session_store_save_delay` ms
 //!   (15 s) while it changes, and at exit. `session_store=0` turns all of
 //!   it off (nothing read or written, no menu item).
@@ -17,9 +17,9 @@
 //!   runs again; when its first rows come the list scrolls to the saved row
 //!   and the saved files are selected again as their rows arrive (the
 //!   refresh's `Reselect`), so a file now elsewhere in the results is still
-//!   found; a tab that had every row selected has every row selected again,
-//!   the files that came since included, as a refresh keeps it. The other
-//!   tabs do the same when they are shown.
+//!   found; a tab whose rows Select All had all selected has every row
+//!   selected again, the files that came since included, as a refresh
+//!   keeps it. The other tabs do the same when they are shown.
 //! - **Several goz-gui windows**: each writes its own session, so the file
 //!   holds the window written last, which is the last one closed.
 
@@ -246,7 +246,7 @@ impl App {
 
     /// The row at the top of the list, and the focused and selected files
     /// by path: those held, and those a refresh or a restore is still to
-    /// select again; and whether every row is selected.
+    /// select again; and whether Select All has every row selected.
     fn place_now(&self) -> Place {
         if let Some(v) = self.sessions.view.borrow().as_ref() {
             // A restore whose rows have not come yet.
@@ -282,9 +282,12 @@ impl App {
         ))
         .ok();
         let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
-        let all = reselect::every_row(selected, self.model.borrow().total);
+        // Only Select All's: a selection that just covers every row (the
+        // only row, clicked) is its files, as any other is.
+        let all = reselect::all_chosen(self.select_all.get(), selected, self.model.borrow().total);
         // With every row selected, the rows held are noted too: Everything
-        // reading the session selects those.
+        // reading the session selects those (and so does goz-gui when the
+        // search finds no rows).
         let held = self.selected_held();
         let (mut focus, mut selection) = {
             let m = self.model.borrow();
@@ -386,6 +389,9 @@ impl App {
     /// was: its navigation entries now, its place and selection when its
     /// rows come.
     pub(super) fn begin_view(&self, view: &View) {
+        // Select All was of the rows on screen; the view's comes with its
+        // rows (`apply_view`).
+        self.select_all.set(false);
         let entries = view.nav.iter().map(NavState::from_search).collect();
         *self.nav.borrow_mut() = NavHistory::from_parts(entries, view.nav_index);
         *self.sessions.view.borrow_mut() = Some(PendingView {
@@ -437,12 +443,15 @@ impl App {
             }
         }
         let mut reselect = Reselect::sought_again(view.selection, view.focus);
-        if view.all && total > 0 {
-            // Every row was selected: every row is again, however many
-            // there are now (`reselect.rs`); the focus is still sought.
+        // Select All had every row selected: every row is again, however
+        // many there are now, and it stays in force (`reselect.rs`); the
+        // focus is still sought. No rows: its files are sought by path.
+        let all = view.all && total > 0;
+        if all {
             self.quietly(|| self.select_every_row());
             reselect.every_row_selected();
         }
+        self.select_all.set(all);
         if !reselect.is_done() {
             *self.reselect.borrow_mut() = Some(reselect);
         }

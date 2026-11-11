@@ -193,6 +193,9 @@ impl App {
             menu::SELECT_ALL => {
                 if send(self.list, LVM_GETITEMCOUNT, 0, 0) > 0 {
                     self.set_state(usize::MAX, LVIS_SELECTED, LVIS_SELECTED);
+                    // After the list's report of the change, which ends
+                    // any Select All (`reselect.rs`): every row is chosen.
+                    self.select_all.set(true);
                 }
             }
             menu::FOCUS_SEARCH => {

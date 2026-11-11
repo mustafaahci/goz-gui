@@ -17,12 +17,13 @@
 //!   paths, as Everything's), `columns` (the shown columns left to right,
 //!   each `{"name":…,"width":…}` at 96 DPI), and goz-gui's own
 //!   `listview_top_index` (the row at the top of the list),
-//!   `listview_select_all` (1 when every row was selected: written only
-//!   then, and every row of the result is selected again), `nav_history`
-//!   (Back and Forward's entries, oldest first, each with the search keys
-//!   above) and `nav_history_index` (the current one). The open tabs come
-//!   first, left to right; the tabs closed (Reopen Closed Tab's, oldest
-//!   first) follow with `"is_closed":1`, as Everything keeps its own.
+//!   `listview_select_all` (1 when Select All had every row selected:
+//!   written only then, and every row of the result is selected again),
+//!   `nav_history` (Back and Forward's entries, oldest first, each with
+//!   the search keys above) and `nav_history_index` (the current one).
+//!   The open tabs come first, left to right; the tabs closed (Reopen
+//!   Closed Tab's, oldest first) follow with `"is_closed":1`, as
+//!   Everything keeps its own.
 //!
 //! Unknown keys are ignored. The file is replaced as a whole: the session
 //! written last wins. `SessionFile` writes it on the store thread, like
@@ -76,9 +77,10 @@ pub struct View {
     pub focus: Option<Vec<u16>>,
     /// The selected files' full paths.
     pub selection: Vec<Vec<u16>>,
-    /// Every row was selected (Select All): every row of the search's
+    /// Select All had every row selected: every row of the search's
     /// result is selected again, however many there are now, and
-    /// `selection` (the rows that were held) is only for Everything.
+    /// `selection` (the rows that were held) is for Everything, and for a
+    /// search that now finds no rows (sought by path, as a refresh's).
     pub select_all: bool,
     /// Back and Forward's entries, oldest first.
     pub nav: Vec<Search>,

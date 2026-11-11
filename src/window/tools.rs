@@ -274,9 +274,12 @@ impl App {
             None => (true, self.selected_scanned()),
         };
         // The user chose other rows: an action waiting for the old ones is
-        // not wanted; the rows change unseen, then repaint once, and the
-        // status bar and the panes hear of it once (`in_bulk`).
+        // not wanted, and they are not Select All's every row (inverting
+        // none selects every row as it is now, as a click on each would);
+        // the rows change unseen, then repaint once, and the status bar and
+        // the panes hear of it once (`in_bulk`).
         self.cancel_fetch();
+        self.select_all.set(false);
         self.in_bulk(|| {
             let (first, then) = if all {
                 (LVIS_SELECTED, 0)

@@ -337,6 +337,12 @@ pub struct App {
     reselect: RefCell<Option<reselect::Reselect>>,
     /// The list's selection is being changed by goz-gui, not the user.
     restoring: Cell<bool>,
+    /// Select All (Ctrl+A) chose every row, and the user has not chosen
+    /// other rows since: a refresh, a later block or the tab shown again
+    /// selects every row, however many there are (`reselect.rs`). A
+    /// selection that only happens to cover every row (a click on the only
+    /// row) is not this.
+    select_all: Cell<bool>,
     /// Rows' states are being changed one by one (`in_bulk`): the list is
     /// given no names to measure, and whether it reported a change.
     bulk: Cell<bool>,
@@ -1034,6 +1040,7 @@ impl App {
                 enter_pending: Cell::new(false),
                 reselect: RefCell::new(None),
                 restoring: Cell::new(false),
+                select_all: Cell::new(false),
                 bulk: Cell::new(false),
                 bulk_changed: Cell::new(false),
                 sel: RefCell::default(),
@@ -2047,9 +2054,12 @@ impl App {
                         return 0;
                     }
                     // The user chose other rows: an action waiting for the
-                    // rows chosen before is not wanted any more.
+                    // rows chosen before is not wanted any more, and they
+                    // are not Select All's every row (a move of the focus
+                    // alone keeps both).
                     if !self.restoring.get() && change.is_some() {
                         self.cancel_fetch();
+                        self.select_all.set(false);
                     }
                     self.selection_changed();
                     self.invalidate_status();
@@ -2206,6 +2216,8 @@ impl App {
             self.enter_pending.set(false);
             self.cancel_fetch();
             self.clear_note();
+            // Select All was of the rows on screen, not of this search's.
+            self.select_all.set(false);
             // Files still to be selected again stay sought when a new
             // search keeps the selection (Options > Results).
             if self.ui.get().clear_selection {
@@ -2418,7 +2430,7 @@ impl App {
                 // still the ones held: for a refresh, and for a new search
                 // when Options > Results keeps the selection.
                 let keep_selection = fresh && !self.ui.get().clear_selection;
-                let kept = (refresh || keep_selection).then(|| self.note_selection(refresh));
+                let kept = (refresh || keep_selection).then(|| self.note_selection(refresh, total));
                 let on_screen = self.view_blocks();
                 let mut m = self.model.borrow_mut();
                 let mut adopted = None;
@@ -2450,8 +2462,10 @@ impl App {
                     Some(keep) => {
                         self.icons.reset(epoch);
                         if !keep {
-                            // Other files: their thumbnails are not wanted.
+                            // Other files: their thumbnails are not wanted,
+                            // and Select All was of the rows before.
                             self.reset_thumbs();
+                            self.select_all.set(false);
                         }
                         // Taken first: the count's own selection changes
                         // must not drop it.
@@ -2491,7 +2505,7 @@ impl App {
                     }
                     None => {
                         if old_total != total {
-                            // A selection of every row stays one.
+                            // Select All stays every row.
                             self.recount(old_total, total);
                         }
                         let first = u64::from(block) * u64::from(BLOCK_ROWS);

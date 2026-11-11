@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_TIMEOUT};
 use windows_sys::Win32::Graphics::Gdi::{CreateBitmap, CreateCompatibleDC, SelectObject};
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
@@ -41,7 +41,7 @@ use windows_sys::Win32::System::Threading::{
     CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Controls::{HIMAGELIST, ILD_TRANSPARENT, ImageList_Draw};
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW};
 
 use crate::filetype::{self, Key};
 
@@ -66,24 +66,34 @@ struct Book {
     asked: HashSet<Key>,
     /// Asked during the paint now going on, sent when it is over.
     batch: Vec<Key>,
+    /// The message that sends the batch is on its way to the window.
+    posted: bool,
     /// The answers' icons, by extension (`None`: the shell gave none).
     icons: HashMap<Vec<u16>, Option<i32>>,
 }
 
 impl Book {
-    /// Notes `key` to be asked for, unless it was. True when it is the
-    /// first of its batch: the batch is to be sent after the paint.
+    /// Notes `key` to be asked for, unless it was. True when the window
+    /// is to be sent the message that sends the batch after the paint: a
+    /// batch waits and no such message is on its way. So a post that
+    /// failed (the thread's queue full) is made again at the next draw of
+    /// a type not known, the batch's own included, not never.
     fn ask(&mut self, key: &Key) -> bool {
-        if self.asked.contains(key) {
-            return false;
+        if !self.asked.contains(key) {
+            self.asked.insert(key.clone());
+            self.batch.push(key.clone());
         }
-        self.asked.insert(key.clone());
-        self.batch.push(key.clone());
-        self.batch.len() == 1
+        !self.batch.is_empty() && !self.posted
     }
 
-    /// The batch, to send to the thread.
+    /// Whether the message `ask` called for was posted.
+    fn posted(&mut self, posted: bool) {
+        self.posted = posted;
+    }
+
+    /// The batch, to send to the thread: its message came.
     fn take_batch(&mut self) -> Vec<Key> {
+        self.posted = false;
         std::mem::take(&mut self.batch)
     }
 
@@ -183,11 +193,12 @@ impl TypeInfo {
     }
 
     fn ask(&self, key: &Key) {
-        let first = self.book.borrow_mut().ask(key);
-        if first {
+        let post = self.book.borrow_mut().ask(key);
+        if post {
             // SAFETY: posts to this thread's window; the batch goes once
             // the paint asking is over (`send`).
-            unsafe { PostMessageW(self.shared.hwnd as HWND, self.ask_msg, 0, 0) };
+            let posted = unsafe { PostMessageW(self.shared.hwnd as HWND, self.ask_msg, 0, 0) };
+            self.book.borrow_mut().posted(posted != 0);
         }
     }
 
@@ -283,8 +294,26 @@ fn lookup_thread(shared: &Shared, first: Vec<i32>) {
             next
         };
         let Some(key) = next else {
+            // Answers the window was not told of (the post failed: its
+            // queue was full) are told again a moment later, unless a
+            // batch comes first; else nothing is owed until one comes.
+            let owed = !shared.told.load(Ordering::SeqCst)
+                && !shared
+                    .answers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty();
+            let wait = if owed {
+                TELL_EVERY.as_millis() as u32
+            } else {
+                INFINITE
+            };
             // SAFETY: a live event handle.
-            unsafe { WaitForSingleObject(shared.work as HANDLE, INFINITE) };
+            if unsafe { WaitForSingleObject(shared.work as HANDLE, wait) } == WAIT_TIMEOUT
+                && tell(shared)
+            {
+                last_told = Instant::now();
+            }
             continue;
         };
         // Folders have one icon, known from the start: only their name.
@@ -304,15 +333,33 @@ fn lookup_thread(shared: &Shared, first: Vec<i32>) {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
         };
-        if (idle || last_told.elapsed() >= TELL_EVERY) && !shared.told.swap(true, Ordering::SeqCst)
-        {
+        if (idle || last_told.elapsed() >= TELL_EVERY) && tell(shared) {
             last_told = Instant::now();
-            // SAFETY: posts to the window; if it is gone, nothing is owed.
-            if unsafe { PostMessageW(shared.hwnd as HWND, shared.msg, 0, 0) } == 0 {
-                shared.told.store(false, Ordering::SeqCst);
-            }
         }
     }
+}
+
+/// Tells the window there are answers, unless it has been told already
+/// (and has not taken them yet): true when it was told now. A post that
+/// fails (its queue full) leaves it untold, to be told again
+/// (`lookup_thread`); if the window is gone, nothing is owed: it stays
+/// told, so nothing is posted again.
+fn tell(shared: &Shared) -> bool {
+    if shared.told.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let hwnd = shared.hwnd as HWND;
+    // SAFETY: posts to the window, and asks whether it is one; a window
+    // that is gone fails both, harmlessly.
+    unsafe {
+        if PostMessageW(hwnd, shared.msg, 0, 0) != 0 {
+            return true;
+        }
+        if IsWindow(hwnd) != 0 {
+            shared.told.store(false, Ordering::SeqCst);
+        }
+    }
+    false
 }
 
 impl Drop for Shared {
@@ -335,6 +382,7 @@ mod tests {
         let mut b = Book::default();
         // The first of a paint's types posts the message; the others join.
         assert!(b.ask(&k("txt")));
+        b.posted(true);
         assert!(!b.ask(&k("log")));
         assert!(!b.ask(&k("txt")), "asked already");
         assert!(!b.ask(&None));
@@ -346,6 +394,7 @@ mod tests {
         assert!(b.batch.is_empty());
         // A new type starts a new batch.
         assert!(b.ask(&k("md")));
+        b.posted(true);
         assert_eq!(b.take_batch(), [k("md")]);
         b.answered(k("txt"), Some(70));
         b.answered(k("odd"), None);
@@ -354,6 +403,27 @@ mod tests {
         assert_eq!(b.icons.get(&ext("txt")[..]), Some(&Some(70)));
         assert_eq!(b.icons.get(&ext("odd")[..]), Some(&None));
         assert_eq!(b.icons.len(), 2, "a folder's icon is not kept here");
+    }
+
+    #[test]
+    fn a_batch_whose_message_was_not_posted_is_posted_again() {
+        let mut b = Book::default();
+        // The window's queue was full: the post failed.
+        assert!(b.ask(&k("txt")));
+        b.posted(false);
+        // The next type met posts again, and so does the next draw of the
+        // same type (a later paint, nothing new on it).
+        assert!(b.ask(&k("log")));
+        b.posted(false);
+        assert!(b.ask(&k("txt")));
+        b.posted(true);
+        // Posted: the rest join the batch.
+        assert!(!b.ask(&k("md")));
+        assert!(!b.ask(&k("txt")));
+        assert_eq!(b.take_batch(), [k("txt"), k("log"), k("md")]);
+        // Sent: nothing waits, nothing is posted.
+        assert!(!b.ask(&k("txt")));
+        assert!(b.ask(&k("ini")), "a new batch");
     }
 
     #[test]
