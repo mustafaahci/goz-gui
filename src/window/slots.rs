@@ -436,7 +436,40 @@ mod tests {
                 menu::SHELL_FIRST,
                 usize::from(menu::SHELL_LAST - menu::SHELL_FIRST) + 1,
             ),
+            // W6 (C): File | Set File List Slot 0..9.
+            (
+                "file-list slots",
+                crate::filelist::slots::cmd::SET_SLOT_FIRST,
+                crate::filelist::slots::COUNT,
+            ),
         ]
+    }
+
+    /// Every command the keyboard editor lists (`keymap::COMMANDS`) is one
+    /// the window runs: named above or in one of the ranges.
+    #[test]
+    fn every_keyboard_command_is_a_window_command() {
+        let all = commands();
+        let ranges = ranges();
+        for c in crate::keymap::COMMANDS {
+            let named = all.iter().any(|&(_, id)| id == c.cmd);
+            let ranged = ranges.iter().any(|&(_, first, n)| {
+                (usize::from(first)..usize::from(first) + n).contains(&usize::from(c.cmd))
+            });
+            assert!(
+                named || ranged,
+                "{} ({}) is not a window command",
+                c.key,
+                c.cmd
+            );
+        }
+        // The slots' range is routed to them (4850..=4899), past the File
+        // List Editor's (4750..=4799).
+        const {
+            use crate::filelist::slots::cmd as slots;
+            assert!(crate::listedit::cmd::END <= slots::SET_SLOT_FIRST);
+            assert!(slots::SET_SLOT_FIRST == 4850 && slots::END == 4900);
+        }
     }
 
     #[test]
@@ -531,6 +564,8 @@ mod tests {
             super::super::custom::WM_DOUBLE_CTRL,
             // W6: rows selected a slice at a time.
             super::super::selecting::WM_SELECTING,
+            // W6 (C): the File List Editor closed.
+            crate::listedit::WM_EDITOR_CLOSED,
         ];
         for (i, &(a, m)) in messages.iter().enumerate() {
             for &(b, other) in &messages[i + 1..] {
@@ -552,6 +587,15 @@ mod tests {
                 in_g2,
                 a.starts_with("super::super::custom::"),
                 "{a} and G2's range"
+            );
+            // W6 (C) routes WM_APP + 360..370 to `lists_message`: only
+            // the File List Editor's sit there.
+            let in_w6c =
+                (crate::listedit::WM_EDITOR_CLOSED..crate::listedit::W6_MSG_END).contains(&m);
+            assert_eq!(
+                in_w6c,
+                a.starts_with("crate::listedit::"),
+                "{a} and W6 C's range"
             );
         }
         assert!(!is_feature_message(crate::datatools::MSG_FIRST));
@@ -592,6 +636,7 @@ mod tests {
         assert!((F5_TIMER..F5_TIMER + TIMER_RANGE).contains(&file_tools::TIMER_NEW_FOLDER));
         assert!((F6_TIMER..F6_TIMER + TIMER_RANGE).contains(&uiopts::TIMER_SEARCH_DELAY));
         assert!(!is_feature_timer(crate::celltip::TIMER));
+        assert!(!is_feature_timer(super::super::selecting::TIMER_SELECTING));
         // G2's timers (300..310) route as a range: only its own sit there.
         for &(a, t) in &timers {
             let in_g2 = super::super::custom::is_timer(t);

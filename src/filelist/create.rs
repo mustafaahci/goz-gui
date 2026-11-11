@@ -244,9 +244,8 @@ mod tests {
     /// W6: Everything's include and exclude filters.
     #[test]
     fn include_and_exclude_filters() {
-        let dir = std::env::temp_dir().join(format!("goz-gui-create-f-{}", std::process::id()));
+        let dir = crate::store::file::tests::fresh_dir("goz-gui-create", "f");
         let tree = dir.join("tree");
-        let _ = fs::remove_dir_all(&dir);
         for d in [r"Music\live", r"cache\deep", "docs"] {
             fs::create_dir_all(tree.join(d)).unwrap();
         }
