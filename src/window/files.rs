@@ -93,22 +93,45 @@ pub(super) fn renamable(path: &[u16]) -> bool {
 /// quotes when it holds a space or goz's `!`. It takes the place of
 /// `current`, or with `append` (Shift held) goes after it.
 fn drop_search(current: &str, item: &str, is_dir: bool, append: bool) -> String {
+    let mut path = dropped_path(item, is_dir);
+    if path.chars().any(|c| c.is_whitespace() || c == '!') {
+        path = format!("\"{path}\"");
+    }
+    with_search(current, path, append)
+}
+
+/// A dropped item's path, a folder's ending in a backslash.
+fn dropped_path(item: &str, is_dir: bool) -> String {
     let mut path = item.to_owned();
     if is_dir && !path.ends_with('\\') {
         path.push('\\');
     }
-    if path.chars().any(|c| c.is_whitespace() || c == '!') {
-        path = format!("\"{path}\"");
-    }
+    path
+}
+
+/// `term` in place of the search `current`, or after it with `append`.
+fn with_search(current: &str, term: String, append: bool) -> String {
     if !append || current.trim().is_empty() {
-        return path;
+        return term;
     }
     let gap = if current.ends_with(char::is_whitespace) {
         ""
     } else {
         " "
     };
-    format!("{current}{gap}{path}")
+    format!("{current}{gap}{term}")
+}
+
+/// The search a drop of several items makes with a gozd that reads OR:
+/// one OR group of their paths, each quoted (`<"C:\a.txt" | "C:\b\">`),
+/// in place of `current` or after it, as [`drop_search`].
+fn drop_search_any(current: &str, items: &[(String, bool)], append: bool) -> String {
+    let group = items
+        .iter()
+        .map(|(item, is_dir)| format!("\"{}\"", dropped_path(item, *is_dir)))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    with_search(current, format!("<{group}>"), append)
 }
 
 /// How far `row_after` looks for a row that stays.
@@ -760,7 +783,8 @@ impl App {
 
     /// WM_DROPFILES on the window or the search box: what was dropped
     /// becomes the search (Shift held: is added to it). A shortcut stands
-    /// for its target. goz searches one path at a time (it has no OR), so
+    /// for its target. Several items make an OR group of their paths with
+    /// a gozd that reads OR; an older one searches one path at a time, so
     /// of several items the first is taken and the status bar says so. A
     /// drop of goz-gui's own rows on itself does nothing.
     pub(super) fn drop_files(&self, drop: HDROP) {
@@ -780,26 +804,33 @@ impl App {
         // when another program's drag had it.
         // SAFETY: reads the keyboard's state.
         let append = key_down(VK_SHIFT) || unsafe { GetAsyncKeyState(i32::from(VK_SHIFT)) } < 0;
-        let lnk = String::from_utf16_lossy(first)
-            .to_lowercase()
-            .ends_with(".lnk");
-        let target = lnk
-            .then(|| shell::link_target(first))
-            .flatten()
-            .unwrap_or_else(|| first.clone());
-        let text = drop_search(
-            &window_text(self.edit),
-            &String::from_utf16_lossy(&target),
-            is_dir(&target),
-            append,
-        );
+        // A shortcut stands for its target.
+        let target_of = |path: &Vec<u16>| {
+            let lnk = String::from_utf16_lossy(path)
+                .to_lowercase()
+                .ends_with(".lnk");
+            let target = lnk
+                .then(|| shell::link_target(path))
+                .flatten()
+                .unwrap_or_else(|| path.clone());
+            let dir = is_dir(&target);
+            (String::from_utf16_lossy(&target), dir)
+        };
+        let any = paths.len() > 1 && crate::client::boolean_syntax();
+        let text = if any {
+            let items: Vec<(String, bool)> = paths.iter().map(target_of).collect();
+            drop_search_any(&window_text(self.edit), &items, append)
+        } else {
+            let (target, dir) = target_of(first);
+            drop_search(&window_text(self.edit), &target, dir, append)
+        };
         let z = wz(&text);
         // SAFETY: a NUL-terminated text for this thread's box; EN_CHANGE
         // searches.
         unsafe { SetWindowTextW(self.edit, z.as_ptr()) };
         let end = z.len() - 1;
         send(self.edit, EM_SETSEL, end, end as isize);
-        if paths.len() > 1 {
+        if paths.len() > 1 && !any {
             self.show_note(format!(
                 "{} items dropped; goz searches one path at a time, so this is the first",
                 paths.len()
@@ -894,6 +925,23 @@ mod tests {
             r"ext:pdf C:\a"
         );
         assert_eq!(drop_search("  ", r"C:\a", false, true), r"C:\a");
+    }
+
+    #[test]
+    fn several_drops_make_an_or_group() {
+        let items = [
+            (r"C:\Users\me\a.txt".to_owned(), false),
+            (r"C:\Program Files".to_owned(), true),
+            (r"D:\".to_owned(), true),
+        ];
+        assert_eq!(
+            drop_search_any("old", &items, false),
+            r#"<"C:\Users\me\a.txt" | "C:\Program Files\" | "D:\">"#
+        );
+        assert_eq!(
+            drop_search_any("ext:pdf", &items[..2], true),
+            r#"ext:pdf <"C:\Users\me\a.txt" | "C:\Program Files\">"#
+        );
     }
 
     #[test]

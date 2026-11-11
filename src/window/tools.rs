@@ -626,10 +626,21 @@ impl App {
         let selection = start != end;
         // SAFETY: reads this thread's search box.
         let has_text = unsafe { GetWindowTextLengthW(edit) } > 0;
-        let operator = menu::submenu(&[
-            Item::Cmd(st::BOX_AND, "AND\tspace"),
-            Item::Cmd(st::BOX_QUOTE, "Quote\t\" \""),
-        ]);
+        // OR, NOT and Group with a gozd that reads them.
+        let operator = if crate::client::boolean_syntax() {
+            menu::submenu(&[
+                Item::Cmd(st::BOX_AND, "AND\tspace"),
+                Item::Cmd(st::BOX_OR, "OR\t|"),
+                Item::Cmd(st::BOX_NOT, "NOT\t!"),
+                Item::Cmd(st::BOX_GROUP, "Group\t< >"),
+                Item::Cmd(st::BOX_QUOTE, "Quote\t\" \""),
+            ])
+        } else {
+            menu::submenu(&[
+                Item::Cmd(st::BOX_AND, "AND\tspace"),
+                Item::Cmd(st::BOX_QUOTE, "Quote\t\" \""),
+            ])
+        };
         let modifier = menu::submenu(&[
             Item::Cmd(st::BOX_CASE, "Match Case\tcase:"),
             Item::Cmd(st::BOX_PATH, "Match Path\tpath:"),
@@ -791,6 +802,7 @@ impl App {
                     filters: filters.iter().map(|f| f.title().to_owned()).collect(),
                     filter: filters.iter().position(|&f| f == current).unwrap_or(0),
                     last_folder: last,
+                    boolean_syntax: crate::client::boolean_syntax(),
                 },
                 self.dialog_look(),
             )

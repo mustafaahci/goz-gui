@@ -990,6 +990,7 @@ mod tests {
                 clear_on_close: true,
                 match_only_when_shown: false,
                 labels: false,
+                subfolders: false,
                 bookmarks_expanded: vec!["Music".into(), "Music/Rock".into()],
             },
             // F6 (integration and the Options pages).

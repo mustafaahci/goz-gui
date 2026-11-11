@@ -43,6 +43,11 @@ pub const BOX_CASE: u16 = F4_FIRST + 32;
 pub const BOX_PATH: u16 = F4_FIRST + 33;
 pub const BOX_FILES: u16 = F4_FIRST + 34;
 pub const BOX_FOLDERS: u16 = F4_FIRST + 35;
+/// Search Operator's OR, NOT and Group: only with a gozd that reads them
+/// (`client::boolean_syntax`).
+pub const BOX_OR: u16 = F4_FIRST + 36;
+pub const BOX_NOT: u16 = F4_FIRST + 37;
+pub const BOX_GROUP: u16 = F4_FIRST + 38;
 pub const BOX_LOCATED_IN: u16 = F4_FIRST + 40;
 pub const BOX_DM_BEFORE: u16 = F4_FIRST + 41;
 pub const BOX_DM_AFTER: u16 = F4_FIRST + 42;
@@ -56,6 +61,9 @@ pub fn box_syntax(id: u16) -> Option<(&'static str, Insert)> {
     Some(match id {
         BOX_AND => ("", Insert::Prefix),
         BOX_QUOTE => ("", Insert::Quote),
+        BOX_OR => ("|", Insert::Prefix),
+        BOX_NOT => ("!", Insert::Prefix),
+        BOX_GROUP => ("", Insert::Group),
         BOX_CASE => ("case:", Insert::Term),
         BOX_PATH => ("path:", Insert::Prefix),
         BOX_FILES => ("file:", Insert::Prefix),
@@ -260,6 +268,8 @@ pub enum Insert {
     Term,
     /// Quotes round the selection, or the caret between two.
     Quote,
+    /// `< >` round the selection, or the caret between them.
+    Group,
 }
 
 /// `text` (UTF-16) with `piece` put in at the selection `start..end` as
@@ -294,11 +304,16 @@ pub fn insert(
             caret = mid.len();
             mid.extend(selected);
         }
-        Insert::Quote => {
-            mid.push(u16::from(b'"'));
+        Insert::Quote | Insert::Group => {
+            let (open, close) = if how == Insert::Quote {
+                (b'"', b'"')
+            } else {
+                (b'<', b'>')
+            };
+            mid.push(u16::from(open));
             mid.extend(selected);
             caret = mid.len();
-            mid.push(u16::from(b'"'));
+            mid.push(u16::from(close));
         }
     }
     let mut out = Vec::with_capacity(text.len() + mid.len());
@@ -509,6 +524,31 @@ mod tests {
             );
         }
         assert_eq!(box_syntax(BOX_UNDO), None);
+    }
+
+    /// OR, NOT and Group write the new query language's shapes (goz-core
+    /// v0.6.0 cannot parse them, so the shapes are what is tested): `|`
+    /// between terms (spaces round it are ignored), `!` right before its
+    /// term, `< >` round the selection.
+    #[test]
+    fn the_new_operators_shapes() {
+        let typed = |id, text: &str, sel: (usize, usize), value: &str| {
+            let (piece, how) = box_syntax(id).expect("an item");
+            let text: Vec<u16> = text.encode_utf16().collect();
+            let (out, (caret, _)) = insert(&text, sel, piece, how);
+            let mut s = String::from_utf16_lossy(&out[..caret]);
+            s.push_str(value);
+            s.push_str(&String::from_utf16_lossy(&out[caret..]));
+            s
+        };
+        assert_eq!(
+            typed(BOX_OR, "report", (6, 6), "invoice"),
+            "report |invoice"
+        );
+        assert_eq!(typed(BOX_NOT, "report", (6, 6), "draft"), "report !draft");
+        assert_eq!(typed(BOX_NOT, "report draft", (7, 12), ""), "report !draft");
+        assert_eq!(typed(BOX_GROUP, "a b|c", (0, 3), ""), "<a b>|c");
+        assert_eq!(typed(BOX_GROUP, "x", (1, 1), "a|b"), "x <a|b>");
     }
 
     #[test]

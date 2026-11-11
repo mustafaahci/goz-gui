@@ -6,8 +6,9 @@
 //!   typed (`"C:\Users\me\" report`), which stays in the search box as it
 //!   was, so editing the search keeps the folder. The term ends with a
 //!   backslash, so only what is inside the folder matches, at any depth
-//!   (Everything's Subfolders on; its "off", the folder's own items only,
-//!   needs gozd's `parent:`).
+//!   (Everything's Subfolders on). With a gozd that reads the new query
+//!   language, Subfolders can be turned off: the folder then goes as
+//!   `parent:"C:\Users\me"`, its own items only.
 //! - **Bookmarks** shows the bookmarks as a tree under a box that filters
 //!   them; which folders are open is kept (`bookmarks_sidebar_expanded`).
 //!
@@ -34,6 +35,10 @@ pub struct Settings {
     /// `folders_sidebar_labels` (1): drives show with their labels, as
     /// Explorer names them (`Windows (C:)`), rather than as `C:`.
     pub labels: bool,
+    /// `folders_sidebar_subfolders` (1): the folder scopes the search with
+    /// its subfolders; off, its own items only (`parent:`), which needs a
+    /// gozd that reads the new query language.
+    pub subfolders: bool,
     /// `bookmarks_sidebar_expanded` (`[]`): the bookmark folders open in
     /// the Bookmarks pane, each as its place (`Music/Rock`).
     pub bookmarks_expanded: Vec<String>,
@@ -45,6 +50,7 @@ impl Default for Settings {
             clear_on_close: false,
             match_only_when_shown: true,
             labels: true,
+            subfolders: true,
             bookmarks_expanded: Vec::new(),
         }
     }
@@ -75,6 +81,7 @@ impl Settings {
             match_only_when_shown: flag(get("folders_sidebar_match_only_when_shown"))
                 .unwrap_or(d.match_only_when_shown),
             labels: flag(get("folders_sidebar_labels")).unwrap_or(d.labels),
+            subfolders: flag(get("folders_sidebar_subfolders")).unwrap_or(d.subfolders),
             bookmarks_expanded: get("bookmarks_sidebar_expanded")
                 .map(expanded_from_text)
                 .unwrap_or_default(),
@@ -93,6 +100,7 @@ impl Settings {
                 "folders_sidebar_match_only_when_shown".into(),
                 bit(self.match_only_when_shown),
             ),
+            ("folders_sidebar_subfolders".into(), bit(self.subfolders)),
             (
                 "bookmarks_sidebar_expanded".into(),
                 expanded_to_text(&self.bookmarks_expanded),
@@ -156,12 +164,29 @@ pub fn scope_term(folder: &str) -> String {
     format!("\"{}\\\"", folder.trim_end_matches(['\\', '/']))
 }
 
+/// The term that keeps a search to `folder`'s own items, its subfolders'
+/// left out (the new query language's `parent:`): quoted, without a
+/// trailing backslash but for a drive's root.
+pub fn parent_term(folder: &str) -> String {
+    format!("parent:\"{}\"", normalize(folder))
+}
+
 /// The search gozd gets for `text` inside `folder`: the folder's term in
 /// front of the text (the text alone without a folder).
+#[cfg(test)]
 pub fn scoped(folder: Option<&str>, text: &str) -> String {
+    scoped_with(folder, text, true)
+}
+
+/// [`scoped`], the folder's subfolders left out unless `subfolders`.
+pub fn scoped_with(folder: Option<&str>, text: &str, subfolders: bool) -> String {
     match folder {
         Some(f) if !f.is_empty() => {
-            let term = scope_term(f);
+            let term = if subfolders {
+                scope_term(f)
+            } else {
+                parent_term(f)
+            };
             if text.trim().is_empty() {
                 term
             } else {
@@ -293,6 +318,7 @@ mod tests {
             clear_on_close: true,
             match_only_when_shown: false,
             labels: false,
+            subfolders: false,
             bookmarks_expanded: vec!["Music".into(), "Music/Rock \"live\"".into()],
         };
         let keys = s.to_keys();
@@ -345,6 +371,30 @@ mod tests {
         assert_eq!(scoped(Some(r"C:\x"), "  "), r#""C:\x\""#);
         assert_eq!(scoped(None, "report"), "report");
         assert_eq!(scoped(Some(""), "a b"), "a b");
+    }
+
+    #[test]
+    fn subfolders_off_keeps_the_folders_own_items() {
+        assert_eq!(
+            scoped_with(Some(r"C:\Program Files"), "report", false),
+            r#"parent:"C:\Program Files" report"#
+        );
+        assert_eq!(scoped_with(Some(r"C:\"), "", false), r#"parent:"C:\""#);
+        assert_eq!(
+            scoped_with(Some(r"D:\x\"), "a|b", false),
+            r#"parent:"D:\x" a|b"#
+        );
+        assert_eq!(
+            scoped_with(Some(r"C:\x"), "report", true),
+            scoped(Some(r"C:\x"), "report")
+        );
+        assert!(Settings::default().subfolders);
+        let off = Settings::from_keys(|k| (k == "folders_sidebar_subfolders").then_some("0"));
+        assert!(!off.subfolders);
+        assert!(
+            off.to_keys()
+                .contains(&("folders_sidebar_subfolders".into(), "0".into()))
+        );
     }
 
     #[test]
