@@ -1,11 +1,14 @@
 //! Keyboard shortcuts: the window's accelerator table, and the keys only the
-//! results list takes.
+//! results list or the search box takes.
 //!
 //! The accelerator table sees every key of the window before the focused
 //! control does, so it holds only keys that mean the same wherever the focus
 //! is. Keys the search box needs for its text (Ctrl+A, Ctrl+C, Shift+Insert,
 //! Ctrl+Backspace and the like) mean something else in the list; those are
 //! the list's own, handled by its subclass through [`list_command`].
+//!
+//! The tables here are goz-gui's defaults. Options > Keyboard rebinds them
+//! (`crate::keymap`): what is in force is asked of `keymap::current`.
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_ADD, VK_BACK, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F11,
@@ -13,22 +16,23 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_RETURN, VK_RIGHT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ACCEL, CreateAcceleratorTableW, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL,
+    ACCEL, CreateAcceleratorTableW, DestroyAcceleratorTable, FALT, FCONTROL, FSHIFT, FVIRTKEY,
+    HACCEL,
 };
 
-use crate::{menu, searchtools};
+use crate::{keymap, menu, searchtools};
 
-const NONE: u8 = 0;
-const CTRL: u8 = FCONTROL;
-const SHIFT: u8 = FSHIFT;
-const ALT: u8 = FALT;
+pub const NONE: u8 = 0;
+pub const CTRL: u8 = FCONTROL;
+pub const SHIFT: u8 = FSHIFT;
+pub const ALT: u8 = FALT;
 
 const fn key(c: u8) -> u16 {
     c as u16
 }
 
 /// The window's shortcuts: modifiers, virtual key, command.
-const ACCELERATORS: &[(u8, u16, u16)] = &[
+pub const ACCELERATORS: &[(u8, u16, u16)] = &[
     (CTRL | SHIFT, key(b'Q'), menu::EXIT),
     // Everything 1.5's three (Ctrl+F is Edit > Find..., F4's).
     (ALT, key(b'D'), menu::FOCUS_SEARCH),
@@ -123,8 +127,43 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     // F6 (integration).
 ];
 
+/// The results list's own keys (Everything's "Result List" scope, 0x2000
+/// in its codes): modifiers, virtual key, command.
+pub const LIST_KEYS: &[(u8, u16, u16)] = &[
+    (NONE, VK_RETURN, menu::OPEN),
+    (SHIFT, VK_RETURN, menu::OPEN),
+    (CTRL, VK_RETURN, menu::REVEAL),
+    (CTRL | SHIFT, VK_RETURN, menu::RUN_AS),
+    (CTRL | SHIFT, key(b'C'), menu::COPY_FULL_PATH),
+    (CTRL, key(b'C'), menu::COPY),
+    (CTRL, VK_INSERT, menu::COPY),
+    (CTRL, key(b'X'), menu::CUT),
+    (CTRL, key(b'V'), menu::PASTE),
+    (SHIFT, VK_INSERT, menu::PASTE),
+    (NONE, VK_DELETE, menu::DELETE),
+    (SHIFT, VK_DELETE, menu::DELETE_PERMANENT),
+    (NONE, VK_F2, menu::RENAME),
+    (CTRL, key(b'A'), menu::SELECT_ALL),
+    (NONE, VK_ESCAPE, menu::FOCUS_SEARCH),
+    // Everything's result-list keys (`edit_undo_keys=8538,8712`,
+    // `edit_redo_keys=8537`, `edit_advanced_advanced_rename_keys=9329`):
+    // in the search box Ctrl+Z and Ctrl+Y undo and redo its text.
+    (CTRL, key(b'Z'), crate::filetools::cmd::UNDO),
+    (ALT, VK_BACK, crate::filetools::cmd::UNDO),
+    (CTRL, key(b'Y'), crate::filetools::cmd::REDO),
+    (SHIFT, VK_F2, crate::filetools::cmd::ADVANCED_RENAME),
+];
+
+/// The search box's own keys (Everything's "Search Edit" scope, 0x1000):
+/// F2 is Advanced Search... there (`search_advanced_search_keys=4209`), as
+/// it renames in the list.
+pub const SEARCH_BOX_KEYS: &[(u8, u16, u16)] = &[(NONE, VK_F2, searchtools::ADVANCED_SEARCH)];
+
+/// An accelerator table of the window's shortcuts in force.
 pub fn accelerators() -> HACCEL {
-    let table: Vec<ACCEL> = ACCELERATORS
+    let current = keymap::current();
+    let table: Vec<ACCEL> = current
+        .global
         .iter()
         .map(|&(mods, key, cmd)| ACCEL {
             fVirt: FVIRTKEY | mods,
@@ -132,47 +171,60 @@ pub fn accelerators() -> HACCEL {
             cmd,
         })
         .collect();
-    // SAFETY: the table and its length; Windows copies it.
+    // SAFETY: the table and its length; Windows copies it. (An empty
+    // table cannot be made: a length of 0 fails and gives null, which
+    // TranslateAccelerator takes as "no shortcuts".)
     unsafe { CreateAcceleratorTableW(table.as_ptr(), table.len() as i32) }
 }
 
-/// The command a key pressed in the results list runs, if it is one of the
-/// list's own. Alt+key never is: with Ctrl it is AltGr, which types.
-pub fn list_command(vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<u16> {
-    if alt {
-        return None;
-    }
-    Some(match (vk, ctrl, shift) {
-        (VK_RETURN, false, _) => menu::OPEN,
-        (VK_RETURN, true, false) => menu::REVEAL,
-        (VK_RETURN, true, true) => menu::RUN_AS,
-        (k, true, true) if k == key(b'C') => menu::COPY_FULL_PATH,
-        (k, true, false) if k == key(b'C') => menu::COPY,
-        (VK_INSERT, true, false) => menu::COPY,
-        (k, true, false) if k == key(b'X') => menu::CUT,
-        (k, true, false) if k == key(b'V') => menu::PASTE,
-        (VK_INSERT, false, true) => menu::PASTE,
-        (VK_DELETE, false, false) => menu::DELETE,
-        (VK_DELETE, false, true) => menu::DELETE_PERMANENT,
-        (VK_F2, false, false) => menu::RENAME,
-        (k, true, false) if k == key(b'A') => menu::SELECT_ALL,
-        (VK_ESCAPE, false, false) => menu::FOCUS_SEARCH,
-        // Everything's result-list keys (`edit_undo_keys=8538`,
-        // `edit_redo_keys=8537`, `edit_advanced_advanced_rename_keys=9329`:
-        // 0x2000 is "in the result list"): in the search box Ctrl+Z and
-        // Ctrl+Y undo and redo its text.
-        (k, true, false) if k == key(b'Z') => crate::filetools::cmd::UNDO,
-        (k, true, false) if k == key(b'Y') => crate::filetools::cmd::REDO,
-        (VK_F2, false, true) => crate::filetools::cmd::ADVANCED_RENAME,
-        _ => return None,
+thread_local! {
+    /// This thread's table, and the keys' generation it was made from.
+    static TABLE: core::cell::Cell<(HACCEL, u32)> =
+        const { core::cell::Cell::new((core::ptr::null_mut(), u32::MAX)) };
+}
+
+/// The accelerator table of the shortcuts in force, made again once
+/// Options > Keyboard changed them (the old one is destroyed).
+pub fn table() -> HACCEL {
+    let generation = keymap::generation();
+    TABLE.with(|t| {
+        let (handle, made_for) = t.get();
+        if made_for == generation {
+            return handle;
+        }
+        let new = accelerators();
+        if !handle.is_null() {
+            // SAFETY: a table this function made and no one else holds.
+            unsafe { DestroyAcceleratorTable(handle) };
+        }
+        t.set((new, generation));
+        new
     })
+}
+
+fn mods(ctrl: bool, shift: bool, alt: bool) -> u8 {
+    (if ctrl { CTRL } else { NONE })
+        | (if shift { SHIFT } else { NONE })
+        | if alt { ALT } else { NONE }
+}
+
+/// The command a key pressed in the results list runs, if it is one of the
+/// list's own. With Ctrl, Alt is AltGr, which types: only a key bound with
+/// both takes it.
+pub fn list_command(vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<u16> {
+    keymap::current().list_command(mods(ctrl, shift, alt), vk)
 }
 
 /// The command an Alt+key pressed in the results list runs, if it is one of
 /// the list's own: Everything's second Undo key, Alt+Backspace
 /// (`edit_undo_keys=...,8712`).
 pub fn list_alt_command(vk: u16, ctrl: bool, shift: bool) -> Option<u16> {
-    (vk == VK_BACK && !ctrl && !shift).then_some(crate::filetools::cmd::UNDO)
+    list_command(vk, ctrl, shift, true)
+}
+
+/// The command a key pressed in the search box runs, if one of its own.
+pub fn search_box_command(vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<u16> {
+    keymap::current().edit_command(mods(ctrl, shift, alt), vk)
 }
 
 #[cfg(test)]
@@ -224,7 +276,7 @@ mod tests {
     ];
 
     fn mods(ctrl: bool, shift: bool) -> u8 {
-        (if ctrl { CTRL } else { NONE }) | if shift { SHIFT } else { NONE }
+        super::mods(ctrl, shift, false)
     }
 
     #[test]

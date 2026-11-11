@@ -21,7 +21,6 @@ use windows_sys::Win32::UI::Controls::{
     LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE,
     NMLVCUSTOMDRAW, NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_DELETE, VK_F2};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, DWLP_MSGRESULT, EN_CHANGE,
@@ -434,8 +433,7 @@ impl Organize {
         let lv = Organize::list_view(dlg);
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
         send(lv, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
-        // SAFETY: reads this thread's dialog's DPI.
-        let dpi = unsafe { GetDpiForWindow(dlg) }.max(96) as i32;
+        let dpi = crate::custom::window_dpi(dlg) as i32;
         for (i, (title, width)) in COLUMNS.into_iter().enumerate() {
             let mut text = wz(title);
             let col = LVCOLUMNW {

@@ -377,7 +377,7 @@ impl App {
             self.draw_big_icon(hdc, icon, &geo.thumb);
         }
         let fonts = self.fonts.borrow();
-        name_lines(hdc, &geo.text, &name, &spans, &fonts, pal.fg);
+        name_lines(hdc, &geo.text, &name, &spans, &fonts, pal.list_fg);
         if bits & LVIS_FOCUSED != 0 && list_focused {
             // SAFETY: draws into the list's paint DC.
             unsafe { DrawFocusRect(hdc, &geo.cell) };

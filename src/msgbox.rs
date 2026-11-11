@@ -356,7 +356,7 @@ impl MsgBox {
         // DC for measuring (released), and its owner's monitor's work area;
         // every out-struct outlives its call.
         unsafe {
-            let dpi = GetDpiForWindow(dlg).max(96);
+            let dpi = crate::custom::window_dpi(dlg);
             let mut du = rect(0, 0, 50, 14).to_win();
             MapDialogRect(dlg, &mut du);
             let mut m = Metrics {
@@ -374,7 +374,7 @@ impl MsgBox {
             let style = GetWindowLongPtrW(dlg, GWL_STYLE) as u32;
             let ex = GetWindowLongPtrW(dlg, GWL_EXSTYLE) as u32;
             let mut frame = RECT::default();
-            AdjustWindowRectExForDpi(&mut frame, style, 0, ex, dpi);
+            AdjustWindowRectExForDpi(&mut frame, style, 0, ex, GetDpiForWindow(dlg).max(96));
             let frame = (frame.right - frame.left, frame.bottom - frame.top);
             let owner = GetWindow(dlg, GW_OWNER);
             let mut mi = MONITORINFO {
@@ -440,7 +440,7 @@ impl MsgBox {
         let dpi = unsafe {
             GetClientRect(dlg, &mut rc);
             GetWindowRect(item(dlg, self.buttons.set[0].0 as u16), &mut first);
-            GetDpiForWindow(dlg).max(96)
+            crate::custom::window_dpi(dlg)
         };
         // The strip's top, from where its buttons are now (they move with
         // the DPI).

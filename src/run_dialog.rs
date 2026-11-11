@@ -32,7 +32,6 @@ use windows_sys::Win32::UI::Controls::{
     LVS_SHOWSELALWAYS, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVCUSTOMDRAW,
     NMLVDISPINFOW, NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, VK_CONTROL, VK_DELETE,
 };
@@ -305,8 +304,7 @@ impl Dlg<'_> {
         let ex =
             LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_HEADERDRAGDROP;
         send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
-        // SAFETY: reads this thread's dialog's DPI.
-        let dpi = unsafe { GetDpiForWindow(dlg) }.max(96) as i32;
+        let dpi = crate::custom::window_dpi(dlg) as i32;
         for (i, &(_, title, width, right)) in COLUMNS.iter().enumerate() {
             let mut text = wz(title);
             let col = LVCOLUMNW {

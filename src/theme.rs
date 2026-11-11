@@ -94,10 +94,42 @@ pub struct Palette {
     pub popup_bg: u32,
     pub popup_border: u32,
     pub popup_hot: u32,
+    /// The result list's own colours (Options > Fonts and Colors,
+    /// `crate::colors`; the theme's `bg` and `fg` until one is chosen): its
+    /// background and text, the text of selected rows (with and without
+    /// the focus), of the row under the mouse and of the sorted column.
+    pub list_bg: u32,
+    pub list_fg: u32,
+    pub sel_fg: u32,
+    pub sel_inactive_fg: u32,
+    pub hover_fg: u32,
+    pub sort_fg: u32,
+    /// Matched text (Normal (Highlighted)): its colour and background when
+    /// chosen, and whether it is bold (the default).
+    pub hl_fg: Option<u32>,
+    pub hl_bg: Option<u32>,
+    pub hl_bold: bool,
+    /// The row states whose text is bold (`colors::BOLD_*`).
+    pub bold_rows: u8,
 }
 
 impl Palette {
     pub fn new(dark: bool) -> Palette {
+        let mut p = Palette::sampled(dark);
+        // The result list's own start as the theme's.
+        p.list_bg = p.bg;
+        p.list_fg = p.fg;
+        p.sel_fg = p.fg;
+        p.sel_inactive_fg = p.fg;
+        p.hover_fg = p.fg;
+        p.sort_fg = p.fg;
+        p
+    }
+
+    fn sampled(dark: bool) -> Palette {
+        // Set from `bg` and `fg` by `new`.
+        let (list_bg, list_fg, sel_fg, sel_inactive_fg, hover_fg, sort_fg) = (0, 0, 0, 0, 0, 0);
+        let (hl_fg, hl_bg, hl_bold, bold_rows) = (None, None, true, 0);
         if dark {
             Palette {
                 dark,
@@ -131,6 +163,16 @@ impl Palette {
                 popup_bg: rgb(0x2b, 0x2b, 0x2b),
                 popup_border: rgb(0x80, 0x80, 0x80),
                 popup_hot: rgb(0x45, 0x45, 0x45),
+                list_bg,
+                list_fg,
+                sel_fg,
+                sel_inactive_fg,
+                hover_fg,
+                sort_fg,
+                hl_fg,
+                hl_bg,
+                hl_bold,
+                bold_rows,
             }
         } else {
             Palette {
@@ -165,6 +207,16 @@ impl Palette {
                 popup_bg: rgb(0xff, 0xff, 0xff),
                 popup_border: rgb(0x80, 0x80, 0x80),
                 popup_hot: rgb(0xcc, 0xe8, 0xff),
+                list_bg,
+                list_fg,
+                sel_fg,
+                sel_inactive_fg,
+                hover_fg,
+                sort_fg,
+                hl_fg,
+                hl_bg,
+                hl_bold,
+                bold_rows,
             }
         }
     }

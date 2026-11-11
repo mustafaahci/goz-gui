@@ -6,6 +6,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod a11y;
 mod actions;
 mod bigicon;
 mod bigicons;
@@ -15,9 +16,14 @@ mod celltip;
 mod client;
 mod clipboard;
 mod cmdline;
+mod colorfilter;
+mod colorfilter_dialog;
+mod colors;
 mod columns;
 mod copytext;
 mod csv;
+mod custom;
+mod dblctrl;
 mod dialog;
 mod dock;
 mod dropdown;
@@ -37,6 +43,8 @@ mod icons;
 mod instance;
 mod integration;
 mod json;
+mod jumplist;
+mod keymap;
 mod keys;
 mod layout;
 mod menu;

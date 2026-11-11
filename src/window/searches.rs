@@ -133,6 +133,8 @@ impl App {
         if !file.pending() {
             return;
         }
+        // The taskbar's jump list shows the recent searches.
+        self.jump_list_later();
         let hwnd = self.hwnd as usize;
         let job = Arc::clone(&file);
         self.writer.submit(

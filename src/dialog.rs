@@ -31,7 +31,6 @@ use windows_sys::Win32::UI::Controls::{
     RBS_UNCHECKEDDISABLED, RBS_UNCHECKEDHOT, RBS_UNCHECKEDNORMAL, RBS_UNCHECKEDPRESSED, TS_DRAW,
     TVM_SETBKCOLOR, TVM_SETLINECOLOR, TVM_SETTEXTCOLOR,
 };
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyNameTextW, IsWindowEnabled, MAPVK_VK_TO_VSC, MapVirtualKeyW, VK_CONTROL,
@@ -143,7 +142,9 @@ impl Template {
         t.words.extend([0, 0]);
         t.string(title);
         let (points, face) = message_font();
-        t.words.push(points);
+        // Options > UI's scale makes every dialog's font, and so its
+        // dialog units, that much bigger.
+        t.words.push(crate::custom::scaled_points(points));
         t.words.extend(face);
         t.words.push(0);
         t
@@ -603,7 +604,7 @@ fn paint_dark_group(hwnd: HWND) {
         let text: Vec<u16> = crate::wide::window_text(hwnd).encode_utf16().collect();
         let mut size = SIZE::default();
         GetTextExtentPoint32W(hdc, text.as_ptr(), text.len() as i32, &mut size);
-        let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+        let dpi = crate::custom::window_dpi(hwnd) as i32;
         let px = |v: i32| v * dpi / 96;
         // The frame runs through the caption's middle, broken for it.
         let top = rc.top + size.cy / 2;
@@ -889,7 +890,7 @@ pub fn fill_last_column(list: HWND) {
         };
         SendMessageW(list, LVM_GETCOLUMNW, last, (&raw mut column) as isize);
         let label = SendMessageW(list, LVM_GETSTRINGWIDTHW, 0, text.as_ptr() as isize) as i32;
-        let floor = label + HEADER_MARGIN * GetDpiForWindow(list).max(96) as i32 / 96;
+        let floor = label + HEADER_MARGIN * crate::custom::window_dpi(list) as i32 / 96;
         // Fitting the column can take the horizontal bar away, and with it
         // the need for the vertical one: then once more for the new room
         // (it settles by the second time).
@@ -1018,7 +1019,7 @@ fn paint_selected_row(list: HWND, hdc: HDC, row: usize) {
         }
         let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
         let columns = SendMessageW(header, HDM_GETITEMCOUNT, 0, 0).max(0) as i32;
-        let pad = |v: i32| v * GetDpiForWindow(list).max(96) as i32 / 96;
+        let pad = |v: i32| v * crate::custom::window_dpi(list) as i32 / 96;
         SetBkMode(hdc, TRANSPARENT as i32);
         SetTextColor(hdc, pal.fg);
         for col in 0..columns {
@@ -1161,7 +1162,7 @@ fn paint_dark_radio(button: HWND, cd: &NMCUSTOMDRAW) {
             (true, ..) => RBS_CHECKEDNORMAL,
         };
         fill(hdc, &rc, pal.chrome);
-        let dpi = GetDpiForWindow(button).max(96) as i32;
+        let dpi = crate::custom::window_dpi(button) as i32;
         let px = |v: i32| v * dpi / 96;
         let class = crate::wide::wz("Button");
         let theme = OpenThemeData(button, class.as_ptr());

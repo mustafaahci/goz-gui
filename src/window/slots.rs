@@ -487,6 +487,8 @@ mod tests {
             findbar::WM_FIND,
             tools::WM_FULLSCREEN_AT_START,
             uiopts::WM_FOCUS_SEARCH,
+            // Wave 4 (G2).
+            super::super::custom::WM_DOUBLE_CTRL,
         ];
         for (i, &(a, m)) in messages.iter().enumerate() {
             for &(b, other) in &messages[i + 1..] {
@@ -517,6 +519,8 @@ mod tests {
             findbar::TIMER_TYPED,
             file_tools::TIMER_NEW_FOLDER,
             uiopts::TIMER_SEARCH_DELAY,
+            // Wave 4 (G2).
+            super::super::custom::TIMER_JUMP_LIST,
         ];
         for (i, &(a, t)) in timers.iter().enumerate() {
             for &(b, other) in &timers[i + 1..] {

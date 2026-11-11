@@ -145,12 +145,19 @@ impl App {
             .settings(o.match_case, o.match_path, o.filter, o.sort)
     }
 
+    /// The bookmarks as they are now (the jump list's, `custom.rs`).
+    pub(super) fn bookmark_list(&self) -> Arc<crate::bookmarks::Bookmarks> {
+        self.bookmarks.file.current()
+    }
+
     /// Hands the changes made here to the store thread.
     pub(super) fn save_bookmarks(&self) {
         let file = &self.bookmarks.file;
         if !file.pending() {
             return;
         }
+        // The taskbar's jump list shows the bookmarks.
+        self.jump_list_later();
         let Some(path) = file.path().map(ToOwned::to_owned) else {
             self.show_note("The bookmarks cannot be saved: goz-gui has no data folder".to_owned());
             return;

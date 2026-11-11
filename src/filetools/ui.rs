@@ -5,7 +5,6 @@ use windows_sys::Win32::UI::Controls::{
     BST_CHECKED, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCOLUMNW, LVITEMW,
     LVM_INSERTCOLUMNW, LVM_SETITEMSTATE,
 };
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, GetDlgItem, MapDialogRect, SendMessageW,
@@ -53,8 +52,7 @@ pub fn set_state(list: HWND, row: usize, state: u32, mask: u32) {
 
 /// Adds the columns `(title, width at 96 DPI)` to a list, at its DPI.
 pub fn columns(list: HWND, cols: &[(&str, i32)]) {
-    // SAFETY: reads this thread's list's DPI.
-    let dpi = unsafe { GetDpiForWindow(list) }.max(96) as i32;
+    let dpi = crate::custom::window_dpi(list) as i32;
     for (i, &(title, width)) in cols.iter().enumerate() {
         let mut text = wz(title);
         let col = LVCOLUMNW {

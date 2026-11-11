@@ -143,6 +143,21 @@ impl TabStrip {
         (m, p)
     }
 
+    /// Where each tab in view and the "+" are now (accessibility tools,
+    /// `access.rs`).
+    pub(super) fn tab_rects(&self, app: &App) -> (Vec<(usize, RECT)>, RECT) {
+        let rc = app.strip_rect(StripSlot::Tabs);
+        let (m, p) = self.placed(app, &rc);
+        let span = |l: i32, r: i32| RECT {
+            left: l,
+            top: m.top,
+            right: r,
+            bottom: m.bottom,
+        };
+        let tabs = p.tabs.iter().map(|&(i, l, r)| (i, span(l, r))).collect();
+        (tabs, span(p.plus.0, p.plus.1))
+    }
+
     fn hit_at(&self, app: &App, pt: POINT) -> Hit {
         let rc = app.strip_rect(StripSlot::Tabs);
         if !inside(&rc, pt) {

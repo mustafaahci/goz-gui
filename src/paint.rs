@@ -5,7 +5,7 @@ use windows_sys::Win32::Foundation::{RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DC_BRUSH, DT_CENTER,
     DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC, DeleteObject, DrawFocusRect,
-    DrawTextW, ETO_CLIPPED, EndPaint, ExtTextOutW, FillRect, GetDC, GetStockObject,
+    DrawTextW, ETO_CLIPPED, EndPaint, ExtTextOutW, FillRect, GetDC, GetStockObject, GetTextColor,
     GetTextExtentExPointW, GetTextExtentPoint32W, GetWindowDC, HDC, HFONT, MapWindowPoints,
     OffsetRect, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetDCBrushColor,
     SetTextColor, SetViewportOrgEx, TRANSPARENT,
@@ -76,7 +76,42 @@ pub fn cell_colour(pal: &Palette, state: RowState, sorted: bool) -> u32 {
         (false, _, false, true) if state.alternate => pal.alt_sort_bg,
         (false, _, false, true) => pal.sort_bg,
         (false, _, false, false) if state.alternate => pal.alt_bg,
-        (false, _, false, false) => pal.bg,
+        (false, _, false, false) => pal.list_bg,
+    }
+}
+
+/// The text colour of one cell (Options > Fonts and Colors: each state's
+/// own, the normal text's otherwise), and whether its text is bold.
+pub fn cell_text_colour(pal: &Palette, state: RowState, sorted: bool) -> (u32, bool) {
+    use crate::colors::{BOLD_INACTIVE, BOLD_MOUSEOVER, BOLD_NORMAL, BOLD_SELECTED, BOLD_SORT};
+    let (fg, bit) = match (state.selected, state.focused, state.hot, sorted) {
+        (true, true, _, _) => (pal.sel_fg, BOLD_SELECTED),
+        (true, false, _, _) => (pal.sel_inactive_fg, BOLD_INACTIVE),
+        (false, _, true, _) => (pal.hover_fg, BOLD_MOUSEOVER),
+        (false, _, false, true) => (pal.sort_fg, BOLD_SORT),
+        (false, _, false, false) => (pal.list_fg, BOLD_NORMAL),
+    };
+    (fg, pal.bold_rows & bit != 0)
+}
+
+/// How matched text is drawn: its colour and background when chosen, and
+/// bold or not; and whether the rest of the text is bold.
+#[derive(Clone, Copy, Debug)]
+pub struct Hl {
+    pub fg: Option<u32>,
+    pub bg: Option<u32>,
+    pub bold: bool,
+    pub base_bold: bool,
+}
+
+impl Default for Hl {
+    fn default() -> Hl {
+        Hl {
+            fg: None,
+            bg: None,
+            bold: true,
+            base_bold: false,
+        }
     }
 }
 
@@ -135,7 +170,7 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                 left: span.right,
                 ..rc
             },
-            pal.bg,
+            pal.list_bg,
         );
     }
     if ui.grid_lines {
@@ -181,15 +216,31 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
         &mut scratch.parent_spans,
     );
     let pad = app.scale(CELL_PAD);
+    // A color filter's colour for the row's text (not under a selection,
+    // which keeps its own).
+    let filtered = app.color_filter_colour(row);
     // SAFETY: draws into the list's DC; the old font is put back at the end.
     unsafe {
         let old_font = SelectObject(hdc, fonts.normal);
         SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, pal.fg);
         for &(col, cell) in cols.iter() {
             if cell.right - cell.left <= 2 * pad {
                 continue;
             }
+            let st = cell_state(state, col, ui.full_row_select);
+            let (mut fg, base_bold) = cell_text_colour(&pal, st, col == sorted);
+            if let Some(c) = filtered
+                && !st.selected
+            {
+                fg = c;
+            }
+            SetTextColor(hdc, fg);
+            let hl = Hl {
+                fg: pal.hl_fg,
+                bg: pal.hl_bg,
+                bold: pal.hl_bold,
+                base_bold,
+            };
             let mut inner = RECT {
                 left: cell.left + pad,
                 right: cell.right - pad,
@@ -214,35 +265,44 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                     inner.left += cx + app.scale(ICON_GAP);
                     // The find bar's Highlight All, behind the text.
                     app.paint_find_matches(hdc, &inner, row.name(), &scratch.name_spans, &fonts);
-                    runs(hdc, &inner, row.name(), &scratch.name_spans, &fonts, false);
+                    runs_hl(
+                        hdc,
+                        &inner,
+                        row.name(),
+                        &scratch.name_spans,
+                        &fonts,
+                        false,
+                        hl,
+                    );
                 }
-                COL_PATH => runs(
+                COL_PATH => runs_hl(
                     hdc,
                     &inner,
                     row.parent(),
                     &scratch.parent_spans,
                     &fonts,
                     false,
+                    hl,
                 ),
                 COL_SIZE => {
                     if let (false, Some(size)) = (row.is_dir, row.size) {
                         let text: Vec<u16> = format::size_cell(size).encode_utf16().collect();
-                        runs(hdc, &inner, &text, &[], &fonts, true);
+                        runs_hl(hdc, &inner, &text, &[], &fonts, true, hl);
                     }
                 }
-                COL_EXT => runs(hdc, &inner, filetype::of_row(row), &[], &fonts, false),
+                COL_EXT => runs_hl(hdc, &inner, filetype::of_row(row), &[], &fonts, false, hl),
                 // Looked up once per extension, off this thread
                 // (`typeinfo`): empty until then.
                 COL_TYPE => {
                     if let Some(name) = app.icons.type_name(row) {
-                        runs(hdc, &inner, &name, &[], &fonts, false);
+                        runs_hl(hdc, &inner, &name, &[], &fonts, false, hl);
                     }
                 }
                 COL_DATE => {
                     if let Some(ft) = row.mtime {
                         scratch.text.clear();
                         format::date(ft, &mut scratch.text);
-                        runs(hdc, &inner, &scratch.text, &[], &fonts, false);
+                        runs_hl(hdc, &inner, &scratch.text, &[], &fonts, false, hl);
                     }
                 }
                 _ => {}
@@ -324,7 +384,7 @@ pub fn cell_text(
         let old = SelectObject(hdc, fonts.normal);
         let w = parts(&text, spans, &fonts)
             .iter()
-            .map(|&(s, e, f)| {
+            .map(|&(s, e, f, _)| {
                 SelectObject(hdc, f);
                 width(hdc, &text[s..e])
             })
@@ -357,21 +417,38 @@ pub fn cell_text(
 
 /// `text` cut where `spans` start and end, each part with its font: bold
 /// over the spans.
-fn parts(text: &[u16], spans: &[Span], fonts: &Fonts) -> Vec<(usize, usize, HFONT)> {
-    let mut parts: Vec<(usize, usize, HFONT)> = Vec::with_capacity(spans.len() * 2 + 1);
+fn parts(text: &[u16], spans: &[Span], fonts: &Fonts) -> Vec<(usize, usize, HFONT, bool)> {
+    parts_hl(text, spans, fonts, Hl::default())
+}
+
+/// [`parts`] drawn as `hl` says: each part's font, and whether it is a
+/// match.
+fn parts_hl(
+    text: &[u16],
+    spans: &[Span],
+    fonts: &Fonts,
+    hl: Hl,
+) -> Vec<(usize, usize, HFONT, bool)> {
+    let base = if hl.base_bold {
+        fonts.bold
+    } else {
+        fonts.normal
+    };
+    let matched = if hl.bold { fonts.bold } else { base };
+    let mut parts: Vec<(usize, usize, HFONT, bool)> = Vec::with_capacity(spans.len() * 2 + 1);
     let mut at = 0;
     for &(s, e) in spans {
         let (s, e) = (s.min(text.len()), e.min(text.len()));
         if s > at {
-            parts.push((at, s, fonts.normal));
+            parts.push((at, s, base, false));
         }
         if e > s.max(at) {
-            parts.push((s.max(at), e, fonts.bold));
+            parts.push((s.max(at), e, matched, true));
         }
         at = at.max(e);
     }
     if at < text.len() {
-        parts.push((at, text.len(), fonts.normal));
+        parts.push((at, text.len(), base, false));
     }
     parts
 }
@@ -379,10 +456,24 @@ fn parts(text: &[u16], spans: &[Span], fonts: &Fonts) -> Vec<(usize, usize, HFON
 /// Draws `text` in `rc`, bold over `spans`, ending in an ellipsis when it
 /// does not fit. `right` aligns it to the right edge when it fits.
 pub fn runs(hdc: HDC, rc: &RECT, text: &[u16], spans: &[Span], fonts: &Fonts, right: bool) {
+    runs_hl(hdc, rc, text, spans, fonts, right, Hl::default());
+}
+
+/// [`runs`] with the matches drawn as `hl` says (Options > Fonts and
+/// Colors' Normal (Highlighted)): their colour and background, bold or not.
+pub fn runs_hl(
+    hdc: HDC,
+    rc: &RECT,
+    text: &[u16],
+    spans: &[Span],
+    fonts: &Fonts,
+    right: bool,
+    hl: Hl,
+) {
     if text.is_empty() || rc.right <= rc.left {
         return;
     }
-    let parts = parts(text, spans, fonts);
+    let parts = parts_hl(text, spans, fonts, hl);
     let y = rc.top + (rc.bottom - rc.top - fonts.height) / 2;
     // SAFETY: draws into `hdc`, clipped to `rc`.
     unsafe {
@@ -400,29 +491,58 @@ pub fn runs(hdc: HDC, rc: &RECT, text: &[u16], spans: &[Span], fonts: &Fonts, ri
         };
         let widths: Vec<i32> = parts
             .iter()
-            .map(|&(s, e, f)| {
+            .map(|&(s, e, f, _)| {
                 SelectObject(hdc, f);
                 width(hdc, &text[s..e])
             })
             .collect();
+        // A match in a colour of its own, on a background of its own: the
+        // DC's colour is the cell's, put back after each match.
+        let normal_fg = GetTextColor(hdc);
+        let mark = |x: i32, w: i32, matched: bool| {
+            if !matched {
+                return;
+            }
+            if let Some(bg) = hl.bg {
+                let r = RECT {
+                    left: x.max(rc.left),
+                    right: (x + w).min(rc.right),
+                    top: y,
+                    bottom: (y + fonts.height).min(rc.bottom),
+                };
+                if r.right > r.left {
+                    fill(hdc, &r, bg);
+                }
+            }
+            SetTextColor(hdc, hl.fg.unwrap_or(normal_fg));
+        };
         let total: i32 = widths.iter().sum();
         let avail = rc.right - rc.left;
         if total <= avail {
             let mut x = if right { rc.right - total } else { rc.left };
-            for (&(s, e, f), w) in parts.iter().zip(&widths) {
+            for (&(s, e, f, matched), w) in parts.iter().zip(&widths) {
                 SelectObject(hdc, f);
+                mark(x, *w, matched);
                 draw(x, &text[s..e]);
+                SetTextColor(hdc, normal_fg);
                 x += w;
             }
         } else {
             const ELLIPSIS: [u16; 1] = [0x2026];
-            SelectObject(hdc, fonts.normal);
+            let base = if hl.base_bold {
+                fonts.bold
+            } else {
+                fonts.normal
+            };
+            SelectObject(hdc, base);
             let limit = rc.right - width(hdc, &ELLIPSIS);
             let mut x = rc.left;
-            for (&(s, e, f), &w) in parts.iter().zip(&widths) {
+            for (&(s, e, f, matched), &w) in parts.iter().zip(&widths) {
                 SelectObject(hdc, f);
                 if x + w <= limit {
+                    mark(x, w, matched);
                     draw(x, &text[s..e]);
+                    SetTextColor(hdc, normal_fg);
                     x += w;
                     continue;
                 }
@@ -440,12 +560,15 @@ pub fn runs(hdc: HDC, rc: &RECT, text: &[u16], spans: &[Span], fonts: &Fonts, ri
                         &mut size,
                     );
                     let fit = &text[s..s + fit.max(0) as usize];
+                    let fw = width(hdc, fit);
+                    mark(x, fw, matched);
                     draw(x, fit);
-                    x += width(hdc, fit);
+                    SetTextColor(hdc, normal_fg);
+                    x += fw;
                 }
                 break;
             }
-            SelectObject(hdc, fonts.normal);
+            SelectObject(hdc, base);
             draw(x, &ELLIPSIS);
         }
         SelectObject(hdc, fonts.normal);
@@ -560,7 +683,7 @@ pub fn below_rows(app: &App, hdc: HDC) {
         top = top.max(last.bottom);
     }
     if top < client.bottom {
-        fill(hdc, &RECT { top, ..client }, app.pal.get().bg);
+        fill(hdc, &RECT { top, ..client }, app.pal.get().list_bg);
     }
 }
 

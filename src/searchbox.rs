@@ -138,7 +138,7 @@ pub fn nav_of(app: &App) -> Option<(RECT, RECT)> {
 
 /// Whether a button can be used now: Back and Forward only when there is
 /// somewhere to go.
-fn enabled(app: &App, button: Button) -> bool {
+pub fn enabled(app: &App, button: Button) -> bool {
     match button {
         Button::Back => app.can_navigate(true),
         Button::Forward => app.can_navigate(false),

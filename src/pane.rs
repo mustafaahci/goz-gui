@@ -332,6 +332,21 @@ fn close_of(app: &App, hwnd: HWND) -> RECT {
     close_rect(client(hwnd).right, title_height(app), |v| app.scale(v))
 }
 
+/// What accessibility tools see of a pane window besides its content's
+/// windows (`crate::a11y`): the close button of its title row.
+pub fn accessible_parts(app: &App, hwnd: HWND) -> Vec<crate::a11y::Part> {
+    let rc = close_of(app, hwnd);
+    if rc.right <= rc.left {
+        return Vec::new();
+    }
+    let mut close = crate::a11y::Part::new("Close", crate::a11y::ROLE_PUSHBUTTON, rc);
+    if state(hwnd).is_some_and(|p| p.hot.get()) {
+        close.state = crate::a11y::STATE_HOTTRACKED;
+    }
+    close.action = Some(("Press", crate::a11y::Action::ClosePane));
+    vec![close]
+}
+
 fn invalidate_close(app: &App, hwnd: HWND) {
     let rc = close_of(app, hwnd);
     // SAFETY: repaints part of this thread's window.
@@ -528,6 +543,14 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             WM_PAINT => {
                 paint(app, hwnd, p);
                 return 0;
+            }
+            // Its title and close button for accessibility tools.
+            m if m == windows_sys::Win32::UI::WindowsAndMessaging::WM_GETOBJECT
+                && crate::a11y::wants_client(l) =>
+            {
+                if let Some(answer) = crate::window::pane_object(hwnd, id.code(), w) {
+                    return answer;
+                }
             }
             WM_ERASEBKGND => {
                 erase(app, hwnd, w as HDC);

@@ -33,7 +33,6 @@ use windows_sys::Win32::UI::Controls::{
     TVM_SETEXTENDEDSTYLE, TVM_SETIMAGELIST, TVN_KEYDOWN, TVN_SELCHANGEDW, TVS_EX_DOUBLEBUFFER,
     TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS, TVSIL_NORMAL,
 };
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, IsWindowEnabled, VK_BACK, VK_CONTROL, VK_DELETE, VK_F2,
 };
@@ -300,8 +299,7 @@ impl Organize<'_> {
             LVSIL_SMALL as usize,
             self.icons.list,
         );
-        // SAFETY: reads this thread's dialog's DPI.
-        let dpi = unsafe { GetDpiForWindow(dlg) }.max(96) as i32;
+        let dpi = crate::custom::window_dpi(dlg) as i32;
         for (i, (title, width)) in COLUMNS.into_iter().enumerate() {
             let mut text = wz(title);
             let col = LVCOLUMNW {
@@ -359,7 +357,7 @@ impl Organize<'_> {
         // SAFETY: reads this thread's dialog and its DPI.
         let dpi = unsafe {
             GetClientRect(dlg, &mut rc);
-            GetDpiForWindow(dlg).max(96) as i32
+            crate::custom::window_dpi(dlg) as i32
         };
         let (w, h) = (rc.right, rc.bottom);
         let (m, my) = px(7, 7);

@@ -214,7 +214,19 @@ pub(super) unsafe extern "system" fn edit_proc(
 /// # Safety
 /// `w` and `l` are what `msg` carries, for the box `hwnd`.
 unsafe fn edit_message(app: &App, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // The search box's menu and F2 (F4's, `tools.rs`).
+    // The search box's own keys (Options > Keyboard's "Search Edit" ones:
+    // F2 is Advanced Search..., F4's) before the box's fixed ones below.
+    if matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        // Bit 29: Alt is down (WM_SYSKEYDOWN also comes for F10).
+        let alt = msg == WM_SYSKEYDOWN && l & (1 << 29) != 0;
+        if let Some(cmd) =
+            crate::keys::search_box_command(w as u16, key_down(VK_CONTROL), key_down(VK_SHIFT), alt)
+        {
+            app.command(cmd);
+            return 0;
+        }
+    }
+    // The search box's menu (F4's, `tools.rs`).
     if let Some(answer) = app.search_box_message(msg, w, l) {
         return answer;
     }
