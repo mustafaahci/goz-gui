@@ -16,12 +16,10 @@ path = "src/main.rs"
 # The wire protocol and the pipe trust check come straight from goz, so the GUI
 # speaks exactly what gozd speaks and never re-implements the framing.
 #
-# Wave 9: the local goz repo at the merged gozd commit (Hello.features, Watch,
-# GetConfig/SetConfig, the column flags and sort keys, the content: helper,
-# the new parser). Temporary until goz v0.7.0 is tagged; the commit is only
-# referenced, never checked out in that tree.
-goz-core = { git = "https://github.com/mustafaahci/goz", rev = "5ee8fa98ca912d5f2f6f344a3ad34d91cff25788" }
-goz-winfs = { git = "https://github.com/mustafaahci/goz", rev = "5ee8fa98ca912d5f2f6f344a3ad34d91cff25788" }
+# goz v0.7.0: Hello.features, Watch, GetConfig/SetConfig, the column flags and
+# sort keys, the content: helper and Everything 1.5's search syntax.
+goz-core = { git = "https://github.com/mustafaahci/goz", tag = "v0.7.0" }
+goz-winfs = { git = "https://github.com/mustafaahci/goz", tag = "v0.7.0" }
 # The windows crate's own core (already built for it): `#[implement]`, for
 # the COM objects goz-gui makes itself (the preview handlers' frame and
 # stream, F1; the file operations' progress sink, F5), names it in the code
