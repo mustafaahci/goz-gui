@@ -726,7 +726,7 @@ impl Organize {
             );
             return;
         }
-        if let Err(e) = store::file::write(&path, text.as_bytes(), None) {
+        if let Err(e) = store::file::write_once(&path, text.as_bytes()) {
             warn(
                 dlg,
                 "Export Filters",

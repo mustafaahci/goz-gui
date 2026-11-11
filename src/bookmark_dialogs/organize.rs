@@ -843,7 +843,7 @@ impl Organize<'_> {
             return;
         }
         let text = if only { chosen } else { all };
-        if let Err(e) = store::file::write(&path, text.as_bytes(), None) {
+        if let Err(e) = store::file::write_once(&path, text.as_bytes()) {
             warn(
                 dlg,
                 &format!(

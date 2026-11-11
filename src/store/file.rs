@@ -25,8 +25,14 @@
 //!   written to read it, and while any handle is open on it, a rename onto
 //!   it fails with "Access is denied" (ERROR_ACCESS_DENIED, even when the
 //!   handle shares deletion), and a rename or delete of it with a sharing
-//!   violation when the handle does not. These run on the store's thread,
-//!   never the window's.
+//!   violation when the handle does not. Writes that try again run on the
+//!   threads that write goz-gui's own files (the store's and the writer's)
+//!   and on the jobs' threads (the export's, the File List Editor's), never
+//!   on a window's: a dialog's export to a file the user chose
+//!   ([`write_once`]) makes each step once, so a folder the user cannot
+//!   write to says so at once. (Moving a damaged file aside as it is read
+//!   tries again too, wherever it is read: only a damaged file another
+//!   program holds waits so.)
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -157,9 +163,14 @@ fn refuses_for_good(path: &[u16]) -> bool {
 /// Renames `from` over `to` in one step, through to the disk; tried again
 /// for a moment while another program holds either file ([`retrying`]).
 pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
+    replace_after(from, to, &RETRY_WAITS_MS)
+}
+
+/// [`replace`], tried again after each of `waits` (none: once).
+fn replace_after(from: &Path, to: &Path, waits: &[u64]) -> io::Result<()> {
     let (from, to) = (wide(from), wide(to));
     retrying(
-        &RETRY_WAITS_MS,
+        waits,
         || {
             // SAFETY: two NUL-terminated paths that live across the call.
             let ok = unsafe {
@@ -181,15 +192,12 @@ pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Writes `bytes` to this process's tmp file for `path`, flushed to the
 /// disk; the tmp file is removed again on failure. A tmp file left by an
-/// earlier write that another program still holds is waited for a moment.
-fn write_tmp(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+/// earlier write that another program still holds is waited for after
+/// each of `waits`.
+fn write_tmp(path: &Path, bytes: &[u8], waits: &[u64]) -> io::Result<PathBuf> {
     let tmp = tmp_path(path);
     let wide_tmp = wide(&tmp);
-    let created = retrying(
-        &RETRY_WAITS_MS,
-        || File::create(&tmp),
-        || refuses_for_good(&wide_tmp),
-    );
+    let created = retrying(waits, || File::create(&tmp), || refuses_for_good(&wide_tmp));
     let result = created.and_then(|mut file| {
         file.write_all(bytes)?;
         // FlushFileBuffers: the bytes are on the disk before the rename
@@ -209,7 +217,7 @@ fn write_tmp(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
 /// backup. A hidden or read-only file there is replaced all the same when
 /// `force`.
 fn put(path: &Path, bytes: &[u8], force: bool) -> io::Result<()> {
-    let tmp = write_tmp(path, bytes)?;
+    let tmp = write_tmp(path, bytes, &RETRY_WAITS_MS)?;
     if force {
         // A rename over a read-only file is refused; hidden is cleared too,
         // so the file never keeps an attribute the user did not give it.
@@ -244,7 +252,7 @@ pub fn write(path: &Path, bytes: &[u8], previous: Option<&[u8]>) -> io::Result<O
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = write_tmp(path, bytes)?;
+    let tmp = write_tmp(path, bytes, &RETRY_WAITS_MS)?;
     // An empty file is never a backup worth having over another.
     let note = previous
         .filter(|b| !blank(b))
@@ -255,6 +263,23 @@ pub fn write(path: &Path, bytes: &[u8], previous: Option<&[u8]>) -> io::Result<O
         let _ = fs::remove_file(&tmp);
     }
     result.map(|()| note)
+}
+
+/// Writes `bytes` to `path` atomically (tmp, flush, rename), with no
+/// backup and no step tried again: a dialog's export to a file the user
+/// chose, on the dialog's thread. A folder the user cannot write to
+/// ("Access is denied") is said at once, not after [`write`]'s waits for
+/// a file held for a moment.
+pub fn write_once(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = write_tmp(path, bytes, &[])?;
+    let result = replace_after(&tmp, path, &[]);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// A file's size and time, to notice another program changing it.
@@ -844,6 +869,56 @@ pub mod tests {
         set_attributes(&read_only, FILE_ATTRIBUTE_NORMAL);
         assert!(!refuses_for_good(&wide(&read_only)));
         assert!(!refuses_for_good(&wide(&dir.join("missing.ini"))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// W6R-2: a dialog's export (on the dialog's thread) makes each step
+    /// once. A file it cannot replace ("Access is denied", as a folder the
+    /// user cannot write to gives) or a tmp file it cannot create fails at
+    /// once; [`write`] would wait about 0.6 s for each first.
+    #[test]
+    fn an_export_from_a_dialog_is_not_tried_again() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let all_waits = Duration::from_millis(RETRY_WAITS_MS.iter().sum());
+        let dir = scratch("export-once");
+        let path = dir.join("Exported.csv");
+        fs::write(&path, b"old").expect("file");
+        // The rename onto a file held open: "Access is denied".
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .expect("held");
+        let started = std::time::Instant::now();
+        let e = write_once(&path, b"new").expect_err("refused");
+        let took = started.elapsed();
+        assert_eq!(e.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert!(took < all_waits, "{took:?}");
+        assert!(!tmp_path(&path).exists());
+        drop(held);
+        assert_eq!(fs::read(&path).expect("read"), b"old");
+        // The tmp file's creation refused (a sharing violation).
+        let tmp = tmp_path(&path);
+        fs::write(&tmp, b"left").expect("tmp");
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&tmp)
+            .expect("held");
+        let started = std::time::Instant::now();
+        let e = write_once(&path, b"new").expect_err("refused");
+        let took = started.elapsed();
+        assert_eq!(e.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+        assert!(took < all_waits, "{took:?}");
+        drop(held);
+        fs::remove_file(&tmp).expect("tmp gone");
+        // Nothing in the way: written whole, with no backup and no tmp left.
+        write_once(&path, b"new").expect("written");
+        assert_eq!(fs::read(&path).expect("read"), b"new");
+        assert!(!backup_path(&path).exists() && !tmp_path(&path).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
