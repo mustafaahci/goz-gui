@@ -285,12 +285,11 @@ impl App {
         };
         // The user chose other rows: an action waiting for the old ones is
         // not wanted, and they are not Select All's every row (inverting
-        // none selects every row as it is now, as a click on each would);
-        // the rows change unseen, then repaint once, and the status bar and
-        // the panes hear of it once (`in_bulk`).
+        // none selects every row as it is now, as a click on each would).
         // The rows of the smaller side are set a slice at a time
         // (`selecting.rs`): a few thousand of them cost the list tens of
-        // milliseconds.
+        // milliseconds; the status bar and the panes hear of it once, when
+        // all are set.
         self.cancel_fetch();
         self.select_all.set(false);
         self.select_rows(
