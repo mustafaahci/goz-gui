@@ -411,6 +411,11 @@ pub const COMMANDS: &[Command] = &[
         menu::FOCUS_SEARCH,
     ),
     c(
+        "tools_file_list_editor_keys",
+        "Tools | File List Editor...",
+        crate::listedit::cmd::FILE_LIST_EDITOR,
+    ),
+    c(
         "tools_import_and_export_settings_keys",
         "Tools | Import and Export Settings...",
         datatools::IMPORT_EXPORT_SETTINGS,

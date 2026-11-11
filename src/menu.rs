@@ -844,7 +844,13 @@ pub fn header_menu(shown: &[bool; COLS], on: Option<usize>) -> HMENU {
         Sep,
     ]);
     enable(menu, SIZE_COLUMN_TO_FIT, on.is_some());
-    enable(menu, REMOVE_COLUMN, on.is_some_and(|id| id != COL_NAME));
+    // Date Created (a file list's, outside the layout) comes and goes with
+    // the list.
+    enable(
+        menu,
+        REMOVE_COLUMN,
+        on.is_some_and(|id| id != COL_NAME && id < COLS),
+    );
     for (id, title) in columns::TITLES.iter().enumerate() {
         let cmd = COLUMN_FIRST + id as u16;
         append(menu, &Cmd(cmd, title));

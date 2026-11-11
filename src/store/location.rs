@@ -46,6 +46,9 @@ pub const MENU_DUMP_LOG: &str = "menu-dump.log";
 pub const EXPORT_TO_VAR: &str = "GOZ_GUI_EXPORT_TO";
 pub const PICK_FOLDER_VAR: &str = "GOZ_GUI_PICK_FOLDER";
 pub const DESKTOP_DIR_VAR: &str = "GOZ_GUI_DESKTOP_DIR";
+/// Wave 5: the File List Editor's Open... and Save As... use this file
+/// without asking, and its "Save changes?" is answered No.
+pub const EDITOR_FILE_VAR: &str = "GOZ_GUI_EDITOR_FILE";
 
 /// Which rule chose the data folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +238,14 @@ pub fn export_to() -> Option<PathBuf> {
 /// (`GOZ_GUI_PICK_FOLDER`), if set.
 pub fn pick_folder() -> Option<PathBuf> {
     std::env::var_os(PICK_FOLDER_VAR)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The file the File List Editor opens and saves as without asking
+/// (`GOZ_GUI_EDITOR_FILE`), if set.
+pub fn editor_file() -> Option<PathBuf> {
+    std::env::var_os(EDITOR_FILE_VAR)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
 }

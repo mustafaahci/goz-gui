@@ -2,6 +2,7 @@
 //! shows them, one row per line.
 
 use crate::client::Row;
+use crate::columns::COL_CREATED;
 use crate::columns::Layout;
 use crate::window::{COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE};
 use crate::{filetype, format};
@@ -21,6 +22,8 @@ pub enum Field {
     /// The shell's name for the kind of file.
     Type,
     DateModified,
+    /// A file list's date created (wave 5).
+    DateCreated,
     /// The layout's shown columns, left to right, tab-separated.
     Tsv(Layout),
 }
@@ -34,6 +37,7 @@ impl Field {
             COL_SIZE => Field::Size,
             COL_EXT => Field::Extension,
             COL_TYPE => Field::Type,
+            COL_CREATED => Field::DateCreated,
             _ => Field::DateModified,
         }
     }
@@ -59,6 +63,11 @@ pub fn push(row: &Row, field: Field, out: &mut Vec<u16>) {
         Field::Type => out.extend_from_slice(&filetype::name(row)),
         Field::DateModified => {
             if let Some(ft) = row.mtime {
+                format::date(ft, out);
+            }
+        }
+        Field::DateCreated => {
+            if let Some(ft) = row.ctime {
                 format::date(ft, out);
             }
         }
@@ -99,6 +108,7 @@ mod tests {
             name_start: name_start as u32,
             size,
             mtime: None,
+            ctime: None,
             is_dir,
             icon: Cell::new(0),
         }

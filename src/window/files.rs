@@ -800,6 +800,11 @@ impl App {
         if self.own_drag.get() {
             return;
         }
+        // W5: an Everything File List (only .efu files dropped) opens as
+        // the tab's file list.
+        if self.drop_file_list(&paths) {
+            return;
+        }
         // Shift as the drop came: this thread's keys, or the keyboard's own
         // when another program's drag had it.
         // SAFETY: reads the keyboard's state.

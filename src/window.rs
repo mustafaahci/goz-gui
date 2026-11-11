@@ -66,7 +66,7 @@ use crate::{
     status, syntax, theme,
 };
 
-pub use crate::columns::{COL_DATE, COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE, COLS};
+pub use crate::columns::{COL_DATE, COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE};
 
 mod background;
 mod bar;
@@ -809,9 +809,12 @@ See Help > Search Syntax and the README for goz-gui's switches."
             ShowWindow(hwnd, show);
         }
         // W4 (G1): -filelist (or a bare .efu): the first search is the
-        // list's.
+        // list's. W5: else the previous session's shown tab's list, if it
+        // searched one.
         if let Some(list) = &launch.filelist {
             app.set_file_list(list);
+        } else if let Some(list) = restored.as_ref().and_then(|s| s.view().file_list.clone()) {
+            app.start_with_file_list(&list);
         }
         app.start_search(false);
         if let Some(s) = &restored {
@@ -883,6 +886,9 @@ See Help > Search Syntax and the README for goz-gui's switches."
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        // W5: the File List Editor is asked to close (it asks about unsaved
+        // changes), and goz-gui ends once it has.
+        crate::listedit::ui::finish();
         // A copy or move still running finishes first, and so do the
         // opens handed to the shell (Close window on execute closes right
         // after one).
@@ -1058,6 +1064,7 @@ impl App {
                     sort: SortSpec::default(),
                     match_case: false,
                     filelist: None,
+                    created_sort: None,
                 }))),
                 icons: Icons::new(hwnd, WM_ICON, WM_TYPES, WM_TYPES_ASK),
                 scratch: RefCell::new(Scratch::default()),
@@ -2312,6 +2319,8 @@ impl App {
             match_case: o.match_case,
             // W4 (G1): an open file list is searched instead of gozd.
             filelist: self.filelist(),
+            // W5: sorted by its Date Created, when that is the sort.
+            created_sort: self.created_sort(),
         });
         let epoch = self.next_epoch.get() + 1;
         self.next_epoch.set(epoch);
@@ -2577,6 +2586,9 @@ impl App {
                                 send(self.list, LVM_ENSUREVISIBLE, 0, 0);
                             }
                         }
+                        // W5: a file list's dates created, found as it is
+                        // read, bring the Date Created column.
+                        self.refresh_created_column();
                         // SAFETY: repaints the list.
                         unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
                         self.pane_event(PaneEvent::ResultsChanged { refresh: keep });
@@ -2802,10 +2814,12 @@ impl App {
             COL_PATH => SortKey::Path,
             COL_SIZE => SortKey::Size,
             COL_DATE => SortKey::DateModified,
+            // W5: a file list's Date Created, sorted by the list itself.
+            crate::columns::COL_CREATED => return self.sort_by_created(),
             // gozd sorts by these four only: the sort stays, and the status
             // bar says why for a moment.
             _ => {
-                let title = crate::columns::TITLES.get(col).copied().unwrap_or("it");
+                let title = crate::columns::title(col);
                 self.show_note(format!("goz can't sort by {title} yet"));
                 return;
             }
@@ -2816,6 +2830,8 @@ impl App {
         let mut o = self.opts.get();
         o.sort = sort;
         self.opts.set(o);
+        // Another sort than a file list's Date Created (W5).
+        self.end_created_sort();
         self.show_sort();
         self.start_search(false);
     }
@@ -2823,7 +2839,7 @@ impl App {
     /// Repaints what shows the sort: the header's arrow and shaded item
     /// (header.rs draws them, not the header's HDF_SORT* flags), and the
     /// sorted column's cells.
-    fn show_sort(&self) {
+    pub(super) fn show_sort(&self) {
         // SAFETY: invalidates this thread's windows.
         unsafe {
             InvalidateRect(self.header, core::ptr::null(), 0);
@@ -2833,6 +2849,9 @@ impl App {
 
     /// The column the results are sorted by.
     pub fn sorted_column(&self) -> usize {
+        if self.created_sort().is_some() {
+            return crate::columns::COL_CREATED;
+        }
         match self.opts.get().sort.key {
             SortKey::Name => COL_NAME,
             SortKey::Path => COL_PATH,
@@ -2842,7 +2861,10 @@ impl App {
     }
 
     pub fn sort_ascending(&self) -> bool {
-        self.opts.get().sort.dir == SortDir::Asc
+        match self.created_sort() {
+            Some(dir) => dir == SortDir::Asc,
+            None => self.opts.get().sort.dir == SortDir::Asc,
+        }
     }
 
     /// The search options in force that the status bar shows, left to right.
@@ -2924,7 +2946,7 @@ impl App {
     pub fn column_rects(&self, row: &RECT) -> Cells {
         let cols = self.list_cols.get();
         let n = cols.ids().len();
-        let mut order = [0i32; COLS];
+        let mut order = [0i32; crate::columns::LIST_COLS];
         send(
             self.list,
             LVM_GETCOLUMNORDERARRAY,
@@ -2932,7 +2954,7 @@ impl App {
             order.as_mut_ptr() as isize,
         );
         let mut out = Cells {
-            cells: [(0, RECT::default()); COLS],
+            cells: [(0, RECT::default()); crate::columns::LIST_COLS],
             len: 0,
         };
         let mut x = row.left;
@@ -2968,7 +2990,7 @@ impl App {
 
 /// The shown columns of a row: each one's id and rectangle, left to right.
 pub struct Cells {
-    cells: [(usize, RECT); COLS],
+    cells: [(usize, RECT); crate::columns::LIST_COLS],
     len: usize,
 }
 

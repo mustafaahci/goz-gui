@@ -6,16 +6,31 @@
 //! Advanced Copy/Move to Folder... run through the file tools,
 //! `file_tools.rs`.)
 //!
-//! An open file list is the window's, for every tab: each search the
-//! window makes carries it (`client::Search::filelist`), and the search
-//! worker, Export and the find bar answer from its rows instead of
-//! gozd's. No `RefCell` of the window is borrowed while a dialog runs.
+//! An open file list is the shown tab's (wave 5; Everything's `index` and
+//! `index_file_list` per tab in `Session.json`): each search the window
+//! makes carries it (`client::Search::filelist`), and the search worker,
+//! Export and the find bar answer from its rows instead of gozd's. The
+//! lists other open tabs search are held while those tabs are, so going
+//! back to one costs nothing; a list no open tab names any more is let go,
+//! and read again when a tab that names it (a reopened tab, a restored
+//! session) shows. A new tab searches the index, as Everything's Home
+//! (`home_index`) says by default. Dropping `.efu` files on the window
+//! opens the first as a list (`drop_file_list`).
+//!
+//! While the shown tab's list has dates created, the results have a Date
+//! Created column after the layout's, which sorts the list's matches by
+//! that date (`created_sort`), a sort only a list can make: any other sort
+//! ends it, and so does another list or tab.
+//!
+//! No `RefCell` of the window is borrowed while a dialog runs.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
+use goz_core::types::SortDir;
+
+use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, HMENU, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
     MB_YESNO,
@@ -95,7 +110,14 @@ fn wait_for_process(pid: u32, ms: u32) {
 
 /// The data tools' state in the window.
 pub(super) struct DataTools {
+    /// The shown tab's file list.
     list: RefCell<Option<Arc<FileList>>>,
+    /// The lists the other open tabs search (W5).
+    held: RefCell<Vec<Arc<FileList>>>,
+    /// The shown list's matches are sorted by its Date Created (W5).
+    created_sort: Cell<Option<SortDir>>,
+    /// The Date Created column's width at 96 DPI, while the window lasts.
+    created_width: Cell<i32>,
     /// One of their dialogs is open.
     dialog: Cell<bool>,
     /// Import or Reset Settings waits for the other windows to end.
@@ -106,10 +128,35 @@ impl DataTools {
     pub(super) fn new() -> DataTools {
         DataTools {
             list: RefCell::new(None),
+            held: RefCell::new(Vec::new()),
+            created_sort: Cell::new(None),
+            created_width: Cell::new(crate::columns::DEFAULT_WIDTHS[crate::columns::COL_DATE]),
             dialog: Cell::new(false),
             replacing: RefCell::new(None),
         }
     }
+}
+
+/// Whether `list` is the file at `path` (Windows' paths: any case).
+fn is_list(list: &FileList, path: &str) -> bool {
+    let full = std::path::absolute(Path::new(path)).unwrap_or_else(|_| PathBuf::from(path));
+    list.path()
+        .as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&full.as_os_str().to_string_lossy())
+}
+
+/// The file list a drop opens: the first of `paths` when every one is an
+/// `.efu` file (`is_dir` says which are folders); `None` when any is not,
+/// and the drop searches for the paths as before.
+pub(super) fn efu_drop(paths: &[Vec<u16>], is_dir: impl Fn(&[u16]) -> bool) -> Option<String> {
+    let efu = |p: &Vec<u16>| {
+        String::from_utf16_lossy(p)
+            .to_ascii_lowercase()
+            .ends_with(".efu")
+            && !is_dir(p)
+    };
+    (!paths.is_empty() && paths.iter().all(efu)).then(|| String::from_utf16_lossy(&paths[0]))
 }
 
 /// Open File List...'s file types: Everything's.
@@ -137,11 +184,18 @@ impl App {
         menu::add_items_before(
             self.menus.tools,
             menu::OPTIONS,
-            // Everything's access key, S, is Start goz Service's here.
-            &[Item::Cmd(
-                cmd::IMPORT_EXPORT_SETTINGS,
-                "&Import and Export Settings...",
-            )],
+            // Everything's access key, S, is Start goz Service's here. W5:
+            // the File List Editor first, in Everything's place.
+            &[
+                Item::Cmd(
+                    crate::listedit::cmd::FILE_LIST_EDITOR,
+                    "File List &Editor...",
+                ),
+                Item::Cmd(
+                    cmd::IMPORT_EXPORT_SETTINGS,
+                    "&Import and Export Settings...",
+                ),
+            ],
         );
         menu::add_items(
             self.menus.help,
@@ -158,6 +212,219 @@ impl App {
         if let Some(list) = self.data_tools.list.borrow_mut().take() {
             list.close();
         }
+        for list in self.data_tools.held.take() {
+            list.close();
+        }
+    }
+
+    // ---- W5: a file list per tab, and its Date Created ----
+
+    /// The full path the shown tab's list is kept under in the session.
+    pub(super) fn filelist_path(&self) -> Option<String> {
+        self.filelist()
+            .map(|l| l.path().as_os_str().to_string_lossy().into_owned())
+    }
+
+    /// The lists the open tabs other than the shown one search, by path
+    /// (the shown tab's own entry is not up to date while it shows).
+    fn other_tabs_lists(&self) -> Vec<String> {
+        let t = self.tabs.borrow();
+        t.tabs()
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != t.current())
+            .filter_map(|(_, v)| v.file_list.clone())
+            .collect()
+    }
+
+    /// `old` is not the shown tab's list any more: held while another open
+    /// tab searches it, else let go.
+    fn release_list(&self, old: Arc<FileList>) {
+        if self.other_tabs_lists().iter().any(|p| is_list(&old, p)) {
+            self.data_tools.held.borrow_mut().push(old);
+        } else {
+            old.close();
+        }
+    }
+
+    /// The tab about to show searches `want` (a session's tab, another
+    /// tab's, a reopened one's), or the index for `None`: the window's list
+    /// becomes that one, the one held for it or (not held) opened again
+    /// from its file; a list that cannot be opened now is said in the
+    /// status bar and the tab searches the index. Lists no open tab names
+    /// any more are let go.
+    pub(super) fn tab_file_list(&self, want: Option<&str>) {
+        let current = self.filelist();
+        let same = match (&current, want) {
+            (Some(l), Some(p)) => is_list(l, p),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            let mut held = self.data_tools.held.take();
+            if let Some(old) = self.data_tools.list.borrow_mut().take() {
+                held.push(old);
+            }
+            let next = want.and_then(|p| {
+                if let Some(i) = held.iter().position(|l| is_list(l, p)) {
+                    return Some(held.remove(i));
+                }
+                self.open_list(p, false)
+            });
+            *self.data_tools.list.borrow_mut() = next;
+            *self.data_tools.held.borrow_mut() = held;
+            self.list_changed();
+        }
+        // The tabs' lists as they are now: the others are let go.
+        let named: Vec<String> = self
+            .tabs
+            .borrow()
+            .tabs()
+            .iter()
+            .filter_map(|v| v.file_list.clone())
+            .collect();
+        self.data_tools.held.borrow_mut().retain(|l| {
+            let keep = named.iter().any(|p| is_list(l, p));
+            if !keep {
+                l.close();
+            }
+            keep
+        });
+    }
+
+    /// Opens the list at `path` to read; said when it cannot be: in a
+    /// message box when the user asked (`ask`), else in the status bar.
+    fn open_list(&self, path: &str, ask: bool) -> Option<Arc<FileList>> {
+        let full = std::path::absolute(Path::new(path)).unwrap_or_else(|_| PathBuf::from(path));
+        let notify = Notify {
+            hwnd: self.hwnd as usize,
+            msg: WM_FILELIST,
+        };
+        match FileList::open(&full, Some(notify)) {
+            Ok(list) => Some(list),
+            Err(e) if ask => {
+                msgbox::show(
+                    self.hwnd,
+                    &format!(
+                        "The file list could not be opened:\n\n{}\n\n{e}",
+                        full.display()
+                    ),
+                    "Open File List",
+                    MB_OK | MB_ICONWARNING,
+                );
+                None
+            }
+            Err(e) => {
+                self.show_note(format!(
+                    "The file list {} could not be opened: {e}",
+                    full.display()
+                ));
+                None
+            }
+        }
+    }
+
+    /// The shown tab's list changed (another, none, or another tab's): a
+    /// Date Created sort ends, and the column comes or goes.
+    fn list_changed(&self) {
+        if self.data_tools.created_sort.take().is_some() {
+            self.show_sort();
+        }
+        self.refresh_created_column();
+        self.invalidate_status();
+    }
+
+    /// Whether the results have the Date Created column now: the shown
+    /// tab's list has dates created.
+    pub(super) fn created_column_wanted(&self) -> bool {
+        self.filelist().is_some_and(|l| l.has_created())
+    }
+
+    /// Puts the Date Created column on the list or takes it off, as the
+    /// shown list says (its dates may show up as it is read); a sort by it
+    /// ends with it.
+    pub(super) fn refresh_created_column(&self) {
+        let wanted = self.created_column_wanted();
+        if wanted == self.list_cols.get().has_created() {
+            return;
+        }
+        if !wanted && self.data_tools.created_sort.take().is_some() {
+            self.show_sort();
+        }
+        // The user's last widths and order first.
+        self.sync_columns();
+        self.apply_columns(self.layout.get());
+    }
+
+    pub(super) fn created_width(&self) -> i32 {
+        self.data_tools.created_width.get()
+    }
+
+    pub(super) fn set_created_width(&self, width: i32) {
+        self.data_tools
+            .created_width
+            .set(width.clamp(crate::columns::MIN_WIDTH, 8192));
+    }
+
+    /// The Date Created sort in force: only while the shown list has the
+    /// column.
+    pub(super) fn created_sort(&self) -> Option<SortDir> {
+        self.data_tools
+            .created_sort
+            .get()
+            .filter(|_| self.created_column_wanted())
+    }
+
+    /// Sorts the list's matches by Date Created, `dir`.
+    pub(super) fn set_created_sort(&self, dir: SortDir) {
+        if !self.created_column_wanted() {
+            return;
+        }
+        self.data_tools.created_sort.set(Some(dir));
+        self.show_sort();
+        self.start_search(false);
+    }
+
+    /// A click on Date Created's header: the other way round when it is
+    /// the sort, else newest first (as Date Modified's first sort, Options
+    /// > Results' "Sort date descending first").
+    pub(super) fn sort_by_created(&self) {
+        let dir = match self.created_sort() {
+            Some(SortDir::Asc) => SortDir::Desc,
+            Some(SortDir::Desc) => SortDir::Asc,
+            None => self.first_sort(goz_core::types::SortKey::DateModified).dir,
+        };
+        self.set_created_sort(dir);
+    }
+
+    /// Another sort was chosen: the Date Created sort ends.
+    pub(super) fn end_created_sort(&self) {
+        self.data_tools.created_sort.set(None);
+    }
+
+    /// Files dropped on the window: when they are all `.efu` files, the
+    /// first opens as a file list (true); otherwise false, and the drop
+    /// searches for them as before.
+    pub(super) fn drop_file_list(&self, paths: &[Vec<u16>]) -> bool {
+        let is_dir = |p: &[u16]| crate::filetools::attributes(p).is_some_and(|a| a & 0x10 != 0);
+        match efu_drop(paths, is_dir) {
+            Some(list) => {
+                if paths.len() > 1 {
+                    self.show_note("Only the first file list dropped was opened".into());
+                }
+                self.open_file_list(&list);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The window starts with the previous session's shown tab, which
+    /// searched the list at `path`: it searches it again (a list gone
+    /// since is said in the status bar).
+    pub(super) fn start_with_file_list(&self, path: &str) {
+        *self.data_tools.list.borrow_mut() = self.open_list(path, false);
+        self.list_changed();
     }
 
     /// A menu is about to open: File gets Open File List..., Recent File
@@ -242,6 +509,19 @@ impl App {
         true
     }
 
+    /// W5: Tools > File List Editor... (its own window, on a thread of its
+    /// own; one already open comes to the front); false for another id.
+    pub(super) fn list_editor_command(&self, id: u16) -> bool {
+        if id != crate::listedit::cmd::FILE_LIST_EDITOR {
+            return false;
+        }
+        let mut rc = RECT::default();
+        // SAFETY: reads this thread's window's place.
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut rc) };
+        crate::listedit::ui::open(self.dialog_look(), rc);
+        true
+    }
+
     /// A data tool's WM_APP message.
     pub(super) fn data_tools_message(&self, msg: u32, w: WPARAM, _l: LPARAM) {
         if msg == WM_FILELIST {
@@ -287,50 +567,31 @@ impl App {
         true
     }
 
-    /// Opens the list at `path` for the searches to come (and in Recent
-    /// File Lists); false (said) when it cannot be opened.
+    /// Opens the list at `path` for the shown tab's searches to come (and
+    /// in Recent File Lists); false (said) when it cannot be opened.
     pub(super) fn set_file_list(&self, path: &str) -> bool {
-        let full = std::path::absolute(Path::new(path)).unwrap_or_else(|_| PathBuf::from(path));
-        let notify = Notify {
-            hwnd: self.hwnd as usize,
-            msg: WM_FILELIST,
+        let Some(list) = self.open_list(path, true) else {
+            return false;
         };
-        let list = match FileList::open(&full, Some(notify)) {
-            Ok(list) => list,
-            Err(e) => {
-                msgbox::show(
-                    self.hwnd,
-                    &format!(
-                        "The file list could not be opened:\n\n{}\n\n{e}",
-                        full.display()
-                    ),
-                    "Open File List",
-                    MB_OK | MB_ICONWARNING,
-                );
-                return false;
-            }
-        };
+        let full = list.path().display().to_string();
         let old = self.data_tools.list.replace(Some(list));
         if let Some(old) = old {
-            old.close();
+            self.release_list(old);
         }
-        self.prefs
-            .borrow_mut()
-            .base
-            .file_lists
-            .opened(&full.display().to_string());
+        self.list_changed();
+        self.prefs.borrow_mut().base.file_lists.opened(&full);
         self.settings_changed();
         true
     }
 
     /// File > Close File List (or a double-click on its name in the status
-    /// bar): gozd's index is searched again.
+    /// bar): the shown tab searches gozd's index again.
     pub(super) fn close_file_list(&self) {
         let old = self.data_tools.list.borrow_mut().take();
         let Some(old) = old else { return };
-        old.close();
+        self.release_list(old);
+        self.list_changed();
         self.start_search(false);
-        self.invalidate_status();
     }
 
     /// The open list was read to its end (`ok`), or reading stopped on an
@@ -351,6 +612,7 @@ impl App {
                 crate::format::grouped(list.skipped())
             ));
         }
+        self.refresh_created_column();
         self.start_search(true);
         self.invalidate_status();
     }
@@ -645,5 +907,51 @@ impl App {
         self.exit_other_windows_unsaved();
         // SAFETY: destroys this thread's window; the process ends with it.
         unsafe { DestroyWindow(self.hwnd) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn w(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn a_drop_of_efu_files_only_opens_the_first() {
+        let no_dirs = |_: &[u16]| false;
+        assert_eq!(
+            efu_drop(&[w(r"C:\a\x.EFU"), w(r"C:\b.efu")], no_dirs),
+            Some(r"C:\a\x.EFU".into())
+        );
+        // Anything else in the drop: the paths are searched for, as before.
+        assert_eq!(efu_drop(&[w(r"C:\a.efu"), w(r"C:\b.txt")], no_dirs), None);
+        assert_eq!(efu_drop(&[w(r"C:\a.txt")], no_dirs), None);
+        assert_eq!(efu_drop(&[], no_dirs), None);
+        // A folder named so is no list.
+        let dirs = |p: &[u16]| String::from_utf16_lossy(p).ends_with("dir.efu");
+        assert_eq!(efu_drop(&[w(r"C:\dir.efu")], dirs), None);
+    }
+
+    #[test]
+    fn a_list_is_known_by_its_path_in_any_case() {
+        let dir = std::env::temp_dir().join(format!("goz-gui-islist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("List.efu");
+        std::fs::write(&file, "Filename\r\nC:\\a.txt\r\n").unwrap();
+        let list = FileList::open(&file, None).unwrap();
+        let path = file.display().to_string();
+        assert!(is_list(&list, &path));
+        assert!(is_list(&list, &path.to_uppercase()));
+        assert!(!is_list(
+            &list,
+            &dir.join("other.efu").display().to_string()
+        ));
+        list.close();
+        while !list.loaded() {
+            std::thread::yield_now();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

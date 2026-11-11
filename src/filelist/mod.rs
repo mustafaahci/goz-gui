@@ -16,9 +16,14 @@
 //! numbers each. The last answer is kept, so the blocks of one search after
 //! the first cost a copy of their rows.
 //!
-//! A row costs its path (UTF-8), a size, a date and a flag: about 120 bytes
-//! for a typical path, so a list of a million rows holds about 130 MB while
-//! it is open. Closing the list lets all of it go.
+//! A row costs its path (UTF-8), a size, two dates and a flag: about 130
+//! bytes for a typical path, so a list of a million rows holds about 140 MB
+//! while it is open. Closing the list lets all of it go.
+//!
+//! Wave 5: the list's `Date Created` column is read too. While a list with
+//! any date created is open the window shows a Date Created column, and a
+//! search can be sorted by it here ([`Order::Created`]), which gozd's four
+//! sort keys cannot say.
 
 pub mod create;
 pub mod matcher;
@@ -51,12 +56,13 @@ const NO_SIZE: u64 = u64::MAX;
 const NO_DATE: i64 = i64::MIN;
 
 /// Rows read from the list: their paths end to end, and each row's end in
-/// them, size, date modified and whether it is a folder.
+/// them, size, date modified, date created and whether it is a folder.
 struct Chunk {
     text: Vec<u8>,
     ends: Vec<u32>,
     size: Vec<u64>,
     mtime: Vec<i64>,
+    ctime: Vec<i64>,
     dir: Vec<bool>,
 }
 
@@ -67,6 +73,7 @@ impl Chunk {
             ends: Vec::with_capacity(CHUNK_ROWS),
             size: Vec::with_capacity(CHUNK_ROWS),
             mtime: Vec::with_capacity(CHUNK_ROWS),
+            ctime: Vec::with_capacity(CHUNK_ROWS),
             dir: Vec::with_capacity(CHUNK_ROWS),
         }
     }
@@ -88,16 +95,21 @@ impl Chunk {
         Some(self.mtime[i]).filter(|&t| t != NO_DATE)
     }
 
+    fn ctime(&self, i: usize) -> Option<i64> {
+        Some(self.ctime[i]).filter(|&t| t != NO_DATE)
+    }
+
     /// Adds a row; false when its path does not fit (a chunk's text stays
     /// under 4 GB, far beyond any real list).
-    fn push(&mut self, path: &str, size: Option<u64>, mtime: Option<i64>, dir: bool) -> bool {
+    fn push(&mut self, path: &str, size: Option<u64>, dates: Dates, dir: bool) -> bool {
         let Ok(end) = u32::try_from(self.text.len() + path.len()) else {
             return false;
         };
         self.text.extend_from_slice(path.as_bytes());
         self.ends.push(end);
         self.size.push(size.unwrap_or(NO_SIZE));
-        self.mtime.push(mtime.unwrap_or(NO_DATE));
+        self.mtime.push(dates.modified.unwrap_or(NO_DATE));
+        self.ctime.push(dates.created.unwrap_or(NO_DATE));
         self.dir.push(dir);
         true
     }
@@ -110,6 +122,21 @@ impl Chunk {
             mtime: self.mtime(i),
         }
     }
+}
+
+/// A row's dates, as FILETIMEs: modified and created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dates {
+    pub modified: Option<i64>,
+    pub created: Option<i64>,
+}
+
+/// How a list's matches are ordered: as gozd orders its own, or (wave 5)
+/// by the list's Date Created, which gozd cannot sort by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    Gozd(SortSpec),
+    Created(SortDir),
 }
 
 /// Row `g` of the list: its chunk and its place there.
@@ -129,7 +156,7 @@ struct Ranks {
 /// A search's matches, sorted, as [`FileList::answer`] gives them.
 pub struct Matched {
     query: String,
-    sort: SortSpec,
+    sort: Order,
     match_case: bool,
     /// The rows read when it was made, and whether that was all of them.
     rows: usize,
@@ -153,6 +180,9 @@ pub struct FileList {
     error: Mutex<Option<String>>,
     /// Rows without a path, or whose path did not fit, left out.
     skipped: Mutex<u64>,
+    /// Some row read has a date created (the window then shows the Date
+    /// Created column).
+    created: AtomicBool,
     ranks: OnceLock<Ranks>,
     last: Mutex<Option<Arc<Matched>>>,
 }
@@ -189,6 +219,7 @@ impl FileList {
             stop: AtomicBool::new(false),
             error: Mutex::new(None),
             skipped: Mutex::new(0),
+            created: AtomicBool::new(false),
             ranks: OnceLock::new(),
             last: Mutex::new(None),
         });
@@ -218,12 +249,35 @@ impl FileList {
         Ok(list)
     }
 
-    /// An empty list, read at once: for tests of what uses lists.
+    /// A list of `rows`, read at once: for tests of what uses lists.
     #[cfg(test)]
     pub fn from_rows(rows: &[(&str, Option<u64>, Option<i64>, bool)]) -> Arc<FileList> {
+        let with: Vec<_> = rows
+            .iter()
+            .map(|&(p, s, t, d)| (p, s, t, None, d))
+            .collect();
+        FileList::from_dated_rows(&with)
+    }
+
+    /// [`from_rows`](Self::from_rows) with each row's date created.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub fn from_dated_rows(
+        rows: &[(&str, Option<u64>, Option<i64>, Option<i64>, bool)],
+    ) -> Arc<FileList> {
         let mut chunk = Chunk::new();
-        for &(p, s, t, d) in rows {
-            chunk.push(p, s, t, d);
+        let mut created = false;
+        for &(p, s, modified, c, d) in rows {
+            created |= c.is_some();
+            chunk.push(
+                p,
+                s,
+                Dates {
+                    modified,
+                    created: c,
+                },
+                d,
+            );
         }
         let list = Arc::new(FileList {
             path: PathBuf::from("test.efu"),
@@ -233,6 +287,7 @@ impl FileList {
             stop: AtomicBool::new(false),
             error: Mutex::new(None),
             skipped: Mutex::new(0),
+            created: AtomicBool::new(created),
             ranks: OnceLock::new(),
             last: Mutex::new(None),
         });
@@ -272,6 +327,12 @@ impl FileList {
         *lock(&self.skipped)
     }
 
+    /// Whether a row read so far has a date created: the list has
+    /// Everything's Date Created column with values in it.
+    pub fn has_created(&self) -> bool {
+        self.created.load(Ordering::Relaxed)
+    }
+
     /// The list is closed: reading stops, and what was read goes with the
     /// last reference.
     pub fn close(&self) {
@@ -284,7 +345,7 @@ impl FileList {
     pub fn answer(
         &self,
         query: &str,
-        sort: SortSpec,
+        sort: Order,
         match_case: bool,
         stale: &dyn Fn() -> bool,
     ) -> Result<Option<Arc<Matched>>, String> {
@@ -358,7 +419,9 @@ impl FileList {
                 let path: Box<[u16]> = String::from_utf8_lossy(chunk.path(i))
                     .encode_utf16()
                     .collect();
-                Some(Row::new(path, chunk.size(i), chunk.mtime(i), chunk.dir[i]))
+                let mut row = Row::new(path, chunk.size(i), chunk.mtime(i), chunk.dir[i]);
+                row.ctime = chunk.ctime(i);
+                Some(row)
             })
             .collect()
     }
@@ -406,7 +469,7 @@ impl LocalClock for MachineClock {
 
 /// A reader of the list's text as UTF-8: as it is, or a UTF-16 list
 /// (with its byte order mark) turned into UTF-8 first.
-fn utf8_reader(file: File) -> io::Result<Box<dyn BufRead + Send>> {
+pub(crate) fn utf8_reader(file: File) -> io::Result<Box<dyn BufRead + Send>> {
     let mut reader = BufReader::with_capacity(1 << 20, file);
     let head = reader.fill_buf()?;
     if head.starts_with(&[0xFF, 0xFE]) {
@@ -427,7 +490,6 @@ fn utf8_reader(file: File) -> io::Result<Box<dyn BufRead + Send>> {
 /// Reads the list's rows into `list`, publishing each full chunk.
 fn read_list(list: &FileList, file: File, base: &str) -> Result<(), String> {
     let reader = utf8_reader(file).map_err(|e| e.to_string())?;
-    let mut records = parse::Records::new(reader);
     let clock = MachineClock::read();
     let to_utc = |t: i64| clock.to_utc(t);
     let mut chunk = Chunk::new();
@@ -437,49 +499,25 @@ fn read_list(list: &FileList, file: File, base: &str) -> Result<(), String> {
         chunk.text.shrink_to_fit();
         lock(&list.chunks).push(Arc::new(chunk));
     };
-    let mut add = |chunk: &mut Chunk, path: &str, size, mtime, dir| {
-        if path.is_empty() || !chunk.push(path, size, mtime, dir) {
-            skipped += 1;
-        }
-    };
-    if !records.read().map_err(|e| e.to_string())? {
+    parse::each_row(
+        reader,
+        base,
+        &to_utc,
+        &list.stop,
+        |path, size, dates, _, dir| {
+            if path.is_empty() || !chunk.push(path, size, dates, dir) {
+                skipped += 1;
+            } else if dates.created.is_some() && !list.created.load(Ordering::Relaxed) {
+                list.created.store(true, Ordering::Relaxed);
+            }
+            if chunk.len() == CHUNK_ROWS {
+                publish(std::mem::replace(&mut chunk, Chunk::new()));
+            }
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    if list.stop.load(Ordering::Relaxed) {
         return Ok(());
-    }
-    let columns = parse::Columns::of_header(records.fields());
-    if columns.is_none() {
-        // No header: a plain list of paths, this line the first.
-        records.lines_only();
-        let (p, marked) = parse::path(parse::plain_line(records.raw()), base);
-        add(&mut chunk, &p, None, None, marked);
-    }
-    let mut n = 0usize;
-    while records.read().map_err(|e| e.to_string())? {
-        n += 1;
-        if n.is_multiple_of(4096) && list.stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let (p, size, mtime, dir) = match columns {
-            Some(c) => {
-                let (p, marked) = parse::path(records.field(c.filename), base);
-                let attributes = c
-                    .attributes
-                    .and_then(|i| parse::attributes(records.field(i)));
-                let dir = marked || parse::is_folder_attribute(attributes);
-                let size = c.size.and_then(|i| parse::size(records.field(i)));
-                let mtime = c
-                    .modified
-                    .and_then(|i| parse::date(records.field(i), &to_utc));
-                (p, size, mtime, dir)
-            }
-            None => {
-                let (p, marked) = parse::path(parse::plain_line(records.raw()), base);
-                (p, None, None, marked)
-            }
-        };
-        add(&mut chunk, &p, size, mtime, dir);
-        if chunk.len() == CHUNK_ROWS {
-            publish(std::mem::replace(&mut chunk, Chunk::new()));
-        }
     }
     if chunk.len() > 0 {
         publish(chunk);
@@ -526,21 +564,27 @@ fn path_key(path: &[u8]) -> Vec<u8> {
 
 /// Sorts `order` as gozd sorts its matches: by the sort's key (unknown
 /// sizes and dates last), then the folded name, then the row; a
-/// descending sort is that order reversed.
-fn sort_rows(chunks: &[Arc<Chunk>], ranks: Option<&Ranks>, order: &mut [u32], sort: SortSpec) {
+/// descending sort is that order reversed. Date Created sorts as Date
+/// Modified does, by the other date.
+fn sort_rows(chunks: &[Arc<Chunk>], ranks: Option<&Ranks>, order: &mut [u32], sort: Order) {
     let at = |g: u32| {
         let (c, i) = split(g);
         (&chunks[c], i)
     };
+    let (key, dir, created) = match sort {
+        Order::Gozd(s) => (s.key, s.dir, false),
+        Order::Created(dir) => (SortKey::DateModified, dir, true),
+    };
     let primary = |g: u32| -> u64 {
         let (chunk, i) = at(g);
-        match sort.key {
-            SortKey::Size => size_key(chunk.size(i).filter(|_| !chunk.dir[i]), sort.dir),
-            SortKey::DateModified => mtime_key(chunk.mtime(i), sort.dir),
+        match key {
+            SortKey::Size => size_key(chunk.size(i).filter(|_| !chunk.dir[i]), dir),
+            SortKey::DateModified if created => mtime_key(chunk.ctime(i), dir),
+            SortKey::DateModified => mtime_key(chunk.mtime(i), dir),
             SortKey::Name | SortKey::Path => 0,
         }
     };
-    match (ranks, sort.key) {
+    match (ranks, key) {
         (Some(r), SortKey::Name) => order.sort_unstable_by_key(|&g| r.name[g as usize]),
         (Some(r), SortKey::Path) => order.sort_unstable_by_key(|&g| r.path[g as usize]),
         (Some(r), _) => order.sort_unstable_by_key(|&g| (primary(g), r.name[g as usize])),
@@ -555,7 +599,7 @@ fn sort_rows(chunks: &[Arc<Chunk>], ranks: Option<&Ranks>, order: &mut [u32], so
             (primary(g), name, g)
         }),
     }
-    if sort.dir == SortDir::Desc {
+    if dir == SortDir::Desc {
         order.reverse();
     }
 }
@@ -671,8 +715,12 @@ mod tests {
     ];
 
     fn names(list: &FileList, query: &str, key: SortKey, dir: SortDir) -> Vec<String> {
+        ordered(list, query, Order::Gozd(SortSpec { key, dir }))
+    }
+
+    fn ordered(list: &FileList, query: &str, order: Order) -> Vec<String> {
         let m = list
-            .answer(query, SortSpec { key, dir }, false, &|| false)
+            .answer(query, order, false, &|| false)
             .expect("answers")
             .expect("not stale");
         list.rows_of(&m, 0..m.order.len())
@@ -756,9 +804,55 @@ mod tests {
     }
 
     #[test]
+    fn sorts_by_date_created_with_unknown_dates_last() {
+        let list = FileList::from_dated_rows(&[
+            (r"C:\a\old.txt", Some(1), Some(900), Some(100), false),
+            (r"C:\a\none.txt", Some(1), Some(800), None, false),
+            (r"C:\a\new.txt", Some(1), Some(700), Some(300), false),
+            (r"C:\a\mid.txt", Some(1), Some(600), Some(200), false),
+        ]);
+        assert!(list.has_created());
+        assert!(!FileList::from_rows(&ROWS).has_created());
+        assert_eq!(
+            ordered(&list, "", Order::Created(SortDir::Desc)),
+            [
+                r"C:\a\new.txt",
+                r"C:\a\mid.txt",
+                r"C:\a\old.txt",
+                r"C:\a\none.txt"
+            ]
+        );
+        assert_eq!(
+            ordered(&list, "", Order::Created(SortDir::Asc)),
+            [
+                r"C:\a\old.txt",
+                r"C:\a\mid.txt",
+                r"C:\a\new.txt",
+                r"C:\a\none.txt"
+            ]
+        );
+        // Another order is another answer, not the one kept.
+        let by_dm = ordered(
+            &list,
+            "",
+            Order::Gozd(SortSpec {
+                key: SortKey::DateModified,
+                dir: SortDir::Desc,
+            }),
+        );
+        assert_eq!(by_dm[0], r"C:\a\old.txt");
+        let m = list
+            .answer("", Order::Created(SortDir::Desc), false, &|| false)
+            .unwrap()
+            .unwrap();
+        let rows = list.rows_of(&m, 0..1);
+        assert_eq!(rows[0].ctime, Some(300));
+    }
+
+    #[test]
     fn answers_are_kept_and_refusals_are_gozds() {
         let list = FileList::from_rows(&ROWS);
-        let spec = SortSpec::default();
+        let spec = Order::Gozd(SortSpec::default());
         let a = list.answer("txt", spec, false, &|| false).unwrap().unwrap();
         let b = list.answer("txt", spec, false, &|| false).unwrap().unwrap();
         assert!(Arc::ptr_eq(&a, &b));
@@ -780,7 +874,7 @@ mod tests {
         std::fs::write(
             &efu,
             "Filename,Size,Date Modified,Date Created,Attributes\r\n\
-             \"C:\\x\\a.txt\",5,133000000000000000,,32\r\n\
+             \"C:\\x\\a.txt\",5,133000000000000000,132000000000000000,32\r\n\
              \"C:\\x\\sub\\\",,,,16\r\n\
              \"rel\\b.txt\",7,,,32\r\n\
              ,,,,\r\n",
@@ -802,7 +896,7 @@ mod tests {
         }
         assert_eq!(list.skipped(), 1);
         let m = list
-            .answer("", SortSpec::default(), false, &|| false)
+            .answer("", Order::Gozd(SortSpec::default()), false, &|| false)
             .unwrap()
             .unwrap();
         let rows = list.rows_of(&m, 0..10);
@@ -819,6 +913,8 @@ mod tests {
         assert!(sub.is_dir);
         let a = rows.iter().find(|r| r.size == Some(5)).expect("a.txt");
         assert_eq!(a.mtime, Some(133_000_000_000_000_000));
+        assert_eq!(a.ctime, Some(132_000_000_000_000_000));
+        assert!(list.has_created());
         assert!(FileList::open(&dir.join("missing.efu"), None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

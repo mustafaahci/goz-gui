@@ -379,6 +379,7 @@ mod tests {
             sort: goz_core::types::SortSpec::default(),
             match_case: false,
             filelist: None,
+            created_sort: None,
         }))
     }
 
@@ -388,6 +389,7 @@ mod tests {
             name_start: 3,
             size,
             mtime: None,
+            ctime: None,
             is_dir,
             icon: Cell::new(0),
         }

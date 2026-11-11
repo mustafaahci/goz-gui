@@ -869,7 +869,10 @@ pub(super) struct Finding {
 }
 
 fn same_search(a: &Search, b: &Search) -> bool {
-    a.query == b.query && a.sort == b.sort && a.match_case == b.match_case
+    a.query == b.query
+        && a.sort == b.sort
+        && a.match_case == b.match_case
+        && a.created_sort == b.created_sort
 }
 
 impl App {
@@ -1574,6 +1577,7 @@ mod tests {
             sort: Default::default(),
             match_case: false,
             filelist: None,
+            created_sort: None,
         };
         assert!(same_search(&s("a"), &s("a")));
         assert!(!same_search(&s("a"), &s("b")));

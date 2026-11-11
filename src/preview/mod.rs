@@ -399,6 +399,7 @@ fn focused(app: &App) -> Focus {
                 name_start: r.name_start,
                 size: r.size,
                 mtime: r.mtime,
+                ctime: r.ctime,
                 is_dir: r.is_dir,
                 icon: Cell::new(r.icon.get()),
             })
