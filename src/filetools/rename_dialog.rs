@@ -28,11 +28,14 @@ use std::collections::{HashMap, HashSet};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, GetSysColorBrush, HDC, InvalidateRect, SetBkMode, SetTextColor, TRANSPARENT,
+    COLOR_BTNFACE, COLOR_WINDOWTEXT, DT_CALCRECT, DT_NOPREFIX, DT_WORDBREAK, DrawTextW, FillRect,
+    GetSysColor, GetSysColorBrush, HBRUSH, HDC, HFONT, InvalidateRect, SelectObject, SetBkMode,
+    SetTextColor, TRANSPARENT,
 };
+use windows_sys::Win32::System::SystemServices::SS_OWNERDRAW;
 use windows_sys::Win32::UI::Controls::{
-    CDDS_ITEMPREPAINT, CDDS_SUBITEM, CDRF_NEWFONT, CDRF_NOTIFYSUBITEMDRAW, EM_GETSEL,
-    EM_REPLACESEL, EM_SETSEL, LVIF_TEXT, LVIS_SELECTED, LVM_GETITEMSTATE,
+    CDDS_ITEMPREPAINT, CDDS_SUBITEM, CDRF_NEWFONT, CDRF_NOTIFYSUBITEMDRAW, DRAWITEMSTRUCT,
+    EM_GETSEL, EM_REPLACESEL, EM_SETSEL, LVIF_TEXT, LVIS_SELECTED, LVM_GETITEMSTATE,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVN_GETDISPINFOW, LVN_ODFINDITEMW,
     LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT,
     LVS_SHOWSELALWAYS, NM_CUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW, NMLVDISPINFOW,
@@ -45,10 +48,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN,
     CBN_EDITCHANGE, CBN_SELCHANGE, CBS_AUTOHSCROLL, CBS_DROPDOWN, DWLP_MSGRESULT, EN_CHANGE,
     ES_AUTOHSCROLL, EndDialog, FindWindowExW, GWLP_USERDATA, GetWindowRect, IDCANCEL, IDOK, IDYES,
-    KillTimer, MB_ICONQUESTION, MB_YESNO, MINMAXINFO, PostMessageW, SetTimer, SetWindowLongPtrW,
-    SetWindowTextW, WM_APP, WM_CHAR, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_GETMINMAXINFO,
-    WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY, WM_NOTIFY, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE,
-    WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
+    KillTimer, MB_ICONQUESTION, MB_YESNO, MINMAXINFO, PostMessageW, SendMessageW, SetTimer,
+    SetWindowLongPtrW, SetWindowTextW, WM_APP, WM_CHAR, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DRAWITEM, WM_GETFONT, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY, WM_NOTIFY,
+    WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::name_of;
@@ -432,7 +435,8 @@ pub fn run(
         0,
         places[7].1,
     )
-    .control(Class::Static, "", ID_STATUS, 0, 0, places[8].1)
+    // Drawn here (`paint_status`): centred on the buttons' line.
+    .control(Class::Static, "", ID_STATUS, SS_OWNERDRAW, 0, places[8].1)
     .control(
         Class::Button,
         "OK",
@@ -1328,10 +1332,7 @@ fn transfer_status(
     }
     let verb = if moving { "move" } else { "copy" };
     if no_folder {
-        return (
-            format!("Type or browse for the folder to {verb} to."),
-            false,
-        );
+        return ("Type or browse for the To folder.".into(), false);
     }
     if dest == Some(false) {
         return ("The To folder does not exist.".into(), false);
@@ -1438,6 +1439,53 @@ unsafe extern "system" fn format_box_proc(
 }
 
 /// The status line in red while something is wrong.
+/// Draws the status line, an owner-drawn static: its words wrapped to the
+/// box and centred in its height, which the buttons beside it share, so a
+/// one-line status sits on the buttons' line (a static draws from its top,
+/// above them); red when it tells of a problem.
+fn paint_status(s: &Dlg, dis: &DRAWITEMSTRUCT) {
+    let dark = s.look.get().dark;
+    let hdc = dis.hDC;
+    let text: Vec<u16> = window_text(dis.hwndItem).encode_utf16().collect();
+    let format = DT_WORDBREAK | DT_NOPREFIX;
+    // SAFETY: draws on the DC the static gave for this paint, with its own
+    // font, which is put back; the brushes are kept ones, not to be freed.
+    unsafe {
+        let brush = dialog::ctl_color(WM_CTLCOLORSTATIC, hdc, dark)
+            .map_or_else(|| GetSysColorBrush(COLOR_BTNFACE), |b| b as HBRUSH);
+        FillRect(hdc, &dis.rcItem, brush);
+        let font = SendMessageW(dis.hwndItem, WM_GETFONT, 0, 0) as HFONT;
+        let old = SelectObject(hdc, font);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(
+            hdc,
+            match (s.status_is_bad(), dark) {
+                (true, _) => error_colour(dark),
+                (false, true) => Palette::new(true).fg,
+                (false, false) => GetSysColor(COLOR_WINDOWTEXT),
+            },
+        );
+        let mut measured = dis.rcItem;
+        DrawTextW(
+            hdc,
+            text.as_ptr(),
+            text.len() as i32,
+            &mut measured,
+            format | DT_CALCRECT,
+        );
+        let mut rc = dis.rcItem;
+        rc.top = centred_top(rc.top, rc.bottom, measured.bottom - measured.top);
+        DrawTextW(hdc, text.as_ptr(), text.len() as i32, &mut rc, format);
+        SelectObject(hdc, old);
+    }
+}
+
+/// The top of `height` centred between `top` and `bottom` (at `top` when
+/// it is taller).
+fn centred_top(top: i32, bottom: i32, height: i32) -> i32 {
+    top + (bottom - top - height).max(0) / 2
+}
+
 fn status_colour(s: &Dlg, hdc: HDC, msg: u32) -> isize {
     let dark = s.look.get().dark;
     let brush = dialog::ctl_color(msg, hdc, dark)
@@ -1468,6 +1516,11 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
         return answer;
     }
     match msg {
+        WM_DRAWITEM if w == usize::from(ID_STATUS) => {
+            // SAFETY: WM_DRAWITEM's lParam is a DRAWITEMSTRUCT.
+            paint_status(s, unsafe { &*(l as *const DRAWITEMSTRUCT) });
+            1
+        }
         WM_INITDIALOG => {
             s.init(dlg);
             s.focus_new(dlg);
@@ -1711,6 +1764,16 @@ unsafe extern "system" fn name_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_status_line_is_centred_on_the_buttons() {
+        // A box of 2 lines (36 px) beside the buttons: one line (15 px)
+        // sits in its middle, two fill it, more start at its top.
+        assert_eq!(centred_top(100, 136, 15), 110);
+        assert_eq!(centred_top(100, 136, 30), 103);
+        assert_eq!(centred_top(100, 136, 36), 100);
+        assert_eq!(centred_top(100, 136, 45), 100);
+    }
+
     fn file(name: &str) -> File {
         File {
             path: format!(r"C:\a\{name}").encode_utf16().collect(),
@@ -1792,7 +1855,7 @@ mod tests {
         );
         assert_eq!(
             transfer_status(&files, &p, false, true, None).0,
-            "Type or browse for the folder to copy to."
+            "Type or browse for the To folder."
         );
         assert_eq!(
             transfer_status(&files, &p, false, false, Some(false)),

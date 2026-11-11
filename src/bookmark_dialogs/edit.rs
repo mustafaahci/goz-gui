@@ -15,19 +15,27 @@
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{GetWindowDC, ReleaseDC};
+use windows_sys::Win32::Graphics::Gdi::{
+    BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DrawTextW, EndPaint, GetSysColor, HDC, HFONT, InvalidateRect, PAINTSTRUCT,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+};
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
-use windows_sys::Win32::UI::Controls::EM_REPLACESEL;
+use windows_sys::Win32::UI::Controls::{
+    CBRO_DISABLED, CBRO_NORMAL, CBXSR_DISABLED, CBXSR_NORMAL, COMBOBOXINFO, CP_DROPDOWNBUTTONRIGHT,
+    CP_READONLY, CloseThemeData, DrawThemeBackground, EM_REPLACESEL, GetComboBoxInfo,
+    OpenThemeData,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_RETURN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, CB_GETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, EN_CHANGE, ES_AUTOHSCROLL,
-    ES_AUTOVSCROLL, ES_MULTILINE, EndDialog, GWLP_USERDATA, GetParent, GetWindowRect,
-    GetWindowTextLengthW, IDCANCEL, IDOK, KillTimer, MINMAXINFO, SetTimer, SetWindowLongPtrW,
-    USER_TIMER_MINIMUM, WM_CHAR, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG,
-    WM_KEYDOWN, WM_NCDESTROY, WM_NCPAINT, WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE,
+    ES_AUTOVSCROLL, ES_MULTILINE, EndDialog, GWLP_USERDATA, GetWindowRect, GetWindowTextLengthW,
+    IDCANCEL, IDOK, KillTimer, MINMAXINFO, SetTimer, SetWindowLongPtrW, USER_TIMER_MINIMUM,
+    WM_CHAR, WM_COMMAND, WM_DESTROY, WM_GETFONT, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN,
+    WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE,
     WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
@@ -35,10 +43,9 @@ use super::{enable, item, send, set_text};
 use crate::bookmarks::{Fields, SORT_KEYS, one_line, sort_name};
 use crate::dialog::{
     Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, anchor, center_on_owner, common,
-    fill_later, make_control, state, theme_control, theme_new,
+    fill_later, make_control, placed, state, theme_control, theme_new,
 };
 use crate::filter::Filter;
-use crate::paint::fill;
 use crate::places::{self, Which};
 use crate::theme::Palette;
 use crate::wide::{window_text, wz};
@@ -171,6 +178,9 @@ struct Edit {
 
 /// The editor's timer: it has been drawn, the last row's lists can be made.
 const LAST_ROW: usize = 1;
+/// How far right of a list's item area its text starts, in pixels (as a
+/// themed drop-down list draws it).
+const STAND_IN_INSET: i32 = 1;
 
 /// Shows the editor titled `title` over `owner` with `fields`; the fields
 /// as the user left them on OK.
@@ -332,12 +342,125 @@ impl Edit {
         anchor(dlg, SIZE, &ANCHORS);
     }
 
+    /// The last row's lists as they open: each one's id, where it goes,
+    /// the item it shows, and whether it is enabled (the direction only
+    /// with a sort).
+    fn last_row_look(&self) -> [(u16, Units, String, bool); 3] {
+        let f = &self.was;
+        let shown = |items: &[String], at: usize| {
+            at.checked_sub(1)
+                .and_then(|i| items.get(i))
+                .map_or_else(|| NO_CHANGE.to_owned(), String::clone)
+        };
+        let filter_titles: Vec<&str> = Filter::all().iter().map(|f| f.title()).collect();
+        let (_, filter_at) = choices(&filter_titles, &f.filter);
+        let sort_names: Vec<&str> = SORT_KEYS.iter().map(|&k| sort_name(k)).collect();
+        let (_, sort_at) = choices(&sort_names, &f.sort);
+        [
+            (ID_FILTER, FILTER, shown(&self.filters, filter_at), true),
+            (ID_SORT, SORT, shown(&self.sorts, sort_at), true),
+            (
+                ID_DIR,
+                DIR,
+                DIRECTIONS[usize::from(f.descending)].to_owned(),
+                sort_at != 0,
+            ),
+        ]
+    }
+
+    /// Paints the last row's lists where they will be and as they will
+    /// look, until they are made (`make_last_row`): so the editor's first
+    /// frame has its whole row without waiting for three more lists
+    /// (5 to 10 ms each in comctl32). Drawn with the visual style of a list
+    /// already made (Match case's, dark or light), at its height, with its
+    /// text and button where it has them.
+    fn paint_last_row(&self, dlg: HWND, hdc: HDC) {
+        let model = item(dlg, ID_CASE);
+        let dark = self.look.get().dark;
+        // SAFETY: reads this thread's list (out-structs of the sizes the
+        // calls take), opens its visual style (closed below) and draws on
+        // the DC of this dialog's WM_PAINT with the dialog's font, which is
+        // put back.
+        unsafe {
+            let mut info = COMBOBOXINFO {
+                cbSize: size_of::<COMBOBOXINFO>() as u32,
+                ..core::mem::zeroed()
+            };
+            let mut at = RECT::default();
+            if GetComboBoxInfo(model, &mut info) == 0 || GetWindowRect(model, &mut at) == 0 {
+                return;
+            }
+            let (width, height) = (at.right - at.left, at.bottom - at.top);
+            let class = wz("Combobox");
+            let theme = OpenThemeData(model, class.as_ptr());
+            let font = send(dlg, WM_GETFONT, 0, 0) as HFONT;
+            let old = SelectObject(hdc, font);
+            SetBkMode(hdc, TRANSPARENT as i32);
+            let anchors = |id: u16| ANCHORS.iter().find(|a| a.0 == id).map_or(0, |a| a.2);
+            for (id, units, text, enabled) in self.last_row_look() {
+                let r = placed(dlg, SIZE, units, anchors(id));
+                let rc = RECT {
+                    bottom: r.top + height,
+                    ..r
+                };
+                // Each part as far from the right edge as in the model.
+                let from_right = |x: i32| rc.right - (width - x);
+                if theme != 0 {
+                    let (face, arrow) = if enabled {
+                        (CBRO_NORMAL, CBXSR_NORMAL)
+                    } else {
+                        (CBRO_DISABLED, CBXSR_DISABLED)
+                    };
+                    DrawThemeBackground(theme, hdc, CP_READONLY, face, &rc, core::ptr::null());
+                    let button = RECT {
+                        left: from_right(info.rcButton.left),
+                        top: rc.top + info.rcButton.top,
+                        right: from_right(info.rcButton.right),
+                        bottom: rc.top + info.rcButton.bottom,
+                    };
+                    DrawThemeBackground(
+                        theme,
+                        hdc,
+                        CP_DROPDOWNBUTTONRIGHT,
+                        arrow,
+                        &button,
+                        core::ptr::null(),
+                    );
+                }
+                let ink = match (enabled, dark) {
+                    (false, _) => GetSysColor(COLOR_GRAYTEXT),
+                    (true, true) => Palette::new(true).fg,
+                    (true, false) => GetSysColor(COLOR_WINDOWTEXT),
+                };
+                SetTextColor(hdc, ink);
+                let mut tr = RECT {
+                    left: rc.left + info.rcItem.left + STAND_IN_INSET,
+                    top: rc.top + info.rcItem.top,
+                    right: from_right(info.rcItem.right),
+                    bottom: rc.top + info.rcItem.bottom,
+                };
+                let text: Vec<u16> = text.encode_utf16().collect();
+                DrawTextW(
+                    hdc,
+                    text.as_ptr(),
+                    text.len() as i32,
+                    &mut tr,
+                    DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+                );
+            }
+            SelectObject(hdc, old);
+            if theme != 0 {
+                CloseThemeData(theme);
+            }
+        }
+    }
+
     /// Makes the last row's lists (Filter, Sort and its direction), once
     /// the editor has been drawn or as soon as they are read. Six themed
     /// lists took about 35 ms to make as the editor opened (each 5 to 7 ms
     /// in comctl32, whatever their items); with three made after its first
-    /// paint, it shows sooner and the rest come a frame later, still in its
-    /// opening animation.
+    /// paint, it shows sooner. Until then the editor paints them itself
+    /// (`paint_last_row`), so its first frame has the whole row.
     fn make_last_row(&self, dlg: HWND) {
         if self.last_row.replace(true) {
             return;
@@ -475,9 +598,7 @@ unsafe extern "system" fn search_proc(
 ) -> LRESULT {
     let shift_enter = key_down(VK_SHIFT) && !key_down(VK_CONTROL);
     // SAFETY: `w` and `l` are passed on as they came; the line break is a
-    // NUL-terminated string for this thread's box; its parent is the
-    // editor, whose GWLP_USERDATA is its `Edit`; the window DC is this
-    // box's own, released after.
+    // NUL-terminated string for this thread's box.
     unsafe {
         match msg {
             WM_KEYDOWN if w as u16 == VK_RETURN && shift_enter => {
@@ -487,53 +608,8 @@ unsafe extern "system" fn search_proc(
             }
             // The character the key makes: the line is in already.
             WM_CHAR if w == 0x0d && shift_enter => return 0,
-            // In the dark theme the box's edge is drawn as the one-line
-            // boxes' is (the system draws a several-line box's edge
-            // white).
-            WM_NCPAINT => {
-                let done = DefSubclassProc(hwnd, msg, w, l);
-                let dark = state::<Edit>(GetParent(hwnd)).is_some_and(|s| s.look.get().dark);
-                if dark {
-                    let pal = Palette::new(true);
-                    let mut rc = RECT::default();
-                    GetWindowRect(hwnd, &mut rc);
-                    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-                    let dc = GetWindowDC(hwnd);
-                    for (inset, colour) in [(0, pal.border), (1, pal.bg)] {
-                        let edges = [
-                            RECT {
-                                left: inset,
-                                top: inset,
-                                right: w - inset,
-                                bottom: inset + 1,
-                            },
-                            RECT {
-                                left: inset,
-                                top: h - inset - 1,
-                                right: w - inset,
-                                bottom: h - inset,
-                            },
-                            RECT {
-                                left: inset,
-                                top: inset,
-                                right: inset + 1,
-                                bottom: h - inset,
-                            },
-                            RECT {
-                                left: w - inset - 1,
-                                top: inset,
-                                right: w - inset,
-                                bottom: h - inset,
-                            },
-                        ];
-                        for edge in &edges {
-                            fill(dc, edge, colour);
-                        }
-                    }
-                    ReleaseDC(hwnd, dc);
-                }
-                return done;
-            }
+            // (In the dark theme its edge is the one-line boxes', drawn by
+            // `dialog::theme_control`.)
             WM_NCDESTROY => {
                 RemoveWindowSubclass(hwnd, Some(search_proc), 1);
             }
@@ -580,8 +656,29 @@ unsafe extern "system" fn edit_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             s.make_last_row(dlg);
             1
         }
+        // Until the last row's lists are made, the editor draws them.
+        WM_PAINT if !s.last_row.get() => {
+            // SAFETY: a standard WM_PAINT of this thread's dialog.
+            unsafe {
+                let mut ps: PAINTSTRUCT = core::mem::zeroed();
+                let hdc = BeginPaint(dlg, &mut ps);
+                s.paint_last_row(dlg, hdc);
+                EndPaint(dlg, &ps);
+            }
+            1
+        }
+        // Drawn into another DC (a print of the window): the row too.
+        WM_PRINTCLIENT if !s.last_row.get() => {
+            s.paint_last_row(dlg, w as HDC);
+            1
+        }
         WM_SIZE => {
             anchor(dlg, SIZE, &ANCHORS);
+            if !s.last_row.get() {
+                // SAFETY: invalidates this thread's dialog: the row it
+                // draws moves with its size.
+                unsafe { InvalidateRect(dlg, core::ptr::null(), 1) };
+            }
             1
         }
         WM_GETMINMAXINFO => {
@@ -603,6 +700,63 @@ unsafe extern "system" fn edit_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn editor(fields: Fields) -> Edit {
+        let filter_titles: Vec<&str> = Filter::all().iter().map(|f| f.title()).collect();
+        let sort_names: Vec<&str> = SORT_KEYS.iter().map(|&k| sort_name(k)).collect();
+        Edit {
+            filters: choices(&filter_titles, &fields.filter).0,
+            sorts: choices(&sort_names, &fields.sort).0,
+            was: fields,
+            look: Cell::new(Look {
+                dark: true,
+                follow_system: false,
+            }),
+            result: RefCell::new(None),
+            min: Cell::new((0, 0)),
+            last_row: Cell::new(false),
+        }
+    }
+
+    #[test]
+    fn the_row_drawn_first_shows_what_its_lists_will() {
+        let texts = |e: &Edit| -> Vec<(u16, String, bool)> {
+            e.last_row_look()
+                .into_iter()
+                .map(|(id, _, text, on)| (id, text, on))
+                .collect()
+        };
+        // Nothing set: "(No change)" twice, the direction greyed.
+        let none = editor(Fields::default());
+        assert_eq!(
+            texts(&none),
+            [
+                (ID_FILTER, NO_CHANGE.to_owned(), true),
+                (ID_SORT, NO_CHANGE.to_owned(), true),
+                (ID_DIR, "Ascending".to_owned(), false),
+            ]
+        );
+        // A filter and a sort goz-gui has, descending: their names.
+        let set = editor(Fields {
+            filter: "audio".into(),
+            sort: " size ".into(),
+            descending: true,
+            ..Fields::default()
+        });
+        let shown = texts(&set);
+        assert_eq!(shown[0], (ID_FILTER, "Audio".to_owned(), true));
+        assert_eq!(shown[1], (ID_SORT, "Size".to_owned(), true));
+        assert_eq!(shown[2], (ID_DIR, "Descending".to_owned(), true));
+        // One goz-gui lacks: as the bookmark has it, as its list will.
+        let theirs = editor(Fields {
+            sort: "Extension".into(),
+            ..Fields::default()
+        });
+        assert_eq!(texts(&theirs)[1], (ID_SORT, "Extension".to_owned(), true));
+        // Each where its list goes.
+        let places: Vec<Units> = none.last_row_look().iter().map(|r| r.1).collect();
+        assert_eq!(places, [FILTER, SORT, DIR]);
+    }
 
     #[test]
     fn combos_keep_what_goz_gui_lacks() {

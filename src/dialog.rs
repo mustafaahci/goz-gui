@@ -6,32 +6,32 @@
 
 use std::cell::Cell;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DT_CALCRECT, DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DrawFocusRect, DrawTextW, EndPaint, GetMonitorInfoW,
-    GetTextExtentPoint32W, GetWindowDC, HBRUSH, HDC, HFONT, MONITOR_DEFAULTTONULL, MONITORINFO,
-    MonitorFromRect, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
-    RedrawWindow, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOWTEXT, ClientToScreen, CreateSolidBrush, DT_CALCRECT,
+    DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+    DrawFocusRect, DrawTextW, EndPaint, GetMonitorInfoW, GetSysColor, GetTextExtentPoint32W,
+    GetWindowDC, HBRUSH, HDC, HFONT, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromRect,
+    PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, ReleaseDC,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::Controls::{
-    BP_RADIOBUTTON, BST_CHECKED, CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDIS_DISABLED,
-    CDIS_FOCUS, CDIS_HOT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT,
-    CDRF_SKIPDEFAULT, CloseThemeData, DrawThemeBackground, GetThemePartSize, HDM_GETITEMCOUNT,
-    HIMAGELIST, HKM_GETHOTKEY, HOTKEYF_ALT, HOTKEYF_CONTROL, HOTKEYF_EXT, HOTKEYF_SHIFT,
-    ILD_TRANSPARENT, ImageList_Draw, LVCF_FMT, LVCF_TEXT, LVCFMT_JUSTIFYMASK, LVCFMT_RIGHT,
-    LVCOLUMNW, LVIF_IMAGE, LVIR_BOUNDS, LVIR_ICON, LVIR_LABEL, LVIS_SELECTED, LVITEMW,
-    LVM_GETCOLUMNW, LVM_GETCOLUMNWIDTH, LVM_GETHEADER, LVM_GETIMAGELIST, LVM_GETITEMCOUNT,
-    LVM_GETITEMRECT, LVM_GETITEMSTATE, LVM_GETITEMTEXTW, LVM_GETITEMW, LVM_GETSTRINGWIDTHW,
-    LVM_GETSUBITEMRECT, LVM_SETBKCOLOR, LVM_SETCOLUMNWIDTH, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
-    LVSIL_SMALL, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW, OpenThemeData,
-    RBS_CHECKEDDISABLED, RBS_CHECKEDHOT, RBS_CHECKEDNORMAL, RBS_CHECKEDPRESSED,
-    RBS_UNCHECKEDDISABLED, RBS_UNCHECKEDHOT, RBS_UNCHECKEDNORMAL, RBS_UNCHECKEDPRESSED, TS_DRAW,
-    TVM_SETBKCOLOR, TVM_SETLINECOLOR, TVM_SETTEXTCOLOR,
+    BP_CHECKBOX, BP_RADIOBUTTON, BST_CHECKED, BST_INDETERMINATE, CDDS_ITEMPREPAINT, CDDS_POSTPAINT,
+    CDDS_PREPAINT, CDIS_DISABLED, CDIS_FOCUS, CDIS_HOT, CDIS_SELECTED, CDRF_DODEFAULT,
+    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, CloseThemeData,
+    DrawThemeBackground, DrawThemeParentBackground, GetThemePartSize, HDM_GETITEMCOUNT, HIMAGELIST,
+    HKM_GETHOTKEY, HOTKEYF_ALT, HOTKEYF_CONTROL, HOTKEYF_EXT, HOTKEYF_SHIFT, ILD_TRANSPARENT,
+    ImageList_Draw, LVCF_FMT, LVCF_TEXT, LVCFMT_JUSTIFYMASK, LVCFMT_RIGHT, LVCOLUMNW, LVIF_IMAGE,
+    LVIR_BOUNDS, LVIR_ICON, LVIR_LABEL, LVIS_SELECTED, LVITEMW, LVM_GETCOLUMNW, LVM_GETCOLUMNWIDTH,
+    LVM_GETHEADER, LVM_GETIMAGELIST, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSTATE,
+    LVM_GETITEMTEXTW, LVM_GETITEMW, LVM_GETSTRINGWIDTHW, LVM_GETSUBITEMRECT, LVM_SETBKCOLOR,
+    LVM_SETCOLUMNWIDTH, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVSIL_SMALL, NM_CUSTOMDRAW,
+    NMCUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW, TBCD_CHANNEL, TS_DRAW, TVM_SETBKCOLOR, TVM_SETLINECOLOR,
+    TVM_SETTEXTCOLOR,
 };
-use windows_sys::Win32::UI::HiDpi::SystemParametersInfoForDpi;
+use windows_sys::Win32::UI::HiDpi::{OpenThemeDataForDpi, SystemParametersInfoForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyNameTextW, IsWindowEnabled, MAPVK_VK_TO_VSC, MapVirtualKeyW, VK_CONTROL,
     VK_MENU, VK_SHIFT,
@@ -40,11 +40,12 @@ use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BS_AUTORADIOBUTTON, BS_GROUPBOX, BS_RADIOBUTTON, BS_TYPEMASK, CB_ADDSTRING,
-    CB_DELETESTRING, CB_GETEDITSEL, CB_MSGMAX, CB_SETCURSEL, CBT_CREATEWNDW, CBTACTIVATESTRUCT,
-    CallNextHookEx, CreateDialogIndirectParamW, CreateWindowExW, DLGPROC, DS_CONTROL,
-    DS_MODALFRAME, DS_SETFONT, DWLP_MSGRESULT, DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD,
-    GW_HWNDNEXT, GW_OWNER, GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem,
+    BM_GETCHECK, BS_3STATE, BS_AUTO3STATE, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_CHECKBOX,
+    BS_GROUPBOX, BS_RADIOBUTTON, BS_TYPEMASK, CB_ADDSTRING, CB_DELETESTRING, CB_GETEDITSEL,
+    CB_MSGMAX, CB_SETCURSEL, CBT_CREATEWNDW, CBTACTIVATESTRUCT, CallNextHookEx,
+    CreateDialogIndirectParamW, CreateWindowExW, DLGPROC, DS_CONTROL, DS_MODALFRAME, DS_SETFONT,
+    DWLP_MSGRESULT, DialogBoxIndirectParamW, ES_MULTILINE, GW_CHILD, GW_HWNDNEXT, GW_OWNER,
+    GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetClientRect, GetDlgItem,
     GetForegroundWindow, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HCBT_ACTIVATE, HCBT_CREATEWND, HHOOK, HMENU, IsWindowVisible,
     KillTimer, MapDialogRect, MoveWindow, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
@@ -52,10 +53,23 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetCaretPos, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW,
     UISF_HIDEACCEL, UISF_HIDEFOCUS, USER_TIMER_MINIMUM, UnhookWindowsHookEx, WH_CBT, WINDOWPOS,
     WM_CHAR, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_QUERYUISTATE, WM_SETFONT,
-    WM_SETREDRAW, WM_SETTINGCHANGE, WM_SHOWWINDOW, WM_SYSKEYDOWN, WM_TIMER, WM_WINDOWPOSCHANGING,
-    WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    WM_CTLCOLORSTATIC, WM_ENABLE, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_QUERYUISTATE,
+    WM_SETFONT, WM_SETREDRAW, WM_SETTINGCHANGE, WM_SHOWWINDOW, WM_SYSKEYDOWN, WM_TIMER,
+    WM_WINDOWPOSCHANGING, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE,
+    WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+};
+
+// The list boxes drawn here (`LIST_BOX`), and a combo box's own box.
+use windows_sys::Win32::Graphics::Gdi::{
+    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, GetDC, GetTextMetricsW, TEXTMETRICW,
+};
+use windows_sys::Win32::UI::Controls::{
+    DRAWITEMSTRUCT, EM_SETSEL, ODS_FOCUS, ODS_NOFOCUSRECT, ODS_SELECTED, ODT_LISTBOX,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    FindWindowExW, LB_GETTEXT, LB_GETTEXTLEN, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_OWNERDRAWFIXED,
+    WM_DRAWITEM,
 };
 
 use crate::paint::fill;
@@ -372,14 +386,40 @@ pub fn theme_control(child: HWND, dark: bool, fresh: bool) {
                 );
             }
             // A box of several lines has a scroll bar, which the
-            // Explorer style makes dark (its edge is drawn by its
-            // owner).
+            // Explorer style makes dark; its edge, which Windows draws
+            // white, as a one-line box's (`edge_proc`).
             "Edit" if GetWindowLongPtrW(child, GWL_STYLE) as u32 & ES_MULTILINE as u32 != 0 => {
                 theme::set_class(child, dark.then_some("DarkMode_Explorer"));
+                set_dark_edge(child, dark);
+            }
+            // A list box: dark scroll bars with the dark Explorer style,
+            // its edge as a list view's (Windows draws it white), and its
+            // items drawn here (`LIST_BOX`, `paint_list_item`): under a dark
+            // style Windows draws the selected one white on white.
+            "ListBox" => {
+                if dark || !fresh {
+                    theme::set_class(child, dark.then_some("DarkMode_Explorer"));
+                }
+                set_dark_edge(child, dark);
+                fit_list_items(child);
             }
             "Edit" => theme::set_class(child, dark.then_some("DarkMode_CFD")),
             // Its list's colours come from WM_CTLCOLORLISTBOX.
-            "ComboBox" => theme::set_class(child, dark.then_some("DarkMode_CFD")),
+            "ComboBox" => {
+                theme::set_class(child, dark.then_some("DarkMode_CFD"));
+                // Restyled, a box one can type in selects its text, which
+                // a combo box shows with or without the keyboard: none
+                // unless the box has the keyboard (Fonts and Colors' Size).
+                let edit = FindWindowExW(
+                    child,
+                    core::ptr::null_mut(),
+                    EDIT_CLASS.as_ptr(),
+                    core::ptr::null(),
+                );
+                if !edit.is_null() && GetFocus() != edit {
+                    SendMessageW(edit, EM_SETSEL, usize::MAX, 0);
+                }
+            }
             "SysTreeView32" => {
                 theme::set_class(
                     child,
@@ -821,6 +861,142 @@ fn paint_dark_edge(hwnd: HWND) {
     }
 }
 
+/// [`edge_proc`]'s subclass id.
+const EDGE: usize = 0x6564;
+/// [`edge_proc`]'s data: the edge is Windows' own (light), a dark box's,
+/// or a dark list's.
+const EDGE_LIGHT: usize = 0;
+const EDGE_BOX: usize = 1;
+const EDGE_LIST: usize = 2;
+
+/// Gives a list box or a box of several lines with an edge (a sunken
+/// `WS_EX_CLIENTEDGE`, which a dialog also makes of `WS_BORDER`) the dark
+/// theme's edge while `dark`, and Windows' own again otherwise: Windows
+/// draws that edge white whatever the control's style, where a one-line
+/// box, a list view or a tree has a thin one.
+fn set_dark_edge(control: HWND, dark: bool) {
+    // SAFETY: reads, subclasses (setting it again only updates its data)
+    // and redraws the frame of this thread's control.
+    unsafe {
+        let edged = GetWindowLongPtrW(control, GWL_EXSTYLE) as u32 & WS_EX_CLIENTEDGE != 0
+            || GetWindowLongPtrW(control, GWL_STYLE) as u32 & WS_BORDER != 0;
+        if !edged {
+            return;
+        }
+        let kind = match (dark, class_of(control).as_str()) {
+            (false, _) => EDGE_LIGHT,
+            (true, "ListBox") => EDGE_LIST,
+            (true, _) => EDGE_BOX,
+        };
+        SetWindowSubclass(control, Some(edge_proc), EDGE, kind);
+        RedrawWindow(
+            control,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            RDW_FRAME | RDW_INVALIDATE,
+        );
+    }
+}
+
+/// The dark edge [`edge_proc`] draws, outer line first, then the line
+/// inside it (the rest of the sunken edge's two pixels): as Windows draws
+/// a dark one-line box's (enabled or greyed), or a list view's.
+fn dark_edge_colours(kind: usize, enabled: bool) -> (u32, u32) {
+    let pal = Palette::new(true);
+    match (kind, enabled) {
+        (EDGE_LIST, true) => (theme::rgb(0x82, 0x87, 0x90), pal.bg),
+        (EDGE_LIST, false) => (theme::rgb(0x82, 0x87, 0x90), pal.chrome),
+        (_, true) => (theme::rgb(0x9b, 0x9b, 0x9b), theme::rgb(0x38, 0x38, 0x38)),
+        (_, false) => (theme::rgb(0x40, 0x40, 0x40), theme::rgb(0x38, 0x38, 0x38)),
+    }
+}
+
+/// The subclass of [`set_dark_edge`]: in the dark theme, its edge drawn
+/// over Windows' after Windows has drawn the frame (and any scroll bars
+/// inside it), and again when the control is greyed or enabled.
+unsafe extern "system" fn edge_proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    _id: usize,
+    kind: usize,
+) -> LRESULT {
+    // SAFETY: `w` and `l` are passed on as they came; the window DC is this
+    // control's own, released after; the subclass goes with the control.
+    unsafe {
+        match msg {
+            WM_NCPAINT if kind != EDGE_LIGHT => {
+                let done = DefSubclassProc(hwnd, msg, w, l);
+                let mut rc = RECT::default();
+                GetWindowRect(hwnd, &mut rc);
+                let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+                // The edge's width: where the client area starts (a sunken
+                // edge has two pixels, a border one; scroll bars are on the
+                // other sides).
+                let mut origin = POINT { x: 0, y: 0 };
+                ClientToScreen(hwnd, &mut origin);
+                let thick = (origin.x - rc.left).min(origin.y - rc.top);
+                let (outer, inner) = dark_edge_colours(kind, IsWindowEnabled(hwnd) != 0);
+                let dc = GetWindowDC(hwnd);
+                for (inset, colour) in [(0, outer), (1, inner)] {
+                    if inset >= thick {
+                        break;
+                    }
+                    let (l, t, r, b) = (inset, inset, w - inset, h - inset);
+                    for edge in [
+                        RECT {
+                            left: l,
+                            top: t,
+                            right: r,
+                            bottom: t + 1,
+                        },
+                        RECT {
+                            left: l,
+                            top: b - 1,
+                            right: r,
+                            bottom: b,
+                        },
+                        RECT {
+                            left: l,
+                            top: t,
+                            right: l + 1,
+                            bottom: b,
+                        },
+                        RECT {
+                            left: r - 1,
+                            top: t,
+                            right: r,
+                            bottom: b,
+                        },
+                    ] {
+                        fill(dc, &edge, colour);
+                    }
+                }
+                ReleaseDC(hwnd, dc);
+                return done;
+            }
+            // Greyed or enabled: the edge's colours change too (the
+            // control redraws only its inside).
+            WM_ENABLE if kind != EDGE_LIGHT => {
+                let done = DefSubclassProc(hwnd, msg, w, l);
+                RedrawWindow(
+                    hwnd,
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    RDW_FRAME | RDW_INVALIDATE,
+                );
+                return done;
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(edge_proc), EDGE);
+            }
+            _ => {}
+        }
+        DefSubclassProc(hwnd, msg, w, l)
+    }
+}
+
 /// A dialog list's subclass: in the dark theme it gives its header's item
 /// text the theme's text colour, which the dark header style leaves dark.
 /// The header reports its drawing to the list, its parent.
@@ -1105,15 +1281,53 @@ pub fn ctl_color(msg: u32, hdc: HDC, dark: bool) -> Option<isize> {
     Some(brush as isize)
 }
 
-/// A radio button's `NM_CUSTOMDRAW` (which its dialog gets for every paint
-/// of it, state changes included) in the dark theme: the dark style draws
-/// a radio button's text grey, as if it were greyed, so it is drawn here:
-/// the style's own dark circle for the state, the text in the theme's
-/// colour (dim when greyed), the access key's underline and the focus
-/// rectangle as the keyboard cues say. `None` for any other notification,
-/// any other control, or the light theme (Windows draws those).
-fn radio_custom_draw(l: LPARAM, dark: bool) -> Option<isize> {
-    if !dark || l == 0 {
+/// What a check box or radio button is, for drawing it here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Check {
+    Box,
+    Radio,
+}
+
+/// Whether `button` is a check box or a radio button (`None` for any other
+/// button).
+pub fn check_kind(button: HWND) -> Option<Check> {
+    // SAFETY: reads this thread's button's style.
+    let kind = unsafe { GetWindowLongPtrW(button, GWL_STYLE) } as u32 & BS_TYPEMASK as u32;
+    match kind as i32 {
+        BS_CHECKBOX | BS_AUTOCHECKBOX | BS_3STATE | BS_AUTO3STATE => Some(Check::Box),
+        BS_RADIOBUTTON | BS_AUTORADIOBUTTON => Some(Check::Radio),
+        _ => None,
+    }
+}
+
+/// Whether Options > UI's Scale draws `hwnd` at another DPI than its
+/// monitor's: then Windows draws a check box's or radio button's mark at the
+/// monitor's size, small beside its scaled text, and goz-gui draws it.
+pub fn ui_scaled(hwnd: HWND) -> bool {
+    // SAFETY: reads a window's DPI.
+    let monitor = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    crate::custom::window_dpi(hwnd) != monitor
+}
+
+/// The colours [`paint_check`] draws with: the face behind (`None`: the
+/// parent's, as a see-through button shows it), the text, and the text
+/// greyed.
+#[derive(Clone, Copy)]
+pub struct CheckInk {
+    pub face: Option<u32>,
+    pub fg: u32,
+    pub dim: u32,
+}
+
+/// A dialog's check box or radio button's `NM_CUSTOMDRAW` (which its
+/// dialog gets for every paint of it, state changes included), drawn here
+/// ([`paint_check`]) when Windows would not draw it right: a radio button in
+/// the dark theme (the dark style draws its text grey, as if it were
+/// greyed), and either at a UI scale (Windows draws the mark at the
+/// monitor's size). `None` for any other notification or control, or when
+/// Windows draws it.
+fn button_custom_draw(l: LPARAM, dark: bool) -> Option<isize> {
+    if l == 0 {
         return None;
     }
     // SAFETY: WM_NOTIFY's lParam is an NMHDR; an NM_CUSTOMDRAW's is an
@@ -1123,20 +1337,97 @@ fn radio_custom_draw(l: LPARAM, dark: bool) -> Option<isize> {
         return None;
     }
     let button = cd.hdr.hwndFrom;
-    // SAFETY: reads this thread's button's style.
-    let kind = unsafe { GetWindowLongPtrW(button, GWL_STYLE) } as u32 & BS_TYPEMASK as u32;
-    if kind != BS_RADIOBUTTON as u32 && kind != BS_AUTORADIOBUTTON as u32 {
+    let kind = check_kind(button)?;
+    if !(ui_scaled(button) || dark && kind == Check::Radio) {
         return None;
     }
     if cd.dwDrawStage != CDDS_PREPAINT {
         return Some(CDRF_DODEFAULT as isize);
     }
-    paint_dark_radio(button, cd);
+    let ink = if dark {
+        let pal = Palette::new(true);
+        CheckInk {
+            face: Some(pal.chrome),
+            fg: pal.fg,
+            dim: pal.dim,
+        }
+    } else {
+        // SAFETY: reads system colours.
+        unsafe {
+            CheckInk {
+                face: None,
+                fg: GetSysColor(COLOR_WINDOWTEXT),
+                dim: GetSysColor(COLOR_GRAYTEXT),
+            }
+        }
+    };
+    paint_check(button, cd, kind, ink);
     Some(CDRF_SKIPDEFAULT as isize)
 }
 
-fn paint_dark_radio(button: HWND, cd: &NMCUSTOMDRAW) {
-    let pal = Palette::new(true);
+/// The visual style's state of a check box's or radio button's mark (the
+/// `CBS_*` and `RBS_*` numbers are alike): `check` is its `BM_GETCHECK`.
+pub fn check_state(check: u32, disabled: bool, pressed: bool, hot: bool) -> i32 {
+    let base = match check {
+        BST_CHECKED => 4,
+        BST_INDETERMINATE => 8,
+        _ => 0,
+    };
+    let state = if disabled {
+        4
+    } else if pressed {
+        3
+    } else if hot {
+        2
+    } else {
+        1
+    };
+    base + state
+}
+
+/// The channel of a dark trackbar: its edge and its face, as the light
+/// style's (#d6d6d6 round #e7eaea on the #f0f0f0 face) turned for the dark
+/// face.
+const DARK_CHANNEL: (u32, u32) = (theme::rgb(0x5f, 0x5f, 0x5f), theme::rgb(0x3a, 0x3a, 0x3a));
+
+/// A trackbar's `NM_CUSTOMDRAW` (Options > UI's Scale) in the dark theme:
+/// the visual style draws its channel light grey on any face, so the
+/// channel is drawn here in the dark theme's colours; the thumb and the
+/// ticks stay the style's. `None` for anything else or the light theme.
+fn trackbar_custom_draw(l: LPARAM, dark: bool) -> Option<isize> {
+    if !dark || l == 0 {
+        return None;
+    }
+    // SAFETY: WM_NOTIFY's lParam is an NMHDR; an NM_CUSTOMDRAW's is an
+    // NMCUSTOMDRAW.
+    let cd = unsafe { &*(l as *const NMCUSTOMDRAW) };
+    if cd.hdr.code != NM_CUSTOMDRAW || class_of(cd.hdr.hwndFrom) != "msctls_trackbar32" {
+        return None;
+    }
+    Some(match cd.dwDrawStage {
+        CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW as isize,
+        CDDS_ITEMPREPAINT if cd.dwItemSpec == TBCD_CHANNEL as usize => {
+            let (edge, face) = DARK_CHANNEL;
+            fill(cd.hdc, &cd.rc, edge);
+            let inside = RECT {
+                left: cd.rc.left + 1,
+                top: cd.rc.top + 1,
+                right: cd.rc.right - 1,
+                bottom: cd.rc.bottom - 1,
+            };
+            fill(cd.hdc, &inside, face);
+            CDRF_SKIPDEFAULT as isize
+        }
+        _ => CDRF_DODEFAULT as isize,
+    })
+}
+
+/// Draws a check box or radio button for its `NM_CUSTOMDRAW` (`cd`, its
+/// pre-paint): the visual style's own mark for its state at the window's
+/// DPI with the UI scale (the dark style's in the dark theme), the text in
+/// `ink` (dim when greyed), the access key's underline and the focus
+/// rectangle as the keyboard cues say.
+pub fn paint_check(button: HWND, cd: &NMCUSTOMDRAW, kind: Check, ink: CheckInk) {
     let hdc = cd.hdc;
     let rc = cd.rc;
     let state = cd.uItemState;
@@ -1145,27 +1436,27 @@ fn paint_dark_radio(button: HWND, cd: &NMCUSTOMDRAW) {
     // theme data of this thread's button (closed after); the font selected
     // is put back.
     unsafe {
-        let checked = SendMessageW(button, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
-        let part_state = match (
-            checked,
+        let check = SendMessageW(button, BM_GETCHECK, 0, 0) as u32;
+        let part_state = check_state(
+            check,
             disabled,
             state & CDIS_SELECTED != 0,
             state & CDIS_HOT != 0,
-        ) {
-            (false, true, ..) => RBS_UNCHECKEDDISABLED,
-            (false, _, true, _) => RBS_UNCHECKEDPRESSED,
-            (false, _, _, true) => RBS_UNCHECKEDHOT,
-            (false, ..) => RBS_UNCHECKEDNORMAL,
-            (true, true, ..) => RBS_CHECKEDDISABLED,
-            (true, _, true, _) => RBS_CHECKEDPRESSED,
-            (true, _, _, true) => RBS_CHECKEDHOT,
-            (true, ..) => RBS_CHECKEDNORMAL,
+        );
+        let part = match kind {
+            Check::Box => BP_CHECKBOX,
+            Check::Radio => BP_RADIOBUTTON,
         };
-        fill(hdc, &rc, pal.chrome);
-        let dpi = crate::custom::window_dpi(button) as i32;
-        let px = |v: i32| v * dpi / 96;
+        match ink.face {
+            Some(face) => fill(hdc, &rc, face),
+            None => {
+                DrawThemeParentBackground(button, hdc, &rc);
+            }
+        }
+        let dpi = crate::custom::window_dpi(button);
+        let px = |v: i32| v * dpi as i32 / 96;
         let class = crate::wide::wz("Button");
-        let theme = OpenThemeData(button, class.as_ptr());
+        let theme = OpenThemeDataForDpi(button, class.as_ptr(), dpi);
         let mut size = SIZE {
             cx: px(13),
             cy: px(13),
@@ -1174,7 +1465,7 @@ fn paint_dark_radio(button: HWND, cd: &NMCUSTOMDRAW) {
             GetThemePartSize(
                 theme,
                 hdc,
-                BP_RADIOBUTTON,
+                part,
                 part_state,
                 core::ptr::null(),
                 TS_DRAW,
@@ -1189,14 +1480,7 @@ fn paint_dark_radio(button: HWND, cd: &NMCUSTOMDRAW) {
             bottom: top + size.cy,
         };
         if theme != 0 {
-            DrawThemeBackground(
-                theme,
-                hdc,
-                BP_RADIOBUTTON,
-                part_state,
-                &glyph,
-                core::ptr::null(),
-            );
+            DrawThemeBackground(theme, hdc, part, part_state, &glyph, core::ptr::null());
             CloseThemeData(theme);
         }
         let font = SendMessageW(button, WM_GETFONT, 0, 0) as HFONT;
@@ -1208,7 +1492,7 @@ fn paint_dark_radio(button: HWND, cd: &NMCUSTOMDRAW) {
             format |= DT_HIDEPREFIX;
         }
         SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, if disabled { pal.dim } else { pal.fg });
+        SetTextColor(hdc, if disabled { ink.dim } else { ink.fg });
         let mut tr = RECT {
             left: glyph.right + px(3),
             ..rc
@@ -1237,7 +1521,8 @@ fn paint_dark_radio(button: HWND, cd: &NMCUSTOMDRAW) {
 }
 
 /// What every themed dialog handles alike: its colours (`WM_CTLCOLOR*`),
-/// the dark theme's radio buttons (`WM_NOTIFY`, see `radio_custom_draw`),
+/// check boxes and radio buttons Windows would not draw right (`WM_NOTIFY`,
+/// see `button_custom_draw`),
 /// following the system's theme (`WM_SETTINGCHANGE`) when `look` says so,
 /// and the lists [`fill_later`] put off, once it shows (`WM_SHOWWINDOW`).
 /// `Some` is the dialog procedure's answer.
@@ -1246,7 +1531,8 @@ pub fn common(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM, look: &Cell<Look>) -> O
         WM_CTLCOLORDLG | WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN
         | WM_CTLCOLORLISTBOX => ctl_color(msg, w as HDC, look.get().dark),
         WM_NOTIFY => {
-            let answer = radio_custom_draw(l, look.get().dark)?;
+            let dark = look.get().dark;
+            let answer = button_custom_draw(l, dark).or_else(|| trackbar_custom_draw(l, dark))?;
             // SAFETY: the answer of this dialog's WM_NOTIFY.
             unsafe { SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, answer) };
             Some(1)
@@ -1263,9 +1549,122 @@ pub fn common(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM, look: &Cell<Look>) -> O
             lists_after_show(dlg);
             None
         }
+        WM_DRAWITEM if l != 0 => {
+            // SAFETY: WM_DRAWITEM's lParam is a DRAWITEMSTRUCT.
+            let dis = unsafe { &*(l as *const DRAWITEMSTRUCT) };
+            (dis.CtlType == ODT_LISTBOX && class_of(dis.hwndItem) == "ListBox").then(|| {
+                paint_list_item(dis, look.get().dark);
+                1
+            })
+        }
         _ => None,
     }
 }
+
+/// The edit class's name, NUL-terminated: a combo box's own box.
+const EDIT_CLASS: [u16; 5] = [b'E' as u16, b'd' as u16, b'i' as u16, b't' as u16, 0];
+
+/// The style a dialog's list box takes (with `WS_TABSTOP`, `LBS_NOTIFY`
+/// and the like): its items drawn by the dialog ([`paint_list_item`],
+/// through [`common`]), their texts kept by the list.
+pub const LIST_BOX: u32 = (LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32;
+
+/// An owner-drawn list box's rows as high as its font's, as a list box
+/// that draws its own (it is told its rows' height before it has a font).
+fn fit_list_items(list: HWND) {
+    // SAFETY: reads this thread's list box's style and font, measures the
+    // font on the list's DC (released, the old font put back), and sets
+    // its rows' height.
+    unsafe {
+        if GetWindowLongPtrW(list, GWL_STYLE) as u32 & LBS_OWNERDRAWFIXED as u32 == 0 {
+            return;
+        }
+        let font = SendMessageW(list, WM_GETFONT, 0, 0) as HFONT;
+        let dc = GetDC(list);
+        let old = SelectObject(dc, font);
+        let mut tm: TEXTMETRICW = core::mem::zeroed();
+        GetTextMetricsW(dc, &mut tm);
+        SelectObject(dc, old);
+        ReleaseDC(list, dc);
+        if tm.tmHeight > 0 {
+            SendMessageW(list, LB_SETITEMHEIGHT, 0, tm.tmHeight as isize);
+        }
+    }
+}
+
+/// The colours of a list box's item: selected, Windows' selection; else
+/// the theme's field (greyed text when the list is).
+fn list_item_colours(dark: bool, selected: bool, enabled: bool) -> (u32, u32) {
+    let pal = Palette::new(dark);
+    // SAFETY: reads system colours.
+    unsafe {
+        match (selected, dark, enabled) {
+            (true, ..) => (
+                GetSysColor(COLOR_HIGHLIGHT),
+                GetSysColor(COLOR_HIGHLIGHTTEXT),
+            ),
+            (false, true, true) => (pal.bg, pal.fg),
+            (false, true, false) => (pal.bg, pal.dim),
+            (false, false, true) => (GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOWTEXT)),
+            (false, false, false) => (GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_GRAYTEXT)),
+        }
+    }
+}
+
+/// Draws an item of a dialog's list box ([`LIST_BOX`]) as Windows draws a
+/// plain one: its text a little in from the left, Windows' selection
+/// colours, the focus rectangle when the list has the keyboard.
+fn paint_list_item(dis: &DRAWITEMSTRUCT, dark: bool) {
+    let hdc = dis.hDC;
+    let rc = dis.rcItem;
+    let focus = dis.itemState & ODS_FOCUS != 0 && dis.itemState & ODS_NOFOCUSRECT == 0;
+    // SAFETY: draws on the DC the list gave for this item (with its font
+    // selected), reading the item's text into a buffer of its length.
+    unsafe {
+        // No items: only the focus rectangle, where the first would be.
+        if dis.itemID == u32::MAX {
+            if focus {
+                DrawFocusRect(hdc, &rc);
+            }
+            return;
+        }
+        let selected = dis.itemState & ODS_SELECTED != 0;
+        let enabled = IsWindowEnabled(dis.hwndItem) != 0;
+        let (bg, fg) = list_item_colours(dark, selected, enabled);
+        fill(hdc, &rc, bg);
+        let n = SendMessageW(dis.hwndItem, LB_GETTEXTLEN, dis.itemID as usize, 0);
+        if n > 0 {
+            let mut text = vec![0u16; n as usize + 1];
+            let got = SendMessageW(
+                dis.hwndItem,
+                LB_GETTEXT,
+                dis.itemID as usize,
+                text.as_mut_ptr() as isize,
+            )
+            .clamp(0, n);
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, fg);
+            let mut tr = RECT {
+                left: rc.left + LIST_TEXT_INSET,
+                ..rc
+            };
+            DrawTextW(
+                hdc,
+                text.as_ptr(),
+                got as i32,
+                &mut tr,
+                DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+        if focus {
+            DrawFocusRect(hdc, &rc);
+        }
+    }
+}
+
+/// Where a list box draws an item's text: this many pixels in from its
+/// left.
+const LIST_TEXT_INSET: i32 = 2;
 
 /// The state a dialog procedure keeps in its dialog's GWLP_USERDATA (put
 /// there at WM_INITDIALOG); `None` for the messages that come before.
@@ -1490,6 +1889,22 @@ pub fn make_control(
 /// area has over the template's `size`. In dialog units, so it holds at
 /// every DPI. A combo box's height is its list's, as in the template.
 pub fn anchor(dlg: HWND, size: (i16, i16), controls: &[(u16, Units, u8)]) {
+    for &(id, units, how) in controls {
+        let r = placed(dlg, size, units, how);
+        // SAFETY: moves a control of this thread's dialog.
+        unsafe {
+            let h = GetDlgItem(dlg, i32::from(id));
+            if !h.is_null() {
+                MoveWindow(h, r.left, r.top, r.right - r.left, r.bottom - r.top, 1);
+            }
+        }
+    }
+}
+
+/// Where [`anchor`] puts a control of template rectangle `units` that
+/// follows the dialog's size as `how` says, in pixels of the dialog's
+/// client area.
+pub fn placed(dlg: HWND, size: (i16, i16), units: Units, how: u8) -> RECT {
     let px = |(x, y, cx, cy): Units| {
         let mut r = RECT {
             left: x.into(),
@@ -1509,16 +1924,7 @@ pub fn anchor(dlg: HWND, size: (i16, i16), controls: &[(u16, Units, u8)]) {
         (client.right - base.right).max(0),
         (client.bottom - base.bottom).max(0),
     );
-    for &(id, units, how) in controls {
-        let r = anchored(px(units), grew, how);
-        // SAFETY: moves a control of this thread's dialog.
-        unsafe {
-            let h = GetDlgItem(dlg, i32::from(id));
-            if !h.is_null() {
-                MoveWindow(h, r.left, r.top, r.right - r.left, r.bottom - r.top, 1);
-            }
-        }
-    }
+    anchored(px(units), grew, how)
 }
 
 /// Centres a dialog on its owner, kept inside the work area of the owner's
@@ -1599,6 +2005,44 @@ mod tests {
         for msg in [WM_PAINT, WM_SETFONT, WM_SIZE, WM_MOVE, WM_TIMER, WM_GETTEXT] {
             assert!(!wants_list(msg), "{msg:#x}");
         }
+    }
+
+    #[test]
+    fn check_marks_take_the_styles_states() {
+        use windows_sys::Win32::UI::Controls::BST_UNCHECKED;
+        use windows_sys::Win32::UI::Controls::{
+            CBS_CHECKEDDISABLED, CBS_CHECKEDNORMAL, CBS_MIXEDHOT, CBS_UNCHECKEDHOT,
+            CBS_UNCHECKEDNORMAL, CBS_UNCHECKEDPRESSED, RBS_CHECKEDPRESSED, RBS_UNCHECKEDDISABLED,
+        };
+        let (off, on, mixed) = (BST_UNCHECKED, BST_CHECKED, BST_INDETERMINATE);
+        assert_eq!(check_state(off, false, false, false), CBS_UNCHECKEDNORMAL);
+        assert_eq!(check_state(off, false, false, true), CBS_UNCHECKEDHOT);
+        assert_eq!(check_state(off, false, true, true), CBS_UNCHECKEDPRESSED);
+        assert_eq!(check_state(on, false, false, false), CBS_CHECKEDNORMAL);
+        // Greyed wins over hot and pressed.
+        assert_eq!(check_state(on, true, true, true), CBS_CHECKEDDISABLED);
+        assert_eq!(check_state(mixed, false, false, true), CBS_MIXEDHOT);
+        // A radio button's states are numbered alike.
+        assert_eq!(check_state(on, false, true, false), RBS_CHECKEDPRESSED);
+        assert_eq!(check_state(off, true, false, false), RBS_UNCHECKEDDISABLED);
+    }
+
+    #[test]
+    fn dark_edges_are_a_one_line_boxs_or_a_list_views() {
+        let grey = |v: u8| theme::rgb(v, v, v);
+        // A box: the dark one-line box's edge, dimmer greyed.
+        assert_eq!(dark_edge_colours(EDGE_BOX, true), (grey(0x9b), grey(0x38)));
+        assert_eq!(dark_edge_colours(EDGE_BOX, false), (grey(0x40), grey(0x38)));
+        // A list: a list view's edge round the list's face.
+        let pal = Palette::new(true);
+        assert_eq!(
+            dark_edge_colours(EDGE_LIST, true),
+            (theme::rgb(0x82, 0x87, 0x90), pal.bg)
+        );
+        assert_eq!(
+            dark_edge_colours(EDGE_LIST, false),
+            (theme::rgb(0x82, 0x87, 0x90), pal.chrome)
+        );
     }
 
     #[test]

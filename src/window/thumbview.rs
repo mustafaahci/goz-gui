@@ -23,8 +23,8 @@ use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
     CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, CLR_DEFAULT, CLR_NONE, HIMAGELIST, ILC_COLOR32,
     ILD_ASYNC, ILD_SCALE, ILD_TRANSPARENT, IMAGELISTDRAWPARAMS, ImageList_Create,
-    ImageList_Destroy, ImageList_DrawIndirect, ImageList_GetIconSize, LVA_DEFAULT, LVIR_ICON,
-    LVIS_FOCUSED, LVIS_SELECTED, LVM_ARRANGE, LVM_ENSUREVISIBLE, LVM_GETCOUNTPERPAGE,
+    ImageList_Destroy, ImageList_Draw, ImageList_DrawIndirect, ImageList_GetIconSize, LVA_DEFAULT,
+    LVIR_ICON, LVIS_FOCUSED, LVIS_SELECTED, LVM_ARRANGE, LVM_ENSUREVISIBLE, LVM_GETCOUNTPERPAGE,
     LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSPACING, LVM_GETITEMSTATE, LVM_GETNEXTITEM,
     LVM_GETTOPINDEX, LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETICONSPACING, LVM_SETIMAGELIST,
     LVNI_FOCUSED, LVS_AUTOARRANGE, LVS_ICON, LVS_OWNERDRAWFIXED, LVS_REPORT, LVS_TYPEMASK,
@@ -555,10 +555,82 @@ impl App {
         }
     }
 
-    /// Big icons were loaded on their thread: the thumbnails paint again,
-    /// with them.
+    /// A result row's icon in Details at `square`, whose side is bigger
+    /// than the shell's small icons (`paint::row_icon_side`: a UI scale, or
+    /// a monitor of more DPI than the system's): from the least larger of
+    /// the shell's lists, shrunk with a filter on the big icons' thread as
+    /// the thumbnails' are (`bigicons.rs`), never loaded on this thread; the
+    /// small icon, centred, stands in meanwhile.
+    pub(crate) fn draw_row_icon(&self, hdc: HDC, icon: i32, square: &RECT) {
+        let side = square.right - square.left;
+        let mut chosen = None;
+        for which in [SHIL_SMALL, SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO] {
+            let list = self.system_list(which);
+            if list == 0 {
+                continue;
+            }
+            let (mut cx, mut cy) = (0, 0);
+            // SAFETY: reads the size of a system image list.
+            unsafe { ImageList_GetIconSize(list, &mut cx, &mut cy) };
+            if cx >= side {
+                chosen = Some((list, cx));
+                break;
+            }
+        }
+        let Some((list, cx)) = chosen else {
+            return;
+        };
+        let shrink = cx > side;
+        if shrink
+            && self
+                .big_loads
+                .draw_shrunk(list, icon, side, |b| draw_bitmap(hdc, b, square))
+        {
+            return;
+        }
+        let params = IMAGELISTDRAWPARAMS {
+            cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
+            himl: list,
+            i: icon,
+            hdcDst: hdc,
+            x: square.left,
+            y: square.top,
+            cx: if shrink { side } else { 0 },
+            cy: if shrink { side } else { 0 },
+            rgbBk: CLR_NONE as u32,
+            rgbFg: CLR_DEFAULT as u32,
+            fStyle: if shrink {
+                ILD_TRANSPARENT | ILD_SCALE
+            } else {
+                ILD_TRANSPARENT
+            },
+            // SAFETY: the rest of the struct is plain data.
+            ..unsafe { core::mem::zeroed() }
+        };
+        if !self.big_loads.draw(&params, true) {
+            // The small icon meanwhile, centred, drawn as Details draws it
+            // at 100 % (the icons' thread has loaded it already).
+            let (mut cx, mut cy) = (0, 0);
+            // SAFETY: reads the small list's icon size and draws one of its
+            // icons on this paint's DC.
+            unsafe {
+                ImageList_GetIconSize(self.icons.list, &mut cx, &mut cy);
+                ImageList_Draw(
+                    self.icons.list,
+                    icon,
+                    hdc,
+                    square.left + (side - cx) / 2,
+                    square.top + (side - cy) / 2,
+                    ILD_TRANSPARENT,
+                );
+            }
+        }
+    }
+
+    /// Big icons were loaded (or shrunk) on their thread: the view paints
+    /// again, with them (the thumbnails, or Details' rows at a UI scale).
     pub(super) fn big_icons_loaded(&self) {
-        if self.big_loads.arrived() && self.view.get().thumbnails {
+        if self.big_loads.arrived() {
             // SAFETY: repaints this thread's list.
             unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
         }

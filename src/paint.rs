@@ -15,10 +15,11 @@ use windows_sys::Win32::UI::Controls::{
     LVM_GETITEMCOUNT, LVM_GETITEMRECT, ODS_DISABLED, ODS_FOCUS, ODS_GRAYED, ODS_HOTLIGHT,
     ODS_INACTIVE, ODS_NOACCEL, ODS_SELECTED,
 };
+use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetMenuBarInfo, GetMenuItemInfoW, GetWindowRect, HMENU, MENUBARINFO,
-    MENUITEMINFOW, MIIM_STRING, OBJID_MENU, SendMessageW,
+    MENUITEMINFOW, MIIM_STRING, OBJID_MENU, SM_CXSMICON, SendMessageW,
 };
 
 use crate::format;
@@ -36,10 +37,21 @@ const ICON_GAP: i32 = 5;
 /// How far the Name cell's text starts from the cell's left edge: the
 /// padding, the icon and the gap after it. Rename's box sits there.
 pub fn name_text_offset(app: &App) -> i32 {
+    app.scale(CELL_PAD) + row_icon_side(app) + app.scale(ICON_GAP)
+}
+
+/// A row's icon's side in Details: the small icon of the window's DPI with
+/// Options > UI's Scale, at least the shell's small icons' (made at the
+/// system's DPI, so smaller at a UI scale or on a monitor of more DPI).
+pub fn row_icon_side(app: &App) -> i32 {
     let (mut cx, mut cy) = (0, 0);
-    // SAFETY: reads the size of the system image list's icons.
-    unsafe { ImageList_GetIconSize(app.icons.list, &mut cx, &mut cy) };
-    app.scale(CELL_PAD) + cx + app.scale(ICON_GAP)
+    // SAFETY: reads the size of the system image list's icons, and a
+    // metric.
+    let wanted = unsafe {
+        ImageList_GetIconSize(app.icons.list, &mut cx, &mut cy);
+        GetSystemMetricsForDpi(SM_CXSMICON, app.dpi.get())
+    };
+    cx.max(wanted)
 }
 
 /// Fills `rc` with `colour` through the DC's own brush, so no brush is made.
@@ -263,11 +275,31 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                     }
                     let (mut cx, mut cy) = (0, 0);
                     ImageList_GetIconSize(app.icons.list, &mut cx, &mut cy);
-                    if inner.right - inner.left > cx {
-                        let y = rc.top + (rc.bottom - rc.top - cy) / 2;
-                        ImageList_Draw(app.icons.list, icon, hdc, inner.left, y, ILD_TRANSPARENT);
+                    let side = row_icon_side(app);
+                    if inner.right - inner.left > side {
+                        let y = rc.top + (rc.bottom - rc.top - side) / 2;
+                        if side > cx {
+                            // Bigger than the shell's small icons: from a
+                            // bigger list, never loaded on this thread.
+                            let square = RECT {
+                                left: inner.left,
+                                top: y,
+                                right: inner.left + side,
+                                bottom: y + side,
+                            };
+                            app.draw_row_icon(hdc, icon, &square);
+                        } else {
+                            ImageList_Draw(
+                                app.icons.list,
+                                icon,
+                                hdc,
+                                inner.left,
+                                y,
+                                ILD_TRANSPARENT,
+                            );
+                        }
                     }
-                    inner.left += cx + app.scale(ICON_GAP);
+                    inner.left += side + app.scale(ICON_GAP);
                     // The find bar's Highlight All, behind the text.
                     app.paint_find_matches(hdc, &inner, row.name(), &scratch.name_spans, &fonts);
                     runs_hl(
@@ -405,10 +437,7 @@ pub fn cell_text(
     };
     let pad = app.scale(CELL_PAD);
     let lead = if col == COL_NAME {
-        let (mut cx, mut cy) = (0, 0);
-        // SAFETY: reads the size of the system image list's icons.
-        unsafe { ImageList_GetIconSize(app.icons.list, &mut cx, &mut cy) };
-        cx + app.scale(ICON_GAP)
+        row_icon_side(app) + app.scale(ICON_GAP)
     } else {
         0
     };

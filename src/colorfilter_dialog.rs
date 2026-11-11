@@ -24,7 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::colorfilter::ColorFilter;
 use crate::colors::{format_color, parse_color};
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common, state};
+use crate::dialog::{Class, LIST_BOX, Look, Template, apply_theme, center_on_owner, common, state};
 use crate::wide::{window_text, wz};
 
 const STATIC: u16 = 0xffff;
@@ -119,7 +119,7 @@ pub fn edit(owner: HWND, rules: Vec<ColorFilter>, look: Look) -> Option<Vec<Colo
         Class::Named("LISTBOX"),
         "",
         LIST,
-        WS_TABSTOP | WS_VSCROLL | WS_BORDER | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
+        WS_TABSTOP | WS_VSCROLL | WS_BORDER | LIST_BOX | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
         0,
         (7, 27, 228, 80),
     )

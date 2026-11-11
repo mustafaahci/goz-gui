@@ -26,9 +26,9 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::Controls::{
-    BST_CHECKED, BST_UNCHECKED, EM_SETCUEBANNER, EM_SETSEL, LVIS_FOCUSED, LVIS_SELECTED,
-    LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_SETSELECTIONMARK, LVNI_FOCUSED,
-    WM_MOUSELEAVE,
+    BST_CHECKED, BST_UNCHECKED, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_SKIPDEFAULT, EM_SETCUEBANNER,
+    EM_SETSEL, LVIS_FOCUSED, LVIS_SELECTED, LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT, LVM_GETNEXTITEM,
+    LVM_SETSELECTIONMARK, LVNI_FOCUSED, NM_CUSTOMDRAW, NMCUSTOMDRAW, WM_MOUSELEAVE,
 };
 use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -42,8 +42,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PostMessageW, SM_CXMENUCHECK, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowPos, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND,
     WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFONT, WM_SYSCHAR, WM_SYSKEYDOWN, WS_CHILD,
-    WS_TABSTOP,
+    WM_MOUSEMOVE, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFONT, WM_SYSCHAR, WM_SYSKEYDOWN,
+    WS_CHILD, WS_TABSTOP,
 };
 
 use super::{App, Fonts, key_down, send, slots};
@@ -735,9 +735,32 @@ impl Strip for FindBar {
         }
     }
 
-    fn message(&self, app: &App, msg: u32, w: WPARAM, _l: LPARAM) -> Option<LRESULT> {
+    fn message(&self, app: &App, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         let pal = app.pal.get();
         match msg {
+            // At a UI scale the check boxes are drawn here, their marks at
+            // the scale (Windows draws them at the monitor's size).
+            WM_NOTIFY if l != 0 => {
+                // SAFETY: WM_NOTIFY's lParam is an NMHDR; an
+                // NM_CUSTOMDRAW's is an NMCUSTOMDRAW.
+                let cd = unsafe { &*(l as *const NMCUSTOMDRAW) };
+                let button = cd.hdr.hwndFrom;
+                if cd.hdr.code != NM_CUSTOMDRAW || !crate::dialog::ui_scaled(button) {
+                    return None;
+                }
+                let kind = crate::dialog::check_kind(button)?;
+                if cd.dwDrawStage != CDDS_PREPAINT {
+                    return Some(CDRF_DODEFAULT as LRESULT);
+                }
+                let bar = pal.ink(ColorItem::FindBar, ColorState::Normal);
+                let ink = crate::dialog::CheckInk {
+                    face: Some(bar.bg),
+                    fg: bar.fg,
+                    dim: pal.dim,
+                };
+                crate::dialog::paint_check(button, cd, kind, ink);
+                Some(CDRF_SKIPDEFAULT as LRESULT)
+            }
             WM_COMMAND => {
                 let (id, code) = (w & 0xffff, ((w >> 16) & 0xffff) as u32);
                 match (id, code) {

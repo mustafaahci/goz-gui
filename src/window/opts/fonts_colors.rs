@@ -24,14 +24,14 @@ use windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_GROUPBOX,
     CB_ADDSTRING, CB_ERR, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_RESETCONTENT,
-    CB_SELECTSTRING, CB_SETCURSEL, CBN_EDITCHANGE, CBN_SELCHANGE, CBS_DROPDOWN, CBS_DROPDOWNLIST,
-    CBS_SORT, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LBN_SELCHANGE,
-    LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, WM_COMMAND, WM_DRAWITEM, WS_BORDER, WS_GROUP, WS_TABSTOP,
-    WS_VSCROLL,
+    CB_SELECTSTRING, CB_SETCURSEL, CB_SETEDITSEL, CBN_EDITCHANGE, CBN_SELCHANGE, CBS_DROPDOWN,
+    CBS_DROPDOWNLIST, CBS_SORT, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
+    LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, WM_COMMAND, WM_DRAWITEM, WS_BORDER, WS_GROUP,
+    WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::colors::{Accent, AccentMode, Colors, FontSpec, Item, Look, SIZES, State, Weight};
-use crate::dialog::Class;
+use crate::dialog::{Class, LIST_BOX};
 use crate::options::{Invalid, LABEL, Page, Rows, enable, item, order, send, set_text, text};
 use crate::paint::fill;
 use crate::theme::{Ink, Palette};
@@ -43,6 +43,9 @@ const THEME: u16 = 1532;
 const ITEM: u16 = 1534;
 const FONT: u16 = 1142;
 const SIZE: u16 = 1143;
+/// `CB_SETEDITSEL`'s lParam that takes the selection away: a start of -1
+/// (low word), no end.
+const NO_SELECTION: isize = 0xffff;
 const ACCENT_NONE: u16 = 1398;
 const ACCENT_DEFAULT: u16 = 1399;
 const ACCENT_CUSTOM: u16 = 1400;
@@ -193,6 +196,10 @@ impl FontsColors {
                 font.size.to_string()
             };
             set_text(page, SIZE, &size);
+            // Setting the box's text selects it, and a combo box's text
+            // shows its selection with or without the keyboard: none,
+            // until the box is used (as the Font list beside it).
+            send(page, SIZE, CB_SETEDITSEL, 0, NO_SELECTION);
             for (id, mode) in [
                 (ACCENT_NONE, AccentMode::None),
                 (ACCENT_DEFAULT, AccentMode::Default),
@@ -576,7 +583,11 @@ impl Page for FontsColors {
                 Class::Named("LISTBOX"),
                 "",
                 STATES,
-                WS_TABSTOP | WS_VSCROLL | WS_BORDER | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
+                WS_TABSTOP
+                    | WS_VSCROLL
+                    | WS_BORDER
+                    | LIST_BOX
+                    | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
                 0,
                 (0, 0, w, 48),
             )
