@@ -378,31 +378,31 @@ impl App {
         let Some(folder) = folder else { return };
         s.last_folder = text(&folder);
         self.set_tool_settings(s);
-        let targets = self.moved_with_folders(moving, targets, |t| &t.path);
-        let steps = targets
-            .into_iter()
-            // A move into the folder the item is in already is nothing to
-            // do, as a paste there.
-            .filter(|t| {
-                !(moving
-                    && parent(&t.path).is_some_and(|p| crate::filetools::same_path(p, &folder)))
-            })
-            .map(|t| {
-                if moving {
-                    Step::Move {
-                        path: t.path,
-                        folder: folder.clone(),
-                        name: None,
-                    }
-                } else {
-                    Step::Copy {
-                        path: t.path,
-                        folder: folder.clone(),
-                        name: None,
-                    }
-                }
-            })
-            .collect();
+        let steps = if moving {
+            // A move into the folder an item is in already is nothing to
+            // do, as a paste there; what a moved folder holds goes with it.
+            let items: Vec<(&[u16], Option<&[u16]>)> =
+                targets.iter().map(|t| (t.path.as_slice(), None)).collect();
+            let plan = crate::filetools::plan_moves(&items, &folder);
+            self.note_with_folders(plan.with_folders);
+            plan.steps
+                .into_iter()
+                .map(|(_, path)| Step::Move {
+                    path,
+                    folder: folder.clone(),
+                    name: None,
+                })
+                .collect()
+        } else {
+            targets
+                .into_iter()
+                .map(|t| Step::Copy {
+                    path: t.path,
+                    folder: folder.clone(),
+                    name: None,
+                })
+                .collect()
+        };
         let action = if moving { Action::Move } else { Action::Copy };
         self.run_task(steps, false, Purpose::Do(action));
     }
@@ -521,53 +521,50 @@ impl App {
         s.last_folder = text(&chosen.folder);
         self.set_tool_settings(s);
         let folder = chosen.folder;
-        let renames = self.moved_with_folders(moving, chosen.renames, |(path, _)| path);
-        let steps = renames
-            .into_iter()
-            .map(|(path, name)| {
-                // Its own name, as Copy and Move to Folder give it (the
-                // dialog refused a copy into its own folder under it).
-                let keep = crate::filetools::name_of(&path) == name.as_slice();
-                let name = (!keep).then_some(name);
-                if moving {
-                    Step::Move {
-                        path,
-                        folder: folder.clone(),
-                        name,
-                    }
-                } else {
-                    Step::Copy {
-                        path,
-                        folder: folder.clone(),
-                        name,
-                    }
-                }
-            })
-            .collect();
+        // Its own name, as Copy and Move to Folder give it (the dialog
+        // refused a copy into its own folder under it, and left out a move
+        // into its own folder under it).
+        let new_name = |path: &[u16], name: &[u16]| {
+            (crate::filetools::name_of(path) != name).then(|| name.to_vec())
+        };
+        let steps = if moving {
+            let items: Vec<(&[u16], Option<Vec<u16>>)> = chosen
+                .renames
+                .iter()
+                .map(|(path, name)| (path.as_slice(), new_name(path, name)))
+                .collect();
+            let refs: Vec<(&[u16], Option<&[u16]>)> =
+                items.iter().map(|(p, n)| (*p, n.as_deref())).collect();
+            let plan = crate::filetools::plan_moves(&refs, &folder);
+            self.note_with_folders(plan.with_folders);
+            plan.steps
+                .into_iter()
+                .map(|(i, path)| Step::Move {
+                    path,
+                    folder: folder.clone(),
+                    name: items[i].1.clone(),
+                })
+                .collect()
+        } else {
+            chosen
+                .renames
+                .into_iter()
+                .map(|(path, name)| Step::Copy {
+                    name: new_name(&path, &name),
+                    path,
+                    folder: folder.clone(),
+                })
+                .collect()
+        };
         let action = if moving { Action::Move } else { Action::Copy };
         self.run_task(steps, false, Purpose::Do(action));
     }
 
-    /// W5: of the items a move takes, those inside another of them (a
-    /// folder selected with an item in it) go with that folder, as they
-    /// are, and are left out (their own move would fail: the item is gone
-    /// by then); the status bar says how many. A copy takes them all.
-    fn moved_with_folders<T>(
-        &self,
-        moving: bool,
-        items: Vec<T>,
-        path: impl Fn(&T) -> &Vec<u16>,
-    ) -> Vec<T> {
-        if !moving {
-            return items;
-        }
-        let inside = {
-            let paths: Vec<&[u16]> = items.iter().map(|t| path(t).as_slice()).collect();
-            crate::filetools::inside_another(&paths)
-        };
-        let n = inside.iter().filter(|&&i| i).count();
+    /// W5: says how many of the items a move takes go with a selected
+    /// folder that holds them (`filetools::plan_moves`), when any do.
+    fn note_with_folders(&self, n: usize) {
         if n == 0 {
-            return items;
+            return;
         }
         self.show_note(if n == 1 {
             "1 item inside a selected folder moves with its folder".into()
@@ -577,11 +574,6 @@ impl App {
                 crate::format::grouped(n as u64)
             )
         });
-        items
-            .into_iter()
-            .zip(inside)
-            .filter_map(|(t, inside)| (!inside).then_some(t))
-            .collect()
     }
 
     /// Edit > Advanced > Set File Time...: asks what each time becomes,

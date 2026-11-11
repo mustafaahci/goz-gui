@@ -48,7 +48,8 @@ use crate::msgbox;
 use crate::store::location;
 
 /// A file list finished reading: wParam 1 when every row was read, 0 when
-/// reading stopped on an error.
+/// reading stopped on an error; lParam the list's id (the shown tab's list
+/// or one held for another tab).
 pub(super) const WM_FILELIST: u32 = MSG_FIRST;
 /// The other windows asked to end for Import or Reset Settings have ended
 /// (or the wait for them is over): the files can be replaced.
@@ -114,6 +115,9 @@ pub(super) struct DataTools {
     list: RefCell<Option<Arc<FileList>>>,
     /// The lists the other open tabs search (W5).
     held: RefCell<Vec<Arc<FileList>>>,
+    /// Held lists whose reading ended while held (their ids): how it ended
+    /// is said when their tab shows (W5R-5).
+    unsaid: RefCell<Vec<u64>>,
     /// The shown list's matches are sorted by its Date Created (W5).
     created_sort: Cell<Option<SortDir>>,
     /// The Date Created column's width at 96 DPI, while the window lasts.
@@ -124,11 +128,60 @@ pub(super) struct DataTools {
     replacing: RefCell<Option<Replace>>,
 }
 
+/// Whose a list whose reading ended is (its WM_FILELIST).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reader {
+    /// The shown tab's.
+    Shown,
+    /// Another tab's, held: kept to say when that tab shows.
+    Held,
+    /// No tab's any more.
+    Gone,
+}
+
 impl DataTools {
+    /// The reading of the list `id` ended: whose it is (a held one's end
+    /// is kept, to be said when its tab shows).
+    fn read_ended(&self, id: u64) -> Reader {
+        if self.list.borrow().as_ref().is_some_and(|l| l.id() == id) {
+            Reader::Shown
+        } else if self.held.borrow().iter().any(|l| l.id() == id) {
+            self.unsaid.borrow_mut().push(id);
+            Reader::Held
+        } else {
+            Reader::Gone
+        }
+    }
+
+    /// The held `list` is to show: whether how its reading ended is still
+    /// to be said (it is not kept any more).
+    fn take_unsaid(&self, list: &FileList) -> bool {
+        let mut unsaid = self.unsaid.borrow_mut();
+        let at = unsaid.iter().position(|&id| id == list.id());
+        at.map(|i| unsaid.swap_remove(i)).is_some()
+    }
+
+    /// A navigation entry or a tab is shown (Back and Forward, a bookmark,
+    /// a tab switch; W5R-3): its sort is the one in force, so a Date
+    /// Created sort, which no entry or tab keeps, ends.
+    fn state_shown(&self) {
+        self.created_sort.set(None);
+    }
+
+    /// Only the lists still shown or held are kept to say.
+    fn forget_unsaid_of_gone(&self) {
+        let list = self.list.borrow();
+        let held = self.held.borrow();
+        self.unsaid
+            .borrow_mut()
+            .retain(|&id| list.iter().chain(held.iter()).any(|l| l.id() == id));
+    }
+
     pub(super) fn new() -> DataTools {
         DataTools {
             list: RefCell::new(None),
             held: RefCell::new(Vec::new()),
+            unsaid: RefCell::new(Vec::new()),
             created_sort: Cell::new(None),
             created_width: Cell::new(crate::columns::DEFAULT_WIDTHS[crate::columns::COL_DATE]),
             dialog: Cell::new(false),
@@ -265,15 +318,24 @@ impl App {
             if let Some(old) = self.data_tools.list.borrow_mut().take() {
                 held.push(old);
             }
+            // A held list whose reading ended while held: said now.
+            let mut unsaid = None;
             let next = want.and_then(|p| {
                 if let Some(i) = held.iter().position(|l| is_list(l, p)) {
-                    return Some(held.remove(i));
+                    let list = held.remove(i);
+                    if self.data_tools.take_unsaid(&list) {
+                        unsaid = Some(Arc::clone(&list));
+                    }
+                    return Some(list);
                 }
                 self.open_list(p, false)
             });
             *self.data_tools.list.borrow_mut() = next;
             *self.data_tools.held.borrow_mut() = held;
             self.list_changed();
+            if let Some(list) = unsaid {
+                self.say_how_read(&list);
+            }
         }
         // The tabs' lists as they are now: the others are let go.
         let named: Vec<String> = self
@@ -290,6 +352,7 @@ impl App {
             }
             keep
         });
+        self.data_tools.forget_unsaid_of_gone();
     }
 
     /// Opens the list at `path` to read; said when it cannot be: in a
@@ -400,6 +463,11 @@ impl App {
     /// Another sort was chosen: the Date Created sort ends.
     pub(super) fn end_created_sort(&self) {
         self.data_tools.created_sort.set(None);
+    }
+
+    /// A navigation entry or a tab is shown: [`DataTools::state_shown`].
+    pub(super) fn created_sort_state_shown(&self) {
+        self.data_tools.state_shown();
     }
 
     /// Files dropped on the window: when they are all `.efu` files, the
@@ -523,9 +591,13 @@ impl App {
     }
 
     /// A data tool's WM_APP message.
-    pub(super) fn data_tools_message(&self, msg: u32, w: WPARAM, _l: LPARAM) {
+    pub(super) fn data_tools_message(&self, msg: u32, _w: WPARAM, l: LPARAM) {
         if msg == WM_FILELIST {
-            self.file_list_read(w != 0);
+            // Only the shown list's end shows now (W5R-5); a held list's is
+            // said when its tab shows.
+            if self.data_tools.read_ended(l as u64) == Reader::Shown {
+                self.file_list_read();
+            }
         } else if msg == WM_OTHERS_ENDED {
             let replace = self.data_tools.replacing.take();
             if let Some(replace) = replace {
@@ -594,16 +666,24 @@ impl App {
         self.start_search(false);
     }
 
-    /// The open list was read to its end (`ok`), or reading stopped on an
-    /// error: the results show all of it now, and the status bar says why
-    /// a list stopped short.
-    fn file_list_read(&self, ok: bool) {
+    /// The shown list was read to its end, or reading stopped on an error:
+    /// the results show all of it now, and the status bar says why a list
+    /// stopped short.
+    fn file_list_read(&self) {
         let Some(list) = self.filelist() else { return };
         if !list.loaded() {
-            // A list closed and opened again since: its own message comes.
             return;
         }
-        if !ok && let Some(why) = list.error() {
+        self.say_how_read(&list);
+        self.refresh_created_column();
+        self.start_search(true);
+        self.invalidate_status();
+    }
+
+    /// Says in the status bar why `list` (read) stopped short, or how many
+    /// rows it left out.
+    fn say_how_read(&self, list: &FileList) {
+        if let Some(why) = list.error() {
             self.show_note(format!("{} could not be read whole: {why}", list.name()));
         } else if list.skipped() > 0 {
             self.show_note(format!(
@@ -612,9 +692,6 @@ impl App {
                 crate::format::grouped(list.skipped())
             ));
         }
-        self.refresh_created_column();
-        self.start_search(true);
-        self.invalidate_status();
     }
 
     /// Help > Troubleshooting Information.
@@ -932,6 +1009,41 @@ mod tests {
         // A folder named so is no list.
         let dirs = |p: &[u16]| String::from_utf16_lossy(p).ends_with("dir.efu");
         assert_eq!(efu_drop(&[w(r"C:\dir.efu")], dirs), None);
+    }
+
+    #[test]
+    fn a_held_lists_end_of_reading_waits_for_its_tab() {
+        // W5R-5: the shown tab's list Y; another tab's X, held.
+        let d = DataTools::new();
+        let y = FileList::from_rows(&[(r"C:\a.txt", None, None, false)]);
+        let x = FileList::from_rows(&[(r"C:\b.txt", None, None, false)]);
+        let gone = FileList::from_rows(&[(r"C:\c.txt", None, None, false)]);
+        assert!(x.id() != y.id() && gone.id() != x.id() && gone.id() != y.id());
+        *d.list.borrow_mut() = Some(Arc::clone(&y));
+        d.held.borrow_mut().push(Arc::clone(&x));
+        // X's message is X's, not Y's: Y's note and refresh do not come
+        // again; X's end is kept for its tab.
+        assert_eq!(d.read_ended(x.id()), Reader::Held);
+        assert_eq!(d.read_ended(y.id()), Reader::Shown);
+        assert_eq!(d.read_ended(gone.id()), Reader::Gone);
+        assert!(!d.take_unsaid(&y));
+        // X's tab shows: said once.
+        assert!(d.take_unsaid(&x));
+        assert!(!d.take_unsaid(&x));
+        // A list let go before its tab showed is not kept.
+        assert_eq!(d.read_ended(x.id()), Reader::Held);
+        d.held.borrow_mut().clear();
+        d.forget_unsaid_of_gone();
+        assert!(d.unsaid.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_shown_entry_or_tab_ends_the_date_created_sort() {
+        // W5R-3: Back, a bookmark or a tab switch shows its own sort.
+        let d = DataTools::new();
+        d.created_sort.set(Some(SortDir::Desc));
+        d.state_shown();
+        assert_eq!(d.created_sort.get(), None);
     }
 
     #[test]

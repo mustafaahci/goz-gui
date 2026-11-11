@@ -9,7 +9,8 @@ use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO,
+    MonitorFromRect, MonitorFromWindow,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::Controls::{
@@ -50,6 +51,10 @@ struct Full {
     /// minimized: put back exactly, as `SetWindowPlacement` alone moves a
     /// window that was partly or wholly off every monitor onto one.
     rect: Option<RECT>,
+    /// That rectangle was on a monitor then (W5R-4): it is put back
+    /// exactly only while it still is, else the placement alone puts the
+    /// window on one (a monitor unplugged while fullscreen).
+    rect_on_monitor: bool,
     style: isize,
     /// The menu bar was taken away (`fullscreen_menu=0`).
     menu_hidden: bool,
@@ -510,6 +515,7 @@ impl App {
         *self.tools.full.borrow_mut() = Some(Full {
             placement,
             rect,
+            rect_on_monitor: rect.as_ref().is_some_and(on_a_monitor),
             style,
             menu_hidden: !keep_menu,
         });
@@ -566,9 +572,13 @@ impl App {
             }
             SetWindowPlacement(self.hwnd, &placement);
             let flags = SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE;
-            match full.rect {
+            match full
+                .rect
+                .filter(|rc| exactly_back(full.rect_on_monitor, on_a_monitor(rc)))
+            {
                 // Exactly where it was, on a monitor or not (the placement
-                // alone brings one that was off every monitor onto one).
+                // alone brings one that was off every monitor onto one);
+                // not where no monitor is any more.
                 Some(rc) => SetWindowPos(
                     self.hwnd,
                     core::ptr::null_mut(),
@@ -835,5 +845,42 @@ impl App {
         }
         self.set_search_text(&done.query);
         self.focus_box();
+    }
+}
+
+/// Whether any of `rc` is on a monitor.
+fn on_a_monitor(rc: &RECT) -> bool {
+    // SAFETY: reads a plain rectangle; DEFAULTTONULL gives null for none.
+    !unsafe { MonitorFromRect(rc, MONITOR_DEFAULTTONULL) }.is_null()
+}
+
+/// Whether leaving fullscreen puts the window back at its exact old
+/// rectangle: while that is on a monitor (`on_now`), or when it was off
+/// every monitor already before (a test's window, kept off screen);
+/// otherwise the placement alone, which Windows brings onto a monitor.
+fn exactly_back(was_on: bool, on_now: bool) -> bool {
+    on_now || !was_on
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fullscreen_goes_back_where_a_monitor_is() {
+        // W5R-4: on a monitor at F11, on none at the second F11 (it was
+        // unplugged meanwhile): the placement alone, not the old place.
+        assert!(!exactly_back(true, false));
+        assert!(exactly_back(true, true));
+        // Off every monitor already at F11: back there exactly.
+        assert!(exactly_back(false, false));
+        assert!(exactly_back(false, true));
+        let far = RECT {
+            left: -2_000_000,
+            top: -2_000_000,
+            right: -1_999_000,
+            bottom: -1_999_500,
+        };
+        assert!(!on_a_monitor(&far));
     }
 }

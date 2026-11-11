@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use goz_core::fold::fold_into;
@@ -169,6 +169,9 @@ pub struct Matched {
 
 /// An open file list.
 pub struct FileList {
+    /// Its own number in the process (W5R-5): its reader's message says
+    /// it, so a window knows which of its lists the message is about.
+    id: u64,
     path: PathBuf,
     name: String,
     chunks: Mutex<Vec<Arc<Chunk>>>,
@@ -192,7 +195,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Where to tell that a list is read: a window and its message (wParam 1
-/// when every row was read, 0 when reading stopped on an error).
+/// when every row was read, 0 when reading stopped on an error; lParam
+/// the list's [`id`](FileList::id)).
 #[derive(Clone, Copy)]
 pub struct Notify {
     pub hwnd: usize,
@@ -212,6 +216,7 @@ impl FileList {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         let list = Arc::new(FileList {
+            id: next_id(),
             path: path.to_path_buf(),
             name,
             chunks: Mutex::new(Vec::new()),
@@ -237,7 +242,7 @@ impl FileList {
                 }
                 reading.done.store(true, Ordering::Release);
                 if let Some(n) = notify {
-                    post(n, outcome.is_ok());
+                    post(n, outcome.is_ok(), reading.id);
                 }
                 if outcome.is_ok() && !reading.stop.load(Ordering::Relaxed) {
                     let chunks = lock(&reading.chunks).clone();
@@ -280,6 +285,7 @@ impl FileList {
             );
         }
         let list = Arc::new(FileList {
+            id: next_id(),
             path: PathBuf::from("test.efu"),
             name: "test.efu".into(),
             chunks: Mutex::new(vec![Arc::new(chunk)]),
@@ -300,6 +306,11 @@ impl FileList {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Its own number in the process: no two lists opened have the same.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Its file name, as the status bar and the title show it.
@@ -427,11 +438,17 @@ impl FileList {
     }
 }
 
-fn post(n: Notify, ok: bool) {
+fn post(n: Notify, ok: bool, id: u64) {
     use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
     // SAFETY: a plain post to the window that asked; nothing is passed by
     // pointer, and a window gone since just drops it.
-    unsafe { PostMessageW(n.hwnd as _, n.msg, usize::from(ok), 0) };
+    unsafe { PostMessageW(n.hwnd as _, n.msg, usize::from(ok), id as isize) };
+}
+
+/// A new list's [`FileList::id`]: never 0.
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The clock and time zone a `dm:` date resolves against, read as each

@@ -62,7 +62,9 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::{HRESULT, Interface, PCWSTR, implement};
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HWND, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+use windows_sys::Win32::Globalization::{
+    CSTR_EQUAL, CompareStringOrdinal, LCMAP_UPPERCASE, LCMapStringEx, LOCALE_NAME_INVARIANT,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, DeleteFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -374,34 +376,134 @@ pub fn same_path(a: &[u16], b: &[u16]) -> bool {
     }
 }
 
-/// Whether `inner` is inside the folder `outer` (at any depth; not the
-/// same path), as Windows compares paths.
-pub fn is_inside(inner: &[u16], outer: &[u16]) -> bool {
-    let mut outer = outer;
-    while let [rest @ .., BACKSLASH] = outer {
-        outer = rest;
-    }
-    inner.len() > outer.len() + 1
-        && inner[outer.len()] == BACKSLASH
-        && same_path(&inner[..outer.len()], outer)
+/// What a move of several items into one folder runs (wave 5): each item
+/// that has a step of its own, as its index and the path its step moves,
+/// in the order the steps run; and how many items go with a selected
+/// folder that holds them instead.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MovePlan {
+    pub steps: Vec<(usize, Vec<u16>)>,
+    pub with_folders: usize,
 }
 
-/// Which of `paths` are inside another of them (wave 5): a move of both
-/// a folder and an item in it moves the item with the folder, so the
-/// item's own move is left out. Moving it first instead would leave it
-/// out of its folder, and Undo, which checks each step before any runs,
-/// could not put it back in a folder that is not back yet.
-pub fn inside_another(paths: &[&[u16]]) -> Vec<bool> {
-    paths
+/// Plans the move of `items` (each a path, and its new name, `None` to
+/// keep its own) into `folder`:
+/// - an item in `folder` already under its own name has nothing to do, as
+///   a paste there;
+/// - an item inside a selected folder that leaves for `folder` goes with
+///   it, as it is: its own step is left out (it would fail, the item is
+///   gone by then) and it is counted in `with_folders`. Moving it first
+///   instead would leave it out of its folder, and Undo, which checks each
+///   step before any runs, could not put it back in a folder not back yet;
+/// - an item inside a selected folder that stays where it is keeps its own
+///   step: from where it is when that folder has nothing to do; from under
+///   the folder's new name when the folder is renamed in place (Advanced
+///   Move), the folder's step going first. Undo then puts it back in the
+///   renamed folder, then renames the folder back.
+///
+/// Paths are compared as Windows compares them (any case; a trailing
+/// backslash or none). O(n log n): a Select All of 100,000 rows is planned
+/// at once on the window's thread.
+pub fn plan_moves(items: &[(&[u16], Option<&[u16]>)], folder: &[u16]) -> MovePlan {
+    let n = items.len();
+    // Already in `folder`: nothing to do, or a rename in place.
+    let stays: Vec<bool> = items
         .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            paths
-                .iter()
-                .enumerate()
-                .any(|(j, q)| i != j && is_inside(p, q))
-        })
-        .collect()
+        .map(|(p, _)| parent(p).is_some_and(|q| same_path(q, folder)))
+        .collect();
+    let in_place = |i: usize| stays[i] && items[i].1.is_some();
+    // Each path as a key: trimmed, folded, its backslashes made the lowest
+    // unit. Sorted so, a folder comes right before what it holds.
+    let keys: Vec<Vec<u16>> = items.iter().map(|(p, _)| path_key(p)).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by(|&a, &b| keys[a].cmp(&keys[b]));
+    let holds = |outer: &[u16], inner: &[u16]| {
+        inner.len() > outer.len() && inner[outer.len()] == 0 && inner.starts_with(outer)
+    };
+    // The selected items holding the one walked, outermost first.
+    let mut open: Vec<usize> = Vec::new();
+    let mut carried = vec![false; n];
+    let mut renamed_in: Vec<Option<usize>> = vec![None; n];
+    for &i in &order {
+        while let Some(&t) = open.last() {
+            if holds(&keys[t], &keys[i]) {
+                break;
+            }
+            open.pop();
+        }
+        carried[i] = open.iter().any(|&t| !stays[t]);
+        renamed_in[i] = open.iter().copied().find(|&t| in_place(t));
+        open.push(i);
+    }
+    let own = |i: usize| !carried[i] && !(stays[i] && items[i].1.is_none());
+    // A folder renamed in place goes before what it holds that moves.
+    let mut first = vec![false; n];
+    for i in (0..n).filter(|&i| own(i)) {
+        if let Some(t) = renamed_in[i] {
+            first[t] = true;
+        }
+    }
+    let path_of = |i: usize| match renamed_in[i] {
+        Some(t) => {
+            let mut path = join(folder, items[t].1.unwrap_or_default());
+            path.extend_from_slice(&items[i].0[keys[t].len()..]);
+            path
+        }
+        None => items[i].0.to_vec(),
+    };
+    let steps = (0..n)
+        .filter(|&i| first[i] && own(i))
+        .chain((0..n).filter(|&i| !first[i] && own(i)))
+        .map(|i| (i, path_of(i)))
+        .collect();
+    MovePlan {
+        steps,
+        with_folders: carried.iter().filter(|&&c| c).count(),
+    }
+}
+
+/// `path` as [`plan_moves`] sorts it: without trailing backslashes, in
+/// upper case as Windows' ordinal comparison folds it (one unit for one,
+/// so a prefix of the key is the key of the path's prefix), each
+/// backslash 0, below every other unit.
+fn path_key(path: &[u16]) -> Vec<u16> {
+    let mut p = path;
+    while let [rest @ .., BACKSLASH] = p {
+        p = rest;
+    }
+    let mut key = vec![0u16; p.len()];
+    // SAFETY: `p` is read and `key` written, each for its own length,
+    // which is the same.
+    let written = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            p.as_ptr(),
+            p.len() as i32,
+            key.as_mut_ptr(),
+            key.len() as i32,
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+        )
+    };
+    if written as usize != p.len() {
+        key = p.iter().map(|&c| ascii_upper(c)).collect();
+    }
+    for c in &mut key {
+        if *c == BACKSLASH {
+            *c = 0;
+        }
+    }
+    key
+}
+
+fn ascii_upper(c: u16) -> u16 {
+    if (u16::from(b'a')..=u16::from(b'z')).contains(&c) {
+        c - 32
+    } else {
+        c
+    }
 }
 
 /// The name in `path` (after its last backslash).
@@ -1255,30 +1357,119 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The plan's steps as text: each item's index and the path it moves.
+    fn planned(items: &[(&str, Option<&str>)], folder: &str) -> (Vec<(usize, String)>, usize) {
+        let owned: Vec<(Vec<u16>, Option<Vec<u16>>)> =
+            items.iter().map(|&(p, n)| (ws(p), n.map(ws))).collect();
+        let refs: Vec<(&[u16], Option<&[u16]>)> = owned
+            .iter()
+            .map(|(p, n)| (p.as_slice(), n.as_deref()))
+            .collect();
+        let plan = plan_moves(&refs, &ws(folder));
+        let steps = plan
+            .steps
+            .into_iter()
+            .map(|(i, p)| (i, String::from_utf16_lossy(&p)))
+            .collect();
+        (steps, plan.with_folders)
+    }
+
     #[test]
-    fn items_inside_other_items_are_found() {
-        let p: Vec<Vec<u16>> = [
-            r"C:\x\F",
-            r"C:\x\F\a.txt",
-            r"c:\X\f\deep\b.txt",
-            r"C:\x\Fa.txt",
-            r"C:\y\other.txt",
-            r"D:\",
-            r"D:\z.txt",
-        ]
-        .iter()
-        .map(|s| ws(s))
-        .collect();
-        let refs: Vec<&[u16]> = p.iter().map(Vec::as_slice).collect();
-        assert_eq!(
-            inside_another(&refs),
-            [false, true, true, false, false, false, true]
+    fn items_inside_a_moved_folder_go_with_it() {
+        let (steps, with) = planned(
+            &[
+                (r"C:\x\F", None),
+                (r"C:\x\F\a.txt", None),
+                (r"c:\X\f\deep\b.txt", None),
+                (r"C:\x\Fa.txt", None),
+                (r"C:\x\F a\c.txt", None),
+                (r"C:\y\other.txt", None),
+                (r"D:\", None),
+                (r"D:\z.txt", None),
+            ],
+            r"E:\to",
         );
-        // A folder with its trailing backslash; the same path is not inside.
-        assert!(is_inside(&ws(r"C:\x\F\a"), &ws(r"C:\x\F\")));
-        assert!(!is_inside(&ws(r"C:\x\F"), &ws(r"C:\x\F")));
-        assert!(!is_inside(&ws(r"C:\x\F\"), &ws(r"C:\x\F")));
-        assert_eq!(inside_another(&[]), Vec::<bool>::new());
+        let own: Vec<usize> = steps.iter().map(|(i, _)| *i).collect();
+        // In the selection's order; what F and D:\ hold goes with them.
+        assert_eq!(own, [0, 3, 4, 5, 6]);
+        assert_eq!(with, 3);
+        assert_eq!(steps[0].1, r"C:\x\F");
+        // A folder with its trailing backslash holds what is in it.
+        let (steps, with) = planned(&[(r"C:\x\F\a", None), (r"C:\x\F\", None)], r"E:\");
+        assert_eq!((steps.len(), with), (1, 1));
+        assert_eq!(steps[0].0, 1);
+        assert_eq!(planned(&[], r"E:\"), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn items_inside_a_folder_that_stays_move_on_their_own() {
+        // W5R-1: F is in C:\x already, so it has nothing to do; a.txt,
+        // selected with it, still moves to C:\x.
+        let (steps, with) = planned(&[(r"C:\x\F", None), (r"C:\x\F\a.txt", None)], r"c:\X\");
+        assert_eq!(steps, [(1, r"C:\x\F\a.txt".to_owned())]);
+        assert_eq!(with, 0);
+        // Advanced Move renaming F in place: F's rename first, then a.txt
+        // from under F's new name, under its own new name.
+        let (steps, with) = planned(
+            &[
+                (r"C:\x\F\a.txt", Some("a2.txt")),
+                (r"C:\x\F", Some("G")),
+                (r"C:\x\F\sub", Some("sub2")),
+                (r"C:\x\F\sub\b.txt", Some("b2.txt")),
+                (r"C:\x\other.txt", Some("o2.txt")),
+            ],
+            r"C:\x",
+        );
+        assert_eq!(
+            steps,
+            [
+                (1, r"C:\x\F".to_owned()),
+                (0, r"C:\x\G\a.txt".to_owned()),
+                (2, r"C:\x\G\sub".to_owned()),
+                (4, r"C:\x\other.txt".to_owned()),
+            ]
+        );
+        // b.txt goes with sub, which leaves for C:\x.
+        assert_eq!(with, 1);
+        // Moved elsewhere, the renamed folder takes what it holds.
+        let (steps, with) = planned(
+            &[(r"C:\x\F\a.txt", Some("a2.txt")), (r"C:\x\F", Some("G"))],
+            r"D:\",
+        );
+        assert_eq!(steps, [(1, r"C:\x\F".to_owned())]);
+        assert_eq!(with, 1);
+    }
+
+    #[test]
+    fn a_big_selection_is_planned_at_once() {
+        // W5R-2: 1,000 folders of 100 files each, all selected: the old
+        // pairwise check made 1e10 comparisons; this is a sort.
+        let mut paths: Vec<Vec<u16>> = Vec::new();
+        for f in 0..1000 {
+            paths.push(ws(&format!(r"C:\big\folder{f}")));
+            for i in 0..100 {
+                paths.push(ws(&format!(r"C:\big\folder{f}\file{i}.txt")));
+            }
+        }
+        let refs: Vec<(&[u16], Option<&[u16]>)> =
+            paths.iter().map(|p| (p.as_slice(), None)).collect();
+        let started = std::time::Instant::now();
+        let plan = plan_moves(&refs, &ws(r"D:\to"));
+        assert_eq!(plan.steps.len(), 1000);
+        assert_eq!(plan.with_folders, 100_000);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn path_keys_fold_as_windows_compares() {
+        assert_eq!(path_key(&ws(r"c:\Ä\x\\")), path_key(&ws(r"C:\ä\X")));
+        let c = |c: u8| u16::from(c);
+        assert_eq!(path_key(&ws(r"C:\a")), [c(b'C'), c(b':'), 0, c(b'A')]);
+        assert_eq!(path_key(&ws(r"D:\")), path_key(&ws("d:")));
     }
 
     #[test]

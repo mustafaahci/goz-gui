@@ -203,11 +203,14 @@ impl App {
         self.commit_nav();
     }
 
-    /// Shows `state`'s search, options, filter, sort and folder.
+    /// Shows `state`'s search, options, filter, sort and folder (Back and
+    /// Forward, a bookmark, a tab shown): its sort is the one in force, so a
+    /// file list's Date Created sort, which no entry or tab keeps, ends.
     pub(super) fn restore(&self, state: &NavState) {
         dropdown::close(self);
         self.restore_folder(state.folder.clone());
         self.opts.set(state.opts);
+        self.created_sort_state_shown();
         self.show_sort();
         self.invalidate_status();
         self.set_search_text(&state.text);
