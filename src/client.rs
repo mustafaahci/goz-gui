@@ -138,12 +138,18 @@ impl Search {
             return Err(refused(why));
         }
         let mut looked = slots::is_costly(&self.query);
+        // W8R-4: a list on the disk is read only while the search is wanted.
+        let stale = || shared.is_stale(epoch);
         let resolved = {
             let mut run = |part: &str, now: &Arc<crate::filelist::slots::Slots>| {
-                let query =
-                    slots::for_gozd(part, now, boolean, self.match_case, &mut |q, case| {
-                        look_up(pipe, shared, epoch, q, case)
-                    })?;
+                let query = slots::for_gozd(
+                    part,
+                    now,
+                    boolean,
+                    self.match_case,
+                    &mut |q, case| look_up(pipe, shared, epoch, q, case),
+                    &stale,
+                )?;
                 all_paths(pipe, shared, epoch, &query, self.match_case).map_err(Why::Lookup)
             };
             slots::resolve(&self.query, &self.slots, &mut run)
@@ -152,6 +158,7 @@ impl Search {
             Ok(r) => r,
             Err(Why::Refused(why)) => return Err(refused(why)),
             Err(Why::Lookup(e)) => return Err(e),
+            Err(Why::Stale) => return Err(NotAsked::Io(Io::Cancelled)),
         };
         let answer = {
             // W7: the look-up matches case as the search does (Match Case,
@@ -166,6 +173,7 @@ impl Search {
                 boolean,
                 self.match_case,
                 &mut lookup,
+                &stale,
             )
             .map(std::borrow::Cow::into_owned)
         };
@@ -173,6 +181,7 @@ impl Search {
             Ok(q) => Ok((q, looked, resolved.saves)),
             Err(Why::Refused(why)) => Err(refused(why)),
             Err(Why::Lookup(e)) => Err(e),
+            Err(Why::Stale) => Err(NotAsked::Io(Io::Cancelled)),
         }
     }
 

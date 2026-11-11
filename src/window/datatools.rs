@@ -214,13 +214,19 @@ impl DataTools {
     }
 }
 
+/// The full path a list at `path` is opened at and known by, as
+/// `std::path::absolute` makes it (W8R-1: a doubled `\\`, `.\`, `..\` or a
+/// trailing dot taken out), or `path` as it is when it cannot be made one.
+fn full_path(path: &str) -> PathBuf {
+    std::path::absolute(Path::new(path)).unwrap_or_else(|_| PathBuf::from(path))
+}
+
 /// Whether `list` is the file at `path` (Windows' paths: any case).
 fn is_list(list: &FileList, path: &str) -> bool {
-    let full = std::path::absolute(Path::new(path)).unwrap_or_else(|_| PathBuf::from(path));
     list.path()
         .as_os_str()
         .to_string_lossy()
-        .eq_ignore_ascii_case(&full.as_os_str().to_string_lossy())
+        .eq_ignore_ascii_case(&full_path(path).as_os_str().to_string_lossy())
 }
 
 /// The file list a drop opens: the first of `paths` when every one is an
@@ -263,6 +269,7 @@ impl App {
             .temp
             .borrow()
             .as_ref()
+            .filter(|l| l.open_refusal().is_none())
             .map(|l| l.name().to_owned())
     }
 
@@ -284,6 +291,15 @@ impl App {
     /// one), else the tab's; an error, which the search shows as its
     /// refusal, when the term's list cannot be opened. A search without the
     /// term lets a list it opened go.
+    ///
+    /// W8R-1: the list is opened at the term's full path and known by it,
+    /// so a path written another way (`C:\Lists\\x.efu`) is opened once,
+    /// not again on every search (each reopened list's end searched again).
+    /// W8R-2: the file is opened on the list's own thread, never here: this
+    /// runs on each keystroke, and a network path can take seconds to
+    /// answer. One that cannot be opened is kept, refused, until the term
+    /// names another file or F5 tries it again
+    /// ([`retry_temp_list`](Self::retry_temp_list)).
     pub(super) fn search_file_list(&self, text: &str) -> Result<Option<Arc<FileList>>, String> {
         let Some(wanted) = crate::filelist::slots::open_list(text) else {
             let old = self.data_tools.temp.borrow_mut().take();
@@ -294,23 +310,39 @@ impl App {
             return Ok(self.filelist());
         };
         let path = wanted?;
+        let full = full_path(&path);
         let kept = self.data_tools.temp.borrow().clone();
         if let Some(list) = kept.filter(|l| is_list(l, &path)) {
-            return Ok(Some(list));
+            return match list.open_refusal() {
+                Some(why) => Err(why),
+                None => Ok(Some(list)),
+            };
         }
         let notify = Notify {
             hwnd: self.hwnd as usize,
             msg: WM_FILELIST,
         };
-        let opened = FileList::open(Path::new(&path), Some(notify));
+        let opened = FileList::open_later(&full, Some(notify));
         let old = self.data_tools.temp.replace(opened.as_ref().ok().cloned());
         if let Some(old) = old {
             old.close();
         }
         self.invalidate_status();
-        opened
-            .map(Some)
-            .map_err(|e| format!("open-filelist: cannot open the file list {path}: {e}"))
+        opened.map(Some).map_err(|e| {
+            format!(
+                "open-filelist: cannot open the file list {}: {e}",
+                full.display()
+            )
+        })
+    }
+
+    /// W8R-2: F5: an `open-filelist:` list that could not be opened is let
+    /// go, so the search opens its file again (it may be there now).
+    pub(super) fn retry_temp_list(&self) {
+        let mut temp = self.data_tools.temp.borrow_mut();
+        if temp.as_ref().is_some_and(|l| l.open_refusal().is_some()) {
+            *temp = None;
+        }
     }
 
     /// The window starts: Tools and Help get their items, in Everything's
@@ -1163,6 +1195,38 @@ mod tests {
         list.close();
         while !list.loaded() {
             std::thread::yield_now();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W8R-1: an `open-filelist:` path written another way than its full
+    /// path (a doubled `\\`, `.\`, `..\`, a trailing dot) opens the list at
+    /// the full path, and that list is the one the same text names on the
+    /// next search, so it is kept, not opened (and read) again and again.
+    #[test]
+    fn a_list_opened_for_a_path_is_known_by_it_however_written() {
+        let dir = crate::store::file::tests::fresh_dir("goz-gui-fullpath", "");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("List.efu");
+        std::fs::write(&file, "Filename\r\nC:\\a.txt\r\n").unwrap();
+        let d = dir.display().to_string();
+        for typed in [
+            format!(r"{d}\List.efu"),
+            format!(r"{d}\\List.efu"),
+            format!(r"{d}\.\List.efu"),
+            format!(r"{d}\sub\..\List.efu"),
+            format!(r"{d}\List.efu."),
+            format!(r"{d}/List.efu"),
+        ] {
+            let full = full_path(&typed);
+            assert_eq!(full, file, "{typed}");
+            let list = FileList::open_later(&full, None).unwrap();
+            while !list.loaded() {
+                std::thread::yield_now();
+            }
+            assert!(list.open_refusal().is_none(), "{typed}");
+            assert!(is_list(&list, &typed), "{typed}");
+            assert!(is_list(&list, &typed.to_uppercase()), "{typed}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

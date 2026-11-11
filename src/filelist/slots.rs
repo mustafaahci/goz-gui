@@ -111,6 +111,28 @@ pub const GOZD_MAX_TERMS: usize = 256;
 /// functions.
 pub const LOOKUP_MAX: usize = 4096;
 
+/// W8R-4: how much of an `include-file-list:` file a search reads: at
+/// most `cap` names, and only while `stale` says the search is still
+/// wanted (asked every 4,096 rows).
+#[derive(Clone, Copy)]
+pub struct Reading<'a> {
+    pub cap: usize,
+    pub stale: &'a dyn Fn() -> bool,
+}
+
+impl Reading<'_> {
+    /// All of the file, however long it takes.
+    pub const WHOLE: Reading<'static> = Reading {
+        cap: usize::MAX,
+        stale: &never,
+    };
+}
+
+/// A search that is always wanted.
+fn never() -> bool {
+    false
+}
+
 /// The keyboard commands File | Set File List Slot 0..9: 4850..=4859
 /// (wave 6's range, 4850..=4899).
 pub mod cmd {
@@ -455,18 +477,20 @@ pub fn normalize(name: &str) -> Option<String> {
 
 /// The names `term` stands for: its own, or its slot's. An error for a
 /// slot's term with a value of its own (but `exists-in-filelistN:`, whose
-/// value is the name it looks for).
-pub fn names(term: &Term, slots: &Slots) -> Result<Vec<String>, String> {
+/// value is the name it looks for). W8R-4: an `include-file-list:` file is
+/// read as `reading` says ([`NotAsked::Stale`] when the search went stale).
+pub fn names<E>(term: &Term, slots: &Slots, reading: Reading) -> Result<Vec<String>, NotAsked<E>> {
     // W8: the names in a list on the disk.
     if term.func == Func::Include {
-        return include_names(term);
+        return include_names(term, reading);
     }
     match term.slot {
         Some(n) if term.func != Func::ExistsIn && !term.value.trim().is_empty() => Err(format!(
             "{} takes no value: it works with the names in file list slot {n} \
                  (File | Set File List Slot {n} puts the selected results there)",
             term.name
-        )),
+        )
+        .into()),
         Some(n) => Ok(slots.get(n).iter().filter_map(|s| normalize(s)).collect()),
         None => Ok(split_names(&term.raw)
             .iter()
@@ -516,28 +540,48 @@ fn file_of(term: &Term) -> Result<String, String> {
 /// W8: the names `include-file-list:<file>` stands for: each row's
 /// `Filename` of an EFU or CSV (Everything's "CSV and EFU files must be an
 /// Everything File List with the Filename column"), or each line of any
-/// other list ("TXT files must specify a filename on each line"); a name
-/// with a `\` is a full path, any other a whole name, as `filelist:` reads
-/// them (a relative path is not made one under the list's folder).
-fn include_names(term: &Term) -> Result<Vec<String>, String> {
+/// other list ("TXT files must specify a filename on each line. Use a path
+/// separator to specify the full path"): there a name with a `\` is a full
+/// path, any other a whole name, as `filelist:` reads them. W8R-3: an EFU's
+/// or CSV's relative path is put under the list's folder, as Open File
+/// List, `open-filelist:` and the File List Editor read the same file
+/// (Everything writes such lists with `file_list_relative_paths`).
+///
+/// W8R-4: at most `reading.cap` names are read; a search gone stale stops
+/// the read ([`NotAsked::Stale`]).
+fn include_names<E>(term: &Term, reading: Reading) -> Result<Vec<String>, NotAsked<E>> {
     let path = file_of(term)?;
     let cannot = |e: std::io::Error| format!("{} cannot read {path}: {e}", term.name);
     if std::fs::metadata(&path).map_err(cannot)?.is_dir() {
-        return Err(format!(
-            "{} names the folder {path}, not a file list",
-            term.name
-        ));
+        return Err(format!("{} names the folder {path}, not a file list", term.name).into());
     }
     let file = std::fs::File::open(&path).map_err(cannot)?;
     let reader = super::utf8_reader(file).map_err(cannot)?;
+    let folder = std::path::absolute(&path)
+        .ok()
+        .and_then(|p| p.parent().map(|f| f.display().to_string()))
+        .unwrap_or_default();
     let mut out = Vec::new();
-    let never = std::sync::atomic::AtomicBool::new(false);
-    super::parse::each_row(reader, "", &|_| None, &never, |p, _, _, _, _| {
-        if let Some(n) = normalize(p) {
+    let read = std::cell::Cell::new(0usize);
+    let stale = std::cell::Cell::new(false);
+    let stop = || {
+        read.get() >= reading.cap || {
+            stale.set((reading.stale)());
+            stale.get()
+        }
+    };
+    super::parse::each_row_in(reader, &folder, "", &|_| None, &stop, |p, _, _, _, _| {
+        if read.get() < reading.cap
+            && let Some(n) = normalize(p)
+        {
             out.push(n);
+            read.set(out.len());
         }
     })
     .map_err(cannot)?;
+    if stale.get() {
+        return Err(NotAsked::Stale);
+    }
     Ok(out)
 }
 
@@ -1082,15 +1126,26 @@ pub struct Planned {
 
 /// A search over an open file list: the search without its file-list terms
 /// (each made a space), for goz's parser, and each term's plan; a
-/// `save-filelistN:` term is taken out and tests nothing.
-pub fn split_for_list(query: &str, slots: &Slots) -> Result<(String, Vec<Planned>), String> {
+/// `save-filelistN:` term is taken out and tests nothing. `None` when
+/// `stale` said the search is not wanted any more while an
+/// `include-file-list:` file was read (W8R-4).
+#[allow(clippy::type_complexity)]
+pub fn split_for_list(
+    query: &str,
+    slots: &Slots,
+    stale: &dyn Fn() -> bool,
+) -> Result<Option<(String, Vec<Planned>)>, String> {
     if !may_hold(query) {
-        return Ok((query.to_owned(), Vec::new()));
+        return Ok(Some((query.to_owned(), Vec::new())));
     }
     let found = terms(query);
     if found.is_empty() {
-        return Ok((query.to_owned(), Vec::new()));
+        return Ok(Some((query.to_owned(), Vec::new())));
     }
+    let reading = Reading {
+        cap: usize::MAX,
+        stale,
+    };
     saves(query)?;
     let mut rest = String::with_capacity(query.len());
     let mut planned = Vec::with_capacity(found.len());
@@ -1104,15 +1159,20 @@ pub fn split_for_list(query: &str, slots: &Slots) -> Result<(String, Vec<Planned
         if matches!(t.func, Func::Save | Func::Open) {
             continue;
         }
+        let names = match names::<()>(t, slots, reading) {
+            Ok(names) => names,
+            Err(NotAsked::Refused(why)) => return Err(why),
+            Err(NotAsked::Stale | NotAsked::Lookup(())) => return Ok(None),
+        };
         planned.push(Planned {
             func: t.func,
             name: t.name.clone(),
-            names: names(t, slots)?,
+            names,
             value: t.value.clone(),
         });
     }
     rest.push_str(&query[at..]);
-    Ok((rest, planned))
+    Ok(Some((rest, planned)))
 }
 
 /// One term's test of a row.
@@ -1388,6 +1448,8 @@ pub struct Looked {
 pub enum NotAsked<E> {
     Refused(String),
     Lookup(E),
+    /// W8R-4: the search went stale while a list on the disk was read.
+    Stale,
 }
 
 impl<E> From<String> for NotAsked<E> {
@@ -1403,13 +1465,16 @@ impl<E> From<String> for NotAsked<E> {
 /// whether it matches case, as the search does: [`search_case`] of the
 /// Match Case toggle `match_case`) for them first; else why it cannot be
 /// asked. A `save-filelistN:` term is taken out (the window saves the
-/// results), with any gozd.
+/// results), with any gozd. W8R-4: an `include-file-list:` file is read
+/// only while `stale` says the search is wanted, and only as far as gozd
+/// can be asked ([`GOZD_MAX_TERMS`] names, and one more).
 pub fn for_gozd<'a, E>(
     query: &'a str,
     slots: &Slots,
     boolean: bool,
     match_case: bool,
     lookup: &mut dyn FnMut(&str, bool) -> Result<Looked, E>,
+    stale: &dyn Fn() -> bool,
 ) -> Result<Cow<'a, str>, NotAsked<E>> {
     // Most searches: no function of that name at all.
     if !may_hold(query) {
@@ -1451,9 +1516,24 @@ pub fn for_gozd<'a, E>(
         let names = if t.func == Func::ListName {
             Vec::new()
         } else {
-            names(t, slots)?
+            names(
+                t,
+                slots,
+                Reading {
+                    cap: GOZD_MAX_TERMS + 1,
+                    stale,
+                },
+            )?
         };
         let terms = match t.func {
+            Func::Include if names.len() > GOZD_MAX_TERMS => {
+                return Err(NotAsked::Refused(format!(
+                    "{} names more than {GOZD_MAX_TERMS} items, and gozd searches at most \
+                     {GOZD_MAX_TERMS} terms at once; open the list instead (open-filelist:, or \
+                     File > Open File List...)",
+                    t.name
+                )));
+            }
             Func::Items | Func::Include => names.iter().map(|n| item_term(n)).collect(),
             Func::ListName => Vec::new(),
             Func::Open => unreachable!("refused above"),
@@ -1690,7 +1770,20 @@ mod tests {
     }
 
     fn gozd<'a>(q: &'a str, s: &Slots, boolean: bool) -> Result<Cow<'a, str>, NotAsked<()>> {
-        for_gozd(q, s, boolean, false, &mut none)
+        for_gozd(q, s, boolean, false, &mut none, &never)
+    }
+
+    /// A term's names, its file read whole.
+    fn names_of(t: &Term, s: &Slots) -> Result<Vec<String>, String> {
+        names::<()>(t, s, Reading::WHOLE).map_err(|e| match e {
+            NotAsked::Refused(why) => why,
+            other => panic!("{other:?}"),
+        })
+    }
+
+    /// A search over a list, its file-list terms read whole.
+    fn split(query: &str, s: &Slots) -> Result<(String, Vec<Planned>), String> {
+        split_for_list(query, s, &never).map(|r| r.expect("never stale"))
     }
 
     #[test]
@@ -1783,7 +1876,10 @@ mod tests {
             "ab parent-filelist1: é filelist:a.txt;\"b;c.txt\";\"C:\\d e\\f;g\""
         );
         let back = terms(&new).remove(1);
-        assert_eq!(names(&back, &Slots::default()).unwrap(), odd);
+        assert_eq!(
+            names::<()>(&back, &Slots::default(), Reading::WHOLE).unwrap(),
+            odd
+        );
         assert!(with_names(q, &t, &["a\"b".to_owned()]).is_none());
         assert!(with_names(q, &t, &["a|b".to_owned()]).is_none());
     }
@@ -1793,45 +1889,51 @@ mod tests {
         let s = slots();
         let t = |q: &str| terms(q).remove(0);
         assert_eq!(
-            names(&t(r#"filelist:" a.txt ";"C:/x/y/";"|""#), &s).unwrap(),
+            names_of(&t(r#"filelist:" a.txt ";"C:/x/y/";"|""#), &s).unwrap(),
             ["a.txt", r"C:\x\y"]
         );
-        assert_eq!(names(&t(r#"filelist:"a|b""#), &s).unwrap(), ["a", "b"]);
+        assert_eq!(names_of(&t(r#"filelist:"a|b""#), &s).unwrap(), ["a", "b"]);
         // W7R-3: a `;` in quotes is part of a name, as Everything
         // documents (`filelist:...;"a-file-with-a-semicolon(;).txt"`).
         assert_eq!(
-            names(&t(r#"filelist:a.txt;"b;c.txt""#), &s).unwrap(),
+            names_of(&t(r#"filelist:a.txt;"b;c.txt""#), &s).unwrap(),
             ["a.txt", "b;c.txt"]
         );
         assert_eq!(
-            names(&t(r#"child-filelist:"x;y";z;"C:\a b\c;d.txt""#), &s).unwrap(),
+            names_of(&t(r#"child-filelist:"x;y";z;"C:\a b\c;d.txt""#), &s).unwrap(),
             ["x;y", "z", r"C:\a b\c;d.txt"]
         );
         assert_eq!(
-            names(&t(r#"filelist:a"b;c"d;e"#), &s).unwrap(),
+            names_of(&t(r#"filelist:a"b;c"d;e"#), &s).unwrap(),
             ["ab;cd", "e"],
             "quotes around part of a name"
         );
         assert_eq!(
-            names(&t(r#"filelist:"a;b|c d""#), &s).unwrap(),
+            names_of(&t(r#"filelist:"a;b|c d""#), &s).unwrap(),
             ["a;b", "c d"],
             "Everything 1.4's | in quotes still parts names"
         );
-        assert_eq!(names(&t("filelist:D:\\"), &s).unwrap(), [r"D:\"]);
+        assert_eq!(names_of(&t("filelist:D:\\"), &s).unwrap(), [r"D:\"]);
         assert_eq!(
-            names(&t("filelist1:"), &s).unwrap(),
+            names_of(&t("filelist1:"), &s).unwrap(),
             [r"C:\x\a.txt", r"C:\x\sub"]
         );
-        assert!(names(&t("filelist2:"), &s).unwrap().is_empty());
-        assert!(names(&t("filelist1:x"), &s).unwrap_err().contains("slot 1"));
+        assert!(names_of(&t("filelist2:"), &s).unwrap().is_empty());
         assert!(
-            names(&t("parent-filelist1:x"), &s)
+            names_of(&t("filelist1:x"), &s)
+                .unwrap_err()
+                .contains("slot 1")
+        );
+        assert!(
+            names_of(&t("parent-filelist1:x"), &s)
                 .unwrap_err()
                 .starts_with("parent-filelist1: takes no value")
         );
         // exists-in's value is its own: the slot's names are the list.
         assert_eq!(
-            names(&t("exists-in-filelist1:$name:"), &s).unwrap().len(),
+            names_of(&t("exists-in-filelist1:$name:"), &s)
+                .unwrap()
+                .len(),
             2
         );
     }
@@ -1863,18 +1965,18 @@ mod tests {
     #[test]
     fn a_list_search_loses_its_terms() {
         let s = slots();
-        let (rest, planned) = split_for_list("ext:txt filelist1: size:<1kb", &s).unwrap();
+        let (rest, planned) = split("ext:txt filelist1: size:<1kb", &s).unwrap();
         assert_eq!(rest, "ext:txt   size:<1kb");
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].names, [r"C:\x\a.txt", r"C:\x\sub"]);
-        let (rest, planned) = split_for_list("plain text", &s).unwrap();
+        let (rest, planned) = split("plain text", &s).unwrap();
         assert_eq!((rest.as_str(), planned.len()), ("plain text", 0));
-        assert!(split_for_list("filelist4:x", &s).is_err());
+        assert!(split("filelist4:x", &s).is_err());
         // save-filelist tests nothing.
-        let (rest, planned) = split_for_list("*.txt save-filelist3:", &s).unwrap();
+        let (rest, planned) = split("*.txt save-filelist3:", &s).unwrap();
         assert_eq!((rest.as_str(), planned.len()), ("*.txt  ", 0));
         assert!(
-            split_for_list("save-filelist1: filelist1:", &s)
+            split("save-filelist1: filelist1:", &s)
                 .unwrap_err()
                 .contains("slot 1")
         );
@@ -1898,7 +2000,7 @@ mod tests {
 
     /// The rows of [`ROWS`] the search's file-list terms pass.
     fn hits(query: &str, s: &Slots) -> Vec<&'static str> {
-        let (_, planned) = split_for_list(query, s).unwrap();
+        let (_, planned) = split(query, s).unwrap();
         let mut t = RowTests::new(&planned, false, LIST).unwrap();
         if t.needs_rows() {
             for &(p, d, size) in ROWS {
@@ -2188,7 +2290,7 @@ mod tests {
             })
         };
         assert_eq!(
-            for_gozd("childfilelist1:", &s, true, false, &mut lookup).unwrap(),
+            for_gozd("childfilelist1:", &s, true, false, &mut lookup, &never).unwrap(),
             r#"<whole:"C:\x"|whole:"C:\y"|whole:"C:\top">"#
         );
         assert_eq!(
@@ -2199,15 +2301,23 @@ mod tests {
             )]
         );
         assert_eq!(
-            for_gozd("descendant-filelist1:", &s, true, false, &mut lookup).unwrap(),
+            for_gozd(
+                "descendant-filelist1:",
+                &s,
+                true,
+                false,
+                &mut lookup,
+                &never
+            )
+            .unwrap(),
             r#"<whole:"C:\x"|whole:"C:\y"|whole:"C:\top">"#
         );
         assert_eq!(
-            for_gozd("sibling-filelist1:", &s, true, false, &mut lookup).unwrap(),
+            for_gozd("sibling-filelist1:", &s, true, false, &mut lookup, &never).unwrap(),
             r#"<<parent:"C:\x" !whole:"C:\x\a.txt">|parent:"C:\y"|<parent:"C:\top" !whole:"C:\top\a.txt">|<parent:"C:\" !whole:"C:\a.txt">>"#
         );
         assert_eq!(
-            for_gozd("size-filelist1:", &s, true, false, &mut lookup).unwrap(),
+            for_gozd("size-filelist1:", &s, true, false, &mut lookup, &never).unwrap(),
             "<size:=10|size:=99|size:=5>"
         );
         // W7R-2: the look-up matches case as the search does: the Match
@@ -2221,14 +2331,22 @@ mod tests {
             ("case: child-filelist1: case:0", false),
             ("case:Foo child-filelist1:", false),
         ] {
-            for_gozd(q, &s, true, toggle, &mut lookup).unwrap();
+            for_gozd(q, &s, true, toggle, &mut lookup, &never).unwrap();
         }
         let cases: Vec<bool> = asked.borrow().iter().map(|a| a.1).collect();
         assert_eq!(cases, [true, true, true, false, false, false]);
         // An empty slot: no look-up, nothing matches.
         let mut no = |_: &str, _: bool| -> Result<Looked, ()> { panic!("no look-up") };
         assert_eq!(
-            for_gozd("child-filelist1:", &Slots::default(), true, false, &mut no).unwrap(),
+            for_gozd(
+                "child-filelist1:",
+                &Slots::default(),
+                true,
+                false,
+                &mut no,
+                &never
+            )
+            .unwrap(),
             r#"whole:"""#
         );
         // Too many found: refused, named.
@@ -2239,7 +2357,7 @@ mod tests {
             })
         };
         let NotAsked::Refused(why) =
-            for_gozd("child-filelist1:", &s, true, false, &mut many).unwrap_err()
+            for_gozd("child-filelist1:", &s, true, false, &mut many, &never).unwrap_err()
         else {
             panic!()
         };
@@ -2252,13 +2370,13 @@ mod tests {
             })
         };
         assert!(matches!(
-            for_gozd("size-filelist1:", &s, true, false, &mut pending),
+            for_gozd("size-filelist1:", &s, true, false, &mut pending, &never),
             Err(NotAsked::Refused(_))
         ));
         // The look-up's own failure comes back as it is.
         let mut lost = |_: &str, _: bool| -> Result<Looked, u8> { Err(7) };
         assert_eq!(
-            for_gozd("sibling-filelist1:", &s, true, false, &mut lost).unwrap_err(),
+            for_gozd("sibling-filelist1:", &s, true, false, &mut lost, &never).unwrap_err(),
             NotAsked::Lookup(7)
         );
     }
@@ -2293,6 +2411,7 @@ mod tests {
             true,
             false,
             &mut lookup,
+            &never,
         )
         .unwrap();
         assert_eq!(*asked.borrow(), [r#"<nopath:whole:"a.txt">"#]);
@@ -2483,7 +2602,7 @@ mod tests {
     fn everythings_new_search_example_over_rows() {
         let none = Arc::new(Slots::default());
         let mut run = |part: &str, now: &Arc<Slots>| -> Result<Vec<String>, NotAsked<()>> {
-            let (rest, planned) = split_for_list(part, now)?;
+            let (rest, planned) = split(part, now)?;
             assert_eq!(rest.trim(), "*.txt");
             let mut t = RowTests::new(&planned, false, LIST)?;
             Ok(ROWS
@@ -2527,7 +2646,8 @@ mod tests {
         std::fs::write(&txt, bytes).unwrap();
         let none = Slots::default();
         let q = format!("include-file-list:\"{}\"", efu.display());
-        assert_eq!(hits(&q, &none), [r"C:\x\a.txt", r"C:\x\sub", r"C:\y\c.log"]);
+        // W8R-3: the EFU's relative `c.log` is the one in the list's folder.
+        assert_eq!(hits(&q, &none), [r"C:\x\a.txt", r"C:\x\sub"]);
         let q = format!("includefilelist:\"{}\" x", txt.display());
         assert_eq!(
             hits(&q, &none),
@@ -2544,7 +2664,10 @@ mod tests {
         let q = format!("include-file-list:\"{}\"", efu.display());
         assert_eq!(
             gozd(&q, &none, true).unwrap(),
-            r#"<whole:"C:\x\a.txt"|whole:"C:\x\sub"|nopath:whole:"c.log">"#
+            format!(
+                r#"<whole:"C:\x\a.txt"|whole:"C:\x\sub"|whole:"{}\c.log">"#,
+                dir.display()
+            )
         );
         assert_eq!(
             gozd(&q, &none, false).unwrap_err(),
@@ -2556,12 +2679,166 @@ mod tests {
         assert!(before[0].is_some());
         std::fs::write(&efu, "Filename\r\nC:\\x\\b.TXT\r\n").unwrap();
         assert_ne!(include_stamps(&q), before);
-        let why = |q: &str| split_for_list(q, &none).unwrap_err();
+        let why = |q: &str| split(q, &none).unwrap_err();
         assert!(why("include-file-list:names.efu").contains("full path"));
         assert!(why("include-file-list:").contains("full path"));
         let missing = format!("include-file-list:\"{}\"", dir.join("gone.efu").display());
         assert!(why(&missing).starts_with("include-file-list: cannot read"));
         assert!(why(&format!("include-file-list:\"{}\"", dir.display())).contains("folder"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W8R-3: an EFU's or CSV's relative rows are under the list's folder,
+    /// as `open-filelist:`, Open File List and the File List Editor read
+    /// them; a TXT's lines are names or full paths, as Everything's "Use a
+    /// path separator to specify the full path".
+    #[test]
+    fn include_file_list_puts_an_efus_relative_rows_under_its_folder() {
+        let dir = crate::store::file::tests::scratch("w8r3-include");
+        let d = dir.display().to_string();
+        let lists = [
+            (
+                "x.efu",
+                "Filename,Size\r\nsub\\a.txt,1\r\na.txt,2\r\nC:\\y\\c.log,3\r\n",
+            ),
+            (
+                "x.csv",
+                "Filename\r\nsub/a.txt\r\na.txt\r\nC:\\y\\c.log\r\n",
+            ),
+        ];
+        for (name, text) in lists {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            let q = format!("include-file-list:\"{}\"", path.display());
+            let t = terms(&q).remove(0);
+            assert_eq!(
+                names::<()>(&t, &Slots::default(), Reading::WHOLE).unwrap(),
+                [
+                    format!(r"{d}\sub\a.txt"),
+                    format!(r"{d}\a.txt"),
+                    r"C:\y\c.log".into()
+                ],
+                "{name}"
+            );
+            // The same rows as the list opened as a file list.
+            let list = crate::filelist::FileList::open(&path, None).unwrap();
+            while !list.loaded() {
+                std::thread::yield_now();
+            }
+            let m = list
+                .answer(
+                    "",
+                    crate::filelist::Order::Gozd(Default::default()),
+                    false,
+                    &Arc::new(Slots::default()),
+                    &|| false,
+                )
+                .unwrap()
+                .unwrap();
+            let mut opened: Vec<String> = list
+                .rows_of(&m, 0..10)
+                .iter()
+                .map(|r| String::from_utf16_lossy(&r.path))
+                .collect();
+            opened.sort();
+            let mut included = names::<()>(&t, &Slots::default(), Reading::WHOLE).unwrap();
+            included.sort();
+            assert_eq!(opened, included, "{name}");
+        }
+        // A TXT's lines: a name alone is a whole name, a path a full path.
+        let txt = dir.join("x.txt");
+        std::fs::write(&txt, "sub\\a.txt\r\na.txt\r\n").unwrap();
+        let q = format!("include-file-list:\"{}\"", txt.display());
+        let t = terms(&q).remove(0);
+        assert_eq!(
+            names::<()>(&t, &Slots::default(), Reading::WHOLE).unwrap(),
+            [r"sub\a.txt", "a.txt"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W8R-4: for gozd, `include-file-list:` reads no more of its file than
+    /// gozd can be asked (one name past [`GOZD_MAX_TERMS`] says "too many"),
+    /// and a search gone stale stops the read, for gozd and for a list.
+    #[test]
+    fn include_file_list_reads_only_what_the_search_can_use() {
+        let dir = crate::store::file::tests::scratch("w8r4-include");
+        let big = dir.join("big.efu");
+        let mut text = String::from("Filename\r\n");
+        for i in 0..20_000 {
+            text.push_str(&format!("C:\\many\\{i}.txt\r\n"));
+        }
+        std::fs::write(&big, &text).unwrap();
+        let q = format!("include-file-list:\"{}\" x", big.display());
+        let t = terms(&q).remove(0);
+        let capped = Reading {
+            cap: GOZD_MAX_TERMS + 1,
+            stale: &never,
+        };
+        let got = names::<()>(&t, &Slots::default(), capped).unwrap();
+        assert_eq!(got.len(), GOZD_MAX_TERMS + 1);
+        assert_eq!(got[0], r"C:\many\0.txt");
+        let NotAsked::Refused(why) = gozd(&q, &Slots::default(), true).unwrap_err() else {
+            panic!("refused")
+        };
+        assert!(
+            why.starts_with("include-file-list: names more than 256 items")
+                && why.contains("open-filelist:"),
+            "{why}"
+        );
+        // Exactly 256 names are asked.
+        let fits = dir.join("fits.efu");
+        let mut text = String::from("Filename\r\n");
+        for i in 0..GOZD_MAX_TERMS {
+            text.push_str(&format!("C:\\many\\{i}.txt\r\n"));
+        }
+        std::fs::write(&fits, &text).unwrap();
+        let q = format!("include-file-list:\"{}\"", fits.display());
+        assert!(gozd(&q, &Slots::default(), true).is_ok());
+        // Stale: the read stops, and nothing half read is answered.
+        let q = format!("include-file-list:\"{}\" x", big.display());
+        let stale = Reading {
+            cap: usize::MAX,
+            stale: &|| true,
+        };
+        assert_eq!(
+            names::<()>(&t, &Slots::default(), stale),
+            Err(NotAsked::Stale)
+        );
+        assert!(matches!(
+            split_for_list(&q, &Slots::default(), &|| true),
+            Ok(None)
+        ));
+        let gone = |stale: &dyn Fn() -> bool| {
+            for_gozd(&q, &Slots::default(), true, false, &mut none, stale).unwrap_err()
+        };
+        let asked = std::cell::Cell::new(0);
+        let later = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        // The cap is reached before the first ask (every 4,096 rows): the
+        // refusal, not a stale read.
+        assert!(matches!(gone(&later), NotAsked::Refused(_)));
+        assert_eq!(asked.get(), 0);
+        // A file whose first rows name nothing: a stale search's read
+        // stops at the first ask, and gozd is asked nothing.
+        let blank = dir.join("blank.efu");
+        let mut text = String::from("Filename,Size\r\n");
+        for _ in 0..5_000 {
+            text.push_str(",1\r\n");
+        }
+        text.push_str("C:\\late.txt,1\r\n");
+        std::fs::write(&blank, &text).unwrap();
+        let q = format!("include-file-list:\"{}\"", blank.display());
+        assert_eq!(
+            for_gozd(&q, &Slots::default(), true, false, &mut none, &|| true).unwrap_err(),
+            NotAsked::Stale
+        );
+        assert_eq!(
+            gozd(&q, &Slots::default(), true).unwrap(),
+            r#"<whole:"C:\late.txt">"#
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2638,7 +2915,7 @@ mod tests {
         );
         let q = r"open-filelist:C:\l.efu *.txt";
         assert_eq!(hits(q, &none).len(), ROWS.len());
-        assert_eq!(split_for_list(q, &none).unwrap().0.trim(), "*.txt");
+        assert_eq!(split(q, &none).unwrap().0.trim(), "*.txt");
         let NotAsked::Refused(why) = gozd(q, &none, true).unwrap_err() else {
             panic!()
         };

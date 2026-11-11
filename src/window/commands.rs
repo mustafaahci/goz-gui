@@ -216,7 +216,12 @@ impl App {
             menu::PREV_SELECTED => self.jump_selected(false),
             // Text typed and not searched yet (search as you type off, or
             // its delay running) is searched as a new search.
-            menu::REFRESH => self.start_search(!self.search_is_dirty()),
+            menu::REFRESH => {
+                // W8R-2: an `open-filelist:` file that could not be opened
+                // is tried again.
+                self.retry_temp_list();
+                self.start_search(!self.search_is_dirty());
+            }
             menu::SIZE_ALL_COLUMNS_TO_FIT => self.size_all_columns_to_fit(),
             menu::SORT_NAME | menu::SORT_PATH | menu::SORT_SIZE | menu::SORT_DATE => {
                 self.sort_by_key(sort_key(id));

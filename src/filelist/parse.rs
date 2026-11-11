@@ -346,6 +346,27 @@ pub fn each_row(
     base: &str,
     to_utc: &dyn Fn(i64) -> Option<i64>,
     stop: &AtomicBool,
+    row: impl FnMut(&str, Option<u64>, Dates, Option<u32>, bool),
+) -> io::Result<()> {
+    each_row_in(
+        reader,
+        base,
+        base,
+        to_utc,
+        &|| stop.load(Ordering::Relaxed),
+        row,
+    )
+}
+
+/// W8R-3/4: [`each_row`] with relative paths put under `base` in a list
+/// with columns (EFU, CSV) and under `plain_base` in a plain one, stopping
+/// once `stop` says so (asked every 4,096 rows).
+pub fn each_row_in(
+    reader: impl BufRead,
+    base: &str,
+    plain_base: &str,
+    to_utc: &dyn Fn(i64) -> Option<i64>,
+    stop: &dyn Fn() -> bool,
     mut row: impl FnMut(&str, Option<u64>, Dates, Option<u32>, bool),
 ) -> io::Result<()> {
     let mut records = Records::new(reader);
@@ -356,13 +377,13 @@ pub fn each_row(
     if columns.is_none() {
         // No header: a plain list of paths, this line the first.
         records.lines_only();
-        let (p, marked) = path(plain_line(records.raw()), base);
+        let (p, marked) = path(plain_line(records.raw()), plain_base);
         row(&p, None, Dates::default(), None, marked);
     }
     let mut n = 0usize;
     while records.read()? {
         n += 1;
-        if n.is_multiple_of(4096) && stop.load(Ordering::Relaxed) {
+        if n.is_multiple_of(4096) && stop() {
             return Ok(());
         }
         match columns {
@@ -379,7 +400,7 @@ pub fn each_row(
                 row(&p, bytes, dates, attrs, dir);
             }
             None => {
-                let (p, marked) = path(plain_line(records.raw()), base);
+                let (p, marked) = path(plain_line(records.raw()), plain_base);
                 row(&p, None, Dates::default(), None, marked);
             }
         }

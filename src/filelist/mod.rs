@@ -190,6 +190,9 @@ pub struct FileList {
     stop: AtomicBool,
     /// Why reading stopped short.
     error: Mutex<Option<String>>,
+    /// W8R-2: why a list opened by [`open_later`](FileList::open_later)
+    /// could not be opened (set before `done`).
+    unopened: OnceLock<String>,
     /// Rows without a path, or whose path did not fit, left out.
     skipped: Mutex<u64>,
     /// Some row read has a date created (the window then shows the Date
@@ -216,10 +219,24 @@ impl FileList {
     /// Opens the list at `path` and starts reading it on a thread of its
     /// own; an error when the file cannot be opened.
     pub fn open(path: &Path, notify: Option<Notify>) -> io::Result<Arc<FileList>> {
-        let file = File::open(path)?;
-        if file.metadata()?.is_dir() {
-            return Err(io::Error::other("it is a folder"));
-        }
+        let file = open_file(path)?;
+        FileList::start(path, Some(file), notify)
+    }
+
+    /// W8R-2: [`open`](Self::open) without touching the disk on the
+    /// caller's thread, for the window's `open-filelist:` term, which is
+    /// opened as the search is typed: the file is opened on the reading
+    /// thread too, so a slow or unreachable network path holds only that
+    /// thread. A file that cannot be opened ends the reading at once (and
+    /// `notify` hears it, wParam 0), with [`open_refusal`](Self::open_refusal)
+    /// saying why; an error only when no thread can be started.
+    pub fn open_later(path: &Path, notify: Option<Notify>) -> io::Result<Arc<FileList>> {
+        FileList::start(path, None, notify)
+    }
+
+    /// Reads `file` (or, without one, the file at `path`, opened first) on
+    /// a thread of its own.
+    fn start(path: &Path, file: Option<File>, notify: Option<Notify>) -> io::Result<Arc<FileList>> {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -232,6 +249,7 @@ impl FileList {
             done: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             error: Mutex::new(None),
+            unopened: OnceLock::new(),
             skipped: Mutex::new(0),
             created: AtomicBool::new(false),
             ranks: OnceLock::new(),
@@ -245,6 +263,19 @@ impl FileList {
         std::thread::Builder::new()
             .name("goz-filelist".into())
             .spawn(move || {
+                let file = match file.map_or_else(|| open_file(&reading.path), Ok) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        let _ = reading.unopened.set(e.to_string());
+                        reading.done.store(true, Ordering::Release);
+                        if let Some(n) = notify
+                            && !reading.stop.load(Ordering::Relaxed)
+                        {
+                            post(n, false, reading.id);
+                        }
+                        return;
+                    }
+                };
                 let outcome = read_list(&reading, file, &base);
                 if let Err(why) = &outcome {
                     *lock(&reading.error) = Some(why.clone());
@@ -301,6 +332,7 @@ impl FileList {
             done: AtomicBool::new(true),
             stop: AtomicBool::new(false),
             error: Mutex::new(None),
+            unopened: OnceLock::new(),
             skipped: Mutex::new(0),
             created: AtomicBool::new(created),
             ranks: OnceLock::new(),
@@ -342,6 +374,18 @@ impl FileList {
         lock(&self.error).clone()
     }
 
+    /// W8R-2: why a list opened by [`open_later`](Self::open_later) could
+    /// not be opened, as the search over it is refused (`open-filelist:`
+    /// opens such lists); `None` while it is being opened, and once it is.
+    pub fn open_refusal(&self) -> Option<String> {
+        self.unopened.get().map(|e| {
+            format!(
+                "open-filelist: cannot open the file list {}: {e}",
+                self.path.display()
+            )
+        })
+    }
+
     /// Rows left out: no path in them.
     pub fn skipped(&self) -> u64 {
         *lock(&self.skipped)
@@ -374,6 +418,12 @@ impl FileList {
         // Whether the list was read whole, then its rows: a chunk published
         // after the first look is only more.
         let complete = self.loaded();
+        // W8R-2: a list that could not be opened (known once it is "read",
+        // so a search that started while it was being opened and found it
+        // incomplete asks again and is refused then).
+        if let Some(why) = self.open_refusal() {
+            return Err(why);
+        }
         let chunks = lock(&self.chunks).clone();
         let rows: usize = chunks.iter().map(|c| c.len()).sum();
         // W8: a kept answer is good while the lists it read are the same.
@@ -409,7 +459,7 @@ impl FileList {
         let resolved = match slots::resolve(query, slots, &mut run) {
             Ok(r) => r,
             Err(NotAsked::Refused(why)) => return Err(why),
-            Err(NotAsked::Lookup(())) => return Ok(None),
+            Err(NotAsked::Lookup(()) | NotAsked::Stale) => return Ok(None),
         };
         let Some((mut order, total_size)) =
             self.scan(&chunks, resolved.last, match_case, &resolved.slots, stale)?
@@ -448,7 +498,9 @@ impl FileList {
         stale: &dyn Fn() -> bool,
     ) -> Result<Option<(Vec<u32>, u64)>, String> {
         // W6: the file-list terms are goz-gui's; the rest is goz's.
-        let (rest, planned) = slots::split_for_list(query, slots)?;
+        let Some((rest, planned)) = slots::split_for_list(query, slots, stale)? else {
+            return Ok(None);
+        };
         let parsed =
             parse_query_at(&rest, match_case, &MachineClock::read()).map_err(|e| e.to_string())?;
         let list = self.path.to_string_lossy();
@@ -522,6 +574,15 @@ fn post(n: Notify, ok: bool, id: u64) {
     // SAFETY: a plain post to the window that asked; nothing is passed by
     // pointer, and a window gone since just drops it.
     unsafe { PostMessageW(n.hwnd as _, n.msg, usize::from(ok), id as isize) };
+}
+
+/// The list file at `path`, opened to read; an error for a folder.
+fn open_file(path: &Path) -> io::Result<File> {
+    let file = File::open(path)?;
+    if file.metadata()?.is_dir() {
+        return Err(io::Error::other("it is a folder"));
+    }
+    Ok(file)
 }
 
 /// A new list's [`FileList::id`]: never 0.
@@ -1146,6 +1207,61 @@ mod tests {
         assert_eq!(a.ctime, Some(132_000_000_000_000_000));
         assert!(list.has_created());
         assert!(FileList::open(&dir.join("missing.efu"), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W8R-2: `open_later` touches no disk on the caller's thread: it gives
+    /// a list at once, even for a file that is not there or a folder; that
+    /// list is then "read" with nothing in it, and every search over it is
+    /// refused with why. A file that is there reads as `open` reads it.
+    #[test]
+    fn a_list_opened_later_is_opened_on_its_own_thread() {
+        let dir = crate::store::file::tests::fresh_dir("goz-gui-filelist-later", "");
+        std::fs::create_dir_all(&dir).unwrap();
+        let efu = dir.join("a.efu");
+        std::fs::write(&efu, "Filename\r\nC:\\x\\a.txt\r\nrel\\b.txt\r\n").unwrap();
+        let read = |list: &FileList| {
+            while !list.loaded() {
+                std::thread::yield_now();
+            }
+        };
+        let search = |list: &FileList| {
+            list.answer(
+                "",
+                Order::Gozd(SortSpec::default()),
+                false,
+                &no_slots(),
+                &|| false,
+            )
+        };
+        // A folder: Windows denies opening it as a file.
+        for (path, why) in [
+            (dir.join("missing.efu"), "missing.efu: ".to_owned()),
+            (dir.clone(), format!("{}: ", dir.display())),
+        ] {
+            let list = FileList::open_later(&path, None).expect("a list at once");
+            read(&list);
+            let refusal = list.open_refusal().expect("not opened");
+            assert!(
+                refusal.starts_with("open-filelist: cannot open the file list ")
+                    && refusal.contains(&why),
+                "{refusal}"
+            );
+            assert_eq!(list.rows(), 0);
+            assert!(list.error().is_none(), "no read error to say as well");
+            assert_eq!(search(&list).err(), Some(refusal));
+        }
+        let list = FileList::open_later(&efu, None).unwrap();
+        read(&list);
+        assert!(list.open_refusal().is_none());
+        assert_eq!(list.rows(), 2);
+        let m = search(&list).unwrap().unwrap();
+        let rel = format!(r"{}\rel\b.txt", dir.display());
+        assert!(
+            list.rows_of(&m, 0..10)
+                .iter()
+                .any(|r| String::from_utf16_lossy(&r.path) == rel)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

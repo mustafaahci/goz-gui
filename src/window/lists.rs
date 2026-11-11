@@ -162,7 +162,10 @@ impl App {
             ),
             None => (
                 "Edit File List".to_owned(),
-                slots::names(&term, &Slots::default()).unwrap_or_default(),
+                // A `filelist:` term's own names (a file's term picks its
+                // file above), nothing read from the disk.
+                slots::names::<()>(&term, &Slots::default(), slots::Reading::WHOLE)
+                    .unwrap_or_default(),
             ),
         };
         let kept = self.prefs.borrow().base.file_lists.slot.clone();
