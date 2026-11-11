@@ -17,6 +17,7 @@ pub mod scan;
 pub mod ui;
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_APP;
 
@@ -443,11 +444,24 @@ fn ansi(text: &str) -> Vec<u8> {
     }
 }
 
-/// Whether `path` is under the folder `root` (both folded).
-fn is_under(path: &str, root: &str) -> bool {
-    path.len() > root.len()
-        && path.starts_with(root)
-        && (root.ends_with(BACKSLASH) || path[root.len()..].starts_with(BACKSLASH))
+/// The folders above `path`, nearest first: `c:\a\b.txt` gives `c:\a` and
+/// then `c:\` (a drive's root keeps its backslash, as [`Entry::path`]
+/// does).
+fn parents(path: &str) -> impl Iterator<Item = &str> {
+    let mut p = path;
+    std::iter::from_fn(move || {
+        let i = p.rfind(BACKSLASH)?;
+        let up = if p[..i].ends_with(':') {
+            &p[..=i]
+        } else {
+            &p[..i]
+        };
+        if up.len() >= p.len() {
+            return None;
+        }
+        p = up;
+        Some(up)
+    })
 }
 
 /// W6: Edit > Update's root folders: the folders of the list that no other
@@ -455,57 +469,59 @@ fn is_under(path: &str, root: &str) -> bool {
 /// in the list's order, each with whether the list holds anything below
 /// its own items (it was added with its subfolders, and is walked so
 /// again).
+///
+/// Each path is folded once and each row looks up only the folders above
+/// it, so the cost is the rows times their depth, however many roots the
+/// list has (an Everything export of search results can have tens of
+/// thousands).
 pub fn roots(entries: &[Entry]) -> Vec<(String, bool)> {
-    let folders: std::collections::HashSet<String> = entries
+    let keys: Vec<String> = entries.iter().map(|e| folded(&e.path)).collect();
+    let folders: HashSet<&str> = entries
         .iter()
-        .filter(|e| e.is_dir)
-        .map(|e| folded(&e.path))
+        .zip(&keys)
+        .filter(|(e, _)| e.is_dir)
+        .map(|(_, k)| k.as_str())
         .collect();
-    let held = |path: &str| {
-        // Each folder above it, nearest first.
-        let mut p = path;
-        while let Some(i) = p.rfind(BACKSLASH) {
-            let up = if p[..i].ends_with(':') {
-                &p[..=i]
-            } else {
-                &p[..i]
-            };
-            if up.len() >= p.len() {
-                break;
-            }
-            if folders.contains(up) {
-                return true;
-            }
-            p = up;
+    // The roots, each once, in the list's order: (its index in `entries`,
+    // whether anything lies two levels or more below it).
+    let mut found: Vec<(usize, bool)> = Vec::new();
+    let mut at: HashMap<&str, usize> = HashMap::new();
+    for (i, (e, key)) in entries.iter().zip(&keys).enumerate() {
+        if e.is_dir
+            && !at.contains_key(key.as_str())
+            && !parents(key).any(|up| folders.contains(up))
+        {
+            at.insert(key, found.len());
+            found.push((i, false));
         }
-        false
-    };
-    let mut out: Vec<(String, bool)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for e in entries.iter().filter(|e| e.is_dir) {
-        let key = folded(&e.path);
-        if held(&key) || !seen.insert(key.clone()) {
-            continue;
-        }
-        let deep = entries.iter().any(|x| {
-            let x = folded(&x.path);
-            is_under(&x, &key)
-                && x[key.len()..]
-                    .trim_start_matches(BACKSLASH)
-                    .contains(BACKSLASH)
-        });
-        out.push((e.path.clone(), deep));
     }
-    out
+    // No root is under another, so a row has one root above it at most:
+    // the first one its walk up meets.
+    for key in &keys {
+        if let Some((level, root)) = parents(key)
+            .enumerate()
+            .find_map(|(level, up)| at.get(up).map(|&r| (level, r)))
+        {
+            // Level 0 is the root's own items.
+            if level > 0 {
+                found[root].1 = true;
+            }
+        }
+    }
+    found
+        .into_iter()
+        .map(|(i, deep)| (entries[i].path.clone(), deep))
+        .collect()
 }
 
 /// Takes out each row that is one of `roots` or under one; how many went.
+/// Each row folds its path once and looks up the folders above it.
 pub fn remove_under(entries: &mut Vec<Entry>, roots: &[String]) -> usize {
-    let roots: Vec<String> = roots.iter().map(|r| folded(r)).collect();
+    let roots: HashSet<String> = roots.iter().map(|r| folded(r)).collect();
     let before = entries.len();
     entries.retain(|e| {
         let p = folded(&e.path);
-        !roots.iter().any(|r| p == *r || is_under(&p, r))
+        !roots.contains(&p) && !parents(&p).any(|up| roots.contains(up))
     });
     before - entries.len()
 }
@@ -710,6 +726,46 @@ mod tests {
             ]
         );
         assert!(roots(&[e(r"C:\f.txt", false, None, None)]).is_empty());
+    }
+
+    /// W6R-1: Update on a list with many unrelated root folders (an
+    /// Everything export of search results: 20,000 folders whose parents
+    /// are not listed, 200,000 other rows) costs the rows times their
+    /// depth. Before, each root looked at every row: billions of folds, and
+    /// the editor stopped responding for minutes.
+    #[test]
+    fn update_with_many_roots_takes_each_row_once() {
+        const ROOTS: usize = 20_000;
+        const PER_ROOT: usize = 10;
+        let mut list = Vec::with_capacity(ROOTS * (PER_ROOT + 1));
+        for r in 0..ROOTS {
+            list.push(e(&format!(r"C:\Data\r{r}"), true, None, None));
+            for f in 0..PER_ROOT {
+                // Every other root holds a file in a subfolder (in another
+                // case): it is walked with its subfolders.
+                list.push(if r % 2 == 0 && f == 0 {
+                    e(&format!(r"c:\DATA\R{r}\sub\f.txt"), false, Some(1), None)
+                } else {
+                    e(&format!(r"C:\Data\r{r}\f{f}.txt"), false, Some(1), None)
+                });
+            }
+        }
+        let started = std::time::Instant::now();
+        let found = roots(&list);
+        assert_eq!(found.len(), ROOTS);
+        for (r, (path, deep)) in found.iter().enumerate() {
+            assert_eq!(
+                (path.as_str(), *deep),
+                (&*format!(r"C:\Data\r{r}"), r % 2 == 0)
+            );
+        }
+        let paths: Vec<String> = found.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(remove_under(&mut list, &paths), ROOTS * (PER_ROOT + 1));
+        assert!(list.is_empty());
+        // Milliseconds now (a debug build: well under a second); the old
+        // roots x rows would take minutes.
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
     }
 
     #[test]
