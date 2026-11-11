@@ -250,6 +250,8 @@ impl App {
     /// by path: those held, and those a refresh or a restore is still to
     /// select again; and whether Select All has every row selected.
     fn place_now(&self) -> Place {
+        // The selection as it is to be, rows still being set included.
+        self.finish_selecting();
         if let Some(v) = self.sessions.view.borrow().as_ref() {
             // A restore whose rows have not come yet.
             return Place {

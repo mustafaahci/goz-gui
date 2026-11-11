@@ -457,6 +457,8 @@ impl App {
     /// action waiting runs without them and says so after; otherwise the
     /// status bar says so now.
     pub(super) fn selection_moved(&self, block: u32) {
+        // The selection as it is to be, rows still being set included.
+        self.finish_selecting();
         let total = self.model.borrow().total;
         let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
         if selected == 0 || selected >= total {

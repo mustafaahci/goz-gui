@@ -32,6 +32,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::findbar::{FindBar, Finding, Report, TIMER_TYPED, WM_FIND};
+use super::selecting::Step;
 use super::{App, send, slots};
 use crate::menu::{self, Item};
 use crate::searchtools::{self as st, Insert};
@@ -265,6 +266,8 @@ impl App {
     /// the list's notifications (`selection.rs`), so inverting all rows but
     /// a few costs those few, not the millions selected.
     fn invert_selection(&self) {
+        // The selection as it is to be, rows still being set included.
+        self.finish_selecting();
         let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
         if count == 0 {
             return;
@@ -285,19 +288,14 @@ impl App {
         // none selects every row as it is now, as a click on each would);
         // the rows change unseen, then repaint once, and the status bar and
         // the panes hear of it once (`in_bulk`).
+        // The rows of the smaller side are set a slice at a time
+        // (`selecting.rs`): a few thousand of them cost the list tens of
+        // milliseconds.
         self.cancel_fetch();
         self.select_all.set(false);
-        self.in_bulk(|| {
-            let (first, then) = if all {
-                (LVIS_SELECTED, 0)
-            } else {
-                (0, LVIS_SELECTED)
-            };
-            self.set_state(usize::MAX, first, LVIS_SELECTED);
-            for i in rows.into_iter().flatten() {
-                self.set_state(i, then, LVIS_SELECTED);
-            }
-        });
+        self.select_rows(
+            std::iter::once(Step::All(all)).chain(rows.into_iter().map(|r| Step::Rows(r, !all))),
+        );
         self.selection_changed();
     }
 
