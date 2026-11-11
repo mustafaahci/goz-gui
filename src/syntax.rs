@@ -168,6 +168,48 @@ const IN_GOZ_GUI: &[(&str, &[&str])] = &[
             "Keyboard) puts the selected results there",
         ],
     ),
+    (
+        "Ctrl+click filelist0:",
+        &[
+            "Edits the slot; also F2 with the caret in",
+            "it, or the right-click menu's Edit File",
+            "List Slot...",
+        ],
+    ),
+    (
+        "parent-filelist0:",
+        &[
+            "Items in a folder of slot 0 (by full path",
+            "or name); ancestor-filelist0: anywhere",
+            "under one",
+        ],
+    ),
+    (
+        "child-filelist0:",
+        &[
+            "Folders holding an item of slot 0;",
+            "descendant-filelist0: folders above one;",
+            "sibling-filelist0: items beside one",
+        ],
+    ),
+    (
+        "size-filelist0:",
+        &[
+            "Files of a slot item's size; name- and",
+            "stem-filelist0: of a slot item's name or",
+            "stem",
+        ],
+    ),
+    (
+        "exists-in-filelist0:$stem:.srt",
+        &[
+            "Items whose name, made so, is in slot 0",
+            "($name:, $stem:, $extension:, $path:,",
+            "$full-path:, $parent-name:); in an open",
+            "file list",
+        ],
+    ),
+    ("save-filelist0:", &["Puts the search's results in slot 0"]),
 ];
 
 /// The window's text, lines ending in `\n`, as gozd's syntax is now.
@@ -198,8 +240,13 @@ pub fn text_for(boolean: bool) -> String {
         out.push_str(title);
         out.push('\n');
         for (usage, lines) in rows {
+            // A usage wider than its column has a line of its own.
+            let own_line = usage.chars().count() + 1 > column.saturating_sub(2);
+            if own_line {
+                out.push_str(&format!("  {usage}\n"));
+            }
             for (i, line) in lines.iter().enumerate() {
-                let usage = if i == 0 { *usage } else { "" };
+                let usage = if i == 0 && !own_line { *usage } else { "" };
                 out.push_str(&format!("  {usage:<width$}{line}\n", width = column - 2));
             }
         }

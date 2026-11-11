@@ -10,13 +10,13 @@ use std::rc::Rc;
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO,
-    MonitorFromRect, MonitorFromWindow,
+    MonitorFromRect, MonitorFromWindow, ScreenToClient,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::Controls::{
-    EM_CANUNDO, EM_GETSEL, EM_REPLACESEL, EM_SETSEL, EM_UNDO, LVIS_SELECTED, LVM_GETCOLUMNWIDTH,
-    LVM_GETITEMCOUNT, LVM_GETITEMSTATE, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVNI_FOCUSED,
-    LVNI_SELECTED,
+    EM_CANUNDO, EM_CHARFROMPOS, EM_GETSEL, EM_REPLACESEL, EM_SETSEL, EM_UNDO, LVIS_SELECTED,
+    LVM_GETCOLUMNWIDTH, LVM_GETITEMCOUNT, LVM_GETITEMSTATE, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT,
+    LVNI_FOCUSED, LVNI_SELECTED,
 };
 use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetFocus};
@@ -679,7 +679,32 @@ impl App {
             Item::Cmd(st::BOX_SIZE_LARGER, "Size Larger Than\tsize:>"),
             Item::Cmd(st::BOX_EXT, "Extension\text:"),
         ]);
-        let popup = menu::submenu(&[
+        // W7: on a file-list term (under the mouse, or the caret from the
+        // keyboard), Everything's "Edit File List Slot..." comes first ("Edit
+        // File List..." for a term's own names).
+        let at = if l == -1 {
+            Some(start as usize)
+        } else {
+            let mut p = POINT {
+                x: (l & 0xffff) as i16 as i32,
+                y: ((l >> 16) & 0xffff) as i16 as i32,
+            };
+            // SAFETY: maps a screen point into this thread's search box.
+            unsafe { ScreenToClient(edit, &mut p) };
+            let packed = ((p.y as u32 & 0xffff) << 16) | (p.x as u32 & 0xffff);
+            let r = send(edit, EM_CHARFROMPOS, 0, packed as isize);
+            (r != -1).then_some((r as usize) & 0xffff)
+        };
+        let term = at.and_then(|u| crate::filelist::slots::term_at(&window_text(edit), u));
+        let mut items = Vec::with_capacity(16);
+        if let Some(t) = &term {
+            items.push(match t.slot {
+                Some(_) => Item::Cmd(crate::slotedit::cmd::EDIT_SLOT, "Edit File List Slot..."),
+                None => Item::Cmd(crate::slotedit::cmd::EDIT_LIST, "Edit File List..."),
+            });
+            items.push(Item::Sep);
+        }
+        items.extend([
             Item::Cmd(st::BOX_UNDO, "&Undo"),
             Item::Sep,
             Item::Cmd(st::BOX_CUT, "Cu&t"),
@@ -694,6 +719,7 @@ impl App {
             Item::Sub("Search Function", function),
             Item::Cmd(st::ADVANCED_SEARCH, "Advanced Search..."),
         ]);
+        let popup = menu::submenu(&items);
         enable(popup, st::BOX_UNDO, send(edit, EM_CANUNDO, 0, 0) != 0);
         enable(popup, st::BOX_CUT, selection);
         enable(popup, st::BOX_COPY, selection);
@@ -747,6 +773,11 @@ impl App {
                 }
             }
             st::ADVANCED_SEARCH => self.advanced_search(),
+            crate::slotedit::cmd::EDIT_SLOT | crate::slotedit::cmd::EDIT_LIST => {
+                if let Some(t) = term {
+                    self.edit_file_list_term(t);
+                }
+            }
             other => {
                 if let Some((piece, how)) = st::box_syntax(other) {
                     self.put_in_search(piece, how);

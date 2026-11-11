@@ -45,6 +45,10 @@ pub enum Source {
     /// W6: Edit > Read Extended Information: each row (its place in the
     /// list, and its path) as the disk has it now, in [`Found::refreshed`].
     Refresh(Vec<(usize, String)>),
+    /// W7: Edit > Paste's names: each item as the disk has it, or, when
+    /// nothing is there, the name alone (a list may name anything), counted
+    /// in [`Found::unreadable`].
+    Named(Vec<String>),
 }
 
 /// What a job has for the window.
@@ -113,6 +117,26 @@ impl Job {
                                     break;
                                 }
                                 out.refresh(at, item(&path));
+                            }
+                        }
+                        Source::Named(names) => {
+                            for name in names {
+                                if s.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                match item(&name) {
+                                    Some(e) => out.push(e),
+                                    None => {
+                                        if let Some(path) = crate::filelist::slots::normalize(&name)
+                                        {
+                                            out.unreadable += 1;
+                                            out.push(Entry {
+                                                path,
+                                                ..Entry::default()
+                                            });
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -569,6 +593,23 @@ mod tests {
         ]);
         assert_eq!(names(&items), [r"\a.txt", ""]);
         assert_eq!(items.unreadable, 1);
+        // W7: Paste's names: what is on the disk as it is, the rest by
+        // name alone.
+        let pasted = run(vec![Source::Named(vec![
+            tree.join("a.txt").display().to_string(),
+            format!("{root}\\gone.txt"),
+            "  ".into(),
+        ])]);
+        assert_eq!(names(&pasted), [r"\a.txt", r"\gone.txt"]);
+        assert_eq!(pasted.entries[0].size, Some(5));
+        assert_eq!(
+            pasted.entries[1],
+            Entry {
+                path: format!("{root}\\gone.txt"),
+                ..Entry::default()
+            }
+        );
+        assert_eq!(pasted.unreadable, 1);
         // A stopped job is over at once, with what it had.
         let job = Job::start(
             vec![Source::Folder {

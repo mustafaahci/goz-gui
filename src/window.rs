@@ -1839,6 +1839,11 @@ impl App {
                     self.lists_message(m, w, l);
                     0
                 }
+                // W7 (C): a file-list term to edit, a slot's saved results.
+                m if (crate::slotedit::MSG_FIRST..crate::slotedit::MSG_END).contains(&m) => {
+                    self.w7_message(m, w, l);
+                    0
+                }
                 WM_SERVICE => {
                     if w != 0 {
                         // gozd stopped or (re)started: search again, which
@@ -2681,6 +2686,16 @@ impl App {
                         // W5: a file list's dates created, found as it is
                         // read, bring the Date Created column.
                         self.refresh_created_column();
+                        // W7: a search made (not refreshed) saves its
+                        // results to the slots its save-filelistN: names,
+                        // once they are all there (a list still being read
+                        // or a volume still indexed: at a refresh).
+                        if !keep {
+                            self.data_tools.save_due.set(true);
+                        }
+                        if !incomplete && self.data_tools.save_due.replace(false) {
+                            self.save_to_slots(total);
+                        }
                         // SAFETY: repaints the list.
                         unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
                         self.pane_event(PaneEvent::ResultsChanged { refresh: keep });

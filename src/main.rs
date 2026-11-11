@@ -116,6 +116,9 @@ mod filelist;
 // W5 (C: the File List Editor).
 mod listedit;
 
+// W7 (C: the Edit File List Slot dialog).
+mod slotedit;
+
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };

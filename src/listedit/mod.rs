@@ -5,7 +5,8 @@
 //! Subfolders... (everything under it), Remove, Remove Duplicates and Select
 //! All; files and folders dropped on it are added too (a folder with its
 //! subfolders). The list shows each item's Name, Path, Size, Date Modified
-//! and Date Created, sorted by a click on a column.
+//! and Date Created, sorted by a click on a column; W7 adds Everything's
+//! Extension, Type and Attributes columns, and Edit > Paste.
 //!
 //! This module is the list itself and its file, with no window: the rows
 //! ([`Entry`]), their sorts, and the EFU they are written as and read
@@ -140,29 +141,120 @@ pub enum Column {
     Name,
     Path,
     Size,
+    /// W7: Everything's Extension, Type and Attributes.
+    Extension,
+    Type,
     Modified,
     Created,
+    Attributes,
 }
 
-/// The columns with their titles and widths at 96 DPI.
-pub const COLUMNS: [(Column, &str, i32); 5] = [
+/// The columns with their titles and widths at 96 DPI: Everything's
+/// (Filename, Size, Extension, Type, Date Modified, Date Created,
+/// Attributes), the Filename as goz-gui's Name and Path.
+pub const COLUMNS: [(Column, &str, i32); 8] = [
     (Column::Name, "Name", 220),
     (Column::Path, "Path", 300),
     (Column::Size, "Size", 90),
+    (Column::Extension, "Extension", 72),
+    (Column::Type, "Type", 120),
     (Column::Modified, "Date Modified", 140),
     (Column::Created, "Date Created", 140),
+    (Column::Attributes, "Attributes", 76),
 ];
+
+impl Entry {
+    /// W7: the Extension column's text: after the name's last dot (a
+    /// folder has none).
+    pub fn extension(&self) -> &str {
+        if self.is_dir {
+            return "";
+        }
+        let name = self.name();
+        name.rfind('.').map_or("", |dot| &name[dot + 1..])
+    }
+
+    /// Its attributes, a folder's with FILE_ATTRIBUTE_DIRECTORY (as EFU
+    /// writes them); `None` when not known.
+    fn attribute_bits(&self) -> Option<u32> {
+        match (self.attributes, self.is_dir) {
+            (Some(a), dir) => Some(if dir { a | DIRECTORY } else { a }),
+            (None, true) => Some(DIRECTORY),
+            (None, false) => None,
+        }
+    }
+
+    /// W7: the Attributes column's text, Everything's letters.
+    pub fn attributes_text(&self) -> String {
+        self.attribute_bits()
+            .map(attribute_letters)
+            .unwrap_or_default()
+    }
+}
+
+/// Everything's attribute letters, in the order of their bits: R read-only,
+/// H hidden, S system, D folder, A archive, V device, N normal, T
+/// temporary, P sparse, L reparse point, C compressed, O offline, I not
+/// content indexed, E encrypted, X no scrub, U unpinned, M recall on data
+/// access.
+pub fn attribute_letters(bits: u32) -> String {
+    const LETTERS: [(u32, char); 17] = [
+        (0x1, 'R'),
+        (0x2, 'H'),
+        (0x4, 'S'),
+        (0x10, 'D'),
+        (0x20, 'A'),
+        (0x40, 'V'),
+        (0x80, 'N'),
+        (0x100, 'T'),
+        (0x200, 'P'),
+        (0x400, 'L'),
+        (0x800, 'C'),
+        (0x1000, 'O'),
+        (0x2000, 'I'),
+        (0x4000, 'E'),
+        (0x20000, 'X'),
+        (0x100000, 'U'),
+        (0x400000, 'M'),
+    ];
+    LETTERS
+        .iter()
+        .filter(|(bit, _)| bits & bit != 0)
+        .map(|&(_, c)| c)
+        .collect()
+}
+
+/// W7: the Type column's text for `e`: the shell's name for its kind of
+/// file ("Text Document", "File folder"), asked once per extension on this
+/// thread (the editor's) and kept (`filetype`).
+pub fn type_name(e: &Entry) -> std::rc::Rc<[u16]> {
+    let key: crate::filetype::Key = (!e.is_dir).then(|| {
+        e.extension()
+            .encode_utf16()
+            .map(crate::highlight::fold)
+            .collect()
+    });
+    if let Some(known) = crate::filetype::known(&key) {
+        return known;
+    }
+    let (_, found) = crate::filetype::look_up(key.as_deref(), false);
+    crate::filetype::learn(key.clone(), found);
+    crate::filetype::known(&key).unwrap_or_else(|| std::rc::Rc::from(Vec::new()))
+}
 
 impl Column {
     pub fn at(index: usize) -> Option<Column> {
         COLUMNS.get(index).map(|c| c.0)
     }
 
-    /// A first click's order: names and paths A to Z, sizes and dates the
-    /// largest and newest first (as the results' Options > Results says
-    /// by default).
+    /// A first click's order: names, paths, extensions, types and
+    /// attributes A to Z, sizes and dates the largest and newest first (as
+    /// the results' Options > Results says by default).
     pub fn first_ascending(self) -> bool {
-        matches!(self, Column::Name | Column::Path)
+        matches!(
+            self,
+            Column::Name | Column::Path | Column::Extension | Column::Type | Column::Attributes
+        )
     }
 }
 
@@ -191,6 +283,34 @@ pub fn sort(entries: &mut [Entry], column: Column, ascending: bool) {
         }
         Column::Path => {
             entries.sort_by_cached_key(|e| (folded(e.folder()), folded(e.name())));
+            if !ascending {
+                entries.reverse();
+            }
+        }
+        // W7: then by the path, as the others.
+        Column::Extension => {
+            entries.sort_by_cached_key(|e| (folded(e.extension()), folded(&e.path)));
+            if !ascending {
+                entries.reverse();
+            }
+        }
+        Column::Type => {
+            // One shell look-up per kind, however many rows.
+            let mut types: HashMap<(bool, String), String> = HashMap::new();
+            entries.sort_by_cached_key(|e| {
+                let kind = (e.is_dir, folded(e.extension()));
+                let name = types
+                    .entry(kind)
+                    .or_insert_with(|| folded(&String::from_utf16_lossy(&type_name(e))))
+                    .clone();
+                (name, folded(&e.path))
+            });
+            if !ascending {
+                entries.reverse();
+            }
+        }
+        Column::Attributes => {
+            entries.sort_by_cached_key(|e| (e.attributes_text(), folded(&e.path)));
             if !ascending {
                 entries.reverse();
             }
@@ -526,6 +646,23 @@ pub fn remove_under(entries: &mut Vec<Entry>, roots: &[String]) -> usize {
     before - entries.len()
 }
 
+/// W7: the file names in pasted text (Edit > Paste, and the Edit File List
+/// Slot dialog's): a name a line, white space and enclosing quotes taken
+/// off, empty lines left out.
+pub fn pasted_names(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| {
+            let t = l.trim();
+            t.strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .unwrap_or(t)
+                .trim()
+        })
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// How many items, as the status bar says it.
 pub fn items_text(n: usize) -> String {
     if n == 1 {
@@ -636,8 +773,65 @@ mod tests {
                 r"C:\a"
             ]
         );
-        assert_eq!(Column::at(3), Some(Column::Modified));
+        assert_eq!(Column::at(5), Some(Column::Modified));
         assert!(Column::Name.first_ascending() && !Column::Size.first_ascending());
+    }
+
+    /// W7: Everything's Extension, Type and Attributes columns.
+    #[test]
+    fn extension_type_and_attributes_columns() {
+        let mut a = e(r"C:\x\b.TXT", false, Some(1), None);
+        a.attributes = Some(0x21);
+        let dir = e(r"C:\x\v1.2", true, None, None);
+        let bare = Entry {
+            path: r"C:\x\.gitignore".into(),
+            ..Entry::default()
+        };
+        assert_eq!((a.extension(), dir.extension()), ("TXT", ""));
+        assert_eq!(bare.extension(), "gitignore");
+        assert_eq!(a.attributes_text(), "RA");
+        assert_eq!(dir.attributes_text(), "D");
+        assert_eq!(bare.attributes_text(), "", "not known");
+        assert_eq!(attribute_letters(0x2 | 0x4 | 0x20 | 0x2000), "HSAI");
+        assert_eq!(attribute_letters(0x10 | 0x400), "DL");
+        let mut list = vec![
+            a.clone(),
+            e(r"C:\x\a.doc", false, Some(1), None),
+            dir.clone(),
+            bare.clone(),
+        ];
+        sort(&mut list, Column::Extension, true);
+        assert_eq!(
+            paths(&list),
+            [
+                r"C:\x\v1.2",
+                r"C:\x\a.doc",
+                r"C:\x\.gitignore",
+                r"C:\x\b.TXT"
+            ]
+        );
+        sort(&mut list, Column::Attributes, true);
+        assert_eq!(
+            paths(&list),
+            [
+                r"C:\x\.gitignore",
+                r"C:\x\a.doc",
+                r"C:\x\v1.2",
+                r"C:\x\b.TXT"
+            ]
+        );
+        // The shell's words differ by machine; the folder has one, and the
+        // sort keeps each kind together.
+        assert!(!type_name(&dir).is_empty());
+        sort(&mut list, Column::Type, true);
+        assert_eq!(list.len(), 4);
+        let docs = list.iter().position(|e| e.path.ends_with("a.doc")).unwrap();
+        assert!(list.iter().filter(|e| e.extension() == "doc").count() == 1 && docs < 4);
+        assert!(Column::Type.first_ascending() && Column::Attributes.first_ascending());
+        assert_eq!(
+            pasted_names("C:\\a.txt\r\n  \"C:\\b c\\d.txt\" \r\n\r\nname\n"),
+            [r"C:\a.txt", r"C:\b c\d.txt", "name"]
+        );
     }
 
     #[test]

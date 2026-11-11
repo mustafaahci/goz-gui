@@ -42,6 +42,11 @@
 //!   as it opens and handed back to goz-gui's window as it moves and
 //!   closes ([`take_kept`]).
 //! - View > Theme in goz-gui's window is followed ([`set_look`]).
+//!
+//! Wave 7: Everything's Extension, Type (the shell's name, asked once per
+//! extension on this thread) and Attributes columns, and Edit > Paste
+//! (Ctrl+V): files copied in Explorer as a drop adds them, or text, a name a
+//! line (`GOZ_GUI_PASTE_TEXT` in a test).
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -355,6 +360,8 @@ enum Doing {
     Importing,
     Updating,
     Reading,
+    /// W7: Edit > Paste.
+    Pasting,
 }
 
 impl Doing {
@@ -365,6 +372,7 @@ impl Doing {
             Doing::Importing => "Importing",
             Doing::Updating => "Updating",
             Doing::Reading => "Reading extended information",
+            Doing::Pasting => "Pasting",
         }
     }
 }
@@ -508,6 +516,7 @@ impl Editor {
                     Item::Cmd(cmd::ADD_FILES, "Add &Files..."),
                     Item::Cmd(cmd::ADD_FOLDER, "Add F&older..."),
                     Item::Cmd(cmd::ADD_FOLDER_SUBFOLDERS, "Add Folder and &Subfolders..."),
+                    Item::Cmd(crate::slotedit::cmd::EDITOR_PASTE, "&Paste\tCtrl+V"),
                     Item::Sep,
                     Item::Cmd(cmd::REMOVE, "&Remove\tDel"),
                     Item::Cmd(cmd::REMOVE_DUPLICATES, "Remove &Duplicates"),
@@ -760,6 +769,7 @@ impl Editor {
             cmd::ADD_FOLDER_SUBFOLDERS => self.add_folder(dlg, true),
             cmd::REMOVE => self.remove(dlg),
             cmd::REMOVE_DUPLICATES => self.remove_duplicates(dlg),
+            crate::slotedit::cmd::EDITOR_PASTE => self.paste(dlg),
             cmd::SELECT_ALL => {
                 set_state(Editor::list(dlg), usize::MAX, LVIS_SELECTED, LVIS_SELECTED);
                 self.show_count(dlg);
@@ -786,6 +796,14 @@ impl Editor {
         ] {
             enable_item(m, id, !busy);
         }
+        enable_item(
+            m,
+            crate::slotedit::cmd::EDITOR_PASTE,
+            !busy
+                && (crate::clipboard::has_files()
+                    || crate::clipboard::has_text()
+                    || location::paste_text().is_some()),
+        );
         enable_item(m, cmd::REMOVE, !busy && selected);
         enable_item(m, cmd::REMOVE_DUPLICATES, !busy && rows);
         let folders = self.entries.borrow().iter().any(|e| e.is_dir);
@@ -939,7 +957,17 @@ impl Editor {
         }
         self.show_title(dlg);
         self.show_count(dlg);
-        if found.unreadable > 0 {
+        if doing == Doing::Pasting && found.unreadable > 0 {
+            // W7: a name not on the disk is listed by its name alone.
+            self.set_status(
+                dlg,
+                &format!(
+                    "{}; {} not on the disk, listed without size or dates",
+                    items_text(self.entries.borrow().len()),
+                    items_text(found.unreadable as usize)
+                ),
+            );
+        } else if found.unreadable > 0 {
             let n = crate::format::grouped(found.unreadable);
             let n = if found.unreadable == 1 {
                 "1 item or folder".to_owned()
@@ -1239,6 +1267,61 @@ impl Editor {
         self.start(dlg, sources, None, Doing::Adding);
     }
 
+    /// W7: Edit > Paste (Ctrl+V), Everything's "Paste filenames on the
+    /// clipboard into the file list": files copied in Explorer as a drop
+    /// adds them (folders with what is under them), or text, a name a
+    /// line, each as the disk has it or by its name alone.
+    fn paste(&self, dlg: HWND) {
+        if self.busy() {
+            beep();
+            return;
+        }
+        // A test's names (`GOZ_GUI_PASTE_TEXT`) stand for the clipboard.
+        let test = location::paste_text();
+        let files = if test.is_some() {
+            None
+        } else {
+            crate::clipboard::files(dlg)
+        };
+        let sources = match files {
+            Some(clip) => clip
+                .paths
+                .iter()
+                .map(|p| {
+                    let path = String::from_utf16_lossy(p);
+                    if crate::filetools::attributes(p).is_some_and(|a| a & 0x10 != 0) {
+                        Source::Folder {
+                            path,
+                            subfolders: true,
+                        }
+                    } else {
+                        Source::Item(path)
+                    }
+                })
+                .collect(),
+            None => {
+                let names = test
+                    .or_else(|| crate::clipboard::text(dlg))
+                    .map(|t| super::pasted_names(&t))
+                    .unwrap_or_default();
+                if names.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Source::Named(names)]
+                }
+            }
+        };
+        if sources.is_empty() {
+            beep();
+            self.set_status(
+                dlg,
+                "Nothing to paste: the clipboard holds no files or names",
+            );
+            return;
+        }
+        self.start(dlg, sources, None, Doing::Pasting);
+    }
+
     /// Edit > Remove (Del): the selected rows go.
     fn remove(&self, dlg: HWND) {
         if self.busy() {
@@ -1473,7 +1556,10 @@ impl Editor {
         if info.item.mask & LVIF_TEXT == 0 {
             return;
         }
-        let text: Vec<u16> = {
+        // W7: a Type cell's kind, asked of the shell once the rows are let
+        // go (no borrow is held across its call).
+        let mut kind = None;
+        let mut text: Vec<u16> = {
             let entries = self.entries.borrow();
             let row = usize::try_from(info.item.iItem)
                 .ok()
@@ -1491,6 +1577,14 @@ impl Editor {
                             out.extend(crate::format::size_cell(size).encode_utf16());
                         }
                     }
+                    Column::Extension => out.extend(e.extension().encode_utf16()),
+                    Column::Type => {
+                        kind = Some(Entry {
+                            path: e.name().to_owned(),
+                            is_dir: e.is_dir,
+                            ..Entry::default()
+                        });
+                    }
                     Column::Modified => {
                         if let Some(t) = e.modified {
                             crate::format::date(t, &mut out);
@@ -1501,10 +1595,14 @@ impl Editor {
                             crate::format::date(t, &mut out);
                         }
                     }
+                    Column::Attributes => out.extend(e.attributes_text().encode_utf16()),
                 }
             }
             out
         };
+        if let Some(e) = kind {
+            text.extend_from_slice(&super::type_name(&e));
+        }
         // SAFETY: the list gave a buffer of `cchTextMax` code units.
         unsafe { copy_text(&text, info.item.pszText, info.item.cchTextMax) };
     }
@@ -1521,6 +1619,7 @@ impl Editor {
         let id = match (ctrl, shift, vk) {
             (false, false, VK_DELETE) => cmd::REMOVE,
             (true, false, k) if k == u16::from(b'A') => cmd::SELECT_ALL,
+            (true, false, k) if k == u16::from(b'V') => crate::slotedit::cmd::EDITOR_PASTE,
             (true, false, k) if k == u16::from(b'N') => cmd::NEW,
             (true, false, k) if k == u16::from(b'O') => cmd::OPEN,
             (true, false, k) if k == u16::from(b'S') => cmd::SAVE,
@@ -1571,7 +1670,7 @@ impl Editor {
 
 /// Edit > Add Files...: Windows' Open dialog, several files at once; the
 /// files chosen (none when cancelled).
-fn pick_files(owner: HWND) -> Vec<String> {
+pub(crate) fn pick_files(owner: HWND) -> Vec<String> {
     use windows::Win32::Foundation::HWND as WHWND;
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
     use windows::Win32::UI::Shell::{

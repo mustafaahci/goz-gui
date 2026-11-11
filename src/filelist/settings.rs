@@ -5,7 +5,10 @@
 //! Open File List... opened last: its dialog starts there). W6: the File
 //! List Editor's Export..., `editor_last_export_type` (the file type it
 //! chose last, from 0 in its list: CSV, EFU, M3U, M3U8, TSV, TXT) and
-//! `editor_last_export_selection_only` (0).
+//! `editor_last_export_selection_only` (0). W7: the Edit File List Slot
+//! dialog's `file_list_slot_export_type` (CSV, EFU, TXT from 0),
+//! `file_list_slot_last_export_filename`, `filelist_slot_last_add_folder_path`
+//! and `filelist_slot_last_import_filename`.
 
 use crate::csv::{self, Field};
 
@@ -24,7 +27,26 @@ pub struct ListSettings {
     /// W6: `editor_last_export_type` and `editor_last_export_selection_only`.
     pub editor_export_type: usize,
     pub editor_export_selection: bool,
+    /// W7: the Edit File List Slot dialog's Export..., Add Folder... and
+    /// Import... choices.
+    pub slot: SlotKept,
 }
+
+/// W7: what the Edit File List Slot dialog keeps (Everything's keys).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlotKept {
+    /// `file_list_slot_export_type`: CSV, EFU, TXT, from 0.
+    pub export_type: usize,
+    /// `file_list_slot_last_export_filename`.
+    pub last_export: String,
+    /// `filelist_slot_last_add_folder_path`.
+    pub last_add_folder: String,
+    /// `filelist_slot_last_import_filename`.
+    pub last_import: String,
+}
+
+/// How many types the slot dialog's Export... has.
+pub const SLOT_EXPORT_KINDS: usize = 3;
 
 impl Default for ListSettings {
     fn default() -> ListSettings {
@@ -35,6 +57,7 @@ impl Default for ListSettings {
             last_open: String::new(),
             editor_export_type: 0,
             editor_export_selection: false,
+            slot: SlotKept::default(),
         }
     }
 }
@@ -43,6 +66,7 @@ impl ListSettings {
     pub fn from_keys<'a>(get: impl Fn(&str) -> Option<&'a str>) -> ListSettings {
         let d = ListSettings::default();
         let num = |k: &str| get(k).and_then(|v| v.trim().parse::<i64>().ok());
+        let text = |k: &str| get(k).unwrap_or_default().to_owned();
         let history_max = num("file_list_history_max")
             .and_then(|n| usize::try_from(n).ok())
             .map_or(d.history_max, |n| n.min(MENU_MAX));
@@ -73,6 +97,15 @@ impl ListSettings {
                 .unwrap_or(d.editor_export_type),
             editor_export_selection: num("editor_last_export_selection_only")
                 .map_or(d.editor_export_selection, |n| n != 0),
+            slot: SlotKept {
+                export_type: num("file_list_slot_export_type")
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|&n| n < SLOT_EXPORT_KINDS)
+                    .unwrap_or(0),
+                last_export: text("file_list_slot_last_export_filename"),
+                last_add_folder: text("filelist_slot_last_add_folder_path"),
+                last_import: text("filelist_slot_last_import_filename"),
+            },
         }
     }
 
@@ -105,6 +138,22 @@ impl ListSettings {
                 "editor_last_export_selection_only".into(),
                 u8::from(self.editor_export_selection).to_string(),
             ),
+            (
+                "file_list_slot_export_type".into(),
+                self.slot.export_type.to_string(),
+            ),
+            (
+                "file_list_slot_last_export_filename".into(),
+                self.slot.last_export.clone(),
+            ),
+            (
+                "filelist_slot_last_add_folder_path".into(),
+                self.slot.last_add_folder.clone(),
+            ),
+            (
+                "filelist_slot_last_import_filename".into(),
+                self.slot.last_import.clone(),
+            ),
         ]
     }
 
@@ -133,6 +182,12 @@ mod tests {
         assert!(d.history_enabled);
         assert_eq!(d.history_max, 24);
         let mut s = d.clone();
+        s.slot = SlotKept {
+            export_type: 2,
+            last_export: r"C:\out\slot.txt".into(),
+            last_add_folder: r"D:\music".into(),
+            last_import: r"C:\in.efu".into(),
+        };
         s.opened(r"C:\a.efu");
         s.opened(r"C:\b,c.efu");
         s.opened(r"c:\A.EFU");

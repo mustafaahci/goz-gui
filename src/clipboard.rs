@@ -11,7 +11,9 @@ use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
     IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
-use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows_sys::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows_sys::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_MOVE};
 use windows_sys::Win32::System::Threading::Sleep;
 use windows_sys::Win32::UI::Shell::{CFSTR_PREFERREDDROPEFFECT, DROPFILES, DragQueryFileW, HDROP};
@@ -168,6 +170,32 @@ pub fn files(hwnd: HWND) -> Option<Clip> {
         moving: is_move(effect),
         sequence,
     })
+}
+
+/// W7: the text on the clipboard (CF_UNICODETEXT), for a paste of file
+/// names; `None` when it holds none or cannot be opened.
+pub fn text(hwnd: HWND) -> Option<String> {
+    if !has_text() || !open_as_is(hwnd) {
+        return None;
+    }
+    // SAFETY: the clipboard is open; its handle is read while locked, no
+    // further than its size, and stays the clipboard's; it is closed below.
+    unsafe {
+        let mut out = None;
+        let mem = GetClipboardData(u32::from(CF_UNICODETEXT));
+        if !mem.is_null() {
+            let p = GlobalLock(mem) as *const u16;
+            if !p.is_null() {
+                let units = GlobalSize(mem) / 2;
+                let all = core::slice::from_raw_parts(p, units);
+                let len = all.iter().position(|&c| c == 0).unwrap_or(units);
+                out = Some(String::from_utf16_lossy(&all[..len]));
+                GlobalUnlock(mem);
+            }
+        }
+        CloseClipboard();
+        out
+    }
 }
 
 /// The paths of a CF_HDROP block (a drop's, or the clipboard's).

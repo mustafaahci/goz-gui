@@ -410,6 +410,10 @@ mod tests {
             crate::datatools::cmd::IMPORT_EXPORT_SETTINGS,
             crate::datatools::cmd::TROUBLESHOOTING,
             crate::listedit::cmd::FILE_LIST_EDITOR,
+            // W7 (C): the search box menu's Edit File List Slot... and Edit
+            // File List... (the editor's Paste is its own window's).
+            crate::slotedit::cmd::EDIT_SLOT,
+            crate::slotedit::cmd::EDIT_LIST,
         ]
     }
 
@@ -516,6 +520,13 @@ mod tests {
             } else if name.starts_with("crate::listedit::") {
                 // W5 (C): 4750..=4799.
                 Some(crate::listedit::cmd::FIRST)
+            } else if name.starts_with("crate::slotedit::") {
+                // W7 (C): 4950..=4999.
+                assert!(
+                    (crate::slotedit::cmd::FIRST..crate::slotedit::cmd::END).contains(&id),
+                    "{name} ({id})"
+                );
+                Some(crate::slotedit::cmd::FIRST)
             } else {
                 None
             };
@@ -566,6 +577,9 @@ mod tests {
             super::super::selecting::WM_SELECTING,
             // W6 (C): the File List Editor closed.
             crate::listedit::WM_EDITOR_CLOSED,
+            // W7 (C): a file-list term to edit, a slot's saved results.
+            crate::slotedit::WM_EDIT_TERM_AT,
+            crate::slotedit::WM_SLOT_SAVED,
         ];
         for (i, &(a, m)) in messages.iter().enumerate() {
             for &(b, other) in &messages[i + 1..] {
@@ -597,6 +611,15 @@ mod tests {
                 a.starts_with("crate::listedit::"),
                 "{a} and W6 C's range"
             );
+            // W7 (C) routes WM_APP + 380..390 to `w7_message`: only its own
+            // sit there.
+            let in_w7c = (crate::slotedit::MSG_FIRST..crate::slotedit::MSG_END).contains(&m);
+            assert_eq!(
+                in_w7c,
+                a.starts_with("crate::slotedit::"),
+                "{a} and W7 C's range"
+            );
+            assert!(!is_feature_message(m) || !in_w7c);
         }
         assert!(!is_feature_message(crate::datatools::MSG_FIRST));
         assert!(!is_feature_message(crate::datatools::MSG_END - 1));

@@ -46,7 +46,7 @@ use goz_winfs::TimeZone;
 
 use crate::client::Row;
 use matcher::{Candidate, Matcher, name_of};
-use slots::{ListMatcher, Slots};
+use slots::{RowTests, Slots};
 
 /// Rows in a chunk: the row's number in the list is its chunk's number
 /// times this, plus its place in the chunk.
@@ -382,18 +382,28 @@ impl FileList {
         {
             return Ok(Some(Arc::clone(last)));
         }
-        // W6: the `filelist:` terms are goz-gui's; the rest is goz's.
-        let (rest, lists) = slots::split_for_list(query, slots)?;
+        // W6: the file-list terms are goz-gui's; the rest is goz's.
+        let (rest, planned) = slots::split_for_list(query, slots)?;
         let parsed =
             parse_query_at(&rest, match_case, &MachineClock::read()).map_err(|e| e.to_string())?;
-        let lists: Vec<ListMatcher> = lists
-            .iter()
-            .map(|names| ListMatcher::new(names, parsed.match_case))
-            .collect();
+        let mut lists = RowTests::new(&planned, parsed.match_case)?;
+        let mut tested = 0usize;
+        // W7: `child-`, `descendant-`, `sibling-` and `size-filelistN:` look
+        // at every row first, for the list's items the slot names.
+        if lists.needs_rows() {
+            for chunk in &chunks {
+                for i in 0..chunk.len() {
+                    tested += 1;
+                    if tested.is_multiple_of(STALE_EVERY) && stale() {
+                        return Ok(None);
+                    }
+                    lists.see(chunk.path(i), chunk.dir[i], chunk.size(i));
+                }
+            }
+        }
         let mut matcher = Matcher::new(parsed);
         let mut order = Vec::new();
         let mut total_size = 0u64;
-        let mut tested = 0usize;
         for (c, chunk) in chunks.iter().enumerate() {
             for i in 0..chunk.len() {
                 tested += 1;
@@ -401,7 +411,9 @@ impl FileList {
                     return Ok(None);
                 }
                 let row = chunk.candidate(i);
-                if matcher.matches(&row) && lists.iter().all(|l| l.matches(row.path)) {
+                if matcher.matches(&row)
+                    && (lists.is_empty() || lists.matches(row.path, row.is_dir, row.size))
+                {
                     order.push(((c << CHUNK_SHIFT) | i) as u32);
                     if !chunk.dir[i] {
                         total_size = total_size.saturating_add(chunk.size(i).unwrap_or(0));

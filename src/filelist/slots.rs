@@ -1,5 +1,5 @@
-//! The `filelist:` search function and the file-list slots (wave 6), as
-//! Everything 1.5 has them.
+//! The `filelist:` search function and the file-list slots (wave 6), with
+//! Everything 1.5's other slot functions (wave 7), as Everything has them.
 //!
 //! `filelist:<names>` matches the items named: a name without a `\`
 //! matches an item of that whole name (any folder), a path with a `\`
@@ -17,22 +17,53 @@
 //! Everything keeps them (`filelist_slot0`..`9`, arrays of names). An
 //! empty slot matches nothing.
 //!
+//! W7: the rest of Everything's slot functions ([`Func`]), each spelt as
+//! Everything spells it, with or without its hyphens (`parent-filelist1:`,
+//! `parentfilelist1:`, `parent-file-list-1:`). With the items "found" being
+//! the items of the index (or of the open file list) that `filelistN:`
+//! matches:
+//! - `exists-in-filelistN:<name>`: the name, with `$name:`, `$stem:`,
+//!   `$extension:`, `$path:`, `$full-path:` or `$parent-name:` put in from
+//!   each item, is in the slot (`exists-in-filelist1:$stem:.srt`); a name
+//!   with a `\` is a full path, else a whole name;
+//! - `parent-filelistN:` / `ancestor-filelistN:`: the item's folder / one
+//!   of the folders above it is in the slot (by full path or name);
+//! - `child-filelistN:` (and `child-filelist:<names>`): folders holding a
+//!   found item; `descendant-filelistN:`: folders above a found item;
+//!   `sibling-filelistN:`: items in a found item's folder, but that item;
+//! - `size-filelistN:`: files of a found file's size;
+//! - `name-filelistN:` / `stem-filelistN:`: items whose name / stem (the
+//!   name to its last dot; a folder's is its name) is a slot item's;
+//! - `save-filelistN:`: no test: the search's results go in slot N
+//!   (Everything's "Save the current results to the specified file list
+//!   slot"); the window does that ([`saves`]).
+//!
 //! Where it is answered:
-//! - **An open file list**: by goz-gui ([`split_for_list`]): the terms
-//!   are taken out of the search, the rest goes to goz's parser as before,
-//!   and a row must match every term too.
-//! - **gozd's index** ([`for_gozd`]): gozd has no such function (v0.6.0
-//!   and the query-language branch both refuse `filelist:` as unknown).
-//!   A gozd that reads OR, groups and `whole:` (the query-language branch,
-//!   which goz-gui's probe finds) gets each term as the group of its names
-//!   (`<whole:"a.txt"|whole:"C:\x\b.txt"|"*.log">`), which is the same
-//!   search, and an empty list as `whole:""`, which matches nothing; at
-//!   most 256 names, gozd's own limit on a search's terms. The deployed
-//!   v0.6.0 gozd cannot say "any of these", so the search is refused with
-//!   a precise reason rather than answered wrongly.
+//! - **An open file list**: by goz-gui ([`split_for_list`], [`RowTests`]):
+//!   the terms are taken out of the search, the rest goes to goz's parser
+//!   as before, and a row must match every term too. The functions that
+//!   need the found items look at every row once first.
+//! - **gozd's index** ([`for_gozd`]): gozd has no such functions (v0.6.0
+//!   and the query-language branch both refuse them as unknown). A gozd
+//!   that reads OR, groups and `whole:` (the query-language branch, which
+//!   goz-gui's probe finds) gets each term as the same search in its own
+//!   words: `filelist:` as the group of its names
+//!   (`<whole:"a.txt"|whole:"C:\x\b.txt"|"*.log">`), `parent-` as
+//!   `parent:` / `parent-name:`, `ancestor-` as `ancestor:` / a path
+//!   wildcard, `name-` / `stem-` as whole names / `stem:`; the found items'
+//!   functions (`child-`, `descendant-`, `sibling-`, `size-`) look the
+//!   slot's items up in the index first ([`Looked`], one search) and send
+//!   their folders, sizes and paths. An empty list is `whole:""`, which
+//!   matches nothing; at most 256 terms, gozd's own limit on a search. What
+//!   gozd cannot be asked exactly (each result tested against the slot:
+//!   `exists-in-`; a wildcard path under `parent-`/`ancestor-`; more found
+//!   items than one look-up takes) is refused with a precise reason rather
+//!   than answered wrongly, and so is all of it with the deployed v0.6.0
+//!   gozd, which cannot say "any of these". gozd never lists a drive's root
+//!   itself (`C:\`), so `child-`/`descendant-` leave roots out.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::matcher::name_of;
 use super::wild::{folded, glob, has_wildcard};
@@ -43,6 +74,10 @@ pub const COUNT: usize = 10;
 /// gozd's most terms in one search (the query-language branch's
 /// `MAX_QUERY_TERMS`).
 pub const GOZD_MAX_TERMS: usize = 256;
+
+/// The most items one look-up in gozd's index takes for the found items'
+/// functions.
+pub const LOOKUP_MAX: usize = 4096;
 
 /// The keyboard commands File | Set File List Slot 0..9: 4850..=4859
 /// (wave 6's range, 4850..=4899).
@@ -84,31 +119,102 @@ impl Slots {
     }
 }
 
-/// A `filelist:` term of a search: where it is (bytes `start..end`, from
-/// its function name to the end of its value), its slot (`filelistN:`)
-/// and its value, quotes taken off.
+/// Everything's file-list functions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Func {
+    /// `filelist:` / `filelistN:`: the items named.
+    Items,
+    /// `exists-in-filelistN:<name>`.
+    ExistsIn,
+    /// `parent-filelistN:`.
+    Parent,
+    /// `child-filelist:` / `child-filelistN:`.
+    Child,
+    /// `sibling-filelistN:`.
+    Sibling,
+    /// `ancestor-filelistN:`.
+    Ancestor,
+    /// `descendant-filelistN:`.
+    Descendant,
+    /// `size-filelistN:`.
+    Size,
+    /// `name-filelistN:`.
+    Name,
+    /// `stem-filelistN:`.
+    Stem,
+    /// `save-filelistN:`.
+    Save,
+}
+
+impl Func {
+    /// The function a name stands for (any case, hyphens and underscores
+    /// left out), and whether it takes a slot only (`true`) or also a list
+    /// of its own (`false`).
+    fn named(base: &str) -> Option<(Func, bool)> {
+        Some(match base {
+            "filelist" => (Func::Items, false),
+            "existsinfilelist" => (Func::ExistsIn, true),
+            "parentfilelist" => (Func::Parent, true),
+            "childfilelist" => (Func::Child, false),
+            "siblingfilelist" => (Func::Sibling, true),
+            "ancestorfilelist" => (Func::Ancestor, true),
+            "descendantfilelist" => (Func::Descendant, true),
+            "sizefilelist" => (Func::Size, true),
+            "namefilelist" => (Func::Name, true),
+            "stemfilelist" => (Func::Stem, true),
+            "savefilelist" => (Func::Save, true),
+            _ => return None,
+        })
+    }
+}
+
+/// A file-list term of a search: where it is (bytes `start..end`, from its
+/// function name to the end of its value), its function as typed (with its
+/// colon), its slot (`filelistN:`) and its value, quotes taken off.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Term {
     pub start: usize,
     pub end: usize,
+    pub func: Func,
+    pub name: String,
     pub slot: Option<usize>,
     pub value: String,
 }
 
-/// `filelist:` or `filelistN:` (any case) at the start of `b`: the slot,
-/// and how long the function's name is with its colon.
-fn head(b: &[u8]) -> Option<(Option<usize>, usize)> {
-    if b.len() < 9 || !b[..8].eq_ignore_ascii_case(b"filelist") {
+/// A file-list function at the start of `b`: the function, its slot, and
+/// how long its name is with its colon.
+fn head(b: &[u8]) -> Option<(Func, Option<usize>, usize)> {
+    // The longest name, hyphens and all, is well under 40 bytes.
+    let colon = b.iter().take(40).position(|&c| c == b':')?;
+    let raw = &b[..colon];
+    if raw.is_empty()
+        || !raw
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+    {
         return None;
     }
-    match b[8] {
-        b':' => Some((None, 9)),
-        d @ b'0'..=b'9' if b.get(9) == Some(&b':') => Some((Some(usize::from(d - b'0')), 10)),
+    let mut base: String = raw
+        .iter()
+        .filter(|c| !matches!(c, b'-' | b'_'))
+        .map(|&c| char::from(c.to_ascii_lowercase()))
+        .collect();
+    let slot = match base.as_bytes().last() {
+        Some(d @ b'0'..=b'9') => {
+            let n = usize::from(d - b'0');
+            base.pop();
+            Some(n)
+        }
         _ => None,
+    };
+    let (func, slot_only) = Func::named(&base)?;
+    if slot_only && slot.is_none() {
+        return None;
     }
+    Some((func, slot, colon + 1))
 }
 
-/// The `filelist:` terms of `query`: each where a term may start (the
+/// The file-list terms of `query`: each where a term may start (the
 /// search's start, after white space, or after `!`, `<` or `|`), not in
 /// quotes.
 pub fn terms(query: &str) -> Vec<Term> {
@@ -121,7 +227,7 @@ pub fn terms(query: &str) -> Vec<Term> {
         let c = b[i];
         if !quoted
             && at_start
-            && let Some((slot, len)) = head(&b[i..])
+            && let Some((func, slot, len)) = head(&b[i..])
         {
             let from = i + len;
             let mut j = from;
@@ -137,6 +243,8 @@ pub fn terms(query: &str) -> Vec<Term> {
             out.push(Term {
                 start: i,
                 end: j,
+                func,
+                name: query[i..from].to_owned(),
                 slot,
                 value: query[from..j].replace('"', ""),
             });
@@ -153,9 +261,52 @@ pub fn terms(query: &str) -> Vec<Term> {
     out
 }
 
+/// The term of `query` at UTF-16 position `unit` (the search box's caret,
+/// or the character under the mouse), from its function's first character
+/// to its value's last.
+pub fn term_at(query: &str, unit: usize) -> Option<Term> {
+    let mut units = 0usize;
+    let mut byte = query.len();
+    for (i, ch) in query.char_indices() {
+        if units >= unit {
+            byte = i;
+            break;
+        }
+        units += ch.len_utf16();
+    }
+    terms(query)
+        .into_iter()
+        .find(|t| t.start <= byte && byte <= t.end)
+}
+
+/// The search with `term`'s value made `names` (an inline list's: the
+/// File List editor's OK), quoted when a name needs it; `None` when a name
+/// cannot be written in a search (it holds a `;` or a `"`).
+pub fn with_names(query: &str, term: &Term, names: &[String]) -> Option<String> {
+    if names.iter().any(|n| n.contains([';', '"'])) {
+        return None;
+    }
+    let value = names.join(";");
+    let quote = value
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '|' | '<' | '>'));
+    let mut out = String::with_capacity(query.len() + value.len() + 2);
+    out.push_str(&query[..term.start]);
+    out.push_str(&term.name);
+    if quote {
+        out.push('"');
+        out.push_str(&value);
+        out.push('"');
+    } else {
+        out.push_str(&value);
+    }
+    out.push_str(&query[term.end..]);
+    Some(out)
+}
+
 /// A name as a list holds it: trimmed, `/` made `\`, a folder's trailing
 /// `\` taken off (a drive's root keeps its own: `C:\`).
-fn normalize(name: &str) -> Option<String> {
+pub fn normalize(name: &str) -> Option<String> {
     let t = name.trim();
     if t.is_empty() {
         return None;
@@ -168,16 +319,120 @@ fn normalize(name: &str) -> Option<String> {
 }
 
 /// The names `term` stands for: its own, or its slot's. An error for a
-/// slot's term with a value of its own.
+/// slot's term with a value of its own (but `exists-in-filelistN:`, whose
+/// value is the name it looks for).
 pub fn names(term: &Term, slots: &Slots) -> Result<Vec<String>, String> {
     match term.slot {
-        Some(n) if !term.value.trim().is_empty() => Err(format!(
-            "filelist{n}: takes no value: it matches the names in file list slot {n} \
-             (File | Set File List Slot {n} puts the selected results there)"
+        Some(n) if term.func != Func::ExistsIn && !term.value.trim().is_empty() => Err(format!(
+            "{} takes no value: it works with the names in file list slot {n} \
+                 (File | Set File List Slot {n} puts the selected results there)",
+            term.name
         )),
         Some(n) => Ok(slots.get(n).iter().filter_map(|s| normalize(s)).collect()),
         None => Ok(term.value.split([';', '|']).filter_map(normalize).collect()),
     }
+}
+
+/// The slots the search's `save-filelistN:` terms put its results in, in
+/// their order, each once; an error when the search also reads a slot it
+/// saves (its answer would change what it answers).
+pub fn saves(query: &str) -> Result<Vec<usize>, String> {
+    if !may_hold(query) {
+        return Ok(Vec::new());
+    }
+    let found = terms(query);
+    let mut out = Vec::new();
+    for t in &found {
+        if t.func == Func::Save
+            && let Some(n) = t.slot
+            && !out.contains(&n)
+        {
+            out.push(n);
+        }
+    }
+    for t in &found {
+        if t.func != Func::Save
+            && let Some(n) = t.slot
+            && out.contains(&n)
+        {
+            return Err(format!(
+                "{} reads file list slot {n}, which this search's save-filelist{n}: \
+                 fills; search for one in another search",
+                t.name
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `query` may hold a file-list function at all: most searches
+/// do not, and cost no more.
+fn may_hold(query: &str) -> bool {
+    let b = query.as_bytes();
+    b.windows(4).any(|w| w.eq_ignore_ascii_case(b"list"))
+}
+
+/// The name part of an item's path (a drive's root: all of it).
+fn name_part(path: &str) -> &str {
+    match path.rfind('\\') {
+        Some(i) if i + 1 < path.len() => &path[i + 1..],
+        _ => path,
+    }
+}
+
+/// A file's stem as Everything parts a name: up to its last dot (a
+/// folder's is its whole name).
+fn stem_of(name: &[u8], is_dir: bool) -> &[u8] {
+    if is_dir {
+        return name;
+    }
+    match memchr::memrchr(b'.', name) {
+        Some(dot) => &name[..dot],
+        None => name,
+    }
+}
+
+/// A file's extension: after its last dot (a folder has none).
+fn extension_of(name: &[u8], is_dir: bool) -> &[u8] {
+    if is_dir {
+        return &[];
+    }
+    match memchr::memrchr(b'.', name) {
+        Some(dot) => &name[dot + 1..],
+        None => &[],
+    }
+}
+
+/// The folder holding `path` (`C:\x\a` → `C:\x`, `C:\a` → `C:\`); none for
+/// a drive's root or a bare name.
+pub fn parent_of(path: &[u8]) -> Option<&[u8]> {
+    let i = memchr::memrchr(b'\\', path)?;
+    if i + 1 >= path.len() {
+        // A root's own backslash (`C:\`).
+        return None;
+    }
+    if i > 0 && path[i - 1] == b':' {
+        Some(&path[..=i])
+    } else if i == 0 {
+        None
+    } else {
+        Some(&path[..i])
+    }
+}
+
+/// The folders above `path`, nearest first.
+fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut at = Some(path);
+    std::iter::from_fn(move || {
+        let up = parent_of(at?)?;
+        at = Some(up);
+        Some(up)
+    })
+}
+
+/// Whether `path` is a drive's root (`C:\`).
+fn is_root(path: &[u8]) -> bool {
+    path.len() == 3 && path[1] == b':' && path[2] == b'\\'
 }
 
 /// What a row must match for one `filelist:` term of a search over a file
@@ -215,6 +470,11 @@ impl ListMatcher {
             }
         }
         m
+    }
+
+    /// Whether it names nothing.
+    fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.paths.is_empty() && self.globs.is_empty()
     }
 
     /// Whether the row at `path` (UTF-8, a folder's without its trailing
@@ -255,90 +515,632 @@ fn key(case: bool, text: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
-/// A search over an open file list: the search without its `filelist:`
-/// terms (each made a space), for goz's parser, and each term's names.
-pub fn split_for_list(query: &str, slots: &Slots) -> Result<(String, Vec<Vec<String>>), String> {
+/// An item's property `exists-in-filelistN:` can put in its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prop {
+    Name,
+    Stem,
+    Extension,
+    /// The folder it is in.
+    Path,
+    FullPath,
+    ParentName,
+}
+
+/// A piece of an `exists-in-filelistN:` value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Piece {
+    Text(String),
+    Prop(Prop),
+}
+
+/// An `exists-in-filelistN:` value read into its pieces: `$name:` and its
+/// kind put in an item's property; a `$` not so is itself.
+fn substitution(value: &str, func: &str) -> Result<Vec<Piece>, String> {
+    let mut out = Vec::new();
+    let mut text = String::new();
+    let mut rest = value;
+    while let Some(at) = rest.find('$') {
+        text.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let word_len = after
+            .bytes()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+            .count();
+        if word_len == 0 || after.as_bytes().get(word_len) != Some(&b':') {
+            text.push('$');
+            rest = after;
+            continue;
+        }
+        let word: String = after[..word_len]
+            .chars()
+            .filter(|c| !matches!(c, '-' | '_'))
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let prop = match word.as_str() {
+            "name" => Prop::Name,
+            "stem" => Prop::Stem,
+            "ext" | "extension" => Prop::Extension,
+            "path" | "location" => Prop::Path,
+            "fullpath" | "pathandname" => Prop::FullPath,
+            "parentname" => Prop::ParentName,
+            _ => {
+                return Err(format!(
+                    "{func} cannot put in ${}: (goz-gui puts in $name:, $stem:, $extension:, \
+                     $path:, $full-path: and $parent-name:)",
+                    &after[..word_len]
+                ));
+            }
+        };
+        if !text.is_empty() {
+            out.push(Piece::Text(std::mem::take(&mut text)));
+        }
+        out.push(Piece::Prop(prop));
+        rest = &after[word_len + 1..];
+    }
+    text.push_str(rest);
+    if !text.is_empty() {
+        out.push(Piece::Text(text));
+    }
+    Ok(out)
+}
+
+/// The name `pieces` make for the item at `path`.
+fn substitute(pieces: &[Piece], path: &[u8], is_dir: bool, out: &mut Vec<u8>) {
+    out.clear();
+    let name = name_of(path);
+    for p in pieces {
+        match p {
+            Piece::Text(t) => out.extend_from_slice(t.as_bytes()),
+            Piece::Prop(Prop::Name) => out.extend_from_slice(name),
+            Piece::Prop(Prop::Stem) => out.extend_from_slice(stem_of(name, is_dir)),
+            Piece::Prop(Prop::Extension) => out.extend_from_slice(extension_of(name, is_dir)),
+            Piece::Prop(Prop::Path) => {
+                if let Some(up) = parent_of(path) {
+                    // `$path:\x` makes one backslash after a drive's root.
+                    out.extend_from_slice(up.strip_suffix(b"\\").unwrap_or(up));
+                }
+            }
+            Piece::Prop(Prop::FullPath) => out.extend_from_slice(path),
+            Piece::Prop(Prop::ParentName) => {
+                if let Some(up) = parent_of(path) {
+                    out.extend_from_slice(name_of(up));
+                }
+            }
+        }
+    }
+}
+
+/// A file-list term of a search over an open file list, before the case
+/// is known: its function, its names and its value.
+#[derive(Clone, Debug)]
+pub struct Planned {
+    func: Func,
+    name: String,
+    names: Vec<String>,
+    value: String,
+}
+
+/// A search over an open file list: the search without its file-list terms
+/// (each made a space), for goz's parser, and each term's plan; a
+/// `save-filelistN:` term is taken out and tests nothing.
+pub fn split_for_list(query: &str, slots: &Slots) -> Result<(String, Vec<Planned>), String> {
+    if !may_hold(query) {
+        return Ok((query.to_owned(), Vec::new()));
+    }
     let found = terms(query);
     if found.is_empty() {
         return Ok((query.to_owned(), Vec::new()));
     }
+    saves(query)?;
     let mut rest = String::with_capacity(query.len());
-    let mut lists = Vec::with_capacity(found.len());
+    let mut planned = Vec::with_capacity(found.len());
     let mut at = 0;
     for t in &found {
         rest.push_str(&query[at..t.start]);
         rest.push(' ');
-        lists.push(names(t, slots)?);
         at = t.end;
+        if t.func == Func::Save {
+            continue;
+        }
+        planned.push(Planned {
+            func: t.func,
+            name: t.name.clone(),
+            names: names(t, slots)?,
+            value: t.value.clone(),
+        });
     }
     rest.push_str(&query[at..]);
-    Ok((rest, lists))
+    Ok((rest, planned))
 }
 
-/// Why gozd cannot be asked a `filelist:` search when it reads no OR.
-pub const NEEDS_OR: &str = "filelist: needs a gozd that reads OR (|), and the gozd running \
-     (goz v0.6.0) does not, so it is not asked; filelist: works in an open file list \
-     (File > Open File List...)";
+/// One term's test of a row.
+enum Test {
+    /// `filelist:`: the row is named.
+    Items(ListMatcher),
+    /// `name-filelist`: its name is a slot item's name.
+    Name(ListMatcher),
+    /// `stem-filelist`: its stem is a slot item's (whole, or wildcards).
+    Stem {
+        whole: HashSet<Vec<u8>>,
+        globs: Vec<Vec<u8>>,
+    },
+    /// `parent-filelist`: its folder is named.
+    Parent(ListMatcher),
+    /// `ancestor-filelist`: a folder above it is named.
+    Ancestor(ListMatcher),
+    /// `exists-in-filelist`: the name its value makes for it is in the
+    /// slot (a full path among the full paths, a name among the names).
+    ExistsIn {
+        pieces: Vec<Piece>,
+        /// The slot's full paths, and its names.
+        slot: Box<(ListMatcher, ListMatcher)>,
+    },
+    /// `child-filelist`: a folder holding a found item (folded paths).
+    Child {
+        slot: ListMatcher,
+        folders: HashSet<Vec<u8>>,
+    },
+    /// `descendant-filelist`: a folder above a found item.
+    Descendant {
+        slot: ListMatcher,
+        folders: HashSet<Vec<u8>>,
+    },
+    /// `sibling-filelist`: by folded folder, the first found item there
+    /// and whether another one is.
+    Sibling {
+        slot: ListMatcher,
+        folders: HashMap<Vec<u8>, (Vec<u8>, bool)>,
+    },
+    /// `size-filelist`: a found file's size.
+    Size {
+        slot: ListMatcher,
+        sizes: HashSet<u64>,
+    },
+}
 
-/// The search as gozd is asked it: as it is without a `filelist:` term;
-/// with each one as the group of its names when gozd reads OR, groups and
-/// `whole:` (`boolean`); else an error saying why it cannot be asked.
-pub fn for_gozd<'a>(query: &'a str, slots: &Slots, boolean: bool) -> Result<Cow<'a, str>, String> {
+/// The tests a search's file-list terms make of each row of an open file
+/// list. Those that need the found items see every row first
+/// ([`RowTests::see`]).
+pub struct RowTests {
+    case: bool,
+    tests: Vec<Test>,
+    buf: Vec<u8>,
+}
+
+impl RowTests {
+    /// The tests of `planned`, the case as the search's (goz's parser said
+    /// it, `case:` and all).
+    pub fn new(planned: &[Planned], case: bool) -> Result<RowTests, String> {
+        let mut tests = Vec::with_capacity(planned.len());
+        for p in planned {
+            let slot = || ListMatcher::new(&p.names, case);
+            let name_parts =
+                || -> Vec<String> { p.names.iter().map(|n| name_part(n).to_owned()).collect() };
+            tests.push(match p.func {
+                Func::Items => Test::Items(slot()),
+                Func::Name => Test::Name(ListMatcher::new(&name_parts(), case)),
+                Func::Stem => {
+                    let (mut whole, mut globs) = (HashSet::new(), Vec::new());
+                    for n in name_parts() {
+                        let stem = key(case, stem_of(n.as_bytes(), false)).into_owned();
+                        if has_wildcard(&n) {
+                            globs.push(stem);
+                        } else {
+                            whole.insert(stem);
+                        }
+                    }
+                    Test::Stem { whole, globs }
+                }
+                Func::Parent => Test::Parent(slot()),
+                Func::Ancestor => Test::Ancestor(slot()),
+                Func::ExistsIn => Test::ExistsIn {
+                    pieces: substitution(&p.value, &p.name)?,
+                    slot: Box::new((slot(), ListMatcher::new(&name_parts(), case))),
+                },
+                Func::Child => Test::Child {
+                    slot: slot(),
+                    folders: HashSet::new(),
+                },
+                Func::Descendant => Test::Descendant {
+                    slot: slot(),
+                    folders: HashSet::new(),
+                },
+                Func::Sibling => Test::Sibling {
+                    slot: slot(),
+                    folders: HashMap::new(),
+                },
+                Func::Size => Test::Size {
+                    slot: slot(),
+                    sizes: HashSet::new(),
+                },
+                Func::Save => continue,
+            });
+        }
+        Ok(RowTests {
+            case,
+            tests,
+            buf: Vec::new(),
+        })
+    }
+
+    /// Whether there is a test at all.
+    pub fn is_empty(&self) -> bool {
+        self.tests.is_empty()
+    }
+
+    /// Whether a test needs the found items: every row is [`seen`] first.
+    ///
+    /// [`seen`]: RowTests::see
+    pub fn needs_rows(&self) -> bool {
+        self.tests.iter().any(|t| {
+            matches!(
+                t,
+                Test::Child { .. }
+                    | Test::Descendant { .. }
+                    | Test::Sibling { .. }
+                    | Test::Size { .. }
+            )
+        })
+    }
+
+    /// A row of the list, before any is tested: a found item's folder,
+    /// folders above it and size are kept.
+    pub fn see(&mut self, path: &[u8], is_dir: bool, size: Option<u64>) {
+        for t in &mut self.tests {
+            match t {
+                Test::Child { slot, folders } if !slot.is_empty() && slot.matches(path) => {
+                    if let Some(up) = parent_of(path) {
+                        folders.insert(folded(up));
+                    }
+                }
+                Test::Descendant { slot, folders } if !slot.is_empty() && slot.matches(path) => {
+                    for up in ancestors(path) {
+                        if !folders.insert(folded(up)) {
+                            // Those above it are in already.
+                            break;
+                        }
+                    }
+                }
+                Test::Sibling { slot, folders } if !slot.is_empty() && slot.matches(path) => {
+                    if let Some(up) = parent_of(path) {
+                        let me = folded(path);
+                        folders
+                            .entry(folded(up))
+                            .and_modify(|(first, more)| *more |= *first != me)
+                            .or_insert((me, false));
+                    }
+                }
+                Test::Size { slot, sizes } if !is_dir && !slot.is_empty() && slot.matches(path) => {
+                    if let Some(s) = size {
+                        sizes.insert(s);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether the row at `path` passes every test.
+    pub fn matches(&mut self, path: &[u8], is_dir: bool, size: Option<u64>) -> bool {
+        let case = self.case;
+        let buf = &mut self.buf;
+        self.tests.iter().all(|t| match t {
+            Test::Items(m) => m.matches(path),
+            Test::Name(m) => m.matches(name_of(path)),
+            Test::Stem { whole, globs } => {
+                let stem = key(case, stem_of(name_of(path), is_dir));
+                whole.contains(stem.as_ref()) || globs.iter().any(|g| glob(g, &stem))
+            }
+            Test::Parent(m) => parent_of(path).is_some_and(|up| m.matches(up)),
+            Test::Ancestor(m) => ancestors(path).any(|up| m.matches(up)),
+            Test::ExistsIn { pieces, slot } => {
+                substitute(pieces, path, is_dir, buf);
+                if buf.is_empty() {
+                    false
+                } else if buf.contains(&b'\\') {
+                    slot.0.matches(buf)
+                } else {
+                    slot.1.matches(buf)
+                }
+            }
+            Test::Child { folders, .. } | Test::Descendant { folders, .. } => {
+                !folders.is_empty() && folders.contains(&folded(path))
+            }
+            Test::Sibling { folders, .. } => {
+                !folders.is_empty()
+                    && parent_of(path).is_some_and(|up| {
+                        folders
+                            .get(&folded(up))
+                            .is_some_and(|(first, more)| *more || *first != folded(path))
+                    })
+            }
+            Test::Size { sizes, .. } => !is_dir && size.is_some_and(|s| sizes.contains(&s)),
+        })
+    }
+}
+
+/// Why gozd cannot be asked a file-list search when it reads no OR.
+pub fn needs_or(func: &str) -> String {
+    format!(
+        "{func} needs a gozd that reads OR (|), and the gozd running (goz v0.6.0) does not, \
+         so it is not asked; {func} works in an open file list (File > Open File List...)"
+    )
+}
+
+/// The found items of a slot as gozd's index has them: an item of the
+/// index that the slot names, with whether it is a folder and its size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundItem {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: Option<u64>,
+}
+
+/// What a look-up in gozd's index found: at most [`LOOKUP_MAX`] + 1 items,
+/// and how many there are in all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Looked {
+    pub items: Vec<FoundItem>,
+    pub total: u64,
+}
+
+/// Why [`for_gozd`] gave no search: a reason to show, or the look-up's own
+/// failure (the connection's, for the caller to tell apart).
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotAsked<E> {
+    Refused(String),
+    Lookup(E),
+}
+
+impl<E> From<String> for NotAsked<E> {
+    fn from(why: String) -> NotAsked<E> {
+        NotAsked::Refused(why)
+    }
+}
+
+/// The search as gozd is asked it: as it is without a file-list term; with
+/// each one in gozd's own words when gozd reads OR, groups and `whole:`
+/// (`boolean`), the found items' functions asking `lookup` (a search of
+/// gozd's index: at most [`LOOKUP_MAX`] + 1 items with their sizes) for
+/// them first; else why it cannot be asked. A `save-filelistN:` term is
+/// taken out (the window saves the results), with any gozd.
+pub fn for_gozd<'a, E>(
+    query: &'a str,
+    slots: &Slots,
+    boolean: bool,
+    lookup: &mut dyn FnMut(&str) -> Result<Looked, E>,
+) -> Result<Cow<'a, str>, NotAsked<E>> {
     // Most searches: no function of that name at all.
-    if !query
-        .as_bytes()
-        .windows(8)
-        .any(|w| w.eq_ignore_ascii_case(b"filelist"))
-    {
+    if !may_hold(query) {
         return Ok(Cow::Borrowed(query));
     }
     let found = terms(query);
     if found.is_empty() {
         return Ok(Cow::Borrowed(query));
     }
-    if !boolean {
-        return Err(NEEDS_OR.into());
+    saves(query)?;
+    if !boolean && let Some(t) = found.iter().find(|t| t.func != Func::Save) {
+        return Err(needs_or(&t.name).into());
     }
     let mut out = String::with_capacity(query.len() + 64);
     let mut at = 0;
     for t in &found {
         out.push_str(&query[at..t.start]);
-        let names = names(t, slots)?;
-        if names.len() > GOZD_MAX_TERMS {
-            let f = t
-                .slot
-                .map_or_else(|| "filelist:".to_owned(), |n| format!("filelist{n}:"));
-            return Err(format!(
-                "{f} holds {} names, and gozd searches at most {GOZD_MAX_TERMS} terms at once; \
-                 open them as a file list instead (Tools > File List Editor...)",
-                crate::format::grouped(names.len() as u64)
-            ));
-        }
-        out.push_str(&gozd_group(&names));
         at = t.end;
+        if t.func == Func::Save {
+            out.push(' ');
+            continue;
+        }
+        let names = names(t, slots)?;
+        let terms = match t.func {
+            Func::Items => names.iter().map(|n| item_term(n)).collect(),
+            Func::Name => names.iter().map(|n| item_term(name_part(n))).collect(),
+            Func::Stem => stem_terms(t, &names)?,
+            Func::Parent => parent_terms(t, &names)?,
+            Func::Ancestor => ancestor_terms(t, &names)?,
+            Func::ExistsIn => {
+                return Err(NotAsked::Refused(format!(
+                    "{} tests each result against file list slot {}, which gozd cannot be \
+                     asked; it works in an open file list (File > Open File List...)",
+                    t.name,
+                    t.slot.unwrap_or(0)
+                )));
+            }
+            Func::Child | Func::Descendant | Func::Sibling | Func::Size => {
+                let looked = if names.is_empty() {
+                    Looked::default()
+                } else {
+                    if names.len() > GOZD_MAX_TERMS {
+                        return Err(too_many(t, names.len(), "names").into());
+                    }
+                    let items: Vec<String> = names.iter().map(|n| item_term(n)).collect();
+                    lookup(&format!("<{}>", items.join("|"))).map_err(NotAsked::Lookup)?
+                };
+                if looked.total > LOOKUP_MAX as u64 || looked.items.len() > LOOKUP_MAX {
+                    return Err(NotAsked::Refused(format!(
+                        "{} names {} items of the index, and goz-gui looks up at most {} for \
+                         it; open them as a file list instead (Tools > File List Editor...)",
+                        t.name,
+                        crate::format::grouped(looked.total.max(looked.items.len() as u64)),
+                        crate::format::grouped(LOOKUP_MAX as u64)
+                    )));
+                }
+                found_terms(t, &looked.items)?
+            }
+            Func::Save => unreachable!("taken out above"),
+        };
+        if terms.len() > GOZD_MAX_TERMS {
+            return Err(too_many(t, terms.len(), "terms").into());
+        }
+        out.push_str(&group(&terms));
     }
     out.push_str(&query[at..]);
     Ok(Cow::Owned(out))
 }
 
-/// The names as one group gozd reads: `whole:` for a whole name or path,
-/// a quoted wildcard as it is (a wildcard is matched whole already).
-fn gozd_group(names: &[String]) -> String {
-    if names.is_empty() {
-        // No name is empty: nothing matches.
+/// Why a term is too long for gozd.
+fn too_many(t: &Term, n: usize, what: &str) -> String {
+    format!(
+        "{} makes {} {what}, and gozd searches at most {GOZD_MAX_TERMS} terms at once; \
+         open them as a file list instead (Tools > File List Editor...)",
+        t.name,
+        crate::format::grouped(n as u64)
+    )
+}
+
+/// Terms as one group gozd reads; none: `whole:""`, which matches nothing
+/// (no name is empty).
+fn group(terms: &[String]) -> String {
+    if terms.is_empty() {
         return "whole:\"\"".into();
     }
-    let items: Vec<String> = names
+    format!("<{}>", terms.join("|"))
+}
+
+/// An item of a list as gozd reads it: `whole:` for a whole name or path,
+/// a quoted wildcard as it is (a wildcard is matched whole already).
+fn item_term(n: &str) -> String {
+    if has_wildcard(n) {
+        format!("\"{n}\"")
+    } else {
+        format!("whole:\"{n}\"")
+    }
+}
+
+/// `stem-filelistN:`: each slot item's stem, whole (a wildcard as it is).
+fn stem_terms(t: &Term, names: &[String]) -> Result<Vec<String>, String> {
+    names
         .iter()
         .map(|n| {
-            if has_wildcard(n) {
-                format!("\"{n}\"")
-            } else {
-                format!("whole:\"{n}\"")
+            let name = name_part(n);
+            let stem = String::from_utf8_lossy(stem_of(name.as_bytes(), false)).into_owned();
+            if stem.is_empty() {
+                return Err(format!(
+                    "{} cannot be asked of gozd: {name} has an empty stem",
+                    t.name
+                ));
             }
+            Ok(if has_wildcard(&stem) {
+                format!("stem:\"{stem}\"")
+            } else {
+                format!("whole:stem:\"{stem}\"")
+            })
         })
-        .collect();
-    format!("<{}>", items.join("|"))
+        .collect()
+}
+
+/// `parent-filelistN:`: a full path is `parent:`, a name `parent-name:`.
+fn parent_terms(t: &Term, names: &[String]) -> Result<Vec<String>, String> {
+    names
+        .iter()
+        .map(|n| match (n.contains('\\'), has_wildcard(n)) {
+            (true, false) => Ok(format!("parent:\"{n}\"")),
+            (false, false) => Ok(format!("whole:parent-name:\"{n}\"")),
+            (false, true) => Ok(format!("parent-name:\"{n}\"")),
+            (true, true) => Err(wildcard_path(t, n)),
+        })
+        .collect()
+}
+
+/// `ancestor-filelistN:`: a full path is `ancestor:`, a name a folder of
+/// that name anywhere above (`"**\name\**"`).
+fn ancestor_terms(t: &Term, names: &[String]) -> Result<Vec<String>, String> {
+    names
+        .iter()
+        .map(|n| match (n.contains('\\'), has_wildcard(n)) {
+            (true, false) => Ok(format!("ancestor:\"{n}\"")),
+            (false, _) => Ok(format!("\"**\\{n}\\**\"")),
+            (true, true) => Err(wildcard_path(t, n)),
+        })
+        .collect()
+}
+
+fn wildcard_path(t: &Term, n: &str) -> String {
+    format!(
+        "{} can ask gozd for full paths and names, not for the wildcard path {n}; \
+         it works in an open file list (File > Open File List...)",
+        t.name
+    )
+}
+
+/// The found items' functions in gozd's words, from the items found.
+fn found_terms(t: &Term, items: &[FoundItem]) -> Result<Vec<String>, String> {
+    // Each folder once (any case), as the index spells it.
+    let mut seen = HashSet::new();
+    let mut once = |p: &str, out: &mut Vec<String>, term: &dyn Fn(&str) -> String| {
+        if seen.insert(folded(p.as_bytes())) {
+            out.push(term(p));
+        }
+    };
+    let mut out = Vec::new();
+    match t.func {
+        Func::Child => {
+            for f in items {
+                if let Some(up) = parent_of(f.path.as_bytes()).filter(|up| !is_root(up)) {
+                    let up = String::from_utf8_lossy(up);
+                    once(&up, &mut out, &|p| format!("whole:\"{p}\""));
+                }
+            }
+        }
+        Func::Descendant => {
+            for f in items {
+                for up in ancestors(f.path.as_bytes()).filter(|up| !is_root(up)) {
+                    let up = String::from_utf8_lossy(up);
+                    once(&up, &mut out, &|p| format!("whole:\"{p}\""));
+                }
+            }
+        }
+        Func::Sibling => {
+            // By folder: the items found there.
+            let mut by_folder: Vec<(String, Vec<&str>)> = Vec::new();
+            let mut at: HashMap<Vec<u8>, usize> = HashMap::new();
+            for f in items {
+                let Some(up) = parent_of(f.path.as_bytes()) else {
+                    continue;
+                };
+                let i = *at.entry(folded(up)).or_insert_with(|| {
+                    by_folder.push((String::from_utf8_lossy(up).into_owned(), Vec::new()));
+                    by_folder.len() - 1
+                });
+                let mine = &mut by_folder[i].1;
+                if !mine
+                    .iter()
+                    .any(|p| folded(p.as_bytes()) == folded(f.path.as_bytes()))
+                {
+                    mine.push(&f.path);
+                }
+            }
+            for (folder, found) in by_folder {
+                out.push(match found.as_slice() {
+                    [one] => format!("<parent:\"{folder}\" !whole:\"{one}\">"),
+                    // Each is the others' sibling: all of the folder.
+                    _ => format!("parent:\"{folder}\""),
+                });
+            }
+        }
+        Func::Size => {
+            let mut sizes = HashSet::new();
+            for f in items.iter().filter(|f| !f.is_dir) {
+                match f.size {
+                    Some(s) => {
+                        if sizes.insert(s) {
+                            out.push(format!("size:={s}"));
+                        }
+                    }
+                    None => {
+                        return Err(format!(
+                            "{} needs the size of {}, which gozd has not read yet; \
+                             try again in a moment",
+                            t.name, f.path
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -352,6 +1154,15 @@ mod tests {
         s
     }
 
+    /// No look-up wanted.
+    fn none(_: &str) -> Result<Looked, ()> {
+        panic!("no look-up was wanted")
+    }
+
+    fn gozd<'a>(q: &'a str, s: &Slots, boolean: bool) -> Result<Cow<'a, str>, NotAsked<()>> {
+        for_gozd(q, s, boolean, &mut none)
+    }
+
     #[test]
     fn terms_are_found_where_a_term_may_start() {
         let t = terms(r#"abc filelist:"a b.txt;c.txt" !FileList3: <filelist:x|y> "filelist:no""#);
@@ -362,10 +1173,74 @@ mod tests {
             r#"filelist:"a b.txt;c.txt""#
         );
         assert_eq!((t[1].slot, t[1].value.as_str()), (Some(3), ""));
+        assert_eq!(t[1].name, "FileList3:");
         // An unquoted `|` or `>` ends the value.
         assert_eq!(t[2].value, "x");
-        assert!(terms("myfilelist:x filelistx: filelist12:").is_empty());
+        assert!(terms("myfilelist:x filelistx: filelist12: filelist-filename:a").is_empty());
         assert!(terms(r#""a filelist:x""#).is_empty(), "inside quotes");
+    }
+
+    /// W7: every function, in each of Everything's spellings.
+    #[test]
+    fn every_function_in_everythings_spellings() {
+        let one = |q: &str| {
+            let t = terms(q);
+            assert_eq!(t.len(), 1, "{q}: {t:?}");
+            (t[0].func, t[0].slot)
+        };
+        for (q, want) in [
+            ("exists-in-filelist2:a", (Func::ExistsIn, Some(2))),
+            ("existsinfilelist2:a", (Func::ExistsIn, Some(2))),
+            ("parent-filelist0:", (Func::Parent, Some(0))),
+            ("parentfilelist0:", (Func::Parent, Some(0))),
+            ("parent-file-list-0:", (Func::Parent, Some(0))),
+            ("child-filelist:a;b", (Func::Child, None)),
+            ("childfilelist4:", (Func::Child, Some(4))),
+            ("child-file-list-4:", (Func::Child, Some(4))),
+            ("sibling-filelist1:", (Func::Sibling, Some(1))),
+            ("ANCESTORFILELIST9:", (Func::Ancestor, Some(9))),
+            ("descendant-file-list-1:", (Func::Descendant, Some(1))),
+            ("size-file-list-1:", (Func::Size, Some(1))),
+            ("sizefilelist1:", (Func::Size, Some(1))),
+            ("name-filelist1:", (Func::Name, Some(1))),
+            ("stem-filelist1:", (Func::Stem, Some(1))),
+            ("save-filelist1:", (Func::Save, Some(1))),
+            ("savefilelist1:", (Func::Save, Some(1))),
+            ("file-list-1:", (Func::Items, Some(1))),
+        ] {
+            assert_eq!(one(q), want, "{q}");
+        }
+        // A slot's function needs its slot.
+        for q in [
+            "parentfilelist:",
+            "size-filelist:",
+            "savefilelist:",
+            "existsinfilelist:a",
+        ] {
+            assert!(terms(q).is_empty(), "{q}");
+        }
+    }
+
+    #[test]
+    fn the_term_at_a_place_of_the_box() {
+        let q = "ab parent-filelist1: é filelist:\"x y\"";
+        let t = term_at(q, 3).unwrap();
+        assert_eq!(t.func, Func::Parent);
+        assert_eq!(term_at(q, 20).unwrap().func, Func::Parent, "its end");
+        assert!(term_at(q, 1).is_none());
+        // UTF-16 places: the é is one unit.
+        let t = term_at(q, 25).unwrap();
+        assert_eq!((t.func, t.value.as_str()), (Func::Items, "x y"));
+        let names = vec!["a b.txt".to_owned(), r"C:\c".to_owned()];
+        assert_eq!(
+            with_names(q, &t, &names).unwrap(),
+            "ab parent-filelist1: é filelist:\"a b.txt;C:\\c\""
+        );
+        assert_eq!(
+            with_names("filelist:a x", &terms("filelist:a x")[0], &["b".into()]).unwrap(),
+            "filelist:b x"
+        );
+        assert!(with_names(q, &t, &["a;b".to_owned()]).is_none());
     }
 
     #[test]
@@ -384,6 +1259,16 @@ mod tests {
         );
         assert!(names(&t("filelist2:"), &s).unwrap().is_empty());
         assert!(names(&t("filelist1:x"), &s).unwrap_err().contains("slot 1"));
+        assert!(
+            names(&t("parent-filelist1:x"), &s)
+                .unwrap_err()
+                .starts_with("parent-filelist1: takes no value")
+        );
+        // exists-in's value is its own: the slot's names are the list.
+        assert_eq!(
+            names(&t("exists-in-filelist1:$name:"), &s).unwrap().len(),
+            2
+        );
     }
 
     #[test]
@@ -413,35 +1298,226 @@ mod tests {
     #[test]
     fn a_list_search_loses_its_terms() {
         let s = slots();
-        let (rest, lists) = split_for_list("ext:txt filelist1: size:<1kb", &s).unwrap();
+        let (rest, planned) = split_for_list("ext:txt filelist1: size:<1kb", &s).unwrap();
         assert_eq!(rest, "ext:txt   size:<1kb");
-        assert_eq!(
-            lists,
-            [vec![r"C:\x\a.txt".to_owned(), r"C:\x\sub".to_owned()]]
-        );
-        let (rest, lists) = split_for_list("plain text", &s).unwrap();
-        assert_eq!((rest.as_str(), lists.len()), ("plain text", 0));
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].names, [r"C:\x\a.txt", r"C:\x\sub"]);
+        let (rest, planned) = split_for_list("plain text", &s).unwrap();
+        assert_eq!((rest.as_str(), planned.len()), ("plain text", 0));
         assert!(split_for_list("filelist4:x", &s).is_err());
+        // save-filelist tests nothing.
+        let (rest, planned) = split_for_list("*.txt save-filelist3:", &s).unwrap();
+        assert_eq!((rest.as_str(), planned.len()), ("*.txt  ", 0));
+        assert!(
+            split_for_list("save-filelist1: filelist1:", &s)
+                .unwrap_err()
+                .contains("slot 1")
+        );
+    }
+
+    /// A list's rows: `(path, is_dir, size)`.
+    const ROWS: &[(&str, bool, Option<u64>)] = &[
+        (r"C:\", true, None),
+        (r"C:\x", true, None),
+        (r"C:\x\a.txt", false, Some(10)),
+        (r"C:\x\b.TXT", false, Some(20)),
+        (r"C:\x\a.srt", false, Some(5)),
+        (r"C:\x\sub", true, None),
+        (r"C:\x\sub\deep.txt", false, Some(10)),
+        (r"C:\x\sub\v1.2", true, None),
+        (r"C:\y", true, None),
+        (r"C:\y\c.log", false, Some(20)),
+        (r"C:\y\a.txt", false, Some(99)),
+        (r"C:\top.txt", false, Some(1)),
+    ];
+
+    /// The rows of [`ROWS`] the search's file-list terms pass.
+    fn hits(query: &str, s: &Slots) -> Vec<&'static str> {
+        let (_, planned) = split_for_list(query, s).unwrap();
+        let mut t = RowTests::new(&planned, false).unwrap();
+        if t.needs_rows() {
+            for &(p, d, size) in ROWS {
+                t.see(p.as_bytes(), d, size);
+            }
+        }
+        ROWS.iter()
+            .filter(|&&(p, d, size)| t.matches(p.as_bytes(), d, size))
+            .map(|r| r.0)
+            .collect()
+    }
+
+    fn with(slot: &[&str]) -> Slots {
+        let mut s = Slots::default();
+        s.set(1, slot.iter().map(|p| (*p).to_owned()).collect());
+        s
+    }
+
+    /// W7: each slot function over an open file list's rows.
+    #[test]
+    fn each_slot_function_over_a_lists_rows() {
+        let s = with(&[r"C:\x\a.txt", r"C:\x\sub"]);
+        assert_eq!(hits("filelist1:", &s), [r"C:\x\a.txt", r"C:\x\sub"]);
+        assert_eq!(
+            hits("parent-filelist1:", &s),
+            [r"C:\x\sub\deep.txt", r"C:\x\sub\v1.2"]
+        );
+        // By name too: a folder named x.
+        assert_eq!(
+            hits("parentfilelist1:", &with(&["x"])),
+            [r"C:\x\a.txt", r"C:\x\b.TXT", r"C:\x\a.srt", r"C:\x\sub"]
+        );
+        assert_eq!(
+            hits("ancestor-filelist1:", &with(&[r"C:\x"])),
+            [
+                r"C:\x\a.txt",
+                r"C:\x\b.TXT",
+                r"C:\x\a.srt",
+                r"C:\x\sub",
+                r"C:\x\sub\deep.txt",
+                r"C:\x\sub\v1.2"
+            ]
+        );
+        assert_eq!(
+            hits("ancestorfilelist1:", &with(&["sub"])),
+            [r"C:\x\sub\deep.txt", r"C:\x\sub\v1.2"]
+        );
+        // The folders holding a found item: C:\x holds both.
+        assert_eq!(hits("child-filelist1:", &s), [r"C:\x"]);
+        assert_eq!(hits("child-filelist:top.txt;c.log", &s), [r"C:\", r"C:\y"]);
+        // A name found in two folders: both.
+        assert_eq!(
+            hits("childfilelist1:", &with(&["a.txt"])),
+            [r"C:\x", r"C:\y"]
+        );
+        // Not found in the list: nothing holds it.
+        assert!(hits("childfilelist1:", &with(&[r"C:\gone\a.txt"])).is_empty());
+        assert_eq!(
+            hits("descendant-filelist1:", &with(&[r"C:\x\sub\deep.txt"])),
+            [r"C:\", r"C:\x", r"C:\x\sub"]
+        );
+        // Siblings: not the item itself...
+        assert_eq!(
+            hits("sibling-filelist1:", &with(&[r"C:\y\c.log"])),
+            [r"C:\y\a.txt"]
+        );
+        // ...but each of two found in one folder is the other's.
+        assert_eq!(
+            hits("sibling-filelist1:", &with(&[r"C:\y\c.log", r"C:\y\a.txt"])),
+            [r"C:\y\c.log", r"C:\y\a.txt"]
+        );
+        // Files of a found file's size (10: a.txt and deep.txt).
+        assert_eq!(
+            hits("size-filelist1:", &with(&[r"C:\x\a.txt"])),
+            [r"C:\x\a.txt", r"C:\x\sub\deep.txt"]
+        );
+        assert_eq!(
+            hits("sizefilelist1:", &with(&[r"C:\y\c.log"])),
+            [r"C:\x\b.TXT", r"C:\y\c.log"]
+        );
+        assert_eq!(
+            hits("name-filelist1:", &with(&[r"D:\other\A.TXT"])),
+            [r"C:\x\a.txt", r"C:\y\a.txt"]
+        );
+        // Stems: a folder's is its whole name.
+        assert_eq!(
+            hits("stem-filelist1:", &with(&[r"D:\a.doc", "v1.2.zip"])),
+            [
+                r"C:\x\a.txt",
+                r"C:\x\a.srt",
+                r"C:\x\sub\v1.2",
+                r"C:\y\a.txt"
+            ]
+        );
+        // exists-in: the name each item makes is in the slot.
+        let subs = with(&[r"E:\subs\a.srt", r"E:\subs\z.srt"]);
+        assert_eq!(
+            hits("exists-in-filelist1:$stem:.srt", &subs)
+                .into_iter()
+                .filter(|p| p.ends_with(".txt"))
+                .collect::<Vec<_>>(),
+            [r"C:\x\a.txt", r"C:\y\a.txt"]
+        );
+        assert_eq!(
+            hits(
+                r"exists-in-filelist1:$path:\$stem:.srt",
+                &with(&[r"C:\x\a.srt"])
+            ),
+            [r"C:\x\a.txt", r"C:\x\a.srt"]
+        );
+        assert_eq!(
+            hits("exists-in-filelist1:$parent-name:", &with(&["sub"])),
+            [r"C:\x\sub\deep.txt", r"C:\x\sub\v1.2"]
+        );
+        // An empty slot: nothing, whatever the function.
+        let empty = Slots::default();
+        for f in [
+            "filelist1:",
+            "parent-filelist1:",
+            "child-filelist1:",
+            "descendant-filelist1:",
+            "sibling-filelist1:",
+            "size-filelist1:",
+            "name-filelist1:",
+            "stem-filelist1:",
+            "ancestor-filelist1:",
+            "exists-in-filelist1:$name:",
+        ] {
+            assert!(hits(f, &empty).is_empty(), "{f}");
+        }
+    }
+
+    #[test]
+    fn exists_in_reads_its_substitutions() {
+        assert_eq!(
+            substitution("$stem:.srt", "f").unwrap(),
+            [Piece::Prop(Prop::Stem), Piece::Text(".srt".into())]
+        );
+        assert_eq!(
+            substitution("a$b$Full-Path:", "f").unwrap(),
+            [Piece::Text("a$b".into()), Piece::Prop(Prop::FullPath)]
+        );
+        let why = substitution("$size:", "exists-in-filelist1:").unwrap_err();
+        assert!(
+            why.starts_with("exists-in-filelist1: cannot put in $size:"),
+            "{why}"
+        );
+        let mut out = Vec::new();
+        let p = substitution("$path:|$name:|$ext:|$parent-name:", "f").unwrap();
+        substitute(&p, br"C:\a.b", false, &mut out);
+        assert_eq!(out, br"C:|a.b|b|C:\");
+        substitute(&p, br"C:\x\v1.2", true, &mut out);
+        assert_eq!(out, br"C:\x|v1.2||x");
+    }
+
+    #[test]
+    fn folders_above_and_parents() {
+        assert_eq!(parent_of(br"C:\x\a"), Some(&br"C:\x"[..]));
+        assert_eq!(parent_of(br"C:\x"), Some(&br"C:\"[..]));
+        assert_eq!(parent_of(br"C:\"), None);
+        assert_eq!(parent_of(b"name"), None);
+        assert_eq!(parent_of(br"\\srv\share\x"), Some(&br"\\srv\share"[..]));
+        let up: Vec<&[u8]> = ancestors(br"C:\a\b\c").collect();
+        assert_eq!(up, [&br"C:\a\b"[..], br"C:\a", br"C:\"]);
     }
 
     #[test]
     fn gozd_gets_a_group_or_a_reason() {
         let s = slots();
+        assert!(matches!(gozd("a b", &s, false), Ok(Cow::Borrowed("a b"))));
         assert!(matches!(
-            for_gozd("a b", &s, false),
-            Ok(Cow::Borrowed("a b"))
-        ));
-        assert!(matches!(
-            for_gozd(r#""filelist:x""#, &s, false),
+            gozd(r#""filelist:x""#, &s, false),
             Ok(Cow::Borrowed(_))
         ));
-        assert_eq!(for_gozd("x filelist:a", &s, false).unwrap_err(), NEEDS_OR);
         assert_eq!(
-            for_gozd(r#"!filelist:"a.txt;C:\b c\*.log" ext:txt"#, &s, true).unwrap(),
+            gozd("x filelist:a", &s, false).unwrap_err(),
+            NotAsked::Refused(needs_or("filelist:"))
+        );
+        assert_eq!(
+            gozd(r#"!filelist:"a.txt;C:\b c\*.log" ext:txt"#, &s, true).unwrap(),
             r#"!<whole:"a.txt"|"C:\b c\*.log"> ext:txt"#
         );
         assert_eq!(
-            for_gozd("filelist1: | filelist9: filelist2:", &s, true).unwrap(),
+            gozd("filelist1: | filelist9: filelist2:", &s, true).unwrap(),
             r#"<whole:"C:\x\a.txt"|whole:"C:\x\sub"> | <"*.log"> whole:"""#
         );
         let mut big = Slots::default();
@@ -449,12 +1525,149 @@ mod tests {
             0,
             (0..=GOZD_MAX_TERMS).map(|i| format!("{i}.txt")).collect(),
         );
-        let why = for_gozd("filelist0:", &big, true).unwrap_err();
+        let NotAsked::Refused(why) = gozd("filelist0:", &big, true).unwrap_err() else {
+            panic!()
+        };
         assert!(
-            why.contains("257 names") && why.contains("filelist0:"),
+            why.contains("257 terms") && why.contains("filelist0:"),
             "{why}"
         );
         assert_eq!(cmd::slot_of(4853), Some(3));
         assert_eq!(cmd::slot_of(4860), None);
+    }
+
+    /// W7: the functions gozd is asked in its own words, with no look-up.
+    #[test]
+    fn gozd_gets_parents_ancestors_names_and_stems() {
+        let s = with(&[r"C:\x", "sub", "*.d", r"D:\a.b.txt"]);
+        assert_eq!(
+            gozd(
+                "parent-filelist1: ext:txt",
+                &with(&[r"C:\x", "sub", "*.d"]),
+                true
+            )
+            .unwrap(),
+            r#"<parent:"C:\x"|whole:parent-name:"sub"|parent-name:"*.d"> ext:txt"#
+        );
+        assert_eq!(
+            gozd("ancestor-filelist1:", &with(&[r"C:\x", "sub", "*.d"]), true).unwrap(),
+            r#"<ancestor:"C:\x"|"**\sub\**"|"**\*.d\**">"#
+        );
+        assert_eq!(
+            gozd("name-filelist1:", &s, true).unwrap(),
+            r#"<whole:"x"|whole:"sub"|"*.d"|whole:"a.b.txt">"#
+        );
+        assert_eq!(
+            gozd("stem-filelist1:", &s, true).unwrap(),
+            r#"<whole:stem:"x"|whole:stem:"sub"|stem:"*"|whole:stem:"a.b">"#
+        );
+        // A wildcard path is a file list's alone.
+        let NotAsked::Refused(why) =
+            gozd("parent-filelist1:", &with(&[r"C:\x\*"]), true).unwrap_err()
+        else {
+            panic!()
+        };
+        assert!(why.contains(r"wildcard path C:\x\*"), "{why}");
+        // exists-in: never gozd's.
+        let NotAsked::Refused(why) = gozd("exists-in-filelist1:$stem:.srt", &s, true).unwrap_err()
+        else {
+            panic!()
+        };
+        assert!(
+            why.starts_with("exists-in-filelist1: tests each result"),
+            "{why}"
+        );
+        // The old gozd: not asked, the function named.
+        assert_eq!(
+            gozd("size-filelist1:", &s, false).unwrap_err(),
+            NotAsked::Refused(needs_or("size-filelist1:"))
+        );
+        // save-filelist alone needs no OR: it is taken out.
+        assert_eq!(gozd("*.txt savefilelist2:", &s, false).unwrap(), "*.txt  ");
+        assert_eq!(
+            saves("*.txt savefilelist2: save-filelist0: SaveFileList2:").unwrap(),
+            [2, 0]
+        );
+        assert!(saves("savefilelist1: parent-filelist1:").is_err());
+        assert!(saves("savefilelist1: parent-filelist2:").is_ok());
+    }
+
+    /// W7: the found items' functions look the slot up in gozd's index
+    /// first, then send folders, paths and sizes.
+    #[test]
+    fn gozd_gets_the_found_items_functions_after_a_look_up() {
+        let s = with(&["a.txt", r"C:\y\c.log"]);
+        let found = |p: &str, d: bool, size: Option<u64>| FoundItem {
+            path: p.into(),
+            is_dir: d,
+            size,
+        };
+        let index = vec![
+            found(r"C:\x\a.txt", false, Some(10)),
+            found(r"C:\y\a.txt", false, Some(99)),
+            found(r"c:\Y\c.log", false, Some(10)),
+            found(r"C:\top\a.txt", false, Some(5)),
+            found(r"C:\a.txt", false, Some(5)),
+        ];
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut lookup = |q: &str| -> Result<Looked, ()> {
+            asked.borrow_mut().push(q.to_owned());
+            Ok(Looked {
+                items: index.clone(),
+                total: index.len() as u64,
+            })
+        };
+        assert_eq!(
+            for_gozd("childfilelist1:", &s, true, &mut lookup).unwrap(),
+            r#"<whole:"C:\x"|whole:"C:\y"|whole:"C:\top">"#
+        );
+        assert_eq!(*asked.borrow(), [r#"<whole:"a.txt"|whole:"C:\y\c.log">"#]);
+        assert_eq!(
+            for_gozd("descendant-filelist1:", &s, true, &mut lookup).unwrap(),
+            r#"<whole:"C:\x"|whole:"C:\y"|whole:"C:\top">"#
+        );
+        assert_eq!(
+            for_gozd("sibling-filelist1:", &s, true, &mut lookup).unwrap(),
+            r#"<<parent:"C:\x" !whole:"C:\x\a.txt">|parent:"C:\y"|<parent:"C:\top" !whole:"C:\top\a.txt">|<parent:"C:\" !whole:"C:\a.txt">>"#
+        );
+        assert_eq!(
+            for_gozd("size-filelist1:", &s, true, &mut lookup).unwrap(),
+            "<size:=10|size:=99|size:=5>"
+        );
+        // An empty slot: no look-up, nothing matches.
+        let mut no = |_: &str| -> Result<Looked, ()> { panic!("no look-up") };
+        assert_eq!(
+            for_gozd("child-filelist1:", &Slots::default(), true, &mut no).unwrap(),
+            r#"whole:"""#
+        );
+        // Too many found: refused, named.
+        let mut many = |_: &str| -> Result<Looked, ()> {
+            Ok(Looked {
+                items: Vec::new(),
+                total: 5000,
+            })
+        };
+        let NotAsked::Refused(why) = for_gozd("child-filelist1:", &s, true, &mut many).unwrap_err()
+        else {
+            panic!()
+        };
+        assert!(why.contains("5,000 items"), "{why}");
+        // A size not read yet: refused rather than wrong.
+        let mut pending = |_: &str| -> Result<Looked, ()> {
+            Ok(Looked {
+                items: vec![found(r"C:\x\a.txt", false, None)],
+                total: 1,
+            })
+        };
+        assert!(matches!(
+            for_gozd("size-filelist1:", &s, true, &mut pending),
+            Err(NotAsked::Refused(_))
+        ));
+        // The look-up's own failure comes back as it is.
+        let mut lost = |_: &str| -> Result<Looked, u8> { Err(7) };
+        assert_eq!(
+            for_gozd("sibling-filelist1:", &s, true, &mut lost).unwrap_err(),
+            NotAsked::Lookup(7)
+        );
     }
 }
