@@ -15,9 +15,12 @@
 //! tells the window as it finds more, which refreshes the list and shows
 //! the run's progress in the status bar. Esc or another search stops it.
 //!
-//! The candidates are asked of gozd a page at a time (4,096 rows), so a
-//! search that leaves millions of candidates never holds them all, and
-//! gozd is never kept waiting on a pipe while files are read.
+//! Each search's candidates are asked of gozd in one answer and held (at
+//! most 1,000,000, else the search is refused with the reason) before a
+//! file is read, so gozd is never kept waiting on a pipe while files are
+//! read and a change to the index meanwhile neither repeats nor skips a
+//! candidate. The candidates of several searches are put in the search's
+//! order before they are read.
 
 mod exact;
 pub mod plan;
@@ -52,14 +55,12 @@ use crate::client::{
 use plan::{Combine, Plan};
 use scan::{Scanner, Unread};
 
-/// Candidates asked of gozd at a time.
-const BATCH: u32 = 4096;
 /// Progress is told the window at most this often.
 const TELL_EVERY_MS: u64 = 100;
-/// The most candidates a plan of several searches gathers before it reads
-/// (each is held with the searches that found it): a NOT of a content term
-/// with nothing else (`!content:x`) names every file of every volume, and
-/// is refused past this with the reason rather than held.
+/// The most candidates a run gathers before it reads (each is held, with
+/// the searches that found it): a content term with nothing else
+/// (`content:x`, `!content:x`) names every file of every volume, and is
+/// refused past this with the reason rather than held.
 const MANY_MAX: usize = 1_000_000;
 
 /// What a run answers: the same key, the same run (a refresh of the search
@@ -79,12 +80,116 @@ pub struct Key {
     pub exact: Option<(String, bool)>,
 }
 
-/// A file whose content matched.
+/// A file whose content matched, or a folder the exact plan lists.
 struct Found {
     path: Box<[u16]>,
     size: Option<u64>,
     mtime: Option<i64>,
     ctime: Option<i64>,
+    is_dir: bool,
+}
+
+impl Found {
+    fn of(row: Row) -> Found {
+        Found {
+            path: row.path,
+            size: row.size,
+            mtime: row.mtime,
+            ctime: row.ctime,
+            is_dir: row.is_dir,
+        }
+    }
+}
+
+/// Why a search gathering more than [`MANY_MAX`] candidates is refused.
+fn too_many() -> String {
+    format!(
+        "The content search would read more than {} files: narrow it with a name, a folder or \
+         an extension",
+        crate::format::grouped(MANY_MAX as u64)
+    )
+}
+
+/// Puts the candidates of several searches (and which searches found each,
+/// `found_by`, alongside) in the search's order, as gozd or the file list
+/// orders one search's rows: each search's come sorted, but one search's
+/// after another's (W9R-4). The keys are goz-core's `sort_items`, the goz
+/// CLI's order for the same search: the sort's value (unknown last), then
+/// the folded name, then the folded path; a path sort by folder, part by
+/// part, then name; Extension by gozd's groups (folders, files without
+/// one, then by extension); a file list's Date Created sort (`created`) by
+/// its date; the whole order reversed for a descending sort. The rows
+/// carry the sort's column (`Search::want`, `content_run`).
+fn sort_candidates(
+    rows: &mut Vec<Row>,
+    found_by: &mut Vec<u32>,
+    sort: goz_core::types::SortSpec,
+    created: Option<goz_core::types::SortDir>,
+) {
+    use goz_core::fold::fold_into;
+    use goz_core::query::{extension_key, mtime_key, size_key, sort_extension};
+    use goz_core::types::{SortDir, SortKey};
+    let (key, dir) = match created {
+        Some(dir) => (SortKey::DateCreated, dir),
+        None => (sort.key, sort.dir),
+    };
+    /// The sort's value, then three byte strings, as `sort_items` keys.
+    type SortKey4 = (u64, Vec<u8>, Vec<u8>, Vec<u8>);
+    let mut keyed: Vec<(SortKey4, usize)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let path = String::from_utf16_lossy(&row.path).into_bytes();
+            let mut name = Vec::new();
+            fold_into(crate::filelist::matcher::name_of(&path), &mut name);
+            let more = row.more.get();
+            let k = match key {
+                SortKey::Name => (0, Vec::new(), name, Vec::new()),
+                SortKey::Path => (0, crate::filelist::path_key(&path), Vec::new(), Vec::new()),
+                SortKey::Size => (size_key(row.size, dir), Vec::new(), name, Vec::new()),
+                SortKey::DateModified => (mtime_key(row.mtime, dir), Vec::new(), name, Vec::new()),
+                SortKey::DateCreated => {
+                    (mtime_key(row.created(), dir), Vec::new(), name, Vec::new())
+                }
+                SortKey::DateAccessed => {
+                    (mtime_key(more.atime(), dir), Vec::new(), name, Vec::new())
+                }
+                SortKey::DateRecentlyChanged => {
+                    (mtime_key(more.rtime(), dir), Vec::new(), name, Vec::new())
+                }
+                SortKey::Attributes => {
+                    let known = more.attrib().map(goz_core::output::attribute_sort_key);
+                    (size_key(known, dir), Vec::new(), name, Vec::new())
+                }
+                SortKey::Extension => {
+                    let ext = sort_extension(&name, row.is_dir).to_vec();
+                    (extension_key(&name, row.is_dir), ext, name, Vec::new())
+                }
+            };
+            // Ties on the name: the folded path, as `sort_items`.
+            let k = match key {
+                SortKey::Path => k,
+                _ => {
+                    let mut folded = Vec::new();
+                    fold_into(&path, &mut folded);
+                    (k.0, k.1, k.2, folded)
+                }
+            };
+            (k, i)
+        })
+        .collect();
+    keyed.sort();
+    if dir == SortDir::Desc {
+        keyed.reverse();
+    }
+    let mut taken: Vec<Option<Row>> = std::mem::take(rows).into_iter().map(Some).collect();
+    let bits = std::mem::take(found_by);
+    for (_, i) in keyed {
+        if let Some(row) = taken[i].take() {
+            rows.push(row);
+            found_by.push(bits[i]);
+        }
+    }
 }
 
 const RUNNING: u8 = 0;
@@ -114,6 +219,9 @@ pub struct Run {
     last_told: AtomicU64,
     hwnd: usize,
     msg: u32,
+    /// Requests made of the searches' source, for tests.
+    #[cfg(test)]
+    asks: AtomicU64,
 }
 
 impl Run {
@@ -137,6 +245,8 @@ impl Run {
             last_told: AtomicU64::new(0),
             hwnd: hwnd as usize,
             msg,
+            #[cfg(test)]
+            asks: AtomicU64::new(0),
         });
         let thread = Arc::clone(&run);
         let reader = Reader::of(plan);
@@ -231,98 +341,85 @@ impl Run {
     }
 
     /// Reads every candidate of `searches`; the state it ended in.
+    ///
+    /// Each search's candidates are gathered whole (one answer, at most
+    /// [`MANY_MAX`] held) before a file is read, so gozd is never kept
+    /// waiting on a pipe while files are read, and a change to the index
+    /// meanwhile neither repeats a candidate nor skips one, as answers
+    /// asked a page at a time by offset did (W9R-6). The candidates of
+    /// several searches are then put in the search's order (W9R-4).
     fn read_all(&self, searches: &[Search], scanner: &Reader, combine: &Combine) -> u8 {
-        let stopped = || self.stop.stopped();
-        match searches {
-            [] => DONE,
-            [one] => {
-                let mut offset = 0u32;
-                loop {
-                    let mut rows = Vec::new();
-                    let range = RowRange {
-                        offset,
-                        limit: Some(BATCH),
-                        details: true,
-                    };
-                    let streamed = stream_range(&self.stop, one, range, |page, total| {
-                        self.total.store(total, Ordering::Relaxed);
-                        rows.extend(page);
-                        Ok(true)
-                    });
-                    match streamed {
-                        Streamed::Done(_) => {}
-                        Streamed::Stopped => return STOPPED,
-                        Streamed::Failed(f) => return self.fail(f),
-                    }
-                    let got = rows.len() as u32;
-                    for row in rows {
-                        if stopped() {
-                            return STOPPED;
-                        }
-                        self.test(row, 1, scanner, combine);
-                    }
-                    if got < BATCH {
-                        return DONE;
-                    }
-                    offset += got;
+        if searches.is_empty() {
+            return DONE;
+        }
+        let several = searches.len() > 1;
+        // The candidates, which of the searches found each (a bit each),
+        // and, for several searches, where each path is in `order`.
+        let mut order: Vec<Row> = Vec::new();
+        let mut found_by: Vec<u32> = Vec::new();
+        let mut at: std::collections::HashMap<Box<[u16]>, usize> = std::collections::HashMap::new();
+        for (i, search) in searches.iter().enumerate() {
+            let all = RowRange {
+                offset: 0,
+                limit: None,
+                details: true,
+            };
+            #[cfg(test)]
+            self.asks.fetch_add(1, Ordering::Relaxed);
+            let streamed = stream_range(&self.stop, search, all, |page, total| {
+                if i == 0 {
+                    self.total.store(total, Ordering::Relaxed);
                 }
-            }
-            many => {
-                // Which of the searches found each candidate, in the order
-                // the first found them (the others' after).
-                let mut order: Vec<Row> = Vec::new();
-                let mut at: std::collections::HashMap<Box<[u16]>, (usize, u32)> =
-                    std::collections::HashMap::new();
-                for (i, search) in many.iter().enumerate() {
-                    let all = RowRange {
-                        offset: 0,
-                        limit: None,
-                        details: true,
-                    };
-                    let streamed = stream_range(&self.stop, search, all, |page, total| {
-                        if i == 0 {
-                            self.total.store(total, Ordering::Relaxed);
+                for row in page {
+                    if !several {
+                        order.push(row);
+                        found_by.push(1);
+                        continue;
+                    }
+                    match at.get(&row.path) {
+                        Some(&k) => found_by[k] |= 1 << i,
+                        None => {
+                            at.insert(row.path.clone(), order.len());
+                            order.push(row);
+                            found_by.push(1 << i);
                         }
-                        for row in page {
-                            match at.get_mut(&row.path) {
-                                Some((_, found)) => *found |= 1 << i,
-                                None => {
-                                    at.insert(row.path.clone(), (order.len(), 1 << i));
-                                    order.push(row);
-                                }
-                            }
-                        }
-                        if order.len() > MANY_MAX {
-                            return Err(format!(
-                                "The content search would read more than {} files: narrow it \
-                                 with a name, a folder or an extension",
-                                crate::format::grouped(MANY_MAX as u64)
-                            ));
-                        }
-                        Ok(true)
-                    });
-                    match streamed {
-                        Streamed::Done(_) => {}
-                        Streamed::Stopped => return STOPPED,
-                        // Refused, not failed: trying again would gather
-                        // as many again.
-                        Streamed::Failed(Failure::Other(why)) if order.len() > MANY_MAX => {
-                            return self.fail(Failure::Refused(why));
-                        }
-                        Streamed::Failed(f) => return self.fail(f),
                     }
                 }
-                self.total.store(order.len() as u64, Ordering::Relaxed);
-                for row in order {
-                    if stopped() {
-                        return STOPPED;
-                    }
-                    let found = at.get(&row.path).map_or(0, |&(_, f)| f);
-                    self.test(row, found, scanner, combine);
+                if order.len() > MANY_MAX {
+                    return Err(too_many());
                 }
-                DONE
+                Ok(true)
+            });
+            match streamed {
+                Streamed::Done(_) => {}
+                Streamed::Stopped => return STOPPED,
+                // Refused, not failed: trying again would gather as many
+                // again.
+                Streamed::Failed(Failure::Other(why)) if order.len() > MANY_MAX => {
+                    return self.fail(Failure::Refused(why));
+                }
+                Streamed::Failed(f) => return self.fail(f),
             }
         }
+        drop(at);
+        if several {
+            // gozd's sort when it was asked it, else the name order it
+            // sorted by; a file list's own.
+            let sort = if self.key.list == 0 {
+                crate::client::wire_sort(self.key.sort, &crate::client::features())
+            } else {
+                self.key.sort
+            };
+            sort_candidates(&mut order, &mut found_by, sort, self.key.created_sort);
+        }
+        self.total.store(order.len() as u64, Ordering::Relaxed);
+        for (row, found) in order.into_iter().zip(found_by) {
+            if self.stop.stopped() {
+                return STOPPED;
+            }
+            self.test(row, found, scanner, combine);
+        }
+        DONE
     }
 
     fn fail(&self, f: Failure) -> u8 {
@@ -333,8 +430,22 @@ impl Run {
     /// Tests one candidate, found by the searches `found` says.
     fn test(&self, row: Row, found: u32, reader: &Reader, combine: &Combine) {
         self.seen.fetch_add(1, Ordering::Relaxed);
-        // Content is a file's: a folder never matches.
+        // Content is a file's. The older plan ANDs its content terms with
+        // the rest, so a folder never matches it; the exact plan answers a
+        // folder as one whose every content answer is no, as the goz CLI
+        // and Everything do (`report | content:x` lists a folder named
+        // report, `!content:x` every folder), W9R-2.
         if row.is_dir {
+            if let Reader::Exact(..) = reader
+                && combine(found, &mut |_| false)
+                && !self.stop.stopped()
+            {
+                self.found
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(Found::of(row));
+                self.tell(true);
+            }
             return;
         }
         let path = std::path::PathBuf::from(String::from_utf16_lossy(&row.path));
@@ -389,18 +500,13 @@ impl Run {
             self.found
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(Found {
-                    path: row.path,
-                    size: row.size,
-                    mtime: row.mtime,
-                    ctime: row.ctime,
-                });
+                .push(Found::of(row));
         }
         self.tell(verdict);
     }
 
     fn row_of(f: &Found) -> Row {
-        let mut row = Row::new(f.path.clone(), f.size, f.mtime, false);
+        let mut row = Row::new(f.path.clone(), f.size, f.mtime, f.is_dir);
         row.ctime = f.ctime;
         row
     }
@@ -425,9 +531,11 @@ impl Run {
         let from = (block as usize * BLOCK_ROWS as usize).min(found.len());
         let to = (from + BLOCK_ROWS as usize).min(found.len());
         let rows = found[from..to].iter().map(Run::row_of).collect();
+        // Files' sizes, as the goz CLI totals them: a folder's is theirs.
         let total_size = (block == 0).then(|| {
             found
                 .iter()
+                .filter(|f| !f.is_dir)
                 .filter_map(|f| f.size)
                 .fold(0u64, u64::saturating_add)
         });
@@ -502,6 +610,235 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filelist::FileList;
+    use goz_core::types::{SortDir, SortKey, SortSpec};
+
+    /// A run for `plan`, not started: its candidates are given or read
+    /// (`read_all`) on the test's thread.
+    fn run_of(plan: &Plan, sort: SortSpec, list: usize) -> Run {
+        Run {
+            key: Key {
+                queries: plan.queries.clone(),
+                sort,
+                created_sort: None,
+                match_case: false,
+                list,
+                terms: plan.terms.clone(),
+                exact: plan.exact.as_ref().map(|e| (e.1.clone(), e.2)),
+            },
+            stop: Stop::new(),
+            found: Mutex::new(Vec::new()),
+            total: AtomicU64::new(0),
+            seen: AtomicU64::new(0),
+            unread: AtomicU64::new(0),
+            offline: AtomicU64::new(0),
+            state: AtomicU8::new(RUNNING),
+            failure: Mutex::new(None),
+            started: Instant::now(),
+            ended: Mutex::new(None),
+            told: AtomicBool::new(true),
+            last_told: AtomicU64::new(0),
+            hwnd: 0,
+            msg: 0,
+            asks: AtomicU64::new(0),
+        }
+    }
+
+    /// `plan`'s searches over the file list `list`, as `content_run` makes
+    /// them.
+    fn searches_of(plan: &Plan, list: &Arc<FileList>, sort: SortSpec) -> Vec<Search> {
+        plan.queries
+            .iter()
+            .map(|q| Search {
+                query: q.clone(),
+                sort,
+                match_case: false,
+                filelist: Some(Arc::clone(list)),
+                created_sort: None,
+                slots: Arc::new(crate::filelist::slots::Slots::default()),
+                want: Default::default(),
+                content: None,
+            })
+            .collect()
+    }
+
+    /// The paths of a run's matches, as its first block lists them, each
+    /// with whether it is a folder; and the block's total size.
+    fn listed(run: &Run) -> (Vec<(String, bool)>, Option<u64>) {
+        let Reply::Block {
+            rows, total_size, ..
+        } = run.block(1, 0)
+        else {
+            panic!("a block")
+        };
+        let rows = rows
+            .iter()
+            .map(|r| (String::from_utf16_lossy(&r.path), r.is_dir))
+            .collect();
+        (rows, total_size)
+    }
+
+    /// W9R-2 and W9R-4: with the exact plan a folder is answered as one
+    /// whose every content answer is no, as the goz CLI and Everything
+    /// answer it (`report` is listed; the folder `notes.md`, which only the
+    /// searches taking content as yes found, is not), and the matches of
+    /// several searches come in the search's order (Date Modified, newest
+    /// first), not one search's after another's. Read from files on the
+    /// disk, listed by a file list.
+    #[test]
+    fn the_exact_plan_lists_folders_and_keeps_the_sort() {
+        let dir = std::env::temp_dir().join(format!("goz-gui-w9r-exact-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("report")).unwrap();
+        std::fs::create_dir_all(dir.join("notes.md")).unwrap();
+        for (name, body) in [("x.txt", "foo"), ("y.md", "foo"), ("z.md", "bar")] {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let (x, y, z, report, other) = (
+            path("x.txt"),
+            path("y.md"),
+            path("z.md"),
+            path("report"),
+            path("notes.md"),
+        );
+        // The dates the list gives, which the sort reads: y newest.
+        let list = FileList::from_rows(&[
+            (x.as_str(), Some(3), Some(100), false),
+            (y.as_str(), Some(3), Some(300), false),
+            (z.as_str(), Some(3), Some(200), false),
+            (report.as_str(), Some(9), Some(50), true),
+            (other.as_str(), Some(9), Some(400), true),
+        ]);
+        let newest = SortSpec {
+            key: SortKey::DateModified,
+            dir: SortDir::Desc,
+        };
+        let text = "<*.txt content:foo> | <*.md content:foo> | report";
+        let Planned::Content(plan) = plan::plan_exact(text, false) else {
+            panic!("the exact plan")
+        };
+        assert_eq!(plan.queries.len(), 4);
+        let run = run_of(&plan, newest, Arc::as_ptr(&list) as usize);
+        let searches = searches_of(&plan, &list, newest);
+        let state = run.read_all(&searches, &Reader::of(&plan), &plan.combine);
+        assert_eq!(state, DONE);
+        assert_eq!(run.asks.load(Ordering::Relaxed), 4, "one answer a search");
+        let (rows, total_size) = listed(&run);
+        assert_eq!(rows, [(y, false), (x, false), (report, true)]);
+        assert_eq!(total_size, Some(6), "files' sizes, as the CLI totals them");
+
+        // The older plan ANDs content with the rest: no folder.
+        let Planned::Content(plain) = plan::plan("content:foo", false) else {
+            panic!("the older plan")
+        };
+        let run = run_of(&plain, newest, Arc::as_ptr(&list) as usize);
+        let searches = searches_of(&plain, &list, newest);
+        run.read_all(&searches, &Reader::of(&plain), &plain.combine);
+        let (rows, _) = listed(&run);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(_, dir)| !dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// W9R-6: one search's candidates come in one answer, gathered before
+    /// a file is read, not a page of 4,096 at a time by offset, which an
+    /// index changing while files are read shifted, so candidates were
+    /// tested twice or never. Each is tested once.
+    #[test]
+    fn one_search_is_gathered_in_one_answer() {
+        let dir = std::env::temp_dir().join(format!("goz-gui-w9r-gather-{}", std::process::id()));
+        let paths: Vec<String> = (0..5_000)
+            .map(|i| {
+                dir.join(format!("f{i:05}.txt"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let rows: Vec<(&str, Option<u64>, Option<i64>, bool)> = paths
+            .iter()
+            .map(|p| (p.as_str(), Some(1), Some(1), false))
+            .collect();
+        let list = FileList::from_rows(&rows);
+        let Planned::Content(plan) = plan::plan("content:foo", false) else {
+            panic!("the older plan")
+        };
+        assert_eq!(plan.queries.len(), 1);
+        let sort = SortSpec::default();
+        let run = run_of(&plan, sort, Arc::as_ptr(&list) as usize);
+        let searches = searches_of(&plan, &list, sort);
+        let state = run.read_all(&searches, &Reader::of(&plan), &plan.combine);
+        assert_eq!(state, DONE);
+        assert_eq!(run.asks.load(Ordering::Relaxed), 1);
+        assert_eq!(run.seen.load(Ordering::Relaxed), 5_000);
+        assert_eq!(run.total.load(Ordering::Relaxed), 5_000);
+        assert_eq!(run.unread.load(Ordering::Relaxed), 5_000, "none exists");
+    }
+
+    /// W9R-4: the candidates of several searches, sorted as one search's
+    /// rows, with which searches found each kept alongside.
+    #[test]
+    fn candidates_are_sorted_as_one_search() {
+        let row = |p: &str, size: u64, mtime: i64, dir: bool| {
+            Row::new(p.encode_utf16().collect(), Some(size), Some(mtime), dir)
+        };
+        let fresh = || {
+            vec![
+                row(r"C:\b\old.txt", 5, 100, false),
+                row(r"C:\a\new.txt", 1, 400, false),
+                row(r"C:\c\mid.md", 9, 200, false),
+                row(r"C:\a\Dir", 0, 300, true),
+            ]
+        };
+        let names = |rows: &[Row]| -> Vec<String> {
+            rows.iter()
+                .map(|r| String::from_utf16_lossy(r.name()))
+                .collect()
+        };
+        let sorted = |key: SortKey, dir: SortDir| {
+            let mut rows = fresh();
+            let mut bits = vec![1, 2, 4, 8];
+            sort_candidates(&mut rows, &mut bits, SortSpec { key, dir }, None);
+            let n = names(&rows);
+            // Each row keeps its own searches.
+            let by_name: std::collections::HashMap<String, u32> =
+                names(&fresh()).into_iter().zip([1, 2, 4, 8]).collect();
+            for (name, b) in n.iter().zip(&bits) {
+                assert_eq!(by_name[name], *b, "{name}");
+            }
+            n
+        };
+        assert_eq!(
+            sorted(SortKey::DateModified, SortDir::Desc),
+            ["new.txt", "Dir", "mid.md", "old.txt"]
+        );
+        assert_eq!(
+            sorted(SortKey::Name, SortDir::Asc),
+            ["Dir", "mid.md", "new.txt", "old.txt"]
+        );
+        assert_eq!(
+            sorted(SortKey::Size, SortDir::Asc),
+            ["Dir", "new.txt", "old.txt", "mid.md"]
+        );
+        assert_eq!(
+            sorted(SortKey::Path, SortDir::Asc),
+            ["Dir", "new.txt", "old.txt", "mid.md"]
+        );
+        assert_eq!(
+            sorted(SortKey::Extension, SortDir::Asc),
+            ["Dir", "mid.md", "new.txt", "old.txt"]
+        );
+        // A file list's Date Created sort: unknown dates last, then names.
+        let mut rows = fresh();
+        rows[2].ctime = Some(7);
+        let mut bits = vec![0; 4];
+        sort_candidates(
+            &mut rows,
+            &mut bits,
+            SortSpec::default(),
+            Some(SortDir::Asc),
+        );
+        assert_eq!(names(&rows), ["mid.md", "Dir", "new.txt", "old.txt"]);
+    }
 
     /// A run over files on the disk, its candidates given (no gozd): the
     /// files read, matched in order, folders and unreadable files left out.
@@ -535,31 +872,7 @@ mod tests {
         let Planned::Content(plan) = plan::plan("content:\"chicken noodle\"", false) else {
             panic!()
         };
-        let run = Run {
-            key: Key {
-                queries: plan.queries.clone(),
-                sort: Default::default(),
-                created_sort: None,
-                match_case: false,
-                list: 0,
-                terms: plan.terms.clone(),
-                exact: None,
-            },
-            stop: Stop::new(),
-            found: Mutex::new(Vec::new()),
-            total: AtomicU64::new(0),
-            seen: AtomicU64::new(0),
-            unread: AtomicU64::new(0),
-            offline: AtomicU64::new(0),
-            state: AtomicU8::new(RUNNING),
-            failure: Mutex::new(None),
-            started: Instant::now(),
-            ended: Mutex::new(None),
-            told: AtomicBool::new(true),
-            last_told: AtomicU64::new(0),
-            hwnd: 0,
-            msg: 0,
-        };
+        let run = run_of(&plan, Default::default(), 0);
         let scanner = Reader::of(&plan);
         let missing = dir.join("gone.txt");
         for (r, found) in [

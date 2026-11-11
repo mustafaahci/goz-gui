@@ -128,9 +128,10 @@ pub(super) fn query_request(query: String, ask: &Ask, features: &[String]) -> Re
     })
 }
 
-/// A connection of its own, greeted; the features its gozd lists.
-fn greeted(shared: &Shared) -> Result<(Pipe, Vec<String>), Failure> {
-    let mut pipe = Pipe::open()?;
+/// A connection of its own, greeted; the features its gozd lists. It shows
+/// gozd this client's token when `identify` (see `Pipe::open_as`).
+fn greeted(shared: &Shared, identify: bool) -> Result<(Pipe, Vec<String>), Failure> {
+    let mut pipe = Pipe::open_as(identify)?;
     pipe.send(&Request::Hello {
         proto_min: PROTO_VERSION,
         proto_max: PROTO_VERSION,
@@ -146,11 +147,19 @@ fn greeted(shared: &Shared) -> Result<(Pipe, Vec<String>), Failure> {
     }
 }
 
+/// Whether `request` goes on a connection that shows gozd this client's
+/// token: gozd judges a change of its options by the token the connection
+/// carries (W9R-1), and an anonymous one shows it none.
+fn identifies(request: &Request) -> bool {
+    matches!(request, Request::SetConfig(_))
+}
+
 /// Sends `request` on a connection of its own and reads gozd's settings
 /// back.
 fn config_request(request: &Request) -> Result<IndexConfig, String> {
     let stop = Stop::new();
-    let (mut pipe, features) = greeted(&stop.0).map_err(|f| failure_text(&f))?;
+    let (mut pipe, features) =
+        greeted(&stop.0, identifies(request)).map_err(|f| failure_text(&f))?;
     if !lists(&features, feature::CONFIG) {
         return Err("this gozd does not list the \"config\" feature".into());
     }
@@ -257,7 +266,7 @@ pub(super) enum Ended {
 /// hears.
 fn watch(stop: &Stop, min_interval_ms: u32, tell: &mut dyn FnMut(usize)) -> Ended {
     let shared = &*stop.0;
-    let (mut pipe, features) = match greeted(shared) {
+    let (mut pipe, features) = match greeted(shared, false) {
         Ok(g) => g,
         Err(_) if stop.stopped() => return Ended::Stopped,
         Err(f) => return Ended::Failed(failure_text(&f)),
@@ -315,6 +324,29 @@ mod tests {
 
     fn f(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// W9R-1: gozd judges `SetConfig` by the token the connection carries,
+    /// so that request goes on a connection opened at the identification
+    /// level; every other one stays anonymous, so a squatting server learns
+    /// nothing of the user.
+    #[test]
+    fn only_a_change_of_options_shows_the_token() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+        };
+        let set = Request::SetConfig(goz_core::proto::ConfigChange::default());
+        assert!(identifies(&set));
+        assert!(!identifies(&Request::GetConfig));
+        assert_eq!(
+            Pipe::level(identifies(&set)),
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
+        );
+        assert_eq!(
+            Pipe::level(identifies(&Request::GetConfig)),
+            SECURITY_SQOS_PRESENT,
+            "anonymous"
+        );
     }
 
     const ALL_WANT: Want = Want {

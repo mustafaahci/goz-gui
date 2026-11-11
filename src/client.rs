@@ -25,7 +25,8 @@ use windows_sys::Win32::Foundation::{
     WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, SECURITY_SQOS_PRESENT, WriteFile,
+    CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
@@ -40,7 +41,7 @@ mod w9;
 use w9::{Ask, query_request};
 pub use w9::{
     WATCH_CHANGED, WATCH_OFF, WATCH_ON, Watcher, features, get_config, has_feature, set_config,
-    sort_feature,
+    sort_feature, wire_sort,
 };
 
 /// Rows per request. A screen shows a few dozen, so one block covers a lot of
@@ -1218,11 +1219,32 @@ impl Drop for Pipe {
 
 impl Pipe {
     fn open() -> Result<Pipe, Failure> {
+        Pipe::open_as(false)
+    }
+
+    /// The impersonation level a connection offers gozd: anonymous, or
+    /// identification when `identify`.
+    fn level(identify: bool) -> u32 {
+        if identify {
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
+        } else {
+            SECURITY_SQOS_PRESENT
+        }
+    }
+
+    /// A connection that shows gozd this client's token when `identify`:
+    /// gozd judges a change of its options (`SetConfig`) by the token the
+    /// connection carries, which an anonymous one does not show it
+    /// (W9R-1). At the identification level a server learns who the
+    /// client is but cannot act as it.
+    fn open_as(identify: bool) -> Result<Pipe, Failure> {
         let name = wz(PIPE_NAME);
+        let level = Pipe::level(identify);
         let mut tries = 0;
         let handle = loop {
             // SAFETY: `name` is NUL-terminated. SECURITY_SQOS_PRESENT with an
-            // anonymous level keeps a squatting server from impersonating us.
+            // anonymous level (or identification, `identify`) keeps a
+            // squatting server from impersonating us.
             let h = unsafe {
                 CreateFileW(
                     name.as_ptr(),
@@ -1230,7 +1252,7 @@ impl Pipe {
                     0,
                     core::ptr::null(),
                     OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT,
+                    FILE_FLAG_OVERLAPPED | level,
                     core::ptr::null_mut(),
                 )
             };

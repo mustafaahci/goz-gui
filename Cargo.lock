@@ -45,7 +45,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 [[package]]
 name = "goz-core"
 version = "0.6.0"
-source = "git+https://github.com/mustafaahci/goz?rev=c7942bbc62059a342b3d5c6ffc0cc75d6618a5b3#c7942bbc62059a342b3d5c6ffc0cc75d6618a5b3"
+source = "git+https://github.com/mustafaahci/goz?rev=5ee8fa98ca912d5f2f6f344a3ad34d91cff25788#5ee8fa98ca912d5f2f6f344a3ad34d91cff25788"
 dependencies = [
  "hashbrown",
  "memchr",
@@ -77,7 +77,7 @@ dependencies = [
 [[package]]
 name = "goz-winfs"
 version = "0.6.0"
-source = "git+https://github.com/mustafaahci/goz?rev=c7942bbc62059a342b3d5c6ffc0cc75d6618a5b3#c7942bbc62059a342b3d5c6ffc0cc75d6618a5b3"
+source = "git+https://github.com/mustafaahci/goz?rev=5ee8fa98ca912d5f2f6f344a3ad34d91cff25788#5ee8fa98ca912d5f2f6f344a3ad34d91cff25788"
 dependencies = [
  "windows-sys",
 ]

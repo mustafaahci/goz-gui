@@ -19,6 +19,7 @@ use crate::columns::{self, COL_ACCESSED, COL_ATTRIB, COL_CREATED, COL_RECENT};
 use crate::content::plan::{Plan, Planned};
 use crate::content::{Key, Run};
 use crate::props;
+use goz_core::types::SortKey;
 
 /// The disk reader's answers are waiting (`props::Reader::take`).
 pub(super) const WM_PROPS: u32 = WM_APP + 420;
@@ -222,6 +223,18 @@ impl App {
         if let Some(old) = self.w9.content.take() {
             old.stop();
         }
+        // Several searches' candidates are put in the sort's order by the
+        // run (W9R-4), so their rows carry the sort's column.
+        let mut want = base.want;
+        if queries.len() > 1 {
+            match base.sort.key {
+                SortKey::DateCreated => want.ctime = true,
+                SortKey::DateAccessed => want.atime = true,
+                SortKey::Attributes => want.attrib = true,
+                SortKey::DateRecentlyChanged => want.rtime = true,
+                _ => {}
+            }
+        }
         let searches = queries
             .into_iter()
             .map(|query| Search {
@@ -231,7 +244,7 @@ impl App {
                 filelist: base.filelist.clone(),
                 created_sort: base.created_sort,
                 slots: Arc::clone(&base.slots),
-                want: base.want,
+                want,
                 content: None,
             })
             .collect();

@@ -744,7 +744,7 @@ fn folder_key(parent: &[u8], out: &mut Vec<u8>) {
 
 /// The key of a path sort without ranks: the folder's key, then a byte
 /// below its separators, then the folded name.
-fn path_key(path: &[u8]) -> Vec<u8> {
+pub(crate) fn path_key(path: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(path.len());
     folder_key(parent_of(path), &mut key);
     key.push(0);

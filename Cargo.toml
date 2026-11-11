@@ -20,8 +20,8 @@ path = "src/main.rs"
 # GetConfig/SetConfig, the column flags and sort keys, the content: helper,
 # the new parser). Temporary until goz v0.7.0 is tagged; the commit is only
 # referenced, never checked out in that tree.
-goz-core = { git = "https://github.com/mustafaahci/goz", rev = "c7942bbc62059a342b3d5c6ffc0cc75d6618a5b3" }
-goz-winfs = { git = "https://github.com/mustafaahci/goz", rev = "c7942bbc62059a342b3d5c6ffc0cc75d6618a5b3" }
+goz-core = { git = "https://github.com/mustafaahci/goz", rev = "5ee8fa98ca912d5f2f6f344a3ad34d91cff25788" }
+goz-winfs = { git = "https://github.com/mustafaahci/goz", rev = "5ee8fa98ca912d5f2f6f344a3ad34d91cff25788" }
 # The windows crate's own core (already built for it): `#[implement]`, for
 # the COM objects goz-gui makes itself (the preview handlers' frame and
 # stream, F1; the file operations' progress sink, F5), names it in the code
