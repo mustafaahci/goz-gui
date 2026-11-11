@@ -2,7 +2,10 @@
 //! `file_list_history_enabled` (1: File > Recent File Lists keeps the lists
 //! opened), `file_list_history` (them, newest first, one CSV record),
 //! `file_list_history_max` (24) and `last_open_filelist_filename` (the list
-//! Open File List... opened last: its dialog starts there).
+//! Open File List... opened last: its dialog starts there). W6: the File
+//! List Editor's Export..., `editor_last_export_type` (the file type it
+//! chose last, from 0 in its list: CSV, EFU, M3U, M3U8, TSV, TXT) and
+//! `editor_last_export_selection_only` (0).
 
 use crate::csv::{self, Field};
 
@@ -18,6 +21,9 @@ pub struct ListSettings {
     pub history: Vec<String>,
     pub history_max: usize,
     pub last_open: String,
+    /// W6: `editor_last_export_type` and `editor_last_export_selection_only`.
+    pub editor_export_type: usize,
+    pub editor_export_selection: bool,
 }
 
 impl Default for ListSettings {
@@ -27,6 +33,8 @@ impl Default for ListSettings {
             history: Vec::new(),
             history_max: HISTORY_MAX,
             last_open: String::new(),
+            editor_export_type: 0,
+            editor_export_selection: false,
         }
     }
 }
@@ -59,6 +67,12 @@ impl ListSettings {
             last_open: get("last_open_filelist_filename")
                 .unwrap_or_default()
                 .to_owned(),
+            editor_export_type: num("editor_last_export_type")
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|&n| n < crate::listedit::EXPORT_KINDS)
+                .unwrap_or(d.editor_export_type),
+            editor_export_selection: num("editor_last_export_selection_only")
+                .map_or(d.editor_export_selection, |n| n != 0),
         }
     }
 
@@ -83,6 +97,14 @@ impl ListSettings {
             ("file_list_history".into(), history),
             ("file_list_history_max".into(), self.history_max.to_string()),
             ("last_open_filelist_filename".into(), self.last_open.clone()),
+            (
+                "editor_last_export_type".into(),
+                self.editor_export_type.to_string(),
+            ),
+            (
+                "editor_last_export_selection_only".into(),
+                u8::from(self.editor_export_selection).to_string(),
+            ),
         ]
     }
 

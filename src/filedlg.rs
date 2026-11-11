@@ -213,6 +213,30 @@ pub fn save_kind(
     show(owner, &ask).map(|(path, _, kind)| (path, kind))
 }
 
+/// [`save_kind`] with a check box (W6: the File List Editor's Export...,
+/// with Everything's "Export selection only"): the path, whether the box
+/// was ticked, and the file type chosen (from 0).
+pub fn save_kind_check(
+    owner: HWND,
+    title: &str,
+    file_name: &str,
+    kinds: &[Kind],
+    kind: usize,
+    check: Check<'_>,
+) -> Option<(PathBuf, bool, usize)> {
+    let extension = kinds.get(kind).map_or("", |k| k.1.trim_start_matches("*."));
+    let ask = Ask {
+        save: true,
+        title,
+        file_name,
+        kinds,
+        extension,
+        check: Some(check),
+        kind: kind as u32 + 1,
+    };
+    show(owner, &ask)
+}
+
 /// The path chosen, whether the check box was ticked, and the file type
 /// chosen (from 0).
 fn show(owner: HWND, ask: &Ask<'_>) -> Option<(PathBuf, bool, usize)> {

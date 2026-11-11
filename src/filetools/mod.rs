@@ -684,47 +684,127 @@ pub fn hr_text(hr: i32) -> String {
     }
 }
 
+/// Where a step puts its item (`None`: nowhere a later step could need,
+/// or not known before it runs).
+fn target_of(step: &Step) -> Option<Vec<u16>> {
+    match step {
+        Step::Rename { path, name } => Some(join(parent(path)?, name)),
+        Step::Move { path, folder, name } | Step::Copy { path, folder, name } => {
+            Some(join(folder, name.as_deref().unwrap_or(name_of(path))))
+        }
+        Step::Restore { path, .. } => Some(path.clone()),
+        Step::NewFolder { folder, name, .. } => Some(join(folder, name)),
+        Step::Recycle { .. } | Step::Times { .. } | Step::Shortcut { .. } => None,
+    }
+}
+
+/// The paths a step needs there before it runs: its item, and the folder
+/// it goes into.
+fn needs_of(step: &Step) -> Vec<&[u16]> {
+    let mut needs = vec![step.source()];
+    match step {
+        Step::Move { folder, .. } | Step::Copy { folder, .. } => needs.push(folder),
+        Step::Restore { path, .. } => needs.extend(parent(path)),
+        _ => {}
+    }
+    needs
+}
+
+/// The steps in the order they run, as waves (W6): a step that needs what
+/// an earlier step of the task makes (its item, or the folder it goes
+/// into, at or under where that step puts its item) runs in a wave after
+/// that step's, once it is done. An Advanced Move that renames a folder in
+/// place and moves an item out of it moves the item from under the new
+/// name; Redo does the same. Each wave is checked just before it runs, and
+/// its shell items are made then, so they name what is there. A task with
+/// no such step is one wave, as before. O(n × depth).
+fn waves(steps: &[Step]) -> Vec<Vec<usize>> {
+    use std::collections::HashMap;
+    // Each earlier step's target (as `path_key` folds it): its wave.
+    let mut made: HashMap<Vec<u16>, usize> = HashMap::new();
+    let mut wave_of = vec![0usize; steps.len()];
+    for (i, step) in steps.iter().enumerate() {
+        let mut wave = 0;
+        if !made.is_empty() {
+            for need in needs_of(step) {
+                let key = path_key(need);
+                // The path itself and every folder above it.
+                let ends = key
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &c)| c == 0)
+                    .map(|(k, _)| k)
+                    .chain(std::iter::once(key.len()));
+                for end in ends {
+                    if let Some(&w) = made.get(&key[..end]) {
+                        wave = wave.max(w + 1);
+                    }
+                }
+            }
+        }
+        wave_of[i] = wave;
+        if let Some(target) = target_of(step) {
+            let slot = made.entry(path_key(&target)).or_insert(wave);
+            *slot = (*slot).max(wave);
+        }
+    }
+    let count = wave_of.iter().max().map_or(0, |&w| w + 1);
+    let mut out = vec![Vec::new(); count];
+    for (i, &w) in wave_of.iter().enumerate() {
+        out[w].push(i);
+    }
+    out
+}
+
 /// Runs `task` (on the file operations thread, an STA): its results, one
 /// per step, and how it ended as a whole.
 pub fn run(owner: HWND, task: &Task, silent: bool) -> (Outcome, Vec<StepResult>) {
     let mut results: Vec<StepResult> = vec![StepResult::NotRun; task.steps.len()];
     let mut todo: Vec<usize> = Vec::new();
-    for (i, step) in task.steps.iter().enumerate() {
-        match task.checked.then(|| check(step)).flatten() {
-            Some(why) => results[i] = StepResult::Skipped(why.to_owned()),
-            None => todo.push(i),
-        }
-    }
-    // Noted before anything is done: afterwards every target is there.
-    let occupied: Vec<(usize, Vec<u16>)> = todo
-        .iter()
-        .filter_map(|&i| occupied(&task.steps[i]).map(|t| (i, t)))
-        .collect();
+    let mut occupied: Vec<(usize, Vec<u16>)> = Vec::new();
     let mut cancelled = false;
     let mut failure: Option<String> = None;
-    for g in [Group::Transfer, Group::Duplicate, Group::Recycle] {
-        let mine: Vec<usize> = todo
-            .iter()
-            .copied()
-            .filter(|&i| group(&task.steps[i]) == g)
-            .collect();
-        if mine.is_empty() || cancelled {
-            continue;
+    for wave in waves(&task.steps) {
+        if cancelled {
+            break;
         }
-        match shell_steps(owner, &task.steps, &mine, g, silent, &mut results) {
-            Ok(true) => {}
-            Ok(false) => cancelled = true,
-            Err(e) if CANCELLED.contains(&e.code().0) => cancelled = true,
-            Err(e) => {
-                let why = hr_text(e.code().0);
-                for &i in &mine {
-                    if results[i] == StepResult::NotRun {
-                        results[i] = StepResult::Failed(why.clone());
-                    }
-                }
-                failure.get_or_insert(why);
+        let mut now: Vec<usize> = Vec::new();
+        for i in wave {
+            match task.checked.then(|| check(&task.steps[i])).flatten() {
+                Some(why) => results[i] = StepResult::Skipped(why.to_owned()),
+                None => now.push(i),
             }
         }
+        // Noted before anything is done: afterwards every target is there.
+        occupied.extend(
+            now.iter()
+                .filter_map(|&i| self::occupied(&task.steps[i]).map(|t| (i, t))),
+        );
+        for g in [Group::Transfer, Group::Duplicate, Group::Recycle] {
+            let mine: Vec<usize> = now
+                .iter()
+                .copied()
+                .filter(|&i| group(&task.steps[i]) == g)
+                .collect();
+            if mine.is_empty() || cancelled {
+                continue;
+            }
+            match shell_steps(owner, &task.steps, &mine, g, silent, &mut results) {
+                Ok(true) => {}
+                Ok(false) => cancelled = true,
+                Err(e) if CANCELLED.contains(&e.code().0) => cancelled = true,
+                Err(e) => {
+                    let why = hr_text(e.code().0);
+                    for &i in &mine {
+                        if results[i] == StepResult::NotRun {
+                            results[i] = StepResult::Failed(why.clone());
+                        }
+                    }
+                    failure.get_or_insert(why);
+                }
+            }
+        }
+        todo.extend(now);
     }
     if !cancelled {
         for &i in &todo {
@@ -1438,6 +1518,76 @@ mod tests {
         );
         assert_eq!(steps, [(1, r"C:\x\F".to_owned())]);
         assert_eq!(with, 1);
+    }
+
+    /// W6: Advanced Move renaming F in place and moving a.txt out of it
+    /// (the plan's own steps, run for real), then Undo, then Redo: each
+    /// step that needs what an earlier one makes (a.txt under F's new
+    /// name) runs once that one is done, so every item is done each time.
+    #[test]
+    fn a_renamed_folder_and_an_item_moved_out_undo_and_redo() {
+        // SAFETY: COM for this test thread, which ends with the test.
+        let _ = unsafe { WCoInitializeEx(None, WSTA) };
+        let dir = scratch("redo-renamed");
+        let f = dir.join("F");
+        std::fs::create_dir_all(&f).unwrap();
+        std::fs::write(f.join("a.txt"), "a").unwrap();
+        std::fs::write(f.join("keep.txt"), "k").unwrap();
+        let (fw, aw, dw) = (w(&f), w(&f.join("a.txt")), w(&dir));
+        let (g, a2) = (ws("G"), ws("a2.txt"));
+        let plan = plan_moves(
+            &[
+                (aw.as_slice(), Some(a2.as_slice())),
+                (fw.as_slice(), Some(g.as_slice())),
+            ],
+            &dw,
+        );
+        let names = [Some(a2.clone()), Some(g.clone())];
+        let steps: Vec<Step> = plan
+            .steps
+            .into_iter()
+            .map(|(i, path)| Step::Move {
+                path,
+                folder: dw.clone(),
+                name: names[i].clone(),
+            })
+            .collect();
+        // The steps need F renamed before a.txt moves out of G.
+        assert_eq!(waves(&steps), [vec![0], vec![1]]);
+        let sources: Vec<Vec<u16>> = steps.iter().map(|s| s.source().to_vec()).collect();
+        let none = core::ptr::null_mut();
+        let (outcome, r) = run(none, &task(steps, false), true);
+        assert_eq!(outcome, Outcome::Done, "{r:?}");
+        assert_eq!(done_to(&r[0]), dir.join("G"));
+        assert_eq!(done_to(&r[1]), dir.join("a2.txt"));
+        let rec = Record {
+            id: 1,
+            date: 0,
+            action: Action::Move,
+            items: undo::items_of(Action::Move, &sources, &r),
+        };
+        assert_eq!(rec.items.len(), 2);
+        let check = |a: bool, f_name: &str| {
+            assert_eq!(dir.join("a2.txt").exists(), a);
+            assert_eq!(dir.join(f_name).join("a.txt").exists(), !a);
+            assert!(dir.join(f_name).join("keep.txt").exists());
+        };
+        check(true, "G");
+        let (outcome, r) = run(none, &task(rec.undo_steps(), true), true);
+        assert_eq!(outcome, Outcome::Done, "{r:?}");
+        let (undid, left) = rec.split_undone(&r);
+        assert!(left.items.is_empty(), "{r:?}");
+        check(false, "F");
+        let (outcome, r) = run(none, &task(undid.redo_steps(), true), true);
+        assert_eq!(outcome, Outcome::Done, "{r:?}");
+        let (redid, left) = undid.split_redone(&r);
+        assert!(left.items.is_empty(), "Redo skipped an item: {r:?}");
+        check(true, "G");
+        // And back once more.
+        let (_, r) = run(none, &task(redid.undo_steps(), true), true);
+        assert!(redid.split_undone(&r).1.items.is_empty(), "{r:?}");
+        check(false, "F");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -61,6 +61,10 @@ pub enum Which {
     /// `advanced_move_to_*`).
     AdvancedCopyTo,
     AdvancedMoveTo,
+    /// W6: Tools > File List Editor... (Everything's `editor_*`), a window of
+    /// its own thread: it is handed its place as it opens and hands it back
+    /// (`restore_at`, `measured`, `put_place`).
+    FileListEditor,
 }
 
 /// What Everything keeps for a dialog, under which keys.
@@ -82,7 +86,7 @@ struct Keys {
 }
 
 impl Which {
-    pub const ALL: [Which; 13] = [
+    pub const ALL: [Which; 14] = [
         Which::SearchHistory,
         Which::SearchHistorySelect,
         Which::RunHistory,
@@ -96,6 +100,7 @@ impl Which {
         Which::UndoHistory,
         Which::AdvancedCopyTo,
         Which::AdvancedMoveTo,
+        Which::FileListEditor,
     ];
 
     fn keys(self) -> Keys {
@@ -171,6 +176,7 @@ impl Which {
             Which::Rename => k("rename", true, true, "", &[], false),
             Which::AdvancedCopyTo => k("advanced_copy_to", true, true, "", &[], false),
             Which::AdvancedMoveTo => k("advanced_move_to", true, true, "", &[], false),
+            Which::FileListEditor => k("editor", true, true, "", &[], false),
             Which::UndoHistory => k(
                 "undo_history",
                 true,
@@ -460,7 +466,24 @@ fn put(which: Which, place: Place) {
 /// centred on its owner. `list` (or null) gets its columns' widths and
 /// order back. A window kept maximized is shown maximized.
 pub fn restore(window: HWND, which: Which, list: HWND, min: (i32, i32)) {
-    let place = get(which);
+    restore_at(window, which, &get(which), list, min);
+}
+
+/// The place `which` is kept at, for a window of another thread to open
+/// at (W6: the File List Editor's, handed over as it opens).
+pub fn kept(which: Which) -> Place {
+    get(which)
+}
+
+/// Keeps `place` for `which`, as [`keep`] does: a window of another
+/// thread hands its place back so (W6).
+pub fn put_place(which: Which, place: Place) {
+    put(which, place);
+}
+
+/// [`restore`] at `place`, which a window of another thread was handed.
+pub fn restore_at(window: HWND, which: Which, place: &Place, list: HWND, min: (i32, i32)) {
+    let place = place.clone();
     let k = which.keys();
     let mut now = RECT::default();
     // SAFETY: reads this thread's window and its DPI.
@@ -550,7 +573,14 @@ fn restore_columns(list: HWND, columns: &[Column], order: bool) {
 /// `list`'s (or null) columns' widths and order: as it closes
 /// (WM_DESTROY), or as the settings are written while it is open.
 pub fn keep(window: HWND, which: Which, list: HWND) {
-    let mut place = get(which);
+    put(which, measured(window, which, list, get(which)));
+}
+
+/// `was` with where `window` is now, its size and whether it is
+/// maximized, and `list`'s (or null) columns: [`keep`]'s place, for a
+/// window of another thread to hand back ([`put_place`]).
+pub fn measured(window: HWND, which: Which, list: HWND, was: Place) -> Place {
+    let mut place = was;
     if let Some((pos, maximized)) = placement::normal_place(window) {
         place.x = pos.x;
         place.y = pos.y;
@@ -586,7 +616,7 @@ pub fn keep(window: HWND, which: Which, list: HWND) {
             }
         }
     }
-    put(which, place);
+    place
 }
 
 #[cfg(test)]

@@ -1596,6 +1596,7 @@ mod tests {
             match_case: false,
             filelist: None,
             created_sort: None,
+            slots: Default::default(),
         };
         assert!(same_search(&s("a"), &s("a")));
         assert!(!same_search(&s("a"), &s("b")));

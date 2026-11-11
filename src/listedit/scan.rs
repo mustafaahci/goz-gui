@@ -40,8 +40,11 @@ pub enum Source {
     /// (links to other folders, junctions and symbolic links, are listed,
     /// not entered).
     Folder { path: String, subfolders: bool },
-    /// The rows of a list file (File > Open...).
+    /// The rows of a list file (File > Open..., and W6's Import...).
     List(PathBuf),
+    /// W6: Edit > Read Extended Information: each row (its place in the
+    /// list, and its path) as the disk has it now, in [`Found::refreshed`].
+    Refresh(Vec<(usize, String)>),
 }
 
 /// What a job has for the window.
@@ -59,6 +62,9 @@ pub struct Found {
     pub stopped: bool,
     /// Why a list file could not be read.
     pub error: Option<String>,
+    /// W6: the rows read again ([`Source::Refresh`]): each one's place, and
+    /// what the disk has (`None`: nothing there now).
+    pub refreshed: Vec<(usize, Option<Entry>)>,
     /// A message is on its way to the window.
     posted: bool,
 }
@@ -101,6 +107,14 @@ impl Job {
                                 lock(&f).error = Some(why);
                             }
                         }
+                        Source::Refresh(rows) => {
+                            for (at, path) in rows {
+                                if s.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                out.refresh(at, item(&path));
+                            }
+                        }
                     }
                 }
                 lock(&f).stopped = s.load(Ordering::Relaxed);
@@ -126,6 +140,7 @@ impl Job {
             done: f.done,
             stopped: f.stopped,
             error: f.error.clone(),
+            refreshed: std::mem::take(&mut f.refreshed),
             posted: false,
         }
     }
@@ -135,6 +150,7 @@ impl Job {
 struct Out<'a> {
     shared: &'a Mutex<Found>,
     batch: Vec<Entry>,
+    refreshed: Vec<(usize, Option<Entry>)>,
     seen: u64,
     unreadable: u64,
     last: Instant,
@@ -147,6 +163,7 @@ impl<'a> Out<'a> {
         Out {
             shared,
             batch: Vec::new(),
+            refreshed: Vec::new(),
             seen: 0,
             unreadable: 0,
             last: Instant::now(),
@@ -157,8 +174,21 @@ impl<'a> Out<'a> {
 
     fn push(&mut self, e: Entry) {
         self.batch.push(e);
+        self.counted();
+    }
+
+    /// W6: row `at` read again from the disk.
+    fn refresh(&mut self, at: usize, e: Option<Entry>) {
+        if e.is_none() {
+            self.unreadable += 1;
+        }
+        self.refreshed.push((at, e));
+        self.counted();
+    }
+
+    fn counted(&mut self) {
         self.seen += 1;
-        if self.batch.len() >= BATCH
+        if self.batch.len() + self.refreshed.len() >= BATCH
             || (self.seen.is_multiple_of(256) && self.last.elapsed() >= HAND_OVER)
         {
             self.hand_over(false);
@@ -171,6 +201,7 @@ impl<'a> Out<'a> {
         let post = {
             let mut f = lock(self.shared);
             f.entries.append(&mut self.batch);
+            f.refreshed.append(&mut self.refreshed);
             f.seen = self.seen;
             f.unreadable = self.unreadable;
             f.done |= done;
@@ -352,6 +383,8 @@ pub struct Saving {
     /// The list's state when it was taken (the editor's change count).
     pub generation: u64,
     pub rows: usize,
+    /// W6: an Export... in this type, not a save: the list keeps its file.
+    pub exported: Option<super::Export>,
     outcome: Arc<Mutex<Option<Result<(), String>>>>,
 }
 
@@ -366,13 +399,36 @@ impl Saving {
         hwnd: usize,
         msg: u32,
     ) -> std::io::Result<Saving> {
+        Saving::write(entries, path, generation, None, hwnd, msg)
+    }
+
+    /// W6: File > Export...: `entries` written to `path` as `format`, as a
+    /// save is.
+    pub fn export(
+        entries: Vec<Entry>,
+        path: PathBuf,
+        format: super::Export,
+        hwnd: usize,
+        msg: u32,
+    ) -> std::io::Result<Saving> {
+        Saving::write(entries, path, 0, Some(format), hwnd, msg)
+    }
+
+    fn write(
+        entries: Vec<Entry>,
+        path: PathBuf,
+        generation: u64,
+        exported: Option<super::Export>,
+        hwnd: usize,
+        msg: u32,
+    ) -> std::io::Result<Saving> {
         let outcome = Arc::new(Mutex::new(None));
         let (o, to) = (Arc::clone(&outcome), path.clone());
         let rows = entries.len();
         std::thread::Builder::new()
             .name("goz-list-editor-save".into())
             .spawn(move || {
-                let bytes = super::to_efu(&entries);
+                let bytes = exported.map_or_else(|| super::to_efu(&entries), |f| f.bytes(&entries));
                 drop(entries);
                 let result = crate::store::file::write(&to, &bytes, None)
                     .map(|_| ())
@@ -388,6 +444,7 @@ impl Saving {
             path,
             generation,
             rows,
+            exported,
             outcome,
         })
     }
@@ -429,14 +486,43 @@ mod tests {
     fn run(sources: Vec<Source>) -> Found {
         let job = Job::start(sources, 0, 0).unwrap();
         let mut all = Vec::new();
+        let mut again = Vec::new();
         loop {
             let f = job.take();
             all.extend(f.entries);
+            again.extend(f.refreshed);
             if f.done {
-                return Found { entries: all, ..f };
+                return Found {
+                    entries: all,
+                    refreshed: again,
+                    ..f
+                };
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// W6: Read Extended Information reads each row again by its place.
+    #[test]
+    fn rows_are_read_again_by_their_place() {
+        let dir = scratch("refresh");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let f = run(vec![Source::Refresh(vec![
+            (3, file.display().to_string()),
+            (7, dir.join("gone.txt").display().to_string()),
+            (9, format!("{}\\", dir.display())),
+        ])]);
+        assert!(f.entries.is_empty());
+        assert_eq!(f.refreshed.len(), 3);
+        let (at, a) = &f.refreshed[0];
+        let a = a.as_ref().expect("a.txt is there");
+        assert_eq!((*at, a.size, a.is_dir), (3, Some(5), false));
+        assert!(a.modified.is_some() && a.created.is_some() && a.attributes.is_some());
+        assert_eq!(f.refreshed[1], (7, None));
+        assert!(f.refreshed[2].1.as_ref().is_some_and(|d| d.is_dir));
+        assert_eq!(f.unreadable, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

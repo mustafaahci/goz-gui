@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use goz_core::types::SortDir;
 
-use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, HMENU, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
     MB_YESNO,
@@ -76,7 +76,7 @@ pub(super) fn before_window(l: &crate::cmdline::Launch) -> Option<i32> {
     }
     if let Some((file, folders)) = &l.create_file_list {
         return Some(
-            match crate::filelist::create::create(Path::new(file), folders, l.create_options) {
+            match crate::filelist::create::create(Path::new(file), folders, &l.create_options) {
                 Ok(_) => 0,
                 Err(_) => 1,
             },
@@ -126,6 +126,12 @@ pub(super) struct DataTools {
     dialog: Cell<bool>,
     /// Import or Reset Settings waits for the other windows to end.
     replacing: RefCell<Option<Replace>>,
+    /// W6: the shown tab's file-list slots (`lists.rs`).
+    pub(super) slots: RefCell<Arc<crate::filelist::slots::Slots>>,
+    /// W6: goz-gui was started for the File List Editor alone (`-edit`,
+    /// `-filelist-editor`): it ends with the editor while its window was
+    /// never shown.
+    pub(super) editor_alone: Cell<bool>,
 }
 
 /// Whose a list whose reading ended is (its WM_FILELIST).
@@ -186,6 +192,8 @@ impl DataTools {
             created_width: Cell::new(crate::columns::DEFAULT_WIDTHS[crate::columns::COL_DATE]),
             dialog: Cell::new(false),
             replacing: RefCell::new(None),
+            slots: RefCell::new(Arc::default()),
+            editor_alone: Cell::new(false),
         }
     }
 }
@@ -583,10 +591,7 @@ impl App {
         if id != crate::listedit::cmd::FILE_LIST_EDITOR {
             return false;
         }
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's window's place.
-        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut rc) };
-        crate::listedit::ui::open(self.dialog_look(), rc);
+        self.open_list_editor(None);
         true
     }
 

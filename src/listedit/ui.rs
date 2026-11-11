@@ -21,6 +21,27 @@
 //! A test names the file Open... and Save As... use in
 //! `GOZ_GUI_EDITOR_FILE` (then "Save changes?" is answered No), and the
 //! folder Add Folder... adds in `GOZ_GUI_PICK_FOLDER`.
+//!
+//! Wave 6:
+//! - **File:** Import... (a list's rows added to this one: EFU, CSV, TXT)
+//!   and Export... (CSV, EFU, M3U, M3U8, TSV or TXT, Everything's types,
+//!   with "Export selection only"; `editor_last_export_type` and
+//!   `editor_last_export_selection_only` keep the choice). A test's
+//!   `GOZ_GUI_EDITOR_FILE` names their file too (its extension the type,
+//!   `.tsv` for TSV), with the selection only when there is one.
+//! - **Edit:** Update (Everything's "Rescan root folders in the file
+//!   list": each folder no other listed folder holds is walked again, with
+//!   its subfolders when the list held any, in place of what it held) and
+//!   Read Extended Information (the selected rows' size, dates and
+//!   attributes read from the disk again).
+//! - `-edit <file>` opens the editor with that list (handed to the editor
+//!   open, which asks about unsaved changes first), `-filelist-editor` the
+//!   editor alone.
+//! - The editor opens where it was last (Everything's `editor_x`, `_y`,
+//!   `_wide`, `_high`, `_maximized`, goz-gui's `editor_dpi`), handed to it
+//!   as it opens and handed back to goz-gui's window as it moves and
+//!   closes ([`take_kept`]).
+//! - View > Theme in goz-gui's window is followed ([`set_look`]).
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -56,20 +77,25 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateMenu, DWLP_MSGRESULT, DrawMenuBar, EnableMenuItem, EndDialog, GWLP_USERDATA,
     GetClientRect, GetWindowRect, HMENU, IDCANCEL, IDNO, IDOK, IDYES, IsIconic, IsWindow,
     MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNOCANCEL, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED,
-    MF_POPUP, MINMAXINFO, MoveWindow, PostMessageW, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DROPFILES, WM_GETMINMAXINFO, WM_INITDIALOG,
-    WM_INITMENUPOPUP, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY, WM_SETTINGCHANGE, WM_SIZE,
-    WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
+    MF_POPUP, MINMAXINFO, MoveWindow, PostMessageW, SIZE_MAXIMIZED, SIZE_RESTORED, SW_RESTORE,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DROPFILES, WM_EXITSIZEMOVE,
+    WM_GETMINMAXINFO, WM_INITDIALOG, WM_INITMENUPOPUP, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY,
+    WM_SETTINGCHANGE, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_TABSTOP,
+    WS_THICKFRAME,
 };
 
 use super::scan::{Job, Saving, Source};
-use super::{COLUMNS, Column, Entry, WM_FOUND, WM_SAVED, cmd, items_text};
+use super::{
+    COLUMNS, Column, EXPORT_DIALOG, Entry, Export, IMPORT_DIALOG, WM_EDITOR_CLOSED, WM_EDITOR_LOOK,
+    WM_EDITOR_OPEN, WM_FOUND, WM_SAVED, cmd, items_text,
+};
 use crate::dialog::{self, Class, Look, Quiet, Template, common, list_custom_draw, state};
 use crate::filetools::ui::{copy_text, item, send, set_state, units};
 use crate::menu::{self, Item};
 use crate::msgbox;
 use crate::paint;
+use crate::places::{self, Place, Which};
 use crate::store::location;
 use crate::theme::Palette;
 use crate::wide::wz;
@@ -105,23 +131,79 @@ fn editor() -> MutexGuard<'static, Option<Running>> {
     EDITOR.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Tools > File List Editor...: opens the editor, centred over `near` (the
-/// main window's rectangle), in `look`; one already open comes to the
-/// front instead.
-pub fn open(look: Look, near: RECT) {
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// W6: what the editor hands back to goz-gui's window: its place, and
+/// Export...'s last choices.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Kept {
+    pub place: Option<Place>,
+    pub export_type: usize,
+    pub export_selection: bool,
+}
+
+/// The editor's [`Kept`], as it last moved, was sized or closed.
+static KEPT: Mutex<Option<Kept>> = Mutex::new(None);
+/// The list `-edit` hands to the editor open ([`WM_EDITOR_OPEN`]).
+static PENDING: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// What the editor handed back since this was last asked (it hands its
+/// place back each time it moves, is sized or closes), if anything: taken,
+/// so a change made since in goz-gui's settings (Options > Advanced) is
+/// not put back over by an old one.
+pub fn take_kept() -> Option<Kept> {
+    lock(&KEPT).take()
+}
+
+/// How the editor starts.
+pub struct Start {
+    pub look: Look,
+    /// The main window's rectangle: a first editor opens centred over it.
+    pub near: RECT,
+    /// `-edit`'s list, opened at once.
+    pub file: Option<PathBuf>,
+    /// Where it was last (Everything's `editor_*`).
+    pub place: Place,
+    pub export_type: usize,
+    pub export_selection: bool,
+    /// goz-gui's window, told as the editor closes.
+    pub owner: usize,
+}
+
+/// The editor's window, while it is open.
+fn open_window() -> Option<HWND> {
+    let slot = editor();
+    let r = slot.as_ref().filter(|r| !r.thread.is_finished())?;
+    let h = r.hwnd.load(Ordering::Acquire) as HWND;
+    // SAFETY: asks whether a window handle names a window.
+    (!h.is_null() && unsafe { IsWindow(h) } != 0).then_some(h)
+}
+
+/// Tools > File List Editor... (and W6's `-edit`, `-filelist-editor`):
+/// opens the editor as `start` says; one already open comes to the front
+/// instead, and opens `start.file` if one is given (asking about unsaved
+/// changes first).
+pub fn open(start: Start) {
     let mut slot = editor();
     if let Some(r) = slot.as_ref()
         && !r.thread.is_finished()
     {
         let h = r.hwnd.load(Ordering::Acquire) as HWND;
-        // SAFETY: shows and raises a window of this process (the editor's);
-        // a window gone meanwhile is refused.
+        // SAFETY: shows and raises a window of this process (the editor's),
+        // and posts it the list to open; a window gone meanwhile is
+        // refused.
         unsafe {
             if !h.is_null() && IsWindow(h) != 0 {
                 if IsIconic(h) != 0 {
                     ShowWindow(h, SW_RESTORE);
                 }
                 SetForegroundWindow(h);
+                if let Some(file) = start.file {
+                    *lock(&PENDING) = Some(file);
+                    PostMessageW(h, WM_EDITOR_OPEN, 0, 0);
+                }
             }
         }
         return;
@@ -133,10 +215,31 @@ pub fn open(look: Look, near: RECT) {
     let theirs = Arc::clone(&hwnd);
     let thread = std::thread::Builder::new()
         .name("goz-list-editor".into())
-        .spawn(move || run(look, near, theirs));
+        .spawn(move || run(start, theirs));
     if let Ok(thread) = thread {
         *slot = Some(Running { hwnd, thread });
     }
+}
+
+/// W6: goz-gui's window changed View > Theme: the editor open follows.
+pub fn set_look(look: Look) {
+    if let Some(h) = open_window() {
+        // SAFETY: a plain post to the editor's window; one gone meanwhile
+        // drops it.
+        unsafe {
+            PostMessageW(
+                h,
+                WM_EDITOR_LOOK,
+                usize::from(look.dark),
+                isize::from(look.follow_system),
+            )
+        };
+    }
+}
+
+/// Whether the editor is open.
+pub fn is_open() -> bool {
+    open_window().is_some()
 }
 
 /// goz-gui's window has closed: the editor is asked to close (it asks
@@ -156,7 +259,16 @@ pub fn finish() {
 
 /// The editor's thread: COM for the file and folder dialogs, then the
 /// window until it closes.
-fn run(look: Look, near: RECT, hwnd: Arc<AtomicUsize>) {
+fn run(start: Start, hwnd: Arc<AtomicUsize>) {
+    let Start {
+        look,
+        near,
+        file,
+        place,
+        export_type,
+        export_selection,
+        owner,
+    } = start;
     // SAFETY: this thread's own COM, given back as it ends.
     let com = unsafe { CoInitializeEx(core::ptr::null(), COINIT_APARTMENTTHREADED as u32) } >= 0;
     // Message boxes on this thread take the window's look.
@@ -167,6 +279,13 @@ fn run(look: Look, near: RECT, hwnd: Arc<AtomicUsize>) {
     let state = Editor {
         look: Cell::new(look),
         near,
+        place,
+        owner,
+        start_file: RefCell::new(file),
+        export_type: Cell::new(export_type),
+        export_selection: Cell::new(export_selection),
+        doing: Cell::new(Doing::Adding),
+        importing: RefCell::new(None),
         hwnd: Arc::clone(&hwnd),
         entries: RefCell::new(Vec::new()),
         file: RefCell::new(None),
@@ -224,11 +343,47 @@ enum After {
     New,
     Open,
     Close,
+    /// W6: the list `-edit` handed over ([`PENDING`]).
+    OpenPending,
+}
+
+/// What a job does, as the status line says it (W6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Doing {
+    Adding,
+    Opening,
+    Importing,
+    Updating,
+    Reading,
+}
+
+impl Doing {
+    fn verb(self) -> &'static str {
+        match self {
+            Doing::Adding => "Adding",
+            Doing::Opening => "Opening",
+            Doing::Importing => "Importing",
+            Doing::Updating => "Updating",
+            Doing::Reading => "Reading extended information",
+        }
+    }
 }
 
 struct Editor {
     look: Cell<Look>,
     near: RECT,
+    /// W6: where it opens (its place kept), and whose window it tells as
+    /// it closes.
+    place: Place,
+    owner: usize,
+    /// `-edit`'s list, opened as the window starts.
+    start_file: RefCell<Option<PathBuf>>,
+    /// Export...'s last type and "Export selection only".
+    export_type: Cell<usize>,
+    export_selection: Cell<bool>,
+    /// What the job running does, and the file an Import... reads.
+    doing: Cell<Doing>,
+    importing: RefCell<Option<PathBuf>>,
     hwnd: Arc<AtomicUsize>,
     /// The list's rows, as shown.
     entries: RefCell<Vec<Entry>>,
@@ -341,6 +496,9 @@ impl Editor {
                     Item::Cmd(cmd::SAVE, "&Save\tCtrl+S"),
                     Item::Cmd(cmd::SAVE_AS, "Save &As...\tCtrl+Shift+S"),
                     Item::Sep,
+                    Item::Cmd(cmd::IMPORT, "&Import..."),
+                    Item::Cmd(cmd::EXPORT, "&Export..."),
+                    Item::Sep,
                     Item::Cmd(cmd::CLOSE, "&Close\tCtrl+W"),
                 ],
             ),
@@ -353,6 +511,9 @@ impl Editor {
                     Item::Sep,
                     Item::Cmd(cmd::REMOVE, "&Remove\tDel"),
                     Item::Cmd(cmd::REMOVE_DUPLICATES, "Remove &Duplicates"),
+                    Item::Sep,
+                    Item::Cmd(cmd::UPDATE, "&Update"),
+                    Item::Cmd(cmd::READ_EXTENDED, "Read Extended &Information"),
                     Item::Sep,
                     Item::Cmd(cmd::SELECT_ALL, "Select &All\tCtrl+A"),
                     Item::Sep,
@@ -375,13 +536,89 @@ impl Editor {
         let mut wr = RECT::default();
         // SAFETY: reads this thread's dialog.
         unsafe { GetWindowRect(dlg, &mut wr) };
-        self.min
-            .set(((wr.right - wr.left) / 2, (wr.bottom - wr.top) / 2));
+        let min = ((wr.right - wr.left) / 2, (wr.bottom - wr.top) / 2);
+        self.min.set(min);
+        // W6: where it was last, on the monitors there are now.
+        if self.place.sized() {
+            places::restore_at(
+                dlg,
+                Which::FileListEditor,
+                &self.place,
+                core::ptr::null_mut(),
+                min,
+            );
+        }
         self.layout(dlg);
         self.show_title(dlg);
         self.show_count(dlg);
         // SAFETY: gives this thread's list the keyboard.
         unsafe { SetFocus(list) };
+        // W6: `-edit`'s list.
+        let file = self.start_file.take();
+        if let Some(path) = file {
+            self.open_path(dlg, path);
+        }
+    }
+
+    /// W6: what goz-gui's window keeps of the editor now: where it is, and
+    /// Export...'s choices.
+    fn keep(&self, dlg: HWND) {
+        let place = places::measured(
+            dlg,
+            Which::FileListEditor,
+            core::ptr::null_mut(),
+            self.place.clone(),
+        );
+        *lock(&KEPT) = Some(Kept {
+            place: Some(place),
+            export_type: self.export_type.get(),
+            export_selection: self.export_selection.get(),
+        });
+    }
+
+    /// Reads the list at `path` into the editor, in place of what it holds.
+    fn open_path(&self, dlg: HWND, path: PathBuf) {
+        self.clear(dlg);
+        self.start(
+            dlg,
+            vec![Source::List(path.clone())],
+            Some(path),
+            Doing::Opening,
+        );
+    }
+
+    /// W6: `-edit` handed a list to the editor open: it opens once a
+    /// changed list is saved or let go.
+    fn open_pending(&self, dlg: HWND) {
+        if self.saving.borrow().is_some() || !self.settle(dlg, After::OpenPending) {
+            return;
+        }
+        let path = lock(&PENDING).take();
+        if let Some(path) = path {
+            self.open_path(dlg, path);
+        }
+    }
+
+    /// W6: goz-gui's window changed View > Theme.
+    fn restyle(&self, dlg: HWND, look: Look) {
+        if look == self.look.get() {
+            return;
+        }
+        self.look.set(look);
+        dialog::set_app_look(look);
+        dialog::apply_theme(dlg, look.dark);
+        // SAFETY: updates this thread's subclass of the dialog, and
+        // repaints its menu bar and list.
+        unsafe {
+            SetWindowSubclass(
+                dlg,
+                Some(frame_proc),
+                FRAME_SUBCLASS,
+                usize::from(look.dark),
+            );
+            DrawMenuBar(dlg);
+            InvalidateRect(Editor::list(dlg), core::ptr::null(), 1);
+        }
     }
 
     /// Centred over the main window, inside the work area of the monitor
@@ -513,6 +750,10 @@ impl Editor {
             cmd::OPEN => self.open_list(dlg),
             cmd::SAVE => self.save(dlg, false),
             cmd::SAVE_AS => self.save(dlg, true),
+            cmd::IMPORT => self.import(dlg),
+            cmd::EXPORT => self.export(dlg),
+            cmd::UPDATE => self.update(dlg),
+            cmd::READ_EXTENDED => self.read_extended(dlg),
             cmd::CLOSE => self.close(dlg),
             cmd::ADD_FILES => self.add_files(dlg),
             cmd::ADD_FOLDER => self.add_folder(dlg, false),
@@ -536,11 +777,20 @@ impl Editor {
         let selected = send(Editor::list(dlg), LVM_GETSELECTEDCOUNT, 0, 0) > 0;
         enable_item(m, cmd::SAVE, !busy && !saving);
         enable_item(m, cmd::SAVE_AS, !busy && !saving);
-        for id in [cmd::ADD_FILES, cmd::ADD_FOLDER, cmd::ADD_FOLDER_SUBFOLDERS] {
+        enable_item(m, cmd::EXPORT, !busy && !saving && rows);
+        for id in [
+            cmd::ADD_FILES,
+            cmd::ADD_FOLDER,
+            cmd::ADD_FOLDER_SUBFOLDERS,
+            cmd::IMPORT,
+        ] {
             enable_item(m, id, !busy);
         }
         enable_item(m, cmd::REMOVE, !busy && selected);
         enable_item(m, cmd::REMOVE_DUPLICATES, !busy && rows);
+        let folders = self.entries.borrow().iter().any(|e| e.is_dir);
+        enable_item(m, cmd::UPDATE, !busy && folders);
+        enable_item(m, cmd::READ_EXTENDED, !busy && selected);
         enable_item(m, cmd::SELECT_ALL, rows);
         enable_item(m, cmd::STOP, busy);
     }
@@ -554,8 +804,8 @@ impl Editor {
     }
 
     /// Starts a job adding `sources` (`opening`: the file File > Open...
-    /// reads).
-    fn start(&self, dlg: HWND, sources: Vec<Source>, opening: Option<PathBuf>) {
+    /// reads), as `doing` says.
+    fn start(&self, dlg: HWND, sources: Vec<Source>, opening: Option<PathBuf>, doing: Doing) {
         if self.busy() || sources.is_empty() {
             return;
         }
@@ -563,15 +813,40 @@ impl Editor {
             Ok(job) => {
                 *self.job.borrow_mut() = Some(job);
                 *self.opening.borrow_mut() = opening;
-                let what = if self.opening.borrow().is_some() {
-                    "Opening..."
-                } else {
-                    "Adding..."
-                };
-                self.set_status(dlg, what);
+                self.doing.set(doing);
+                self.set_status(dlg, &format!("{}...", doing.verb()));
             }
             Err(e) => self.say(dlg, &format!("Could not start: {e}")),
         }
+    }
+
+    /// W6: rows read again from the disk (Read Extended Information) take
+    /// their place, under the path the list has them by.
+    fn take_refreshed(&self, dlg: HWND, refreshed: Vec<(usize, Option<Entry>)>) {
+        if refreshed.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut entries = self.entries.borrow_mut();
+            for (at, now) in refreshed {
+                if let (Some(row), Some(now)) = (entries.get_mut(at), now) {
+                    let now = Entry {
+                        path: row.path.clone(),
+                        ..now
+                    };
+                    if *row != now {
+                        *row = now;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.changed();
+        }
+        // SAFETY: repaints this thread's list.
+        unsafe { InvalidateRect(Editor::list(dlg), core::ptr::null(), 1) };
     }
 
     fn say(&self, dlg: HWND, text: &str) {
@@ -595,15 +870,51 @@ impl Editor {
             }
             self.show_rows(dlg, true);
         }
+        self.take_refreshed(dlg, found.refreshed);
+        let doing = self.doing.get();
         if !found.done {
-            let verb = if opening { "Opening" } else { "Adding" };
             self.set_status(
                 dlg,
-                &format!("{verb}: {} (Esc stops)", items_text(found.seen as usize)),
+                &format!(
+                    "{}: {} (Esc stops)",
+                    doing.verb(),
+                    items_text(found.seen as usize)
+                ),
             );
             return;
         }
         self.job.take();
+        // W6: an Import... that could not read its file says so.
+        if let Some(path) = self.importing.take()
+            && let Some(why) = &found.error
+        {
+            self.show_title(dlg);
+            self.show_count(dlg);
+            self.say(
+                dlg,
+                &format!(
+                    "The file list could not be imported:\n\n{}\n\n{why}",
+                    path.display()
+                ),
+            );
+            return;
+        }
+        if doing == Doing::Reading {
+            self.show_title(dlg);
+            let n = found.seen.saturating_sub(found.unreadable);
+            let mut text = format!("Read extended information for {}", items_text(n as usize));
+            if found.unreadable > 0 {
+                text.push_str(&format!(
+                    "; {} not there now",
+                    items_text(found.unreadable as usize)
+                ));
+            }
+            if found.stopped {
+                text.push_str(" (stopped)");
+            }
+            self.set_status(dlg, &text);
+            return;
+        }
         if let Some(path) = self.opening.take() {
             match found.error {
                 Some(why) => {
@@ -743,8 +1054,7 @@ impl Editor {
             None => crate::filedlg::open(dlg, "Open File List", KINDS, "efu"),
         };
         let Some(path) = path else { return };
-        self.clear(dlg);
-        self.start(dlg, vec![Source::List(path.clone())], Some(path));
+        self.open_path(dlg, path);
     }
 
     /// File > Save (`as_new`: Save As..., or a list with no file yet).
@@ -785,6 +1095,32 @@ impl Editor {
         let outcome = self.saving.borrow().as_ref().and_then(Saving::outcome);
         let Some(outcome) = outcome else { return };
         let Some(s) = self.saving.take() else { return };
+        if s.exported.is_some() {
+            // W6: an Export...: the list keeps its file and its changes.
+            self.show_count(dlg);
+            match outcome {
+                Ok(()) => {
+                    let name = s
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.set_status(dlg, &format!("Exported {} to {name}", items_text(s.rows)));
+                }
+                Err(why) => self.say(
+                    dlg,
+                    &format!(
+                        "The file list could not be exported:\n\n{}\n\n{why}",
+                        s.path.display()
+                    ),
+                ),
+            }
+            // Close waited for it.
+            if self.after.take() == Some(After::Close) {
+                self.close(dlg);
+            }
+            return;
+        }
         let after = self.after.take();
         match outcome {
             Ok(()) => {
@@ -796,6 +1132,7 @@ impl Editor {
                 match after {
                     Some(After::New) => self.new_list(dlg),
                     Some(After::Open) => self.open_list(dlg),
+                    Some(After::OpenPending) => self.open_pending(dlg),
                     Some(After::Close) => self.close(dlg),
                     None => {}
                 }
@@ -840,7 +1177,12 @@ impl Editor {
             return;
         }
         let files = pick_files(dlg);
-        self.start(dlg, files.into_iter().map(Source::Item).collect(), None);
+        self.start(
+            dlg,
+            files.into_iter().map(Source::Item).collect(),
+            None,
+            Doing::Adding,
+        );
     }
 
     /// Edit > Add Folder... (`subfolders`: and Subfolders...): a folder
@@ -858,7 +1200,12 @@ impl Editor {
             return;
         };
         let path = String::from_utf16_lossy(&folder);
-        self.start(dlg, vec![Source::Folder { path, subfolders }], None);
+        self.start(
+            dlg,
+            vec![Source::Folder { path, subfolders }],
+            None,
+            Doing::Adding,
+        );
     }
 
     /// Files and folders dropped on the editor: files as they are, folders
@@ -889,7 +1236,7 @@ impl Editor {
                 }
             })
             .collect();
-        self.start(dlg, sources, None);
+        self.start(dlg, sources, None, Doing::Adding);
     }
 
     /// Edit > Remove (Del): the selected rows go.
@@ -940,6 +1287,148 @@ impl Editor {
             dlg,
             &format!("{}; {} removed", items_text(n), items_text(gone)),
         );
+    }
+
+    /// W6: File > Import...: the rows of a list file (EFU, CSV, a text file
+    /// of paths) added to this list.
+    fn import(&self, dlg: HWND) {
+        if self.busy() {
+            beep();
+            return;
+        }
+        let path = match location::editor_file() {
+            Some(p) => Some(p),
+            None => crate::filedlg::open(dlg, "Import File List", IMPORT_DIALOG, "efu"),
+        };
+        let Some(path) = path else { return };
+        *self.importing.borrow_mut() = Some(path.clone());
+        self.start(dlg, vec![Source::List(path)], None, Doing::Importing);
+    }
+
+    /// W6: File > Export...: the list (or the selected rows, "Export
+    /// selection only") written in one of Everything's types; the list
+    /// keeps its own file.
+    fn export(&self, dlg: HWND) {
+        if self.busy() || self.saving.borrow().is_some() {
+            beep();
+            return;
+        }
+        let selected = Editor::selected(dlg);
+        let last = Export::at(self.export_type.get());
+        let chosen = match location::editor_file() {
+            Some(p) => {
+                let format = Export::of_path(&p).unwrap_or(last);
+                Some((p, !selected.is_empty(), format))
+            }
+            None => {
+                let name = self.name();
+                let stem = std::path::Path::new(&name)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or(name);
+                let check = crate::filedlg::Check {
+                    label: "Export selection only",
+                    checked: self.export_selection.get() && !selected.is_empty(),
+                    enabled: !selected.is_empty(),
+                };
+                crate::filedlg::save_kind_check(
+                    dlg,
+                    "Export File List",
+                    &stem,
+                    EXPORT_DIALOG,
+                    last.index(),
+                    check,
+                )
+                .map(|(p, checked, kind)| {
+                    // All Files: the type its extension names, else the last.
+                    let format = Export::ALL
+                        .get(kind)
+                        .copied()
+                        .or_else(|| Export::of_path(&p))
+                        .unwrap_or(last);
+                    (p, checked, format)
+                })
+            }
+        };
+        let Some((path, only_selected, format)) = chosen else {
+            return;
+        };
+        self.export_type.set(format.index());
+        if !selected.is_empty() {
+            self.export_selection.set(only_selected);
+        }
+        let entries: Vec<Entry> = {
+            let all = self.entries.borrow();
+            if only_selected && !selected.is_empty() {
+                selected
+                    .iter()
+                    .filter_map(|&r| all.get(r).cloned())
+                    .collect()
+            } else {
+                all.clone()
+            }
+        };
+        self.keep(dlg);
+        match Saving::export(entries, path, format, dlg as usize, WM_SAVED) {
+            Ok(s) => {
+                *self.saving.borrow_mut() = Some(s);
+                self.set_status(dlg, "Exporting...");
+            }
+            Err(e) => self.say(dlg, &format!("The file list could not be exported: {e}")),
+        }
+    }
+
+    /// W6: Edit > Update: Everything's "Rescan root folders in the file
+    /// list": each folder no other listed folder holds is walked again
+    /// (with its subfolders when the list held any), in place of what the
+    /// list held under it; the files listed on their own stay as they are.
+    fn update(&self, dlg: HWND) {
+        if self.busy() {
+            beep();
+            return;
+        }
+        let roots = super::roots(&self.entries.borrow());
+        if roots.is_empty() {
+            beep();
+            self.set_status(dlg, "Nothing to update: the list holds no folder");
+            return;
+        }
+        let paths: Vec<String> = roots.iter().map(|(p, _)| p.clone()).collect();
+        let gone = super::remove_under(&mut self.entries.borrow_mut(), &paths);
+        if gone > 0 {
+            self.changed();
+        }
+        if self.sort.take().is_some() {
+            self.show_arrow(dlg);
+        }
+        self.show_rows(dlg, false);
+        let sources = roots
+            .into_iter()
+            .map(|(path, subfolders)| Source::Folder { path, subfolders })
+            .collect();
+        self.start(dlg, sources, None, Doing::Updating);
+        self.show_title(dlg);
+    }
+
+    /// W6: Edit > Read Extended Information: the selected rows' size, dates
+    /// and attributes read from the disk again.
+    fn read_extended(&self, dlg: HWND) {
+        if self.busy() {
+            beep();
+            return;
+        }
+        let rows: Vec<(usize, String)> = {
+            let entries = self.entries.borrow();
+            Editor::selected(dlg)
+                .into_iter()
+                .filter_map(|r| entries.get(r).map(|e| (r, e.path.clone())))
+                .collect()
+        };
+        if rows.is_empty() {
+            beep();
+            return;
+        }
+        self.start(dlg, vec![Source::Refresh(rows)], None, Doing::Reading);
     }
 
     /// A click on a column's header: sorted by it, the other way round
@@ -1206,6 +1695,28 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
         }
         WM_SIZE => {
             s.layout(dlg);
+            // W6: maximized or back: kept at once (a drag at its end).
+            if matches!(w as u32, SIZE_MAXIMIZED | SIZE_RESTORED) {
+                s.keep(dlg);
+            }
+            1
+        }
+        WM_EXITSIZEMOVE => {
+            s.keep(dlg);
+            0
+        }
+        WM_EDITOR_OPEN => {
+            s.open_pending(dlg);
+            1
+        }
+        WM_EDITOR_LOOK => {
+            s.restyle(
+                dlg,
+                Look {
+                    dark: w != 0,
+                    follow_system: l != 0,
+                },
+            );
             1
         }
         WM_GETMINMAXINFO => {
@@ -1262,6 +1773,13 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
         }
         WM_DESTROY => {
             s.hwnd.store(0, Ordering::Release);
+            // W6: its place for goz-gui's window, which is told.
+            s.keep(dlg);
+            if s.owner != 0 {
+                // SAFETY: a plain post to goz-gui's window; one gone
+                // meanwhile drops it.
+                unsafe { PostMessageW(s.owner as HWND, WM_EDITOR_CLOSED, 0, 0) };
+            }
             0
         }
         _ => 0,

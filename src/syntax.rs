@@ -151,6 +151,23 @@ const IN_GOZ_GUI: &[(&str, &[&str])] = &[
             "the same key again reverses the order",
         ],
     ),
+    (
+        "filelist:a.txt;b.txt",
+        &[
+            "Items of those whole names, or full paths",
+            "with a \\ (* and ? too). In an open file",
+            "list; from gozd's index with a gozd that",
+            "reads OR",
+        ],
+    ),
+    (
+        "filelist0:",
+        &[
+            "The names in file list slot 0 (to 9): File |",
+            "Set File List Slot N (a key in Options >",
+            "Keyboard) puts the selected results there",
+        ],
+    ),
 ];
 
 /// The window's text, lines ending in `\n`, as gozd's syntax is now.

@@ -98,6 +98,9 @@ pub struct View {
     /// The file list the tab searches instead of gozd's index (its full
     /// path), if it searches one.
     pub file_list: Option<String>,
+    /// W6: the tab's ten file-list slots (Everything's `filelist_slot0`
+    /// .. `filelist_slot9`), which `filelistN:` searches for.
+    pub slots: crate::filelist::slots::Slots,
 }
 
 /// A window as it was.
@@ -321,7 +324,24 @@ fn read_view(tab: &Json) -> View {
         display: read_display(tab),
         columns: read_columns(tab),
         file_list,
+        slots: read_slots(tab),
     }
+}
+
+/// A tab's `filelist_slot0`..`9`: the names in each (W6).
+fn read_slots(tab: &Json) -> crate::filelist::slots::Slots {
+    let mut slots = crate::filelist::slots::Slots::default();
+    for (n, slot) in slots.0.iter_mut().enumerate() {
+        *slot = tab
+            .get(&format!("filelist_slot{n}"))
+            .and_then(Json::as_array)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Json::as_text)
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+    }
+    slots
 }
 
 /// The keys of one tab, as Everything orders them.
@@ -371,6 +391,16 @@ fn tab_members(v: &View, closed: bool) -> Vec<(String, Json)> {
                 .collect(),
         ),
     ));
+    // W6: the slots that hold names (Everything reads one not there as
+    // empty), before the columns as Everything writes them.
+    for (n, names) in v.slots.0.iter().enumerate() {
+        if !names.is_empty() {
+            tab.push((
+                format!("filelist_slot{n}"),
+                Json::Array(names.iter().map(|t| Json::str(t)).collect()),
+            ));
+        }
+    }
     if let Some(layout) = v.columns {
         tab.push((
             "columns".into(),
@@ -702,6 +732,7 @@ mod tests {
                 display: None,
                 columns: None,
                 file_list: None,
+                slots: Default::default(),
             }],
             current: 0,
             closed: Vec::new(),
@@ -753,6 +784,32 @@ mod tests {
             tab("\"index_file_list\":\"C:\\\\a.efu\""),
             Some(r"C:\a.efu".into())
         );
+    }
+
+    /// W6: each tab's file-list slots, under Everything's keys.
+    #[test]
+    fn a_tabs_slots_read_back_and_everythings_are_read() {
+        let mut v = search_view("slots");
+        v.slots.set(0, vec![r"C:\a b\c.txt".into(), "d.txt".into()]);
+        v.slots.set(9, vec![r"E:\".into()]);
+        let s = Session {
+            tabs: vec![v, search_view("none")],
+            ..Session::default()
+        };
+        let text = s.to_text();
+        assert_eq!(parse(text.as_bytes()), Ok(Some(s.clone())));
+        assert!(text.contains("\"filelist_slot0\":[\"C:\\\\a b\\\\c.txt\",\"d.txt\"]"));
+        assert!(text.contains("\"filelist_slot9\":[\"E:\\\\\"]"));
+        assert!(
+            !text.contains("filelist_slot1"),
+            "empty slots are not written"
+        );
+        // Everything's own: all ten, empty ones too.
+        let doc = "[{\"tabs\":[{\"search\":\"x\",\"filelist_slot0\":[],\
+                   \"filelist_slot3\":[\"C:\\\\x.txt\",\"\"]}]}]";
+        let read = parse(doc.as_bytes()).unwrap().unwrap();
+        assert_eq!(read.view().slots.get(3), [r"C:\x.txt"]);
+        assert!(read.view().slots.get(0).is_empty());
     }
 
     #[test]

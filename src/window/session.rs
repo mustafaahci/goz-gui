@@ -243,6 +243,8 @@ impl App {
             columns: Some(self.layout.get()),
             // W5: the file list the tab searches.
             file_list: self.filelist_path(),
+            // W6: its file-list slots.
+            slots: (*self.file_list_slots()).clone(),
         }
     }
 
@@ -383,8 +385,10 @@ impl App {
             self.settings_changed();
             self.invalidate_status();
         }
-        // W5: the tab's file list (or the index) before its search runs.
+        // W5: the tab's file list (or the index) before its search runs;
+        // W6: and its file-list slots.
         self.tab_file_list(view.file_list.as_deref());
+        self.show_tab_slots(&view.slots);
         self.restore(&NavState::from_search(&view.search));
         self.begin_view(view);
     }

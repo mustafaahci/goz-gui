@@ -23,6 +23,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FSHIFT};
 
 use crate::datatools::cmd as datatools;
+use crate::filelist::slots::cmd as slots;
 use crate::filetools::cmd;
 use crate::{keys, menu, searchtools, tabs};
 
@@ -287,6 +288,58 @@ pub const COMMANDS: &[Command] = &[
     ),
     c("file_rename_keys", "File | Rename", menu::RENAME),
     c("file_run_as_keys", "File | Run As", menu::RUN_AS),
+    // W6: the selected results into a file-list slot (no key by default,
+    // as in Everything).
+    c(
+        "file_set_file_list_slot_0_keys",
+        "File | Set File List Slot 0",
+        slots::SET_SLOT_FIRST,
+    ),
+    c(
+        "file_set_file_list_slot_1_keys",
+        "File | Set File List Slot 1",
+        slots::SET_SLOT_FIRST + 1,
+    ),
+    c(
+        "file_set_file_list_slot_2_keys",
+        "File | Set File List Slot 2",
+        slots::SET_SLOT_FIRST + 2,
+    ),
+    c(
+        "file_set_file_list_slot_3_keys",
+        "File | Set File List Slot 3",
+        slots::SET_SLOT_FIRST + 3,
+    ),
+    c(
+        "file_set_file_list_slot_4_keys",
+        "File | Set File List Slot 4",
+        slots::SET_SLOT_FIRST + 4,
+    ),
+    c(
+        "file_set_file_list_slot_5_keys",
+        "File | Set File List Slot 5",
+        slots::SET_SLOT_FIRST + 5,
+    ),
+    c(
+        "file_set_file_list_slot_6_keys",
+        "File | Set File List Slot 6",
+        slots::SET_SLOT_FIRST + 6,
+    ),
+    c(
+        "file_set_file_list_slot_7_keys",
+        "File | Set File List Slot 7",
+        slots::SET_SLOT_FIRST + 7,
+    ),
+    c(
+        "file_set_file_list_slot_8_keys",
+        "File | Set File List Slot 8",
+        slots::SET_SLOT_FIRST + 8,
+    ),
+    c(
+        "file_set_file_list_slot_9_keys",
+        "File | Set File List Slot 9",
+        slots::SET_SLOT_FIRST + 9,
+    ),
     c(
         "file_set_run_count_keys",
         "File | Set Run Count...",

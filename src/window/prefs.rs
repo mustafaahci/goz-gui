@@ -191,6 +191,9 @@ impl App {
 
     /// The settings as the window has them now.
     pub(super) fn current_settings(&self) -> Settings {
+        // W6: the File List Editor's place and choices as they are now,
+        // if it is open (or closed since).
+        self.take_editor_kept();
         let (window, maximized) = self.placement_now();
         let text = window_text(self.edit);
         let o = self.opts.get();

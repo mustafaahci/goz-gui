@@ -272,6 +272,14 @@ impl App {
         if l.places_window() {
             self.place_window(&l);
         }
+        // W6: -edit and -filelist-editor: the File List Editor; alone,
+        // the window stays as it is.
+        if l.edit.is_some() || l.filelist_editor {
+            self.open_list_editor(l.edit.as_deref());
+            if l.editor_only() && !l.startup {
+                return;
+            }
+        }
         if l.toggle_window {
             self.toggle_window();
         } else if !l.startup {
