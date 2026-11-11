@@ -785,6 +785,8 @@ See Help > Search Syntax and the README for goz-gui's switches."
         ));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as *const App as isize);
         APP.set(Some(app));
+        // W8: GOZ_GUI_TRACE's timeline of this thread (a test hook).
+        crate::trace::start();
         // F3: which window of the instance this is (before the tray and
         // hotkeys, which only the first has).
         app.new_window.set(secondary);
@@ -911,6 +913,7 @@ See Help > Search Syntax and the README for goz-gui's switches."
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        crate::trace::finish();
         // W5: the File List Editor is asked to close (it asks about unsaved
         // changes), and goz-gui ends once it has.
         crate::listedit::ui::finish();

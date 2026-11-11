@@ -53,11 +53,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetCaretPos, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW,
     UISF_HIDEACCEL, UISF_HIDEFOCUS, USER_TIMER_MINIMUM, UnhookWindowsHookEx, WH_CBT, WINDOWPOS,
     WM_CHAR, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_CTLCOLORSTATIC, WM_ENABLE, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_QUERYUISTATE,
-    WM_SETFONT, WM_SETREDRAW, WM_SETTINGCHANGE, WM_SHOWWINDOW, WM_SYSKEYDOWN, WM_TIMER,
-    WM_WINDOWPOSCHANGING, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE,
-    WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    WM_CTLCOLORSTATIC, WM_ENABLE, WM_ERASEBKGND, WM_GETFONT, WM_INITDIALOG, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCPAINT, WM_NOTIFY, WM_PAINT,
+    WM_QUERYUISTATE, WM_SETFONT, WM_SETREDRAW, WM_SETTINGCHANGE, WM_SHOWWINDOW, WM_SYSKEYDOWN,
+    WM_TIMER, WM_WINDOWPOSCHANGING, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
 // The list boxes drawn here (`LIST_BOX`), and a combo box's own box.
@@ -223,9 +223,10 @@ impl Template {
     /// `proc` as WM_INITDIALOG's lParam.
     pub fn run(&self, owner: HWND, proc: DLGPROC, param: LPARAM) -> isize {
         let aligned = self.aligned();
+        crate::trace::mark("dialog run");
         // SAFETY: a complete template that outlives the modal call, a dialog
         // procedure, and a window of this thread as the owner.
-        unsafe {
+        let ended = unsafe {
             DialogBoxIndirectParamW(
                 GetModuleHandleW(core::ptr::null()),
                 aligned.as_ptr().cast(),
@@ -233,7 +234,9 @@ impl Template {
                 proc,
                 param,
             )
-        }
+        };
+        crate::trace::mark("dialog ended");
+        ended
     }
 
     /// Makes a [`Template::child`] page in `parent` (hidden until shown);
@@ -1525,7 +1528,8 @@ pub fn paint_check(button: HWND, cd: &NMCUSTOMDRAW, kind: Check, ink: CheckInk) 
 /// see `button_custom_draw`),
 /// following the system's theme (`WM_SETTINGCHANGE`) when `look` says so,
 /// and the lists [`fill_later`] put off, once it shows (`WM_SHOWWINDOW`).
-/// `Some` is the dialog procedure's answer.
+/// `Some` is the dialog procedure's answer. Its start and its showing are
+/// marks of `GOZ_GUI_TRACE`'s timeline (`crate::trace`).
 pub fn common(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM, look: &Cell<Look>) -> Option<isize> {
     match msg {
         WM_CTLCOLORDLG | WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN
@@ -1546,7 +1550,12 @@ pub fn common(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM, look: &Cell<Look>) -> O
         }
         // Shown: the lists still to come follow (left to the dialog too).
         WM_SHOWWINDOW if w != 0 => {
+            crate::trace::mark("dialog shown");
             lists_after_show(dlg);
+            None
+        }
+        WM_INITDIALOG => {
+            crate::trace::mark("dialog init");
             None
         }
         WM_DRAWITEM if l != 0 => {

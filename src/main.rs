@@ -119,6 +119,9 @@ mod listedit;
 // W7 (C: the Edit File List Slot dialog).
 mod slotedit;
 
+// W8 (P: the dialogs' opening time): the GOZ_GUI_TRACE test hook.
+mod trace;
+
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };
