@@ -127,6 +127,9 @@ mod uiopts;
 // W4 (G1: data and file tools).
 mod datatools;
 
+// W6 (C: file-list slots, the File List Editor's start).
+mod lists;
+
 pub const WM_REPLY: u32 = WM_APP + 1;
 pub const WM_ICON: u32 = WM_APP + 2;
 /// A Tools > goz Service command finished; wParam is 1 if it ran.
@@ -615,7 +618,12 @@ fn prefs_background(app: &App) -> crate::settings::Background {
 /// `-no-new-window`. The settings file is only read here: the running
 /// goz-gui owns it.
 fn new_window_on_start(l: &crate::cmdline::Launch) -> bool {
-    if l.exit || l.toggle_window || l.startup || l.new_window == Some(false) {
+    if l.exit
+        || l.toggle_window
+        || l.startup
+        || l.new_window == Some(false)
+        || (l.editor_only() && l.new_window.is_none())
+    {
         return false;
     }
     let Some(path) = crate::store::location::data_file(crate::store::location::SETTINGS_FILE)
@@ -787,7 +795,10 @@ See Help > Search Syntax and the README for goz-gui's switches."
         // -startup (signing in to Windows) starts in the background, with
         // no window; not a new window, which has no tray icon to come back
         // from.
-        let asked = if launch.startup && !secondary {
+        // W6: -edit or -filelist-editor alone shows the editor, not the
+        // window.
+        let editor_only = launch.editor_only() && !secondary;
+        let asked = if (launch.startup || editor_only) && !secondary {
             SW_HIDE
         } else {
             startup_show()
@@ -814,7 +825,17 @@ See Help > Search Syntax and the README for goz-gui's switches."
         } else if let Some(list) = restored.as_ref().and_then(|s| s.view().file_list.clone()) {
             app.start_with_file_list(&list);
         }
+        // W6: the shown tab's file-list slots, before its first search.
+        if let Some(s) = &restored {
+            app.show_tab_slots(&s.view().slots);
+        }
         app.start_search(false);
+        // W6: -edit and -filelist-editor open the File List Editor; alone
+        // (nothing else asked), goz-gui's window is not shown and ends
+        // with it.
+        if launch.edit.is_some() || launch.filelist_editor {
+            app.start_list_editor(launch.edit.as_deref(), editor_only);
+        }
         if let Some(s) = &restored {
             // Its tabs, the shown one's navigation entries, and its place
             // in the results once they come.
@@ -1073,6 +1094,7 @@ impl App {
                     match_case: false,
                     filelist: None,
                     created_sort: None,
+                    slots: Default::default(),
                 }))),
                 icons: Icons::new(hwnd, WM_ICON, WM_TYPES, WM_TYPES_ASK),
                 scratch: RefCell::new(Scratch::default()),
@@ -1339,6 +1361,8 @@ impl App {
         self.theme_mode.set(mode);
         theme::set_app_mode(mode);
         self.apply_theme();
+        // W6: the File List Editor, a window of its own thread, follows.
+        crate::listedit::ui::set_look(self.dialog_look());
         self.settings_changed();
     }
 
@@ -1795,6 +1819,13 @@ impl App {
                 // W4 (G1): the data tools' messages.
                 m if (crate::datatools::MSG_FIRST..crate::datatools::MSG_END).contains(&m) => {
                     self.data_tools_message(m, w, l);
+                    0
+                }
+                // W6 (C): the File List Editor closed.
+                m if (crate::listedit::WM_EDITOR_CLOSED..crate::listedit::W6_MSG_END)
+                    .contains(&m) =>
+                {
+                    self.lists_message(m, w, l);
                     0
                 }
                 WM_SERVICE => {
@@ -2367,6 +2398,8 @@ impl App {
             filelist: self.filelist(),
             // W5: sorted by its Date Created, when that is the sort.
             created_sort: self.created_sort(),
+            // W6: the tab's file-list slots, for filelistN:.
+            slots: self.file_list_slots(),
         });
         let epoch = self.next_epoch.get() + 1;
         self.next_epoch.set(epoch);

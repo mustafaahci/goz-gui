@@ -29,6 +29,8 @@ pub mod create;
 pub mod matcher;
 pub mod parse;
 pub mod settings;
+pub mod slots;
+pub mod wild;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -44,6 +46,7 @@ use goz_winfs::TimeZone;
 
 use crate::client::Row;
 use matcher::{Candidate, Matcher, name_of};
+use slots::{ListMatcher, Slots};
 
 /// Rows in a chunk: the row's number in the list is its chunk's number
 /// times this, plus its place in the chunk.
@@ -158,6 +161,8 @@ pub struct Matched {
     query: String,
     sort: Order,
     match_case: bool,
+    /// The tab's file-list slots the search's `filelistN:` terms read (W6).
+    slots: Arc<Slots>,
     /// The rows read when it was made, and whether that was all of them.
     rows: usize,
     pub complete: bool,
@@ -350,14 +355,16 @@ impl FileList {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// The rows of the list that match `query` (goz's syntax), sorted by
-    /// `sort`; `Ok(None)` when `stale` said it is not wanted any more
-    /// before it was done, an error (goz's words) for a query goz refuses.
+    /// The rows of the list that match `query` (goz's syntax, and W6's
+    /// `filelist:` terms, read with the tab's `slots`), sorted by `sort`;
+    /// `Ok(None)` when `stale` said it is not wanted any more before it
+    /// was done, an error (goz's words) for a query goz refuses.
     pub fn answer(
         &self,
         query: &str,
         sort: Order,
         match_case: bool,
+        slots: &Arc<Slots>,
         stale: &dyn Fn() -> bool,
     ) -> Result<Option<Arc<Matched>>, String> {
         // Whether the list was read whole, then its rows: a chunk published
@@ -371,11 +378,18 @@ impl FileList {
             && last.match_case == match_case
             && last.rows == rows
             && last.complete == complete
+            && (Arc::ptr_eq(&last.slots, slots) || last.slots == *slots)
         {
             return Ok(Some(Arc::clone(last)));
         }
+        // W6: the `filelist:` terms are goz-gui's; the rest is goz's.
+        let (rest, lists) = slots::split_for_list(query, slots)?;
         let parsed =
-            parse_query_at(query, match_case, &MachineClock::read()).map_err(|e| e.to_string())?;
+            parse_query_at(&rest, match_case, &MachineClock::read()).map_err(|e| e.to_string())?;
+        let lists: Vec<ListMatcher> = lists
+            .iter()
+            .map(|names| ListMatcher::new(names, parsed.match_case))
+            .collect();
         let mut matcher = Matcher::new(parsed);
         let mut order = Vec::new();
         let mut total_size = 0u64;
@@ -386,7 +400,8 @@ impl FileList {
                 if tested.is_multiple_of(STALE_EVERY) && stale() {
                     return Ok(None);
                 }
-                if matcher.matches(&chunk.candidate(i)) {
+                let row = chunk.candidate(i);
+                if matcher.matches(&row) && lists.iter().all(|l| l.matches(row.path)) {
                     order.push(((c << CHUNK_SHIFT) | i) as u32);
                     if !chunk.dir[i] {
                         total_size = total_size.saturating_add(chunk.size(i).unwrap_or(0));
@@ -402,6 +417,7 @@ impl FileList {
             query: query.to_owned(),
             sort,
             match_case,
+            slots: Arc::clone(slots),
             rows,
             complete,
             order,
@@ -731,13 +747,57 @@ mod tests {
         (r"C:\a\beta.txt", Some(20), Some(400), false),
     ];
 
+    fn no_slots() -> Arc<Slots> {
+        Arc::new(Slots::default())
+    }
+
     fn names(list: &FileList, query: &str, key: SortKey, dir: SortDir) -> Vec<String> {
         ordered(list, query, Order::Gozd(SortSpec { key, dir }))
     }
 
+    /// W6: `filelist:` and the slots, over a list.
+    #[test]
+    fn filelist_terms_and_slots_in_a_list() {
+        let list = FileList::from_rows(&ROWS);
+        let spec = Order::Gozd(SortSpec::default());
+        let found = |q: &str, slots: &Arc<Slots>| -> Result<Vec<String>, String> {
+            let m = list
+                .answer(q, spec, false, slots, &|| false)?
+                .expect("not stale");
+            Ok(list
+                .rows_of(&m, 0..m.order.len())
+                .iter()
+                .map(|r| String::from_utf16_lossy(&r.path))
+                .collect())
+        };
+        let none = no_slots();
+        assert_eq!(
+            found(r#"filelist:"alpha.txt|C:\b\zeta.txt""#, &none).unwrap(),
+            [r"C:\a\Alpha.TXT", r"C:\b\zeta.txt"]
+        );
+        // With the rest of the search, as AND; a wildcard; a folder.
+        assert_eq!(
+            found(r#"filelist:*.txt "a b\""#, &none).unwrap(),
+            [r"C:\a b\x.txt"]
+        );
+        assert_eq!(found(r"filelist:C:\a\ folder:", &none).unwrap(), [r"C:\a"]);
+        let mut s = Slots::default();
+        s.set(2, vec![r"C:\a\beta.txt".into(), "Y.TXT".into()]);
+        let s = Arc::new(s);
+        assert_eq!(
+            found("filelist2:", &s).unwrap(),
+            [r"C:\a\beta.txt", r"C:\a\x\y.txt"]
+        );
+        // The same search, other slots: not the answer kept.
+        assert!(found("filelist2:", &none).unwrap().is_empty());
+        assert!(found("filelist2:x", &s).is_err());
+        // `|` outside quotes is goz's, which v0.6.0 refuses.
+        assert!(found("filelist:a|b", &none).is_err());
+    }
+
     fn ordered(list: &FileList, query: &str, order: Order) -> Vec<String> {
         let m = list
-            .answer(query, order, false, &|| false)
+            .answer(query, order, false, &no_slots(), &|| false)
             .expect("answers")
             .expect("not stale");
         list.rows_of(&m, 0..m.order.len())
@@ -859,7 +919,13 @@ mod tests {
         );
         assert_eq!(by_dm[0], r"C:\a\old.txt");
         let m = list
-            .answer("", Order::Created(SortDir::Desc), false, &|| false)
+            .answer(
+                "",
+                Order::Created(SortDir::Desc),
+                false,
+                &no_slots(),
+                &|| false,
+            )
             .unwrap()
             .unwrap();
         let rows = list.rows_of(&m, 0..1);
@@ -870,17 +936,26 @@ mod tests {
     fn answers_are_kept_and_refusals_are_gozds() {
         let list = FileList::from_rows(&ROWS);
         let spec = Order::Gozd(SortSpec::default());
-        let a = list.answer("txt", spec, false, &|| false).unwrap().unwrap();
-        let b = list.answer("txt", spec, false, &|| false).unwrap().unwrap();
+        let a = list
+            .answer("txt", spec, false, &no_slots(), &|| false)
+            .unwrap()
+            .unwrap();
+        let b = list
+            .answer("txt", spec, false, &no_slots(), &|| false)
+            .unwrap()
+            .unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(a.order.len(), 5);
         assert_eq!(a.total_size, 80);
         assert!(
-            list.answer("zeta", spec, false, &|| true)
+            list.answer("zeta", spec, false, &no_slots(), &|| true)
                 .unwrap()
                 .is_none()
         );
-        assert!(list.answer("bogus:x", spec, false, &|| false).is_err());
+        assert!(
+            list.answer("bogus:x", spec, false, &no_slots(), &|| false)
+                .is_err()
+        );
     }
 
     #[test]
@@ -913,7 +988,13 @@ mod tests {
         }
         assert_eq!(list.skipped(), 1);
         let m = list
-            .answer("", Order::Gozd(SortSpec::default()), false, &|| false)
+            .answer(
+                "",
+                Order::Gozd(SortSpec::default()),
+                false,
+                &no_slots(),
+                &|| false,
+            )
             .unwrap()
             .unwrap();
         let rows = list.rows_of(&m, 0..10);

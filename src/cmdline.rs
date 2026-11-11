@@ -21,6 +21,11 @@
 //! `-install-efu-association` / `-uninstall-efu-association` (and their
 //! `-current-user-` forms) set the `.efu` association and end; `-wait-pid
 //! <pid>` (goz-gui's own, restarting) waits for that process to end first.
+//!
+//! Wave 6: `-create-file-list-include-only-files <filter>`,
+//! `-exclude-files`, `-include-only-folders` and `-exclude-folders`
+//! (Everything's, see `crate::filelist::create`); `-edit <file>` opens the
+//! list in the File List Editor and `-filelist-editor` the editor alone.
 
 use goz_core::types::{SortDir, SortKey};
 
@@ -66,6 +71,10 @@ pub struct Launch {
     pub create_options: crate::filelist::create::Options,
     /// `-install-efu-association` (true) / `-uninstall-efu-association`.
     pub efu_association: Option<bool>,
+    /// W6: `-edit <file>`: that list in the File List Editor.
+    pub edit: Option<String>,
+    /// W6: `-filelist-editor`: the File List Editor.
+    pub filelist_editor: bool,
     /// `-wait-pid <pid>`: wait for that process to end before starting.
     pub wait_pid: Option<u32>,
 }
@@ -80,6 +89,19 @@ impl Launch {
             || self.dir.is_some()
             || self.match_case.is_some()
             || self.match_path.is_some()
+    }
+
+    /// W6: whether it asks for the File List Editor (`-edit`,
+    /// `-filelist-editor`) and nothing of the window itself: the window is
+    /// not shown for it.
+    pub fn editor_only(&self) -> bool {
+        (self.edit.is_some() || self.filelist_editor)
+            && !self.changes_search()
+            && self.filelist.is_none()
+            && !self.toggle_window
+            && self.preview.is_none()
+            && !self.places_window()
+            && self.new_window != Some(true)
     }
 
     /// Whether it says where the window goes.
@@ -154,12 +176,28 @@ pub fn absolute_file_lists(args: &[String]) -> Vec<String> {
             // The rest of the line is the link.
             "url" | "uri" => args.len() - i,
             "create-file-list" => 2,
-            "s" | "search" | "p" | "path" | "filter" | "sort" | "instance" | "x" | "y"
-            | "width" | "height" | "filelist" | "wait-pid" => 1,
+            "s"
+            | "search"
+            | "p"
+            | "path"
+            | "filter"
+            | "sort"
+            | "instance"
+            | "x"
+            | "y"
+            | "width"
+            | "height"
+            | "filelist"
+            | "edit"
+            | "wait-pid"
+            | "create-file-list-include-only-files"
+            | "create-file-list-exclude-files"
+            | "create-file-list-include-only-folders"
+            | "create-file-list-exclude-folders" => 1,
             _ => 0,
         };
         for value in args.iter().skip(i).take(values) {
-            out.push(if name == "filelist" {
+            out.push(if name == "filelist" || name == "edit" {
                 absolute(value)
             } else {
                 value.clone()
@@ -270,6 +308,24 @@ pub fn parse(args: &[String]) -> Result<Launch, String> {
             "create-file-list-no-subfolders" => l.create_options.subfolders = false,
             "create-file-list-no-folders" => l.create_options.folders = false,
             "create-file-list-no-files" => l.create_options.files = false,
+            // W6: Everything's filters (a `;` list each; given twice, both).
+            "create-file-list-include-only-files"
+            | "create-file-list-exclude-files"
+            | "create-file-list-include-only-folders"
+            | "create-file-list-exclude-folders" => {
+                let filter = value("a filter")?;
+                let o = &mut l.create_options;
+                let slot = match name.as_str() {
+                    "create-file-list-include-only-files" => &mut o.include_only_files,
+                    "create-file-list-exclude-files" => &mut o.exclude_files,
+                    "create-file-list-include-only-folders" => &mut o.include_only_folders,
+                    _ => &mut o.exclude_folders,
+                };
+                crate::filelist::create::add_filter(slot, &filter);
+            }
+            // W6: the File List Editor, with a list to edit or empty.
+            "edit" => l.edit = Some(value("a file list")?),
+            "filelist-editor" => l.filelist_editor = true,
             "install-efu-association" | "install-current-user-efu-association" => {
                 l.efu_association = Some(true);
             }
@@ -376,6 +432,58 @@ mod tests {
         assert_eq!(abs[2], here.join("b.EFU").display().to_string());
         assert_eq!(abs[4], "x.efu", "a search stays as typed");
         assert!(p(&["-wait-pid", "x"]).is_err());
+    }
+
+    #[test]
+    fn create_file_list_filters_and_the_editor() {
+        // Everything's own example, and each filter switch.
+        let l = p(&[
+            "-create-file-list",
+            "music.efu",
+            r"D:\Music",
+            "-create-file-list-include-only-files",
+            "*.mp3;*.flac",
+            "-create-file-list-exclude-folders",
+            "cache",
+            "-Create-File-List-Exclude-Folders",
+            "tmp",
+            "-create-file-list-include-only-folders",
+            "a*",
+            "-create-file-list-exclude-files",
+            "regex:^x",
+        ])
+        .unwrap();
+        let o = &l.create_options;
+        assert_eq!(o.include_only_files.as_deref(), Some("*.mp3;*.flac"));
+        assert_eq!(o.exclude_folders.as_deref(), Some("cache;tmp"));
+        assert_eq!(o.include_only_folders.as_deref(), Some("a*"));
+        assert_eq!(o.exclude_files.as_deref(), Some("regex:^x"));
+        assert!(o.subfolders && o.files && o.folders);
+        assert!(p(&["-create-file-list-exclude-files"]).is_err());
+        // A filter that ends in .efu is a filter, not a list to open.
+        let args: Vec<String> = ["-create-file-list-exclude-files", "*.efu", "-edit", "a.efu"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let abs = absolute_file_lists(&args);
+        assert_eq!(abs[1], "*.efu");
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(abs[3], here.join("a.efu").display().to_string());
+        let l = p(&["-edit", r"C:\x.efu"]).unwrap();
+        assert_eq!(l.edit.as_deref(), Some(r"C:\x.efu"));
+        assert!(l.filelist.is_none() && l.search.is_none());
+        assert!(p(&["-filelist-editor"]).unwrap().filelist_editor);
+        assert!(p(&["-edit"]).is_err());
+        // Alone, they ask for nothing of the window.
+        assert!(p(&["-edit", "a.efu"]).unwrap().editor_only());
+        assert!(
+            p(&["-filelist-editor", "-instance", "x"])
+                .unwrap()
+                .editor_only()
+        );
+        assert!(!p(&["-filelist-editor", "-s", "x"]).unwrap().editor_only());
+        assert!(!p(&["-edit", "a.efu", "-new-window"]).unwrap().editor_only());
+        assert!(!p(&["x"]).unwrap().editor_only());
     }
 
     #[test]

@@ -139,6 +139,9 @@ impl App {
             // W5 (C, the File List Editor): 4750..=4799.
             4750..=4799 => self.list_editor_command(id),
 
+            // W6 (C, file-list slots): 4850..=4899.
+            4850..=4899 => self.lists_command(id),
+
             _ => false,
         }
     }

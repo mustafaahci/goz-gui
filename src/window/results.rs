@@ -444,8 +444,11 @@ impl App {
                 default,
                 extended,
             } => self.show_row_menu(at, default, extended),
+            // W6: File | Set File List Slot N waits the same way.
             Then::FileTool(id) => {
-                self.file_tools_command(id);
+                if !self.lists_command(id) {
+                    self.file_tools_command(id);
+                }
             }
         }
     }

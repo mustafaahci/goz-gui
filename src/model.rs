@@ -380,6 +380,7 @@ mod tests {
             match_case: false,
             filelist: None,
             created_sort: None,
+            slots: Default::default(),
         }))
     }
 

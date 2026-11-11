@@ -101,9 +101,20 @@ pub struct Search {
     /// Wave 5: a file list's matches sorted by its Date Created this way
     /// instead of by `sort` (gozd has no such key; only a list can).
     pub created_sort: Option<SortDir>,
+    /// Wave 6: the tab's file-list slots, which `filelistN:` reads.
+    pub slots: Arc<crate::filelist::slots::Slots>,
 }
 
 impl Search {
+    /// W6: the search as gozd is asked it (`filelist:` terms as groups of
+    /// names when it reads OR, `boolean`), or why it cannot be asked (see
+    /// `crate::filelist::slots::for_gozd`).
+    fn gozd_query(&self, boolean: bool) -> Result<String, Failure> {
+        crate::filelist::slots::for_gozd(&self.query, &self.slots, boolean)
+            .map(std::borrow::Cow::into_owned)
+            .map_err(Failure::Refused)
+    }
+
     /// The order a file list answers this search in.
     pub fn list_order(&self) -> crate::filelist::Order {
         match self.created_sort {
@@ -444,6 +455,12 @@ pub fn stream_range(
     if let Some(list) = &search.filelist {
         return list_stream(stop, search, range, list, page);
     }
+    // W6: what the window's probe learned of gozd's syntax (this
+    // connection is not probed).
+    let query = match search.gozd_query(boolean_syntax()) {
+        Ok(q) => q,
+        Err(f) => return Streamed::Failed(f),
+    };
     let shared = &*stop.0;
     let mut conn = None;
     let pipe = match connect(&mut conn, shared) {
@@ -452,7 +469,7 @@ pub fn stream_range(
         Err(f) => return Streamed::Failed(f),
     };
     let request = Request::Query(QueryRequest {
-        query: search.query.clone(),
+        query,
         scope: None,
         sort: search.sort,
         offset: range.offset,
@@ -564,19 +581,21 @@ fn fetch_block(
         return list_block(shared, epoch, block, search, list);
     }
     let started = Instant::now();
-    let request = Request::Query(QueryRequest {
-        query: search.query.clone(),
-        scope: None,
-        sort: search.sort,
-        offset: block * BLOCK_ROWS,
-        limit: Some(BLOCK_ROWS),
-        want_size: true,
-        want_mtime: true,
-        match_case: search.match_case,
-        // Summing every match costs gozd a pass over them, so only the
-        // first block of a search asks; the status bar shows it.
-        want_total_size: block == 0,
-    });
+    let request = |query: String| {
+        Request::Query(QueryRequest {
+            query,
+            scope: None,
+            sort: search.sort,
+            offset: block * BLOCK_ROWS,
+            limit: Some(BLOCK_ROWS),
+            want_size: true,
+            want_mtime: true,
+            match_case: search.match_case,
+            // Summing every match costs gozd a pass over them, so only the
+            // first block of a search asks; the status bar shows it.
+            want_total_size: block == 0,
+        })
+    };
     let failed = |failure| {
         Some(Reply::Failed {
             epoch,
@@ -590,6 +609,17 @@ fn fetch_block(
         let reused = conn.is_some();
         let pipe = match connect(conn, shared) {
             Ok(p) => p,
+            Err(f) => return failed(f),
+        };
+        // W6: as this connection's probe found gozd (the window's, before
+        // it has heard).
+        let boolean = match shared.syntax.load(Ordering::Relaxed) {
+            2 => true,
+            1 => false,
+            _ => boolean_syntax(),
+        };
+        let request = match search.gozd_query(boolean) {
+            Ok(q) => request(q),
             Err(f) => return failed(f),
         };
         pipe.give_up_at.set(None);
@@ -662,6 +692,7 @@ fn list_block(
         &search.query,
         search.list_order(),
         search.match_case,
+        &search.slots,
         &stale,
     ) {
         Ok(None) => None,
@@ -703,6 +734,7 @@ fn list_stream(
         &search.query,
         search.list_order(),
         search.match_case,
+        &search.slots,
         &stale,
     ) {
         Ok(Some(m)) => m,
@@ -1090,6 +1122,7 @@ mod tests {
                 match_case: false,
                 filelist: None,
                 created_sort: None,
+                slots: Default::default(),
             }),
         }
     }

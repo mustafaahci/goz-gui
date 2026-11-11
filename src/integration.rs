@@ -311,9 +311,12 @@ pub fn set_efu_association(on: bool) -> bool {
             .unwrap_or_default();
         // The program `.efu` had (Everything's, say) is kept to give back.
         let previous = get(&ext, None).filter(|p| p != EFU_PROG_ID && !p.is_empty());
+        // W6: and Everything's Edit verb, the File List Editor's.
+        let edit = cmd.replace(" -filelist \"%1\"", " -edit \"%1\"");
         let ok = set(&prog, None, "Everything File List")
             && set(&format!(r"{prog}\DefaultIcon"), None, &icon)
             && set(&format!(r"{prog}\shell\open\command"), None, &cmd)
+            && set(&format!(r"{prog}\shell\edit\command"), None, &edit)
             && previous.is_none_or(|p| set(&ext, Some(EFU_PREVIOUS), &p))
             && set(&ext, None, EFU_PROG_ID);
         associations_changed();
@@ -484,6 +487,8 @@ mod tests {
         assert!(set_efu_association(true) && has_efu_association());
         let open = get(&format!(r"{}\shell\open\command", efu_prog_key()), None).unwrap();
         assert!(open.ends_with("\" -filelist \"%1\""), "{open}");
+        let edit = get(&format!(r"{}\shell\edit\command", efu_prog_key()), None).unwrap();
+        assert!(edit.ends_with("\" -edit \"%1\""), "{edit}");
         assert!(set_efu_association(false) && !has_efu_association());
         assert_eq!(
             get(&efu_key(), None).as_deref(),

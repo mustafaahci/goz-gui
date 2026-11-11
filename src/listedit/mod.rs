@@ -42,10 +42,20 @@ pub mod cmd {
     /// One past the last.
     pub const END: u16 = FIRST + 50;
 
+    // W6, in wave 6's range (4850..=4899, after the slots' 4850..=4859):
+    // File > Import... and Export...; Edit > Update and Read Extended
+    // Information.
+    pub const IMPORT: u16 = 4860;
+    pub const EXPORT: u16 = 4861;
+    pub const UPDATE: u16 = 4862;
+    pub const READ_EXTENDED: u16 = 4863;
+
     const _: () = {
         assert!(crate::datatools::cmd::END <= FIRST);
         assert!(STOP < END);
         assert!((END as usize) <= crate::menu::SHELL_FIRST as usize);
+        assert!(crate::filelist::slots::cmd::SET_SLOT_END <= IMPORT);
+        assert!(READ_EXTENDED < crate::filelist::slots::cmd::END);
     };
 }
 
@@ -57,9 +67,22 @@ pub const WM_FOUND: u32 = MSG_FIRST;
 pub const WM_SAVED: u32 = MSG_FIRST + 1;
 const MSG_END: u32 = MSG_FIRST + 10;
 
+/// W6 (`WM_APP + 360..370`): the main window's, as the editor closes
+/// (its place is handed back, and a goz-gui started only for the editor
+/// ends with it).
+pub const WM_EDITOR_CLOSED: u32 = WM_APP + 360;
+/// The editor's: open the list `-edit` handed over.
+pub const WM_EDITOR_OPEN: u32 = WM_APP + 361;
+/// The editor's: View > Theme changed (wParam 1 dark, lParam 1 following
+/// the system).
+pub const WM_EDITOR_LOOK: u32 = WM_APP + 362;
+/// One past wave 6's messages.
+pub const W6_MSG_END: u32 = WM_APP + 370;
+
 // Past the main window's ranges (G2's end at WM_APP + 320); the editor's
 // window has no timers.
 const _: () = assert!(MSG_FIRST >= WM_APP + 320 && WM_SAVED < MSG_END);
+const _: () = assert!(MSG_END <= WM_EDITOR_CLOSED && WM_EDITOR_LOOK < W6_MSG_END);
 
 const BACKSLASH: char = '\\';
 /// `FILE_ATTRIBUTE_DIRECTORY`.
@@ -227,25 +250,31 @@ pub fn push_row(e: &Entry, out: &mut String) {
     out.push('"');
     out.push_str(&path.replace('"', "\"\""));
     out.push('"');
-    out.push(',');
-    if let (false, Some(size)) = (e.is_dir, e.size) {
-        out.push_str(&size.to_string());
-    }
-    for date in [e.modified, e.created] {
+    for v in values(e) {
         out.push(',');
-        if let Some(t) = date.filter(|&t| t > 0) {
-            out.push_str(&t.to_string());
-        }
+        out.push_str(&v);
     }
-    out.push(',');
+    out.push_str("\r\n");
+}
+
+/// A row's values after its path, as EFU writes them: its size (none for
+/// a folder), its dates as FILETIMEs, its attributes in decimal; a value
+/// not known is empty.
+fn values(e: &Entry) -> [String; 4] {
+    let size = match (e.is_dir, e.size) {
+        (false, Some(size)) => size.to_string(),
+        _ => String::new(),
+    };
+    let date = |d: Option<i64>| {
+        d.filter(|&t| t > 0)
+            .map_or_else(String::new, |t| t.to_string())
+    };
     let attributes = e
         .attributes
         .or_else(|| e.is_dir.then_some(DIRECTORY))
-        .map(|a| if e.is_dir { a | DIRECTORY } else { a });
-    if let Some(a) = attributes {
-        out.push_str(&a.to_string());
-    }
-    out.push_str("\r\n");
+        .map(|a| if e.is_dir { a | DIRECTORY } else { a })
+        .map_or_else(String::new, |a| a.to_string());
+    [size, date(e.modified), date(e.created), attributes]
 }
 
 /// The whole list as an Everything File List: UTF-8, Everything's header,
@@ -257,6 +286,228 @@ pub fn to_efu(entries: &[Entry]) -> Vec<u8> {
         push_row(e, &mut out);
     }
     out.into_bytes()
+}
+
+/// W6: File > Export...'s file types, in Everything's order (its
+/// `editor_last_export_type` counts them from 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Export {
+    Csv,
+    Efu,
+    M3u,
+    M3u8,
+    Tsv,
+    Txt,
+}
+
+/// How many Export has.
+pub const EXPORT_KINDS: usize = 6;
+
+/// Export...'s file types as its Save dialog lists them (then All Files).
+pub const EXPORT_DIALOG: &[crate::filedlg::Kind] = &[
+    ("CSV Comma Separated Values (*.csv)", "*.csv"),
+    ("EFU Everything File List (*.efu)", "*.efu"),
+    ("M3U Winamp Playlist (*.m3u)", "*.m3u"),
+    ("M3U8 Winamp Playlist (UTF-8) (*.m3u8)", "*.m3u8"),
+    ("TXT Tab Separated Values (*.txt)", "*.txt"),
+    ("TXT Text Files (*.txt)", "*.txt"),
+    ("All Files (*.*)", "*.*"),
+];
+
+/// File > Import...'s file types, as Everything's: what goz-gui's lists
+/// read (an EFU, a CSV with a `Filename` column, a text file of paths).
+pub const IMPORT_DIALOG: &[crate::filedlg::Kind] = &[
+    (
+        "All Supported Files (*.csv;*.efu;*.txt)",
+        "*.csv;*.efu;*.txt",
+    ),
+    ("CSV Comma Separated Values (*.csv)", "*.csv"),
+    ("EFU Everything File List (*.efu)", "*.efu"),
+    ("TXT Text Files (*.txt)", "*.txt"),
+    ("All Files (*.*)", "*.*"),
+];
+
+impl Export {
+    pub const ALL: [Export; EXPORT_KINDS] = [
+        Export::Csv,
+        Export::Efu,
+        Export::M3u,
+        Export::M3u8,
+        Export::Tsv,
+        Export::Txt,
+    ];
+
+    /// Its place in Export...'s list (`editor_last_export_type`); the
+    /// first for one out of range.
+    pub fn at(index: usize) -> Export {
+        Export::ALL.get(index).copied().unwrap_or(Export::Csv)
+    }
+
+    pub fn index(self) -> usize {
+        Export::ALL.iter().position(|&e| e == self).unwrap_or(0)
+    }
+
+    /// The type a file name's extension names, for a test's file
+    /// (`GOZ_GUI_EDITOR_FILE`), where no dialog says it: `.tsv` is TSV, as
+    /// its dialog type writes `.txt`.
+    pub fn of_path(path: &std::path::Path) -> Option<Export> {
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        Some(match ext.as_str() {
+            "csv" => Export::Csv,
+            "efu" => Export::Efu,
+            "m3u" => Export::M3u,
+            "m3u8" => Export::M3u8,
+            "tsv" => Export::Tsv,
+            "txt" => Export::Txt,
+            _ => return None,
+        })
+    }
+
+    /// `entries` written as this type: CSV and EFU as Save writes a list
+    /// (Everything's columns, FILETIMEs), TSV the same columns between
+    /// tabs, TXT the full paths, M3U and M3U8 `#EXTM3U` then the full
+    /// paths (M3U in the system's ANSI code page, Winamp's; the others
+    /// UTF-8).
+    pub fn bytes(self, entries: &[Entry]) -> Vec<u8> {
+        match self {
+            Export::Csv | Export::Efu => to_efu(entries),
+            Export::Tsv => {
+                let mut out = String::with_capacity(64 + entries.len() * 96);
+                out.push_str(&EFU_HEADER.replace(',', "\t"));
+                for e in entries {
+                    out.push_str(&e.path);
+                    if e.is_dir && !e.path.ends_with(BACKSLASH) {
+                        out.push(BACKSLASH);
+                    }
+                    for v in values(e) {
+                        out.push('\t');
+                        out.push_str(&v);
+                    }
+                    out.push_str("\r\n");
+                }
+                out.into_bytes()
+            }
+            Export::Txt | Export::M3u | Export::M3u8 => {
+                let mut out = String::with_capacity(16 + entries.len() * 80);
+                if self != Export::Txt {
+                    out.push_str("#EXTM3U\r\n");
+                }
+                for e in entries {
+                    out.push_str(&e.path);
+                    out.push_str("\r\n");
+                }
+                if self == Export::M3u {
+                    ansi(&out)
+                } else {
+                    out.into_bytes()
+                }
+            }
+        }
+    }
+}
+
+/// `text` in the system's ANSI code page; a character it has not got is
+/// its default character (`?`).
+fn ansi(text: &str) -> Vec<u8> {
+    use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    if wide.is_empty() {
+        return Vec::new();
+    }
+    // SAFETY: two calls on buffers of the lengths given: the first asks
+    // how many bytes, the second writes them.
+    unsafe {
+        let n = WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            wide.len() as i32,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+        );
+        let mut out = vec![0u8; n.max(0) as usize];
+        let written = WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            wide.len() as i32,
+            out.as_mut_ptr(),
+            n,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+        );
+        out.truncate(written.max(0) as usize);
+        out
+    }
+}
+
+/// Whether `path` is under the folder `root` (both folded).
+fn is_under(path: &str, root: &str) -> bool {
+    path.len() > root.len()
+        && path.starts_with(root)
+        && (root.ends_with(BACKSLASH) || path[root.len()..].starts_with(BACKSLASH))
+}
+
+/// W6: Edit > Update's root folders: the folders of the list that no other
+/// folder of it holds (Everything: "Rescan root folders in the file list"),
+/// in the list's order, each with whether the list holds anything below
+/// its own items (it was added with its subfolders, and is walked so
+/// again).
+pub fn roots(entries: &[Entry]) -> Vec<(String, bool)> {
+    let folders: std::collections::HashSet<String> = entries
+        .iter()
+        .filter(|e| e.is_dir)
+        .map(|e| folded(&e.path))
+        .collect();
+    let held = |path: &str| {
+        // Each folder above it, nearest first.
+        let mut p = path;
+        while let Some(i) = p.rfind(BACKSLASH) {
+            let up = if p[..i].ends_with(':') {
+                &p[..=i]
+            } else {
+                &p[..i]
+            };
+            if up.len() >= p.len() {
+                break;
+            }
+            if folders.contains(up) {
+                return true;
+            }
+            p = up;
+        }
+        false
+    };
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for e in entries.iter().filter(|e| e.is_dir) {
+        let key = folded(&e.path);
+        if held(&key) || !seen.insert(key.clone()) {
+            continue;
+        }
+        let deep = entries.iter().any(|x| {
+            let x = folded(&x.path);
+            is_under(&x, &key)
+                && x[key.len()..]
+                    .trim_start_matches(BACKSLASH)
+                    .contains(BACKSLASH)
+        });
+        out.push((e.path.clone(), deep));
+    }
+    out
+}
+
+/// Takes out each row that is one of `roots` or under one; how many went.
+pub fn remove_under(entries: &mut Vec<Entry>, roots: &[String]) -> usize {
+    let roots: Vec<String> = roots.iter().map(|r| folded(r)).collect();
+    let before = entries.len();
+    entries.retain(|e| {
+        let p = folded(&e.path);
+        !roots.iter().any(|r| p == *r || is_under(&p, r))
+    });
+    before - entries.len()
 }
 
 /// How many items, as the status bar says it.
@@ -387,6 +638,78 @@ mod tests {
         assert_eq!(paths(&list), [r"C:\b.txt"]);
         assert_eq!(items_text(1), "1 item");
         assert_eq!(items_text(12_345), "12,345 items");
+    }
+
+    /// W6: Export's types.
+    #[test]
+    fn exports_in_everythings_types() {
+        let list = vec![
+            e(r"C:\x", true, None, Some(5)),
+            e(r"C:\x\a, b.txt", false, Some(12), Some(7)),
+        ];
+        let text = |t: Export| String::from_utf8(t.bytes(&list)).unwrap();
+        assert_eq!(text(Export::Csv), text(Export::Efu));
+        assert_eq!(
+            text(Export::Tsv),
+            "Filename\tSize\tDate Modified\tDate Created\tAttributes\r\n\
+             C:\\x\\\t\t5\t4\t16\r\n\
+             C:\\x\\a, b.txt\t12\t7\t6\t32\r\n"
+        );
+        assert_eq!(text(Export::Txt), "C:\\x\r\nC:\\x\\a, b.txt\r\n");
+        assert_eq!(
+            text(Export::M3u8),
+            "#EXTM3U\r\nC:\\x\r\nC:\\x\\a, b.txt\r\n"
+        );
+        // M3U in the ANSI code page: plain ASCII is the same bytes.
+        assert_eq!(text(Export::M3u), text(Export::M3u8));
+        assert_eq!(Export::at(4), Export::Tsv);
+        assert_eq!(Export::at(99), Export::Csv);
+        assert_eq!(Export::M3u8.index(), 3);
+        assert_eq!(EXPORT_DIALOG.len(), EXPORT_KINDS + 1);
+        assert_eq!(
+            Export::of_path(std::path::Path::new(r"C:\a.TSV")),
+            Some(Export::Tsv)
+        );
+        assert_eq!(Export::of_path(std::path::Path::new("a.bin")), None);
+    }
+
+    /// W6: Update's root folders, and what it takes out to walk again.
+    #[test]
+    fn update_finds_the_root_folders() {
+        let mut list = vec![
+            e(r"C:\loose.txt", false, Some(1), None),
+            e(r"C:\a", true, None, None),
+            e(r"C:\a\f.txt", false, Some(1), None),
+            e(r"C:\a\sub", true, None, None),
+            e(r"C:\a\sub\deep.txt", false, Some(1), None),
+            e(r"D:\flat", true, None, None),
+            e(r"D:\flat\g.txt", false, Some(1), None),
+            e(r"D:\flat\inner", true, None, None),
+            // Under C:\a though C:\a\x is not listed: no root of its own.
+            e(r"c:\A\x\y", true, None, None),
+            e(r"E:\", true, None, None),
+            e(r"E:\z.txt", false, Some(1), None),
+        ];
+        assert_eq!(
+            roots(&list),
+            [
+                (r"C:\a".to_owned(), true),
+                (r"D:\flat".to_owned(), false),
+                (r"E:\".to_owned(), false)
+            ]
+        );
+        let gone = remove_under(&mut list, &[r"C:\a".into(), r"E:\".into()]);
+        assert_eq!(gone, 7);
+        assert_eq!(
+            paths(&list),
+            [
+                r"C:\loose.txt",
+                r"D:\flat",
+                r"D:\flat\g.txt",
+                r"D:\flat\inner"
+            ]
+        );
+        assert!(roots(&[e(r"C:\f.txt", false, None, None)]).is_empty());
     }
 
     #[test]
