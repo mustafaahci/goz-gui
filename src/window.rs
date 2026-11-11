@@ -1260,6 +1260,13 @@ impl App {
         self.ui_fonts.borrow().normal
     }
 
+    /// The window's own font, or its bold (a part whose Fonts and Colors
+    /// style is Bold).
+    pub fn ui_font_of(&self, bold: bool) -> HFONT {
+        let f = self.ui_fonts.borrow();
+        if bold { f.bold } else { f.normal }
+    }
+
     /// A result row: 19 px at 100 % with the usual 9 pt message font, as
     /// in Everything 1.5; never shorter than the row's icon.
     pub fn row_height(&self) -> i32 {
@@ -1373,6 +1380,17 @@ impl App {
             }),
         );
         theme::set_class(self.edit, dark.then_some("DarkMode_CFD"));
+        // The search box's style (Fonts and Colors' Search Edit) is the
+        // theme's own.
+        let current = send(
+            self.edit,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_GETFONT,
+            0,
+            0,
+        ) as HFONT;
+        if self.search_font() != current {
+            send(self.edit, WM_SETFONT, self.search_font() as usize, 1);
+        }
         send(self.list, LVM_SETBKCOLOR, 0, pal.list_bg as isize);
         send(self.list, LVM_SETTEXTBKCOLOR, 0, pal.list_bg as isize);
         send(self.list, LVM_SETTEXTCOLOR, 0, pal.list_fg as isize);
@@ -1600,10 +1618,22 @@ impl App {
                 WM_ERASEBKGND => 1,
                 WM_CTLCOLOREDIT => {
                     let pal = self.pal.get();
-                    SetTextColor(w as _, pal.fg);
-                    SetBkColor(w as _, pal.bg);
+                    // The search box in Fonts and Colors' Search Edit.
+                    let ink = if l as HWND == self.edit {
+                        pal.ink(
+                            crate::colors::Item::SearchEdit,
+                            crate::colors::State::Normal,
+                        )
+                    } else {
+                        crate::theme::Ink {
+                            fg: pal.fg,
+                            bg: pal.bg,
+                        }
+                    };
+                    SetTextColor(w as _, ink.fg);
+                    SetBkColor(w as _, ink.bg);
                     // The edit erases with the brush returned, on its own DC.
-                    SetDCBrushColor(w as _, pal.bg);
+                    SetDCBrushColor(w as _, ink.bg);
                     GetStockObject(DC_BRUSH) as LRESULT
                 }
                 WM_MOUSEMOVE => {
@@ -1965,9 +1995,13 @@ impl App {
                     .accessible_object(w)
                     .unwrap_or_else(|| DefWindowProcW(self.hwnd, msg, w, l)),
                 WM_SETTINGCHANGE => {
-                    if self.theme_mode.get() == ThemeMode::UserDefault
-                        && l != 0
+                    if l != 0
                         && is_wide(l as *const u16, "ImmersiveColorSet")
+                        && (self.theme_mode.get() == ThemeMode::UserDefault
+                            // Windows' accent changed, which Fonts and
+                            // Colors' accent of Default follows.
+                            || self.custom_palette(self.pal.get().dark).inks
+                                != self.pal.get().inks)
                     {
                         self.apply_theme();
                     }
@@ -1981,15 +2015,15 @@ impl App {
                     };
                     0
                 }
-                paint::WM_UAHDRAWMENU if self.pal.get().dark => {
+                paint::WM_UAHDRAWMENU if paint::draws_menubar(&self.pal.get()) => {
                     paint::menubar(self, &*(l as *const paint::UahMenu));
                     1
                 }
-                paint::WM_UAHDRAWMENUITEM if self.pal.get().dark => {
+                paint::WM_UAHDRAWMENUITEM if paint::draws_menubar(&self.pal.get()) => {
                     paint::menubar_item(self, &*(l as *const paint::UahDrawMenuItem));
                     1
                 }
-                WM_NCPAINT | WM_NCACTIVATE if self.pal.get().dark => {
+                WM_NCPAINT | WM_NCACTIVATE if paint::draws_menubar(&self.pal.get()) => {
                     let r = DefWindowProcW(self.hwnd, msg, w, l);
                     paint::menubar_line(self);
                     r
@@ -3063,9 +3097,9 @@ unsafe extern "system" fn list_proc(
             // Rename's box, the list's child, in the list's colours.
             WM_CTLCOLOREDIT => {
                 let pal = app.pal.get();
-                SetTextColor(w as _, pal.fg);
-                SetBkColor(w as _, pal.bg);
-                SetDCBrushColor(w as _, pal.bg);
+                SetTextColor(w as _, pal.list_fg);
+                SetBkColor(w as _, pal.list_bg);
+                SetDCBrushColor(w as _, pal.list_bg);
                 return GetStockObject(DC_BRUSH) as LRESULT;
             }
             // The list taking the keyboard means the search was the one

@@ -23,6 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, GetWindowTextLengthW, SendMessageW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+use crate::colors::{Item, State};
 use crate::paint::fill;
 use crate::theme::{self, Palette};
 use crate::window::App;
@@ -290,7 +291,7 @@ pub fn paint(app: &App, hdc: HDC) {
         } else {
             open || hot == Some(button)
         };
-        let (fg, bg) = colours(&pal, lit);
+        let (fg, bg) = colours(&pal, pal.ink(Item::SearchEdit, State::Normal).bg, lit);
         fill(hdc, &rc, bg);
         let cx = (rc.left + rc.right) / 2;
         let cy = (rc.top + rc.bottom) / 2;
@@ -696,6 +697,8 @@ pub fn paint_filter_bar(app: &App, hdc: HDC, rc: RECT, name: &str, open: bool) {
         return;
     }
     let pal = app.pal.get();
+    // Options > Fonts and Colors' Filter Bar.
+    let ink = pal.ink(Item::FilterBar, State::Normal);
     fill(hdc, &rc, pal.border);
     let inner = RECT {
         left: rc.left + 1,
@@ -703,12 +706,12 @@ pub fn paint_filter_bar(app: &App, hdc: HDC, rc: RECT, name: &str, open: bool) {
         right: rc.right - 1,
         bottom: rc.bottom - 1,
     };
-    fill(hdc, &inner, pal.bg);
+    fill(hdc, &inner, ink.bg);
     let button = RECT {
         left: (inner.right - app.scale(17)).max(inner.left),
         ..inner
     };
-    let (fg, bg) = colours(&pal, open);
+    let (fg, bg) = colours(&pal, ink.bg, open);
     fill(hdc, &button, bg);
     let scale = app.dpi.get() as f32 / 96.0;
     let (cx, cy) = (
@@ -726,12 +729,12 @@ pub fn paint_filter_bar(app: &App, hdc: HDC, rc: RECT, name: &str, open: bool) {
         right: button.left - app.scale(2),
         ..inner
     };
-    let font = app.ui_font();
+    let font = app.ui_font_of(pal.is_bold(Item::FilterBar, State::Normal));
     // SAFETY: draws into the paint buffer; the old font is put back.
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, pal.fg);
+        SetTextColor(hdc, ink.fg);
         DrawTextW(
             hdc,
             text.as_mut_ptr(),
@@ -743,13 +746,13 @@ pub fn paint_filter_bar(app: &App, hdc: HDC, rc: RECT, name: &str, open: bool) {
     }
 }
 
-/// A button's glyph and background colours, lit (under the mouse, held
-/// down, or its dropdown open) or not.
-fn colours(pal: &Palette, lit: bool) -> (u32, u32) {
+/// A button's glyph and background colours on a field of `bg`, lit (under
+/// the mouse, held down, or its dropdown open) or not.
+fn colours(pal: &Palette, bg: u32, lit: bool) -> (u32, u32) {
     if lit {
         (pal.glyph_hot, pal.glyph_hot_bg)
     } else {
-        (pal.glyph, pal.bg)
+        (pal.glyph, bg)
     }
 }
 
@@ -915,11 +918,17 @@ mod tests {
     fn lit_buttons_use_the_hot_colours() {
         let dark = Palette::new(true);
         assert_eq!(
-            colours(&dark, true),
+            colours(&dark, dark.bg, true),
             (rgb(0xff, 0xff, 0xff), rgb(0x3a, 0x3a, 0x3a))
         );
-        assert_eq!(colours(&dark, false), (rgb(0xb4, 0xb4, 0xb4), dark.bg));
+        assert_eq!(
+            colours(&dark, dark.bg, false),
+            (rgb(0xb4, 0xb4, 0xb4), dark.bg)
+        );
         let light = Palette::new(false);
-        assert_eq!(colours(&light, false), (rgb(0x60, 0x60, 0x60), light.bg));
+        assert_eq!(
+            colours(&light, light.bg, false),
+            (rgb(0x60, 0x60, 0x60), light.bg)
+        );
     }
 }

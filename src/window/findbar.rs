@@ -48,11 +48,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::{App, Fonts, key_down, send, slots};
 use crate::client::{self, RowRange, Search, Stop, Streamed};
+use crate::colors::{Item as ColorItem, State as ColorState};
 use crate::find::{self, Gate, Needle, Part, Side, Walked};
 use crate::highlight::Span;
 use crate::paint::fill;
 use crate::strip::{Strip, StripSlot};
-use crate::theme::{self, rgb};
+use crate::theme::{self, Ink, Palette, rgb};
 use crate::wide::{window_text, wz};
 use crate::{hover, searchbox};
 
@@ -94,6 +95,21 @@ fn inside(rc: &RECT, pt: POINT) -> bool {
 
 fn empty(rc: &RECT) -> bool {
     rc.right <= rc.left || rc.bottom <= rc.top
+}
+
+/// The find box's colours: the search field's, unless Fonts and Colors
+/// gives the Find Bar a background of its own, which the box then shares
+/// with the bar (and its text).
+fn field_ink(pal: &Palette) -> Ink {
+    let bar = pal.ink(ColorItem::FindBar, ColorState::Normal);
+    if pal.is_own(ColorItem::FindBar, ColorState::Normal) && bar.bg != pal.chrome {
+        bar
+    } else {
+        Ink {
+            fg: pal.fg,
+            bg: pal.bg,
+        }
+    }
 }
 
 /// The find bar: its controls (made the first time it shows), the buttons
@@ -281,7 +297,7 @@ impl FindBar {
                 rgb(0xff, 0xbf, 0xbf)
             }
         } else {
-            pal.bg
+            field_ink(&pal).bg
         }
     }
 
@@ -529,7 +545,8 @@ impl Strip for FindBar {
 
     fn paint(&self, app: &App, hdc: HDC, rc: &RECT) {
         let pal = app.pal.get();
-        fill(hdc, rc, pal.chrome);
+        let bar = pal.ink(ColorItem::FindBar, ColorState::Normal);
+        fill(hdc, rc, bar.bg);
         let g = self.geo.get();
         if !empty(&g.frame) {
             fill(hdc, &g.frame, pal.border);
@@ -554,7 +571,7 @@ impl Strip for FindBar {
             let bg = match (hot, pressed) {
                 (true, true) => pal.header_pressed,
                 (true, false) => pal.header_hot,
-                _ => pal.chrome,
+                _ => bar.bg,
             };
             let fg = if !usable {
                 pal.border
@@ -735,7 +752,7 @@ impl Strip for FindBar {
                 // SAFETY: the DC the box is about to draw with; the DC
                 // brush takes the colour set on that DC.
                 unsafe {
-                    SetTextColor(w as HDC, pal.fg);
+                    SetTextColor(w as HDC, field_ink(&pal).fg);
                     SetBkColor(w as HDC, colour);
                     SetDCBrushColor(w as HDC, colour);
                     Some(GetStockObject(DC_BRUSH) as LRESULT)
@@ -743,10 +760,11 @@ impl Strip for FindBar {
             }
             WM_CTLCOLORSTATIC => {
                 // SAFETY: as above, for a check box on the bar's chrome.
+                let bar = pal.ink(ColorItem::FindBar, ColorState::Normal);
                 unsafe {
-                    SetTextColor(w as HDC, pal.fg);
-                    SetBkColor(w as HDC, pal.chrome);
-                    SetDCBrushColor(w as HDC, pal.chrome);
+                    SetTextColor(w as HDC, bar.fg);
+                    SetBkColor(w as HDC, bar.bg);
+                    SetDCBrushColor(w as HDC, bar.bg);
                     Some(GetStockObject(DC_BRUSH) as LRESULT)
                 }
             }

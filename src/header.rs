@@ -27,6 +27,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetWindowRect, SendMessageW, WM_CONTEXTMENU, WM_MBUTTONUP, WM_MOUSEMOVE,
 };
 
+use crate::colors::{Item, State};
 use crate::paint::fill;
 use crate::window::App;
 
@@ -245,12 +246,25 @@ fn item(app: &App, cd: &NMCUSTOMDRAW) {
     } else {
         DT_LEFT
     };
-    let font = app.fonts.borrow().normal;
+    // Options > Fonts and Colors' Header: Normal, or Current Sort.
+    let state = if sorted {
+        State::CurrentSort
+    } else {
+        State::Normal
+    };
+    let font = {
+        let fonts = app.fonts.borrow();
+        if pal.is_bold(Item::Header, state) {
+            fonts.bold
+        } else {
+            fonts.normal
+        }
+    };
     // SAFETY: draws into the header's DC; the old font is put back.
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, pal.fg);
+        SetTextColor(hdc, pal.ink(Item::Header, state).fg);
         DrawTextW(
             hdc,
             text.as_mut_ptr(),

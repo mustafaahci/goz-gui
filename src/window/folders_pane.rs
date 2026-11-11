@@ -58,11 +58,12 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
-    HTREEITEM, NMHDR, NMTREEVIEWW, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW,
-    TTM_SETMAXTIPWIDTH, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, TVC_BYMOUSE,
-    TVE_EXPAND, TVM_DELETEITEM, TVM_SETEXTENDEDSTYLE, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW,
-    TVS_EX_AUTOHSCROLL, TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_LINESATROOT,
-    TVS_NOHSCROLL, TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT, WC_TREEVIEWW,
+    HTREEITEM, NM_CUSTOMDRAW, NMHDR, NMTREEVIEWW, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW,
+    TTM_NEWTOOLRECTW, TTM_SETMAXTIPWIDTH, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX,
+    TTTOOLINFOW, TVC_BYMOUSE, TVE_EXPAND, TVM_DELETEITEM, TVM_SETEXTENDEDSTYLE, TVN_ITEMEXPANDINGW,
+    TVN_SELCHANGEDW, TVS_EX_AUTOHSCROLL, TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS,
+    TVS_LINESATROOT, TVS_NOHSCROLL, TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT,
+    WC_TREEVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -887,6 +888,14 @@ impl FoldersPane {
             return None;
         }
         match hdr.code {
+            // Options > Fonts and Colors' Folders Sidebar states.
+            NM_CUSTOMDRAW => Some(treeview::custom_draw(
+                hdr.hwndFrom,
+                l,
+                &app.pal.get(),
+                crate::colors::Item::FoldersSidebar,
+                app.ui_font_of(true),
+            )),
             TVN_ITEMEXPANDINGW => {
                 // SAFETY: as above.
                 let nm = unsafe { &*(l as *const NMTREEVIEWW) };
@@ -1360,6 +1369,13 @@ fn shell_part(
 }
 
 impl crate::pane::PaneContent for FoldersPane {
+    fn colours(&self, app: &App) -> crate::theme::Ink {
+        app.pal.get().ink(
+            crate::colors::Item::FoldersSidebar,
+            crate::colors::State::Normal,
+        )
+    }
+
     fn create(&self, app: &App, pane: HWND) {
         self.pane.set(pane);
         let style = WS_CHILD
@@ -1423,7 +1439,7 @@ impl crate::pane::PaneContent for FoldersPane {
         self.send(TVM_SETEXTENDEDSTYLE, ex as usize, ex as isize);
         self.plain_folder.set(treeview::plain_icons().0);
         self.fit_dpi(app);
-        treeview::apply_theme(tree, &app.pal.get());
+        treeview::apply_theme(tree, &app.pal.get(), crate::colors::Item::FoldersSidebar);
         if !tip.is_null() {
             let mut text = wz(subfolders_tip());
             let info = self.tool(RECT::default(), &mut text);
@@ -1622,7 +1638,11 @@ impl crate::pane::PaneContent for FoldersPane {
     }
 
     fn theme(&self, app: &App, dark: bool) {
-        treeview::apply_theme(self.tree.get(), &app.pal.get());
+        treeview::apply_theme(
+            self.tree.get(),
+            &app.pal.get(),
+            crate::colors::Item::FoldersSidebar,
+        );
         theme_tip(self.tip.get(), dark);
         // SAFETY: repaints this pane's tree.
         unsafe { InvalidateRect(self.tree.get(), core::ptr::null(), 1) };

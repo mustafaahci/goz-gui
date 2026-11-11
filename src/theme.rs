@@ -16,7 +16,15 @@ use windows_sys::Win32::System::LibraryLoader::{
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows_sys::Win32::UI::Controls::SetWindowTheme;
 
+use crate::colors::{Item, SLOTS, State, slot};
 use crate::wide::wz;
+
+/// A part's text and background colours.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ink {
+    pub fg: u32,
+    pub bg: u32,
+}
 
 pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
@@ -104,13 +112,23 @@ pub struct Palette {
     pub sel_inactive_fg: u32,
     pub hover_fg: u32,
     pub sort_fg: u32,
+    /// The text of the alternate rows, of their sorted cells, and of the
+    /// sorted cell under the mouse.
+    pub alt_fg: u32,
+    pub alt_sort_fg: u32,
+    pub hover_sort_fg: u32,
     /// Matched text (Normal (Highlighted)): its colour and background when
     /// chosen, and whether it is bold (the default).
     pub hl_fg: Option<u32>,
     pub hl_bg: Option<u32>,
     pub hl_bold: bool,
-    /// The row states whose text is bold (`colors::BOLD_*`).
-    pub bold_rows: u8,
+    /// Every item state's colours (`crate::colors::slot`): the theme's
+    /// (`colors::theme_inks`), with Fonts and Colors' put in.
+    pub inks: [Ink; SLOTS],
+    /// The item states whose colours are not the theme's, and those whose
+    /// text is bold (bits by slot).
+    pub own: u64,
+    pub bold: u64,
 }
 
 impl Palette {
@@ -123,13 +141,34 @@ impl Palette {
         p.sel_inactive_fg = p.fg;
         p.hover_fg = p.fg;
         p.sort_fg = p.fg;
+        p.alt_fg = p.fg;
+        p.alt_sort_fg = p.fg;
+        p.hover_sort_fg = p.fg;
+        p.inks = crate::colors::theme_inks(&p);
         p
+    }
+
+    /// `item`'s colours in `state`.
+    pub fn ink(&self, item: Item, state: State) -> Ink {
+        self.inks[slot(item, state)]
+    }
+
+    /// `item` in `state` is not in the theme's colours.
+    pub fn is_own(&self, item: Item, state: State) -> bool {
+        self.own & 1 << slot(item, state) != 0
+    }
+
+    /// `item`'s text in `state` is bold.
+    pub fn is_bold(&self, item: Item, state: State) -> bool {
+        self.bold & 1 << slot(item, state) != 0
     }
 
     fn sampled(dark: bool) -> Palette {
         // Set from `bg` and `fg` by `new`.
         let (list_bg, list_fg, sel_fg, sel_inactive_fg, hover_fg, sort_fg) = (0, 0, 0, 0, 0, 0);
-        let (hl_fg, hl_bg, hl_bold, bold_rows) = (None, None, true, 0);
+        let (alt_fg, alt_sort_fg, hover_sort_fg) = (0, 0, 0);
+        let (hl_fg, hl_bg, hl_bold) = (None, None, true);
+        let (inks, own, bold) = ([Ink::default(); SLOTS], 0, 0);
         if dark {
             Palette {
                 dark,
@@ -169,10 +208,15 @@ impl Palette {
                 sel_inactive_fg,
                 hover_fg,
                 sort_fg,
+                alt_fg,
+                alt_sort_fg,
+                hover_sort_fg,
                 hl_fg,
                 hl_bg,
                 hl_bold,
-                bold_rows,
+                inks,
+                own,
+                bold,
             }
         } else {
             Palette {
@@ -213,10 +257,15 @@ impl Palette {
                 sel_inactive_fg,
                 hover_fg,
                 sort_fg,
+                alt_fg,
+                alt_sort_fg,
+                hover_sort_fg,
                 hl_fg,
                 hl_bg,
                 hl_bold,
-                bold_rows,
+                inks,
+                own,
+                bold,
             }
         }
     }
@@ -241,6 +290,34 @@ pub fn system_dark() -> bool {
         )
     };
     rc == ERROR_SUCCESS && data == 0
+}
+
+/// Windows' accent colour (Settings > Personalization > Colors), for an
+/// accent of Default in Options > Fonts and Colors; Windows' default blue
+/// if it cannot be read.
+pub fn system_accent() -> u32 {
+    let key = wz(r"Software\Microsoft\Windows\DWM");
+    let value = wz("AccentColor");
+    let mut data: u32 = 0;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: reads one DWORD into `data`, whose size is passed.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            core::ptr::null_mut(),
+            (&raw mut data).cast(),
+            &mut size,
+        )
+    };
+    if rc == ERROR_SUCCESS {
+        // 0xAABBGGRR: the low three bytes are a COLORREF.
+        data & 0x00ff_ffff
+    } else {
+        rgb(0x00, 0x78, 0xd4)
+    }
 }
 
 struct Uxtheme {

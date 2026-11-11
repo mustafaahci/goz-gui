@@ -45,11 +45,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::{App, point};
+use crate::colors::{Item as ColorItem, State as ColorState};
 use crate::dock::PaneId;
 use crate::filter::Filter;
 use crate::paint::fill;
 use crate::pane::{PaneContent, PaneEvent};
-use crate::theme;
+use crate::theme::{self, Ink};
 use crate::wide::nul;
 use crate::{menu, searchtools};
 
@@ -219,13 +220,10 @@ impl FiltersPane {
         // SAFETY: reads this thread's focus.
         let focused = unsafe { GetFocus() } == list;
         let pal = app.pal.get();
-        let bg = match (selected, focused) {
-            (true, true) => pal.sel,
-            (true, false) => pal.sel_inactive,
-            _ if hot => pal.hover,
-            _ => pal.bg,
-        };
-        fill(hdc, &rc, bg);
+        // Options > Fonts and Colors' Filters Sidebar, in the row's state.
+        let state = ColorState::of_row(selected, focused, hot);
+        let ink = pal.ink(ColorItem::FiltersSidebar, state);
+        fill(hdc, &rc, ink.bg);
         let Some(name) = self.shown.borrow().get(index).map(|(name, _)| name.clone()) else {
             return;
         };
@@ -237,9 +235,10 @@ impl FiltersPane {
         };
         // SAFETY: draws into the list's paint DC; the old font is put back.
         unsafe {
-            let old = SelectObject(hdc, app.ui_font());
+            let font = app.ui_font_of(pal.is_bold(ColorItem::FiltersSidebar, state));
+            let old = SelectObject(hdc, font);
             SetBkMode(hdc, TRANSPARENT as i32);
-            SetTextColor(hdc, pal.fg);
+            SetTextColor(hdc, ink.fg);
             DrawTextW(
                 hdc,
                 text.as_mut_ptr(),
@@ -274,7 +273,7 @@ impl FiltersPane {
             0
         };
         if top < client.bottom {
-            fill(hdc, &RECT { top, ..client }, app.pal.get().bg);
+            fill(hdc, &RECT { top, ..client }, filters_ink(app).bg);
         }
     }
 
@@ -288,6 +287,7 @@ impl FiltersPane {
 
     fn apply_theme(&self, app: &App) {
         let pal = app.pal.get();
+        let ink = filters_ink(app);
         let list = self.list.get();
         theme::allow(list, pal.dark);
         theme::set_class(
@@ -298,9 +298,9 @@ impl FiltersPane {
                 "Explorer"
             }),
         );
-        self.send(LVM_SETBKCOLOR, 0, pal.bg as isize);
-        self.send(LVM_SETTEXTBKCOLOR, 0, pal.bg as isize);
-        self.send(LVM_SETTEXTCOLOR, 0, pal.fg as isize);
+        self.send(LVM_SETBKCOLOR, 0, ink.bg as isize);
+        self.send(LVM_SETTEXTBKCOLOR, 0, ink.bg as isize);
+        self.send(LVM_SETTEXTCOLOR, 0, ink.fg as isize);
     }
 
     /// The filter list as a menu at `l` (screen), or under the chosen entry
@@ -358,7 +358,18 @@ impl App {
     }
 }
 
+/// The list's colours: Options > Fonts and Colors' Filters Sidebar.
+fn filters_ink(app: &App) -> Ink {
+    app.pal
+        .get()
+        .ink(ColorItem::FiltersSidebar, ColorState::Normal)
+}
+
 impl PaneContent for FiltersPane {
+    fn colours(&self, app: &App) -> Ink {
+        filters_ink(app)
+    }
+
     fn create(&self, app: &App, pane: HWND) {
         self.pane.set(pane);
         // SAFETY: a child of this thread's pane window.

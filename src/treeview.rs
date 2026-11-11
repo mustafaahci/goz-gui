@@ -9,17 +9,21 @@
 //! scaled down to it, never up.
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::{HFONT, SelectObject};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::UI::Controls::{
-    HIMAGELIST, HTREEITEM, ILC_COLOR32, ILC_MASK, ILD_NORMAL, ImageList_Create, ImageList_Destroy,
-    ImageList_GetIcon, ImageList_GetIconSize, ImageList_ReplaceIcon, ImageList_SetImageCount,
-    TVE_COLLAPSE, TVE_EXPAND, TVGN_CARET, TVGN_CHILD, TVGN_DROPHILITE, TVGN_NEXT, TVHITTESTINFO,
-    TVI_FIRST, TVI_LAST, TVI_ROOT, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE,
-    TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW,
-    TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM,
-    TVM_GETTOOLTIPS, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETBKCOLOR,
-    TVM_SETIMAGELIST, TVM_SETITEMHEIGHT, TVM_SETITEMW, TVM_SETTEXTCOLOR, TVSIL_NORMAL,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_HOT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NEWFONT,
+    CDRF_NOTIFYITEMDRAW, HIMAGELIST, HTREEITEM, ILC_COLOR32, ILC_MASK, ILD_NORMAL,
+    ImageList_Create, ImageList_Destroy, ImageList_GetIcon, ImageList_GetIconSize,
+    ImageList_ReplaceIcon, ImageList_SetImageCount, NMTVCUSTOMDRAW, TVE_COLLAPSE, TVE_EXPAND,
+    TVGN_CARET, TVGN_CHILD, TVGN_DROPHILITE, TVGN_NEXT, TVHITTESTINFO, TVI_FIRST, TVI_LAST,
+    TVI_ROOT, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE, TVIF_STATE, TVIF_TEXT,
+    TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVM_DELETEITEM, TVM_ENSUREVISIBLE,
+    TVM_EXPAND, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_GETTOOLTIPS, TVM_HITTEST,
+    TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETIMAGELIST, TVM_SETITEMHEIGHT,
+    TVM_SETITEMW, TVM_SETTEXTCOLOR, TVSIL_NORMAL,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows_sys::Win32::UI::Shell::{
     SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGSI_SYSICONINDEX,
     SHGetFileInfoW, SHGetImageList, SHGetStockIconInfo, SHSTOCKICONINFO, SIID_FIND,
@@ -27,6 +31,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON, SendMessageW, WM_SETFONT};
 use windows_sys::core::GUID;
 
+use crate::colors::{Item, State};
 use crate::theme::{self, Palette};
 use crate::wide::{nul, wz};
 
@@ -225,23 +230,75 @@ pub fn item_rect(tree: HWND, item: HTREEITEM, text: bool) -> RECT {
     rc
 }
 
-/// The tree in the window's colours: the list's background and text, the
-/// Explorer look (its hover and selection, dark ones in the dark theme),
-/// and its tooltips to match.
-pub fn apply_theme(tree: HWND, pal: &Palette) {
+/// The tree in `item`'s colours (Options > Fonts and Colors' sidebar: its
+/// Normal background and text), the Explorer look (its hover and
+/// selection, dark ones in the dark theme, where [`custom_draw`] leaves
+/// them), and its tooltips to match.
+pub fn apply_theme(tree: HWND, pal: &Palette, item: Item) {
     let class = if pal.dark {
         "DarkMode_Explorer"
     } else {
         "Explorer"
     };
+    let ink = pal.ink(item, State::Normal);
     theme::allow(tree, pal.dark);
     theme::set_class(tree, Some(class));
-    send(tree, TVM_SETBKCOLOR, 0, pal.bg as isize);
-    send(tree, TVM_SETTEXTCOLOR, 0, pal.fg as isize);
+    send(tree, TVM_SETBKCOLOR, 0, ink.bg as isize);
+    send(tree, TVM_SETTEXTCOLOR, 0, ink.fg as isize);
     let tip = send(tree, TVM_GETTOOLTIPS, 0, 0) as HWND;
     if !tip.is_null() {
         theme::allow(tip, pal.dark);
         theme::set_class(tip, Some(class));
+    }
+}
+
+/// The states of a sidebar's rows besides Normal (whose colours are the
+/// tree's own, [`apply_theme`]).
+const ROW_STATES: [State; 3] = [State::Selected, State::InactiveSelected, State::Mouseover];
+
+/// A sidebar tree's `NM_CUSTOMDRAW` (`l`), for Options > Fonts and
+/// Colors' `item`: a row in a state whose colours are not the theme's
+/// (chosen, or tinted by an accent) is filled with them and keeps no
+/// selection or hover of the visual style; a row whose style is Bold gets
+/// `bold`. Every other row is the visual style's.
+pub fn custom_draw(tree: HWND, l: isize, pal: &Palette, item: Item, bold: HFONT) -> isize {
+    // SAFETY: a tree view's NM_CUSTOMDRAW carries an NMTVCUSTOMDRAW, which
+    // the tree reads back after this returns.
+    let cd = unsafe { &mut *(l as *mut NMTVCUSTOMDRAW) };
+    let wanted = ROW_STATES.iter().any(|&s| pal.is_own(item, s))
+        || [
+            State::Normal,
+            State::Selected,
+            State::InactiveSelected,
+            State::Mouseover,
+        ]
+        .iter()
+        .any(|&s| pal.is_bold(item, s));
+    match cd.nmcd.dwDrawStage {
+        CDDS_PREPAINT if wanted => CDRF_NOTIFYITEMDRAW as isize,
+        CDDS_ITEMPREPAINT => {
+            let st = cd.nmcd.uItemState;
+            // SAFETY: reads this thread's focus.
+            let focused = unsafe { GetFocus() } == tree;
+            let state = State::of_row(st & CDIS_SELECTED != 0, focused, st & CDIS_HOT != 0);
+            let mut answer = CDRF_DODEFAULT;
+            if state != State::Normal && pal.is_own(item, state) {
+                let ink = pal.ink(item, state);
+                crate::paint::fill(cd.nmcd.hdc, &cd.nmcd.rc, ink.bg);
+                cd.nmcd.uItemState &= !(CDIS_SELECTED | CDIS_HOT);
+                cd.clrText = ink.fg;
+                cd.clrTextBk = ink.bg;
+                answer = CDRF_NEWFONT;
+            }
+            if pal.is_bold(item, state) {
+                // SAFETY: the tree's DC for this item; the tree puts its own
+                // font back after the item (CDRF_NEWFONT).
+                unsafe { SelectObject(cd.nmcd.hdc, bold) };
+                answer = CDRF_NEWFONT;
+            }
+            answer as isize
+        }
+        _ => CDRF_DODEFAULT as isize,
     }
 }
 

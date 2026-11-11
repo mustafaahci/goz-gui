@@ -33,6 +33,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::App;
+use crate::colors::{Item as ColorItem, State as ColorState};
 use crate::paint::fill;
 use crate::searchbox::paint_cross;
 use crate::strip::{Strip, StripSlot};
@@ -57,11 +58,16 @@ struct Down {
 
 /// The strip's colours, from the theme's.
 struct Colours {
+    /// The strip, and the text of the tabs not shown (Fonts and Colors'
+    /// Tabs: Normal).
+    strip: u32,
+    text: u32,
     line: u32,
+    /// The shown tab and its text (Tabs: Selected).
     selected: u32,
+    selected_text: u32,
     edge: u32,
     hot: u32,
-    text: u32,
     glyph: u32,
     glyph_hot: u32,
     /// A × or button under the mouse, and held down.
@@ -70,15 +76,19 @@ struct Colours {
 }
 
 fn colours(pal: &Palette) -> Colours {
+    let normal = pal.ink(ColorItem::Tabs, ColorState::Normal);
+    let shown = pal.ink(ColorItem::Tabs, ColorState::Selected);
     if pal.dark {
         // Sampled from Everything's dark strip: the chrome (0x20), a line
         // of 0x30 along the foot, the shown tab 0x39 edged with 0x52.
         Colours {
+            strip: normal.bg,
+            text: normal.fg,
             line: pal.line,
-            selected: pal.header_sort,
+            selected: shown.bg,
+            selected_text: shown.fg,
             edge: pal.header_sort_edge,
             hot: pal.header_hot,
-            text: pal.fg,
             glyph: pal.arrow,
             glyph_hot: pal.glyph_hot,
             button_hot: rgb(0x4a, 0x4a, 0x4a),
@@ -88,11 +98,13 @@ fn colours(pal: &Palette) -> Colours {
         // Light: the shown tab white on the chrome, edged as the search
         // frame is.
         Colours {
+            strip: normal.bg,
+            text: normal.fg,
             line: pal.border,
-            selected: pal.bg,
+            selected: shown.bg,
+            selected_text: shown.fg,
             edge: pal.border,
             hot: rgb(0xe3, 0xe3, 0xe3),
-            text: pal.fg,
             glyph: pal.glyph,
             glyph_hot: rgb(0x00, 0x00, 0x00),
             button_hot: rgb(0xd6, 0xd6, 0xd6),
@@ -290,10 +302,17 @@ impl TabStrip {
         };
         if text_rc.right > text_rc.left {
             let mut text: Vec<u16> = title.encode_utf16().collect();
+            let state = if selected {
+                ColorState::Selected
+            } else {
+                ColorState::Normal
+            };
+            let font = app.ui_font_of(app.pal.get().is_bold(ColorItem::Tabs, state));
             // SAFETY: draws into the paint buffer; the font is put back by
             // the caller.
             unsafe {
-                SetTextColor(hdc, c.text);
+                SelectObject(hdc, font);
+                SetTextColor(hdc, if selected { c.selected_text } else { c.text });
                 DrawTextW(
                     hdc,
                     text.as_mut_ptr(),
@@ -322,7 +341,7 @@ impl TabStrip {
         } else if hot {
             c.hot
         } else {
-            app.pal.get().chrome
+            c.strip
         };
         let bg = match (over, held) {
             (true, true) => c.button_pressed,
@@ -432,7 +451,7 @@ impl Strip for TabStrip {
     fn paint(&self, app: &App, hdc: HDC, rc: &RECT) {
         let pal = app.pal.get();
         let c = colours(&pal);
-        fill(hdc, rc, pal.chrome);
+        fill(hdc, rc, c.strip);
         fill(
             hdc,
             &RECT {
