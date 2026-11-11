@@ -254,8 +254,21 @@ fn join(folder: &str, name: &str) -> String {
     out
 }
 
+/// Whether `p` (`\` separators) names one place whatever the current
+/// folder: a drive's path (`C:\x`), a share's (`\\srv\share\x`) or a
+/// device path (`\\?\C:\x`). A bare or relative name (`readme.txt`,
+/// `src\main.rs`, `C:x`, `\x`) is not: Windows would read it from
+/// goz-gui's current folder, which has nothing to do with the name.
+fn is_absolute(p: &str) -> bool {
+    let b = p.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\')
+        || (b.len() > 2 && b.starts_with(br"\\"))
+}
+
 /// The entry for the item at `path`, as the disk has it now; `None` when
-/// nothing is there (or it cannot be read).
+/// nothing is there (or it cannot be read), and for a path that is not
+/// absolute ([`is_absolute`]; W7: a pasted name is never looked for in
+/// the current folder).
 pub fn item(path: &str) -> Option<Entry> {
     let mut p = path.trim().replace('/', "\\");
     // A folder's trailing backslash goes, but a drive's root keeps it.
@@ -264,6 +277,9 @@ pub fn item(path: &str) -> Option<Entry> {
     }
     if p.len() == 2 && p.ends_with(':') {
         p.push('\\');
+    }
+    if !is_absolute(&p) {
+        return None;
     }
     let z = wz(&p);
     // SAFETY: a NUL-terminated path and a plain out-struct of the size the
@@ -631,6 +647,57 @@ mod tests {
         }
         assert!(!all.stopped);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W7R-4: a pasted bare or relative name is listed by its name alone,
+    /// never with the size and dates of what the current folder holds by
+    /// that name (a test's current folder is the crate's, which holds a
+    /// Cargo.toml and a src\main.rs).
+    #[test]
+    fn a_pasted_relative_name_is_not_read_from_the_current_folder() {
+        assert!(std::path::Path::new("Cargo.toml").is_file());
+        assert!(std::path::Path::new(r"src\main.rs").is_file());
+        let pasted = run(vec![Source::Named(vec![
+            "Cargo.toml".into(),
+            r"src\main.rs".into(),
+            "src/main.rs".into(),
+            "C:Cargo.toml".into(),
+        ])]);
+        let paths: Vec<&str> = pasted.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["Cargo.toml", r"src\main.rs", r"src\main.rs", "C:Cargo.toml"]
+        );
+        for e in &pasted.entries {
+            assert_eq!(
+                *e,
+                Entry {
+                    path: e.path.clone(),
+                    ..Entry::default()
+                },
+                "{}",
+                e.path
+            );
+        }
+        assert_eq!(pasted.unreadable, 4);
+        assert!(item("Cargo.toml").is_none());
+        // An absolute path is still read.
+        let here = std::env::current_dir().unwrap().join("Cargo.toml");
+        assert!(item(&here.display().to_string()).is_some_and(|e| e.size.is_some()));
+        for (p, absolute) in [
+            (r"C:\x", true),
+            (r"C:\", true),
+            (r"\\srv\share\x", true),
+            (r"\\?\C:\x", true),
+            ("readme.txt", false),
+            (r"src\main.rs", false),
+            ("C:x", false),
+            (r"\x", false),
+            (r"\\", false),
+            ("", false),
+        ] {
+            assert_eq!(is_absolute(p), absolute, "{p}");
+        }
     }
 
     #[test]

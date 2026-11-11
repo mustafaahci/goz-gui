@@ -197,7 +197,7 @@ impl App {
                 None => {
                     beep();
                     self.show_note(format!(
-                        "A name holding ; or \" cannot be written after {}; put the names in \
+                        "A name holding | or \" cannot be written after {}; put the names in \
                          a file list slot instead (filelist1:)",
                         term.name
                     ));

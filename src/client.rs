@@ -129,12 +129,20 @@ impl Search {
         use crate::filelist::slots::{self, NotAsked as Why};
         let mut looked = false;
         let answer = {
-            let mut lookup = |query: &str| {
+            // W7: the look-up matches case as the search does (Match Case,
+            // or a `case:` in it), as an open file list's answer does.
+            let mut lookup = |query: &str, match_case: bool| {
                 looked = true;
-                look_up(pipe, shared, epoch, query, self.match_case)
+                look_up(pipe, shared, epoch, query, match_case)
             };
-            slots::for_gozd(&self.query, &self.slots, boolean, &mut lookup)
-                .map(std::borrow::Cow::into_owned)
+            slots::for_gozd(
+                &self.query,
+                &self.slots,
+                boolean,
+                self.match_case,
+                &mut lookup,
+            )
+            .map(std::borrow::Cow::into_owned)
         };
         match answer {
             Ok(q) => Ok((q, looked)),

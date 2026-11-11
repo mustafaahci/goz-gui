@@ -4,11 +4,14 @@
 //! `filelist:<names>` matches the items named: a name without a `\`
 //! matches an item of that whole name (any folder), a path with a `\`
 //! that whole full path; `*` and `?` make a wildcard of either
-//! (`super::wild`). Names are separated by `;`, or by `|` inside quotes
-//! (`filelist:"a.txt|C:\b c\d.txt"`, Everything 1.4's form); an unquoted
-//! `|` or `>` ends the value, as an operator. Case is ignored unless the
-//! search matches case. A name holding a `;` cannot be written there, but
-//! can be in a slot.
+//! (`super::wild`). Names are separated by `;`; a `;` in quotes is part of
+//! a name, as Everything documents (`filelist:a.txt;"b;c.txt"`: two
+//! names). A `|`, which no name holds, separates them too (it can only be
+//! in quotes: `filelist:"a.txt|C:\b c\d.txt"`, Everything 1.4's form); an
+//! unquoted `|` or `>` ends the value, as an operator. Case is ignored
+//! unless the search matches case (the Match Case toggle, or a `case:` in
+//! the search); Match Path (`matchpath:`, `path:`) does not change what a
+//! name matches, as in Everything.
 //!
 //! `filelist0:` .. `filelist9:` match the names in that slot of the tab:
 //! File | Set File List Slot 0..9 (keyboard commands, Everything's
@@ -170,7 +173,8 @@ impl Func {
 
 /// A file-list term of a search: where it is (bytes `start..end`, from its
 /// function name to the end of its value), its function as typed (with its
-/// colon), its slot (`filelistN:`) and its value, quotes taken off.
+/// colon), its slot (`filelistN:`) and its value, quotes taken off (`raw`:
+/// as typed, quotes and all, which say where its names part).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Term {
     pub start: usize,
@@ -179,6 +183,7 @@ pub struct Term {
     pub name: String,
     pub slot: Option<usize>,
     pub value: String,
+    pub raw: String,
 }
 
 /// A file-list function at the start of `b`: the function, its slot, and
@@ -247,6 +252,7 @@ pub fn terms(query: &str) -> Vec<Term> {
                 name: query[i..from].to_owned(),
                 slot,
                 value: query[from..j].replace('"', ""),
+                raw: query[from..j].to_owned(),
             });
             i = j;
             at_start = false;
@@ -280,28 +286,93 @@ pub fn term_at(query: &str, unit: usize) -> Option<Term> {
 }
 
 /// The search with `term`'s value made `names` (an inline list's: the
-/// File List editor's OK), quoted when a name needs it; `None` when a name
-/// cannot be written in a search (it holds a `;` or a `"`).
+/// File List editor's OK), each name quoted when it needs it (white space,
+/// a `;`, `<` or `>`); `None` when a name cannot be written in a search (it
+/// holds a `"` or a `|`, which no file's name holds).
 pub fn with_names(query: &str, term: &Term, names: &[String]) -> Option<String> {
-    if names.iter().any(|n| n.contains([';', '"'])) {
+    if names.iter().any(|n| n.contains(['"', '|'])) {
         return None;
     }
-    let value = names.join(";");
-    let quote = value
-        .chars()
-        .any(|c| c.is_whitespace() || matches!(c, '|' | '<' | '>'));
-    let mut out = String::with_capacity(query.len() + value.len() + 2);
+    let mut out = String::with_capacity(query.len() + names.len() * 16);
     out.push_str(&query[..term.start]);
     out.push_str(&term.name);
-    if quote {
-        out.push('"');
-        out.push_str(&value);
-        out.push('"');
-    } else {
-        out.push_str(&value);
+    for (i, n) in names.iter().enumerate() {
+        if i > 0 {
+            out.push(';');
+        }
+        if n.chars()
+            .any(|c| c.is_whitespace() || matches!(c, ';' | '<' | '>'))
+        {
+            out.push('"');
+            out.push_str(n);
+            out.push('"');
+        } else {
+            out.push_str(n);
+        }
     }
     out.push_str(&query[term.end..]);
     Some(out)
+}
+
+/// An inline list's names as typed (`raw`): parted at each `;` out of
+/// quotes and at each `|` (no name holds one, and an unquoted one ended the
+/// value already), each one's quotes taken off.
+fn split_names(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut name = String::new();
+    let mut quoted = false;
+    for c in raw.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            ';' if !quoted => out.push(std::mem::take(&mut name)),
+            '|' => out.push(std::mem::take(&mut name)),
+            _ => name.push(c),
+        }
+    }
+    out.push(name);
+    out
+}
+
+/// Whether a search matches case: its last `case:` directive (`case:` or
+/// `case:1` on, `case:0` off, as goz's parsers read it: a word of its own,
+/// its value quoted or not), else the Match Case toggle `match_case`.
+pub fn search_case(query: &str, match_case: bool) -> bool {
+    let b = query.as_bytes();
+    let mut case = match_case;
+    let mut quoted = false;
+    let mut at_start = true;
+    let mut i = 0;
+    while i < b.len() {
+        if !quoted && at_start && b.len() - i >= 5 && b[i..i + 5].eq_ignore_ascii_case(b"case:") {
+            let mut j = i + 5;
+            let mut q = false;
+            let mut value = Vec::new();
+            while j < b.len() {
+                match b[j] {
+                    b'"' => q = !q,
+                    d if !q && (d.is_ascii_whitespace() || d == b'|' || d == b'>') => break,
+                    d => value.push(d),
+                }
+                j += 1;
+            }
+            match value.as_slice() {
+                b"" | b"1" => case = true,
+                b"0" => case = false,
+                // `case:Foo`: one term's modifier, not the search's.
+                _ => {}
+            }
+            i = j;
+            at_start = false;
+            continue;
+        }
+        let c = b[i];
+        if c == b'"' {
+            quoted = !quoted;
+        }
+        at_start = !quoted && (c.is_ascii_whitespace() || matches!(c, b'!' | b'<' | b'|'));
+        i += 1;
+    }
+    case
 }
 
 /// A name as a list holds it: trimmed, `/` made `\`, a folder's trailing
@@ -329,7 +400,10 @@ pub fn names(term: &Term, slots: &Slots) -> Result<Vec<String>, String> {
             term.name
         )),
         Some(n) => Ok(slots.get(n).iter().filter_map(|s| normalize(s)).collect()),
-        None => Ok(term.value.split([';', '|']).filter_map(normalize).collect()),
+        None => Ok(split_names(&term.raw)
+            .iter()
+            .filter_map(|n| normalize(n))
+            .collect()),
     }
 }
 
@@ -902,14 +976,17 @@ impl<E> From<String> for NotAsked<E> {
 /// The search as gozd is asked it: as it is without a file-list term; with
 /// each one in gozd's own words when gozd reads OR, groups and `whole:`
 /// (`boolean`), the found items' functions asking `lookup` (a search of
-/// gozd's index: at most [`LOOKUP_MAX`] + 1 items with their sizes) for
-/// them first; else why it cannot be asked. A `save-filelistN:` term is
-/// taken out (the window saves the results), with any gozd.
+/// gozd's index: at most [`LOOKUP_MAX`] + 1 items with their sizes; and
+/// whether it matches case, as the search does: [`search_case`] of the
+/// Match Case toggle `match_case`) for them first; else why it cannot be
+/// asked. A `save-filelistN:` term is taken out (the window saves the
+/// results), with any gozd.
 pub fn for_gozd<'a, E>(
     query: &'a str,
     slots: &Slots,
     boolean: bool,
-    lookup: &mut dyn FnMut(&str) -> Result<Looked, E>,
+    match_case: bool,
+    lookup: &mut dyn FnMut(&str, bool) -> Result<Looked, E>,
 ) -> Result<Cow<'a, str>, NotAsked<E>> {
     // Most searches: no function of that name at all.
     if !may_hold(query) {
@@ -955,7 +1032,11 @@ pub fn for_gozd<'a, E>(
                         return Err(too_many(t, names.len(), "names").into());
                     }
                     let items: Vec<String> = names.iter().map(|n| item_term(n)).collect();
-                    lookup(&format!("<{}>", items.join("|"))).map_err(NotAsked::Lookup)?
+                    lookup(
+                        &format!("<{}>", items.join("|")),
+                        search_case(query, match_case),
+                    )
+                    .map_err(NotAsked::Lookup)?
                 };
                 if looked.total > LOOKUP_MAX as u64 || looked.items.len() > LOOKUP_MAX {
                     return Err(NotAsked::Refused(format!(
@@ -999,12 +1080,16 @@ fn group(terms: &[String]) -> String {
 }
 
 /// An item of a list as gozd reads it: `whole:` for a whole name or path,
-/// a quoted wildcard as it is (a wildcard is matched whole already).
+/// a quoted wildcard as it is (a wildcard is matched whole already). A name
+/// (no `\`) is `nopath:` too, so that it stays on the name under Match Path
+/// (`matchpath:`) or `path:`, as Everything's file-list functions do and as
+/// [`ListMatcher`] matches it in an open file list.
 fn item_term(n: &str) -> String {
+    let on_name = if n.contains('\\') { "" } else { "nopath:" };
     if has_wildcard(n) {
-        format!("\"{n}\"")
+        format!("{on_name}\"{n}\"")
     } else {
-        format!("whole:\"{n}\"")
+        format!("{on_name}whole:\"{n}\"")
     }
 }
 
@@ -1155,12 +1240,12 @@ mod tests {
     }
 
     /// No look-up wanted.
-    fn none(_: &str) -> Result<Looked, ()> {
+    fn none(_: &str, _: bool) -> Result<Looked, ()> {
         panic!("no look-up was wanted")
     }
 
     fn gozd<'a>(q: &'a str, s: &Slots, boolean: bool) -> Result<Cow<'a, str>, NotAsked<()>> {
-        for_gozd(q, s, boolean, &mut none)
+        for_gozd(q, s, boolean, false, &mut none)
     }
 
     #[test]
@@ -1231,16 +1316,31 @@ mod tests {
         // UTF-16 places: the é is one unit.
         let t = term_at(q, 25).unwrap();
         assert_eq!((t.func, t.value.as_str()), (Func::Items, "x y"));
-        let names = vec!["a b.txt".to_owned(), r"C:\c".to_owned()];
+        let two = vec!["a b.txt".to_owned(), r"C:\c".to_owned()];
         assert_eq!(
-            with_names(q, &t, &names).unwrap(),
-            "ab parent-filelist1: é filelist:\"a b.txt;C:\\c\""
+            with_names(q, &t, &two).unwrap(),
+            "ab parent-filelist1: é filelist:\"a b.txt\";C:\\c"
         );
         assert_eq!(
             with_names("filelist:a x", &terms("filelist:a x")[0], &["b".into()]).unwrap(),
             "filelist:b x"
         );
-        assert!(with_names(q, &t, &["a;b".to_owned()]).is_none());
+        // W7R-3: a name with a `;` is written in quotes of its own, and
+        // read back as one name.
+        let odd = vec![
+            "a.txt".to_owned(),
+            "b;c.txt".to_owned(),
+            r"C:\d e\f;g".to_owned(),
+        ];
+        let new = with_names(q, &t, &odd).unwrap();
+        assert_eq!(
+            new,
+            "ab parent-filelist1: é filelist:a.txt;\"b;c.txt\";\"C:\\d e\\f;g\""
+        );
+        let back = terms(&new).remove(1);
+        assert_eq!(names(&back, &Slots::default()).unwrap(), odd);
+        assert!(with_names(q, &t, &["a\"b".to_owned()]).is_none());
+        assert!(with_names(q, &t, &["a|b".to_owned()]).is_none());
     }
 
     #[test]
@@ -1248,10 +1348,30 @@ mod tests {
         let s = slots();
         let t = |q: &str| terms(q).remove(0);
         assert_eq!(
-            names(&t(r#"filelist:" a.txt ;C:/x/y/;|""#), &s).unwrap(),
+            names(&t(r#"filelist:" a.txt ";"C:/x/y/";"|""#), &s).unwrap(),
             ["a.txt", r"C:\x\y"]
         );
         assert_eq!(names(&t(r#"filelist:"a|b""#), &s).unwrap(), ["a", "b"]);
+        // W7R-3: a `;` in quotes is part of a name, as Everything
+        // documents (`filelist:...;"a-file-with-a-semicolon(;).txt"`).
+        assert_eq!(
+            names(&t(r#"filelist:a.txt;"b;c.txt""#), &s).unwrap(),
+            ["a.txt", "b;c.txt"]
+        );
+        assert_eq!(
+            names(&t(r#"child-filelist:"x;y";z;"C:\a b\c;d.txt""#), &s).unwrap(),
+            ["x;y", "z", r"C:\a b\c;d.txt"]
+        );
+        assert_eq!(
+            names(&t(r#"filelist:a"b;c"d;e"#), &s).unwrap(),
+            ["ab;cd", "e"],
+            "quotes around part of a name"
+        );
+        assert_eq!(
+            names(&t(r#"filelist:"a;b|c d""#), &s).unwrap(),
+            ["a;b", "c d"],
+            "Everything 1.4's | in quotes still parts names"
+        );
         assert_eq!(names(&t("filelist:D:\\"), &s).unwrap(), [r"D:\"]);
         assert_eq!(
             names(&t("filelist1:"), &s).unwrap(),
@@ -1513,12 +1633,17 @@ mod tests {
             NotAsked::Refused(needs_or("filelist:"))
         );
         assert_eq!(
-            gozd(r#"!filelist:"a.txt;C:\b c\*.log" ext:txt"#, &s, true).unwrap(),
-            r#"!<whole:"a.txt"|"C:\b c\*.log"> ext:txt"#
+            gozd(r#"!filelist:a.txt;"C:\b c\*.log" ext:txt"#, &s, true).unwrap(),
+            r#"!<nopath:whole:"a.txt"|"C:\b c\*.log"> ext:txt"#
         );
         assert_eq!(
             gozd("filelist1: | filelist9: filelist2:", &s, true).unwrap(),
-            r#"<whole:"C:\x\a.txt"|whole:"C:\x\sub"> | <"*.log"> whole:"""#
+            r#"<whole:"C:\x\a.txt"|whole:"C:\x\sub"> | <nopath:"*.log"> whole:"""#
+        );
+        // W7R-3: a quoted `;` stays in its name, in gozd's words too.
+        assert_eq!(
+            gozd(r#"filelist:a.txt;"b;c.txt""#, &s, true).unwrap(),
+            r#"<nopath:whole:"a.txt"|nopath:whole:"b;c.txt">"#
         );
         let mut big = Slots::default();
         big.set(
@@ -1555,7 +1680,7 @@ mod tests {
         );
         assert_eq!(
             gozd("name-filelist1:", &s, true).unwrap(),
-            r#"<whole:"x"|whole:"sub"|"*.d"|whole:"a.b.txt">"#
+            r#"<nopath:whole:"x"|nopath:whole:"sub"|nopath:"*.d"|nopath:whole:"a.b.txt">"#
         );
         assert_eq!(
             gozd("stem-filelist1:", &s, true).unwrap(),
@@ -1610,64 +1735,149 @@ mod tests {
             found(r"C:\a.txt", false, Some(5)),
         ];
         let asked = std::cell::RefCell::new(Vec::new());
-        let mut lookup = |q: &str| -> Result<Looked, ()> {
-            asked.borrow_mut().push(q.to_owned());
+        let mut lookup = |q: &str, case: bool| -> Result<Looked, ()> {
+            asked.borrow_mut().push((q.to_owned(), case));
             Ok(Looked {
                 items: index.clone(),
                 total: index.len() as u64,
             })
         };
         assert_eq!(
-            for_gozd("childfilelist1:", &s, true, &mut lookup).unwrap(),
-            r#"<whole:"C:\x"|whole:"C:\y"|whole:"C:\top">"#
-        );
-        assert_eq!(*asked.borrow(), [r#"<whole:"a.txt"|whole:"C:\y\c.log">"#]);
-        assert_eq!(
-            for_gozd("descendant-filelist1:", &s, true, &mut lookup).unwrap(),
+            for_gozd("childfilelist1:", &s, true, false, &mut lookup).unwrap(),
             r#"<whole:"C:\x"|whole:"C:\y"|whole:"C:\top">"#
         );
         assert_eq!(
-            for_gozd("sibling-filelist1:", &s, true, &mut lookup).unwrap(),
+            *asked.borrow(),
+            [(
+                r#"<nopath:whole:"a.txt"|whole:"C:\y\c.log">"#.to_owned(),
+                false
+            )]
+        );
+        assert_eq!(
+            for_gozd("descendant-filelist1:", &s, true, false, &mut lookup).unwrap(),
+            r#"<whole:"C:\x"|whole:"C:\y"|whole:"C:\top">"#
+        );
+        assert_eq!(
+            for_gozd("sibling-filelist1:", &s, true, false, &mut lookup).unwrap(),
             r#"<<parent:"C:\x" !whole:"C:\x\a.txt">|parent:"C:\y"|<parent:"C:\top" !whole:"C:\top\a.txt">|<parent:"C:\" !whole:"C:\a.txt">>"#
         );
         assert_eq!(
-            for_gozd("size-filelist1:", &s, true, &mut lookup).unwrap(),
+            for_gozd("size-filelist1:", &s, true, false, &mut lookup).unwrap(),
             "<size:=10|size:=99|size:=5>"
         );
+        // W7R-2: the look-up matches case as the search does: the Match
+        // Case toggle, or the search's own `case:` (the last one wins).
+        asked.borrow_mut().clear();
+        for (q, toggle) in [
+            ("child-filelist1:", true),
+            ("case: child-filelist1:", false),
+            ("CASE:1 child-filelist1:", false),
+            ("case:0 child-filelist1:", true),
+            ("case: child-filelist1: case:0", false),
+            ("case:Foo child-filelist1:", false),
+        ] {
+            for_gozd(q, &s, true, toggle, &mut lookup).unwrap();
+        }
+        let cases: Vec<bool> = asked.borrow().iter().map(|a| a.1).collect();
+        assert_eq!(cases, [true, true, true, false, false, false]);
         // An empty slot: no look-up, nothing matches.
-        let mut no = |_: &str| -> Result<Looked, ()> { panic!("no look-up") };
+        let mut no = |_: &str, _: bool| -> Result<Looked, ()> { panic!("no look-up") };
         assert_eq!(
-            for_gozd("child-filelist1:", &Slots::default(), true, &mut no).unwrap(),
+            for_gozd("child-filelist1:", &Slots::default(), true, false, &mut no).unwrap(),
             r#"whole:"""#
         );
         // Too many found: refused, named.
-        let mut many = |_: &str| -> Result<Looked, ()> {
+        let mut many = |_: &str, _: bool| -> Result<Looked, ()> {
             Ok(Looked {
                 items: Vec::new(),
                 total: 5000,
             })
         };
-        let NotAsked::Refused(why) = for_gozd("child-filelist1:", &s, true, &mut many).unwrap_err()
+        let NotAsked::Refused(why) =
+            for_gozd("child-filelist1:", &s, true, false, &mut many).unwrap_err()
         else {
             panic!()
         };
         assert!(why.contains("5,000 items"), "{why}");
         // A size not read yet: refused rather than wrong.
-        let mut pending = |_: &str| -> Result<Looked, ()> {
+        let mut pending = |_: &str, _: bool| -> Result<Looked, ()> {
             Ok(Looked {
                 items: vec![found(r"C:\x\a.txt", false, None)],
                 total: 1,
             })
         };
         assert!(matches!(
-            for_gozd("size-filelist1:", &s, true, &mut pending),
+            for_gozd("size-filelist1:", &s, true, false, &mut pending),
             Err(NotAsked::Refused(_))
         ));
         // The look-up's own failure comes back as it is.
-        let mut lost = |_: &str| -> Result<Looked, u8> { Err(7) };
+        let mut lost = |_: &str, _: bool| -> Result<Looked, u8> { Err(7) };
         assert_eq!(
-            for_gozd("sibling-filelist1:", &s, true, &mut lost).unwrap_err(),
+            for_gozd("sibling-filelist1:", &s, true, false, &mut lost).unwrap_err(),
             NotAsked::Lookup(7)
         );
+    }
+
+    /// W7R-1: under Match Path (the window sends `matchpath: ` before the
+    /// search) a name stays on the name in gozd's words (`nopath:`), as in
+    /// an open file list and in Everything; a path is a full path anyway.
+    #[test]
+    fn gozd_keeps_names_on_the_name_under_match_path() {
+        let s = with(&["a.txt", r"C:\x\b.txt", "*.log", r"D:\data\*.csv"]);
+        assert_eq!(
+            gozd("matchpath: name-filelist1:", &s, true).unwrap(),
+            r#"matchpath: <nopath:whole:"a.txt"|nopath:whole:"b.txt"|nopath:"*.log"|nopath:"*.csv">"#
+        );
+        assert_eq!(
+            gozd("matchpath: filelist1:", &s, true).unwrap(),
+            r#"matchpath: <nopath:whole:"a.txt"|whole:"C:\x\b.txt"|nopath:"*.log"|"D:\data\*.csv">"#
+        );
+        assert_eq!(
+            gozd("path: filelist:a.txt;*.log", &s, true).unwrap(),
+            r#"path: <nopath:whole:"a.txt"|nopath:"*.log">"#
+        );
+        // The look-up of the found items' functions too.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut lookup = |q: &str, _: bool| -> Result<Looked, ()> {
+            asked.borrow_mut().push(q.to_owned());
+            Ok(Looked::default())
+        };
+        for_gozd(
+            "matchpath: child-filelist:a.txt",
+            &s,
+            true,
+            false,
+            &mut lookup,
+        )
+        .unwrap();
+        assert_eq!(*asked.borrow(), [r#"<nopath:whole:"a.txt">"#]);
+        // An open file list answers the same: names on the name.
+        assert_eq!(
+            hits("matchpath: name-filelist1:", &with(&[r"D:\other\A.TXT"])),
+            [r"C:\x\a.txt", r"C:\y\a.txt"]
+        );
+    }
+
+    /// W7R-2: the search's own `case:`, as goz's parsers read it.
+    #[test]
+    fn a_searchs_own_case_directive() {
+        for (q, toggle, want) in [
+            ("abc", false, false),
+            ("abc", true, true),
+            ("case: abc", false, true),
+            ("abc Case:", false, true),
+            ("case:1 abc", false, true),
+            (r#"case:"1" abc"#, false, true),
+            ("case:0 abc", true, false),
+            ("case: x case:0", false, false),
+            ("case:0 x case:", false, true),
+            // One term's modifier, not the search's.
+            ("case:Foo", false, false),
+            ("mycase: x", false, false),
+            (r#""case:" x"#, false, false),
+            ("<a|case:>", false, true),
+        ] {
+            assert_eq!(search_case(q, toggle), want, "{q} (toggle {toggle})");
+        }
     }
 }
