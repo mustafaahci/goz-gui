@@ -224,7 +224,7 @@ impl FindBar {
     }
 
     fn set_fonts(&self, app: &App) {
-        let font = app.ui_font();
+        let font = app.part_font(ColorItem::FindBar, false);
         for hwnd in self.controls() {
             if !hwnd.is_null() {
                 send(hwnd, WM_SETFONT, font as usize, 1);
@@ -239,7 +239,7 @@ impl FindBar {
         // with its old font.
         let w = unsafe {
             let dc = GetDC(app.hwnd);
-            let old = SelectObject(dc, app.ui_font());
+            let old = SelectObject(dc, app.part_font(ColorItem::FindBar, false));
             let w = crate::paint::width(dc, &text);
             SelectObject(dc, old);
             ReleaseDC(app.hwnd, dc);
@@ -441,7 +441,7 @@ impl Strip for FindBar {
             return 0;
         }
         // Everything's 30 px at 100 % with the usual 15 px font.
-        app.ui_fonts.borrow().height + app.scale(15)
+        app.part_height(ColorItem::FindBar) + app.scale(15)
     }
 
     fn place(&self, app: &App, rc: RECT) {
@@ -450,7 +450,7 @@ impl Strip for FindBar {
             return;
         }
         let s = |v: i32| app.scale(v);
-        let fh = app.ui_fonts.borrow().height;
+        let fh = app.part_height(ColorItem::FindBar);
         let h = rc.bottom - rc.top;
         let button = fh + s(4);
         let box_h = fh + s(8);
@@ -595,7 +595,7 @@ impl Strip for FindBar {
             // SAFETY: draws into the paint buffer; the old font is put
             // back.
             unsafe {
-                let old = SelectObject(hdc, app.ui_font());
+                let old = SelectObject(hdc, app.part_font(ColorItem::FindBar, false));
                 SetBkMode(hdc, TRANSPARENT as i32);
                 SetTextColor(hdc, pal.dim);
                 DrawTextW(

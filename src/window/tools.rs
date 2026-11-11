@@ -710,7 +710,7 @@ impl App {
             // screen from the box.
             unsafe {
                 GetCaretPos(&mut p);
-                let h = self.ui_fonts.borrow().height;
+                let h = self.search_font_height();
                 p.y += h;
                 ClientToScreen(edit, &mut p);
             }

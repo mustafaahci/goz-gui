@@ -307,7 +307,10 @@ impl TabStrip {
             } else {
                 ColorState::Normal
             };
-            let font = app.ui_font_of(app.pal.get().is_bold(ColorItem::Tabs, state));
+            let font = app.part_font(
+                ColorItem::Tabs,
+                app.pal.get().is_bold(ColorItem::Tabs, state),
+            );
             // SAFETY: draws into the paint buffer; the font is put back by
             // the caller.
             unsafe {
@@ -435,14 +438,15 @@ fn down_arrow(hdc: HDC, cx: i32, cy: i32, half: i32, colour: u32) {
 }
 
 impl Strip for TabStrip {
-    /// 31 px at 100 % (the UI font's height and 16 px, so it follows the
-    /// font as the header does), while it shows: Everything's 29 and the
+    /// 31 px at 100 % (its font's height (Fonts and Colors' Tabs) and 16
+    /// px, so it follows the font as the header does), while it shows:
+    /// Everything's 29 and the
     /// 2 px its own menu bar has over Windows' (the search row then keeps 3
     /// px above its frame instead of 5, so the tabs and the search frame sit
     /// exactly where Everything's do).
     fn height(&self, app: &App) -> i32 {
         if app.tab_strip_shown() {
-            app.ui_fonts.borrow().height + app.scale(TOP + 11)
+            app.part_height(ColorItem::Tabs) + app.scale(TOP + 11)
         } else {
             0
         }
@@ -465,7 +469,7 @@ impl Strip for TabStrip {
         let (m, p) = self.placed(app, rc);
         // SAFETY: draws into the paint buffer; the old font is put back.
         let old = unsafe {
-            let old = SelectObject(hdc, app.ui_font());
+            let old = SelectObject(hdc, app.part_font(ColorItem::Tabs, false));
             SetBkMode(hdc, TRANSPARENT as i32);
             old
         };

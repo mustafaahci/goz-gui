@@ -98,14 +98,18 @@ impl App {
         self.set_zoom(z);
     }
 
-    /// Sizes the result list's fonts, rows, header and status bar at `z` %.
+    /// Sizes the result list's fonts, rows, header and status bar at `z` %
+    /// (each in its own font, `fonts.rs`).
     pub(super) fn set_zoom(&self, z: u32) {
         if z != self.zoom.get() {
             self.zoom.set(z);
-            let old = self.fonts.replace(self.list_fonts(self.dpi.get(), z));
+            // The list's fonts, and the header's and the status bar's
+            // where they have their own.
+            let old = self.remake_zoomed_fonts();
             let font = self.fonts.borrow().normal;
             send(self.list, WM_SETFONT, font as usize, 0);
-            // The list no longer draws with the old fonts.
+            crate::celltip::set_font(self);
+            // The list and its tip no longer draw with the old fonts.
             drop(old);
             self.remeasure_rows();
             self.layout();

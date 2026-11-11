@@ -813,6 +813,22 @@ pub fn menubar_item(app: &App, item: &UahDrawMenuItem) {
     menubar_item_of(&app.pal.get(), item);
 }
 
+/// How far a menu bar item's text moves towards the bar's background
+/// while its window is inactive (or the item is greyed): Windows 11's own
+/// menu bar draws its black text on white as #6d6d6d then (measured on a
+/// window with a real menu bar, wave 6). In the dark theme's colours it is
+/// the #a0a0a0 goz-gui has always drawn there.
+const MENU_INACTIVE: f32 = 109.0 / 255.0;
+
+/// A menu bar item's text colour on `ink`, active or not.
+pub fn menubar_text(ink: crate::theme::Ink, dim: bool) -> u32 {
+    if dim {
+        crate::colors::mix(ink.fg, ink.bg, MENU_INACTIVE)
+    } else {
+        ink.fg
+    }
+}
+
 /// Paints one item of a menu bar in `pal`'s colours.
 pub fn menubar_item_of(pal: &Palette, item: &UahDrawMenuItem) {
     let mut buf = [0u16; 256];
@@ -830,9 +846,11 @@ pub fn menubar_item_of(pal: &Palette, item: &UahDrawMenuItem) {
         let mut rc = item.dis.rcItem;
         let ink = menu_ink(pal);
         fill(item.um.hdc, &rc, if hot { pal.hot } else { ink.bg });
+        // Dimmed as Windows' own menu bar dims its items, in either theme
+        // and in Fonts and Colors' Menu colours.
         let dim = state & (ODS_INACTIVE | ODS_GRAYED | ODS_DISABLED) != 0;
         SetBkMode(item.um.hdc, TRANSPARENT as i32);
-        SetTextColor(item.um.hdc, if dim { pal.dim } else { ink.fg });
+        SetTextColor(item.um.hdc, menubar_text(ink, dim));
         let mut flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
         if state & ODS_NOACCEL != 0 {
             flags |= DT_HIDEPREFIX;
@@ -879,6 +897,27 @@ mod tests {
             hot,
             alternate: false,
         }
+    }
+
+    /// An inactive window's menu bar items dim as Windows 11's own do: its
+    /// black on white goes to #6d6d6d (measured); the dark theme's white on
+    /// #202020 to #a0a0a0; Fonts and Colors' Menu colours the same way.
+    #[test]
+    fn menu_bar_items_dim_as_windows_own_while_inactive() {
+        use crate::colors::{Item, State};
+        let light = Palette::new(false).ink(Item::Menu, State::Normal);
+        assert_eq!(light.bg, rgb(0xff, 0xff, 0xff));
+        assert_eq!(menubar_text(light, false), rgb(0, 0, 0));
+        assert_eq!(menubar_text(light, true), rgb(0x6d, 0x6d, 0x6d));
+        let dark = Palette::new(true).ink(Item::Menu, State::Normal);
+        assert_eq!(menubar_text(dark, false), rgb(0xff, 0xff, 0xff));
+        assert_eq!(menubar_text(dark, true), rgb(0xa0, 0xa0, 0xa0));
+        let own = crate::theme::Ink {
+            fg: rgb(0xff, 0xff, 0xff),
+            bg: rgb(0x30, 0x40, 0x50),
+        };
+        let dim = menubar_text(own, true);
+        assert!(dim != own.fg && dim != own.bg);
     }
 
     #[test]

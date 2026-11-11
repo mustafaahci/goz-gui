@@ -1,7 +1,7 @@
 //! Options > Fonts and Colors: the colours of every part of the window
 //! goz-gui draws, in each of its states, in the light and the dark theme;
-//! the accent colour; and the result list's and the search box's fonts,
-//! under Everything 1.5's INI keys.
+//! the accent colour; and each item's font, under Everything 1.5's INI
+//! keys.
 //!
 //! Everything keeps an item state's look as `<item><state>_foreground_color`,
 //! `<item><state>_background_color` (`#RRGGBB`, empty for the theme's own)
@@ -10,9 +10,12 @@
 //! (`selected_background_color`, `dark_treeview_selected_background_color`);
 //! an item's accent as `<item>_accent` (0 None, 1 Default, 2 Custom; the
 //! dark theme's `<item>_dark_accent`) with `<item>_accent_color`, the
-//! (Default) item's as plain `accent` and `accent_color`; the fonts as
-//! `result_list_font` / `search_edit_font` (a face name, empty for the
-//! default) and `..._font_size` (points, empty for the default).
+//! (Default) item's as plain `accent` and `accent_color`; an item's font as
+//! `<item>_font` (a face name, empty for the default) and
+//! `<item>_font_size` (points, empty for the default), the (Default)
+//! item's as plain `font` and `font_size`. An item's face or size left
+//! empty is (Default)'s, and (Default)'s the window's (Windows' message
+//! font).
 //!
 //! Only the items and states goz-gui draws are here (no Toolbar, no Hot
 //! or Drop Target rows, no per-state Highlighted variants): each one's
@@ -203,10 +206,17 @@ impl Item {
         }
     }
 
-    /// goz-gui sets this item's font and size (the others keep the
-    /// window's).
+    /// goz-gui draws this item's text in a font of its own: every item but
+    /// the menu bar, whose items Windows measures and lays out in its own
+    /// menu font.
     pub fn has_font(self) -> bool {
-        matches!(self, Item::ResultList | Item::SearchEdit)
+        self != Item::Menu
+    }
+
+    /// The item's text zooms with the result list (View > Zoom): the
+    /// list's own, the header's and the status bar's.
+    pub fn zooms(self) -> bool {
+        matches!(self, Item::ResultList | Item::Header | Item::StatusBar)
     }
 
     /// The accent colour tints this item's Selected and Mouseover rows
@@ -381,8 +391,9 @@ pub fn format_color(c: u32) -> String {
 /// The fonts, every item state's colours and style, and the accents.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Colors {
-    pub result_list_font: FontSpec,
-    pub search_edit_font: FontSpec,
+    /// The items with a font of their own; a default font is never kept,
+    /// so equal settings compare equal.
+    fonts: BTreeMap<Item, FontSpec>,
     /// The item states with a look of their own, by theme (dark) and slot;
     /// an all-default look is never kept, so equal settings compare equal.
     looks: BTreeMap<(bool, usize), Look>,
@@ -418,12 +429,27 @@ fn accent_key(dark: bool, item: Item, color: bool) -> String {
     k
 }
 
-fn font_from<'a>(get: &impl Fn(&str) -> Option<&'a str>, stem: &str) -> FontSpec {
+/// `font`, `font_size`, `header_font`, `header_font_size`.
+fn font_key(item: Item, size: bool) -> String {
+    let stem = item.stem();
+    let mut k = String::new();
+    if !stem.is_empty() {
+        k.push_str(stem);
+        k.push('_');
+    }
+    k.push_str("font");
+    if size {
+        k.push_str("_size");
+    }
+    k
+}
+
+fn font_from<'a>(get: &impl Fn(&str) -> Option<&'a str>, item: Item) -> FontSpec {
     FontSpec {
-        face: get(&format!("{stem}_font"))
+        face: get(&font_key(item, false))
             .map(|v| v.trim().chars().take(31).collect())
             .unwrap_or_default(),
-        size: get(&format!("{stem}_font_size"))
+        size: get(&font_key(item, true))
             .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|&n| n <= SIZE_MAX)
             .unwrap_or(0),
@@ -448,11 +474,10 @@ const ACCENT_MOUSEOVER: [f32; 2] = [0.1, 0.25];
 
 impl Colors {
     pub fn from_keys<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Colors {
-        let mut c = Colors {
-            result_list_font: font_from(&get, "result_list"),
-            search_edit_font: font_from(&get, "search_edit"),
-            ..Colors::default()
-        };
+        let mut c = Colors::default();
+        for item in Item::ALL.into_iter().filter(|i| i.has_font()) {
+            c.set_font(item, font_from(&get, item));
+        }
         for dark in [false, true] {
             for (item, state) in all_slots() {
                 let k = |part| state_key(dark, item, state, part);
@@ -486,13 +511,11 @@ impl Colors {
 
     pub fn to_keys(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for (stem, f) in [
-            ("result_list", &self.result_list_font),
-            ("search_edit", &self.search_edit_font),
-        ] {
-            out.push((format!("{stem}_font"), f.face.clone()));
+        for item in Item::ALL.into_iter().filter(|i| i.has_font()) {
+            let f = self.font(item);
+            out.push((font_key(item, false), f.face.clone()));
             out.push((
-                format!("{stem}_font_size"),
+                font_key(item, true),
                 if f.size == 0 {
                     String::new()
                 } else {
@@ -526,6 +549,43 @@ impl Colors {
             }
         }
         out
+    }
+
+    /// The item's own font (an empty face and 0 size where it has none).
+    pub fn font(&self, item: Item) -> FontSpec {
+        self.fonts.get(&item).cloned().unwrap_or_default()
+    }
+
+    pub fn set_font(&mut self, item: Item, font: FontSpec) {
+        if font == FontSpec::default() || !item.has_font() {
+            self.fonts.remove(&item);
+        } else {
+            self.fonts.insert(item, font);
+        }
+    }
+
+    /// The font the item draws in: its own face and size, each where it
+    /// has none (Default)'s; (Default)'s where it has none are the
+    /// window's (an empty face and 0 size).
+    pub fn resolved_font(&self, item: Item) -> FontSpec {
+        let base = self.font(Item::Default);
+        if item == Item::Default || !item.has_font() {
+            return base;
+        }
+        let own = self.font(item);
+        FontSpec {
+            face: if own.face.is_empty() {
+                base.face
+            } else {
+                own.face
+            },
+            size: if own.size == 0 { base.size } else { own.size },
+        }
+    }
+
+    /// Whether any item's font is not the same in `other`.
+    pub fn fonts_differ(&self, other: &Colors) -> bool {
+        self.fonts != other.fonts
     }
 
     pub fn look(&self, dark: bool, item: Item, state: State) -> Look {
@@ -718,6 +778,8 @@ pub fn theme_inks(p: &Palette) -> [Ink; SLOTS] {
             (_, State::CurrentSortMouseover) => p.hover_sort,
             (_, State::CurrentSortAlternateRow) => p.alt_sort_bg,
             (Item::Header | Item::Pane, _) => p.header,
+            // Windows 11's own light menu bar is white (measured, wave 6).
+            (Item::Menu, _) if !p.dark => crate::theme::rgb(0xff, 0xff, 0xff),
             (Item::FindBar | Item::Menu | Item::StatusBar | Item::Tabs, _) => p.chrome,
             _ => p.bg,
         };
@@ -789,8 +851,20 @@ mod tests {
             assert!(seen.insert(k.clone()), "{k} twice");
         }
         for k in [
+            "font",
+            "font_size",
             "result_list_font",
             "search_edit_font_size",
+            "header_font",
+            "status_bar_font_size",
+            "filter_bar_font",
+            "findbar_font_size",
+            "tabs_font",
+            "pane_font_size",
+            "preview_font",
+            "treeview_font_size",
+            "filter_sidebar_font",
+            "bookmark_sidebar_font_size",
             "accent",
             "dark_accent_color",
             "result_list_accent",
@@ -820,8 +894,10 @@ mod tests {
         ] {
             assert!(seen.contains(k), "{k} missing");
         }
-        // 2 fonts x 2, 5 accents x 2 x 2 themes, 34 states x 3 x 2 themes.
-        assert_eq!(keys.len(), 4 + 20 + SLOTS * 6);
+        // No font for the menu bar, whose items Windows lays out.
+        assert!(!seen.contains("menu_font"));
+        // 13 fonts x 2, 5 accents x 2 x 2 themes, 34 states x 3 x 2 themes.
+        assert_eq!(keys.len(), 26 + 20 + SLOTS * 6);
     }
 
     #[test]
@@ -843,10 +919,10 @@ mod tests {
             ("treeview_dark_accent", "0"),
         ];
         let c = Colors::from_keys(|k| pairs.iter().find(|(p, _)| *p == k).map(|(_, v)| *v));
-        assert_eq!(c.result_list_font.face, "Consolas");
-        assert_eq!(c.result_list_font.size, 11);
+        assert_eq!(c.font(Item::ResultList).face, "Consolas");
+        assert_eq!(c.font(Item::ResultList).size, 11);
         assert_eq!(
-            c.search_edit_font,
+            c.font(Item::SearchEdit),
             FontSpec {
                 face: String::new(),
                 size: 14
@@ -919,6 +995,66 @@ mod tests {
                 assert!(v.is_empty(), "{k}={v}");
             }
         }
+    }
+
+    /// Each item's font under its own keys; a face or size an item leaves
+    /// empty is (Default)'s; the menu bar has none.
+    #[test]
+    fn every_item_has_a_font_that_falls_back_to_the_defaults() {
+        let pairs = [
+            ("font", "Segoe UI Semibold"),
+            ("font_size", "10"),
+            ("header_font", "Arial"),
+            ("status_bar_font_size", "12"),
+            ("tabs_font", "Georgia"),
+            ("tabs_font_size", "14"),
+            ("treeview_font_size", "300"),
+            ("bookmark_sidebar_font", "  Tahoma  "),
+            ("menu_font", "Wingdings"),
+        ];
+        let c = Colors::from_keys(|k| pairs.iter().find(|(p, _)| *p == k).map(|(_, v)| *v));
+        let spec = |face: &str, size| FontSpec {
+            face: face.into(),
+            size,
+        };
+        assert_eq!(c.font(Item::Default), spec("Segoe UI Semibold", 10));
+        assert_eq!(c.font(Item::Header), spec("Arial", 0));
+        assert_eq!(c.resolved_font(Item::Header), spec("Arial", 10));
+        assert_eq!(
+            c.resolved_font(Item::StatusBar),
+            spec("Segoe UI Semibold", 12)
+        );
+        assert_eq!(c.resolved_font(Item::Tabs), spec("Georgia", 14));
+        // Out of bounds: the default size.
+        assert_eq!(c.font(Item::FoldersSidebar), FontSpec::default());
+        assert_eq!(c.font(Item::BookmarksSidebar), spec("Tahoma", 0));
+        assert_eq!(
+            c.resolved_font(Item::FindBar),
+            c.resolved_font(Item::Default)
+        );
+        // The menu bar's is Windows'.
+        assert_eq!(c.font(Item::Menu), FontSpec::default());
+        assert_eq!(c.resolved_font(Item::Menu), c.font(Item::Default));
+        let out = c.to_keys();
+        let get = |k: &str| out.iter().find(|(p, _)| p == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("font"), Some("Segoe UI Semibold"));
+        assert_eq!(get("status_bar_font_size"), Some("12"));
+        assert_eq!(get("bookmark_sidebar_font"), Some("Tahoma"));
+        assert_eq!(get("treeview_font_size"), Some(""));
+        assert_eq!(get("menu_font"), None);
+        assert_eq!(Colors::from_keys(get), c);
+        // Every font back to its default leaves nothing behind.
+        let mut d = c.clone();
+        assert!(!d.fonts_differ(&c));
+        for item in Item::ALL {
+            d.set_font(item, FontSpec::default());
+        }
+        assert!(d.fonts_differ(&c));
+        assert_eq!(d, Colors::default());
+        // No zoom but the result list's, the header's and the status
+        // bar's.
+        let zoomed: Vec<Item> = Item::ALL.into_iter().filter(|i| i.zooms()).collect();
+        assert_eq!(zoomed, [Item::Header, Item::ResultList, Item::StatusBar]);
     }
 
     #[test]

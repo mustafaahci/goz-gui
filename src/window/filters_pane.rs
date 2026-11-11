@@ -180,10 +180,10 @@ impl FiltersPane {
         });
     }
 
-    /// The rows' height: Everything's 17 px at 100 % (the UI font's 15 and
-    /// 2), where a list's own would be the font's and 4.
+    /// The rows' height: Everything's 17 px at 100 % (the sidebar's font's
+    /// 15 and 2), where a list's own would be the font's and 4.
     fn row_height(app: &App) -> i32 {
-        app.ui_fonts.borrow().height + app.scale(2)
+        app.part_height(ColorItem::FiltersSidebar) + app.scale(2)
     }
 
     /// The list measures its rows again (`WM_MEASUREITEM`), which it does
@@ -235,7 +235,10 @@ impl FiltersPane {
         };
         // SAFETY: draws into the list's paint DC; the old font is put back.
         unsafe {
-            let font = app.ui_font_of(pal.is_bold(ColorItem::FiltersSidebar, state));
+            let font = app.part_font(
+                ColorItem::FiltersSidebar,
+                pal.is_bold(ColorItem::FiltersSidebar, state),
+            );
             let old = SelectObject(hdc, font);
             SetBkMode(hdc, TRANSPARENT as i32);
             SetTextColor(hdc, ink.fg);
@@ -407,7 +410,11 @@ impl PaneContent for FiltersPane {
             ..unsafe { core::mem::zeroed() }
         };
         self.send(LVM_INSERTCOLUMNW, 0, (&raw const column) as isize);
-        self.send(WM_SETFONT, app.ui_font() as usize, 1);
+        self.send(
+            WM_SETFONT,
+            app.part_font(ColorItem::FiltersSidebar, false) as usize,
+            1,
+        );
         self.remeasure();
         self.apply_theme(app);
         self.fill(app);
@@ -545,8 +552,17 @@ impl PaneContent for FiltersPane {
     }
 
     fn dpi(&self, app: &App, _dpi: u32) {
-        self.send(WM_SETFONT, app.ui_font() as usize, 1);
+        self.send(
+            WM_SETFONT,
+            app.part_font(ColorItem::FiltersSidebar, false) as usize,
+            1,
+        );
         self.remeasure();
+    }
+
+    /// One row in the sidebar's font, and the list's edges.
+    fn least_high(&self, app: &App) -> i32 {
+        Self::row_height(app) + app.scale(4)
     }
 
     fn event(&self, app: &App, event: PaneEvent) {

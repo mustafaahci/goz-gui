@@ -418,12 +418,25 @@ fn on_screen(app: &App) -> bool {
     unsafe { IsWindowVisible(app.hwnd) != 0 && IsIconic(app.hwnd) == 0 }
 }
 
-/// The monospaced font of the text view, at the window's DPI.
+/// The text view's font at the window's DPI: Consolas at 13 px (100 %),
+/// or in Fonts and Colors' Preview face and size where it has its own.
 fn mono_font(app: &App) -> HFONT {
+    let own = app.font_spec(crate::colors::Item::Preview);
+    let height = if own.size > 0 {
+        // Points at the DPI.
+        -(((own.size * app.dpi.get() + 36) / 72).max(1) as i32)
+    } else {
+        -app.scale(13)
+    };
+    let (face, pitch) = if own.face.is_empty() {
+        ("Consolas".to_owned(), FIXED_PITCH | FF_MODERN)
+    } else {
+        (own.face, 0)
+    };
     // SAFETY: a font the pane owns and deletes.
     unsafe {
         CreateFontW(
-            -app.scale(13),
+            height,
             0,
             0,
             0,
@@ -435,20 +448,21 @@ fn mono_font(app: &App) -> HFONT {
             u32::from(OUT_DEFAULT_PRECIS),
             u32::from(CLIP_DEFAULT_PRECIS),
             u32::from(CLEARTYPE_QUALITY),
-            u32::from(FIXED_PITCH | FF_MODERN),
-            wz("Consolas").as_ptr(),
+            u32::from(pitch),
+            wz(&face).as_ptr(),
         )
     }
 }
 
-/// The window's font, as preview handlers that take one want it.
+/// The preview's font (Fonts and Colors' Preview), as preview handlers
+/// that take one want it.
 fn logfont(app: &App) -> windows::Win32::Graphics::Gdi::LOGFONTW {
     use windows::Win32::Graphics::Gdi::{GetObjectW, HGDIOBJ, LOGFONTW};
     let mut lf = LOGFONTW::default();
     // SAFETY: reads the font's description into a struct of its size.
     unsafe {
         GetObjectW(
-            HGDIOBJ(app.ui_font() as *mut _),
+            HGDIOBJ(app.part_font(crate::colors::Item::Preview, false) as *mut _),
             size_of::<LOGFONTW>() as i32,
             Some((&raw mut lf).cast()),
         )
@@ -1062,10 +1076,11 @@ fn caption(
     let margin = app.scale(MARGIN);
     let gap = app.scale(GAP);
     let w = (width(rc) - 2 * margin).max(1);
-    let line = app.ui_fonts.borrow().height;
+    // In Fonts and Colors' Preview font.
+    let line = app.part_height(crate::colors::Item::Preview);
     // SAFETY: draws into the paint buffer; the old font is put back.
     unsafe {
-        let old = SelectObject(hdc, app.ui_font());
+        let old = SelectObject(hdc, app.part_font(crate::colors::Item::Preview, false));
         SetBkMode(hdc, TRANSPARENT as i32);
         let shown = image.map(|(i, _, _)| fit(i.natural, (w, (height(rc) / 2).max(1)), false));
         let heights: Vec<i32> = lines
@@ -1370,6 +1385,11 @@ impl PaneContent for PreviewPane {
         if matches!(*self.view.borrow(), View::Icon { .. }) {
             self.reload(app);
         }
+    }
+
+    /// Three lines of the preview's text.
+    fn least_high(&self, app: &App) -> i32 {
+        3 * app.part_height(crate::colors::Item::Preview)
     }
 
     fn event(&self, _app: &App, event: PaneEvent) {

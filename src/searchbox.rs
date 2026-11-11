@@ -729,7 +729,7 @@ pub fn paint_filter_bar(app: &App, hdc: HDC, rc: RECT, name: &str, open: bool) {
         right: button.left - app.scale(2),
         ..inner
     };
-    let font = app.ui_font_of(pal.is_bold(Item::FilterBar, State::Normal));
+    let font = app.part_font(Item::FilterBar, pal.is_bold(Item::FilterBar, State::Normal));
     // SAFETY: draws into the paint buffer; the old font is put back.
     unsafe {
         let old = SelectObject(hdc, font);
