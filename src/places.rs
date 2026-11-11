@@ -526,8 +526,7 @@ pub fn restore(window: HWND, which: Which, list: HWND, min: (i32, i32)) {
 
 /// Gives a list its columns' kept widths (at its DPI) and order.
 fn restore_columns(list: HWND, columns: &[Column], order: bool) {
-    // SAFETY: reads this thread's list's DPI.
-    let dpi = unsafe { GetDpiForWindow(list) }.max(96);
+    let dpi = crate::custom::window_dpi(list);
     for (i, c) in columns.iter().enumerate() {
         if c.width > 0 {
             // SAFETY: a message to this thread's list.
@@ -564,7 +563,7 @@ pub fn keep(window: HWND, which: Which, list: HWND) {
         // SAFETY: reads this thread's list: its DPI, its header's column
         // count, each width, and the order into an array of that count.
         unsafe {
-            let dpi = GetDpiForWindow(list).max(96);
+            let dpi = crate::custom::window_dpi(list);
             let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
             let n = SendMessageW(header, HDM_GETITEMCOUNT, 0, 0).max(0) as usize;
             let n = n.min(place.columns.len());

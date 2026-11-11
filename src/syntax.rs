@@ -20,7 +20,6 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{EM_SETMARGINS, EM_SETSEL};
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_ESCAPE,
 };
@@ -254,7 +253,7 @@ pub fn show(owner: HWND, dark: bool) {
         }
         // Centred on the main window, at its scale; then where it was last
         // (`places`).
-        let dpi = GetDpiForWindow(owner).max(96) as i32;
+        let dpi = crate::custom::window_dpi(owner) as i32;
         let (w, h) = (720 * dpi / 96, 600 * dpi / 96);
         let mut rc = RECT::default();
         GetWindowRect(owner, &mut rc);
@@ -369,8 +368,7 @@ fn text_box(hwnd: HWND) -> HWND {
 }
 
 fn scale(hwnd: HWND, v: i32) -> i32 {
-    // SAFETY: reads the DPI of this thread's window.
-    v * unsafe { GetDpiForWindow(hwnd) }.max(96) as i32 / 96
+    v * crate::custom::window_dpi(hwnd) as i32 / 96
 }
 
 /// A monospaced font at the window's DPI, so goz's two columns line up.

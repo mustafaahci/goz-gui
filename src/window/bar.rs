@@ -8,7 +8,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WHEEL_DELTA, WINDOWPOS, WM_SETFONT, WM_WINDOWPOSCHANGED,
 };
 
-use super::{App, Fonts, send};
+use super::{App, send};
 use crate::filter::Filter;
 use crate::{menu, zoom};
 
@@ -99,10 +99,10 @@ impl App {
     }
 
     /// Sizes the result list's fonts, rows, header and status bar at `z` %.
-    fn set_zoom(&self, z: u32) {
+    pub(super) fn set_zoom(&self, z: u32) {
         if z != self.zoom.get() {
             self.zoom.set(z);
-            let old = self.fonts.replace(Fonts::new(self.dpi.get(), z));
+            let old = self.fonts.replace(self.list_fonts(self.dpi.get(), z));
             let font = self.fonts.borrow().normal;
             send(self.list, WM_SETFONT, font as usize, 0);
             // The list no longer draws with the old fonts.
@@ -116,7 +116,7 @@ impl App {
 
     /// Has the list ask its rows' height again (WM_MEASUREITEM), which an
     /// owner-drawn list does when told it moved, and lay out its header.
-    fn remeasure_rows(&self) {
+    pub(super) fn remeasure_rows(&self) {
         let mut rc = RECT::default();
         // SAFETY: reads the list's place in this thread's window; the
         // WINDOWPOS lives across the synchronous send.

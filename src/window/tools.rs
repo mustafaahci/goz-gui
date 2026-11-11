@@ -18,9 +18,7 @@ use windows_sys::Win32::UI::Controls::{
     LVNI_SELECTED,
 };
 use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetActiveWindow, SetFocus, VK_CONTROL, VK_F2, VK_MENU, VK_SHIFT,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CheckMenuItem, DestroyMenu, EnableMenuItem, GWL_STYLE, GetCaretPos, GetClientRect,
     GetMenuItemCount, GetMenuItemID, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
@@ -28,12 +26,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MF_ENABLED, MF_GRAYED, MF_UNCHECKED, PostMessageW, SM_CXVSCROLL, SW_RESTORE, SW_SHOWMAXIMIZED,
     SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetMenu, SetWindowLongPtrW, SetWindowPlacement,
-    SetWindowPos, ShowWindow, WINDOWPLACEMENT, WM_CLEAR, WM_CONTEXTMENU, WM_COPY, WM_CUT,
-    WM_KEYDOWN, WM_PASTE, WS_CAPTION, WS_THICKFRAME,
+    SetWindowPos, ShowWindow, WINDOWPLACEMENT, WM_CLEAR, WM_CONTEXTMENU, WM_COPY, WM_CUT, WM_PASTE,
+    WS_CAPTION, WS_THICKFRAME,
 };
 
 use super::findbar::{FindBar, Finding, Report, TIMER_TYPED, WM_FIND};
-use super::{App, key_down, send, slots};
+use super::{App, send, slots};
 use crate::menu::{self, Item};
 use crate::searchtools::{self as st, Insert};
 use crate::settings::WindowPos;
@@ -593,21 +591,13 @@ impl App {
 
     // ---- The search box's menu, and F2 in it ----
 
-    /// The search box's messages F4 takes: its context menu, and F2
-    /// (Advanced Search..., Everything's key there).
-    pub(super) fn search_box_message(&self, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
+    /// The search box's messages F4 takes: its context menu. (F2, Advanced
+    /// Search... there, is one of the box's keys in `keys::SEARCH_BOX_KEYS`,
+    /// which Options > Keyboard can rebind.)
+    pub(super) fn search_box_message(&self, msg: u32, _w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         match msg {
             WM_CONTEXTMENU => {
                 self.search_box_menu(l);
-                Some(0)
-            }
-            WM_KEYDOWN
-                if w as u16 == VK_F2
-                    && !key_down(VK_CONTROL)
-                    && !key_down(VK_SHIFT)
-                    && !key_down(VK_MENU) =>
-            {
-                self.advanced_search();
                 Some(0)
             }
             _ => None,

@@ -190,7 +190,7 @@ impl App {
     }
 
     /// The settings as the window has them now.
-    fn current_settings(&self) -> Settings {
+    pub(super) fn current_settings(&self) -> Settings {
         let (window, maximized) = self.placement_now();
         let text = window_text(self.edit);
         let o = self.opts.get();

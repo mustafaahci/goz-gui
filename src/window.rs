@@ -74,6 +74,10 @@ mod bookmarks;
 mod cols;
 mod commands;
 mod context;
+// Wave 4 (G2): customization, and accessibility of the painted parts.
+mod access;
+mod custom;
+pub use access::pane_object;
 mod docks;
 mod edit;
 mod export;
@@ -213,6 +217,16 @@ pub struct Fonts {
 impl Fonts {
     /// The message font at `dpi`, `zoom` % its size (View > Zoom).
     fn new(dpi: u32, zoom: u32) -> Fonts {
+        Fonts::make(dpi, zoom, |_| {})
+    }
+
+    /// The message font at `dpi` as `adjust` changes it (a face and size
+    /// of Options > Fonts and Colors), then `zoom` % its size.
+    fn make(
+        dpi: u32,
+        zoom: u32,
+        adjust: impl FnOnce(&mut windows_sys::Win32::Graphics::Gdi::LOGFONTW),
+    ) -> Fonts {
         // SAFETY: plain out-structs; the font handles are owned by `Fonts`.
         unsafe {
             let mut ncm: NONCLIENTMETRICSW = core::mem::zeroed();
@@ -225,6 +239,7 @@ impl Fonts {
                 dpi,
             );
             let mut lf = ncm.lfMessageFont;
+            adjust(&mut lf);
             if zoom != crate::zoom::DEFAULT {
                 lf.lfHeight = crate::zoom::scale(lf.lfHeight, 96, zoom);
                 lf.lfWidth = crate::zoom::scale(lf.lfWidth, 96, zoom);
@@ -449,6 +464,10 @@ pub struct App {
     regions: Cell<Regions>,
     /// The window was on screen when the panes were last told.
     panes_shown: Cell<bool>,
+    /// Wave 4 (G2): the search box's font, the color filters, the UI
+    /// scale's system DPI, the double-Ctrl hook, the accessible object
+    /// (`custom.rs`, `access.rs`).
+    custom: custom::Custom,
     // Wave 1: each feature adds the state it keeps on its own lines below
     // (and in `App::new`), so their changes never meet (FRAMEWORK.md).
 
@@ -657,6 +676,10 @@ See Help > Search Syntax and the README for goz-gui's switches."
         return 0;
     }
     let prefs = prefs::Prefs::load();
+    // Wave 4 (G2): the UI scale for everything made from here on, and the
+    // instance's own AppUserModelID before its first window.
+    crate::custom::set_ui_dpi(prefs.base.custom.dpi);
+    crate::jumplist::set_app_id(&key);
     let (searches, history) = searches::Searches::load(&prefs.base);
     let mut sessions = session::Sessions::load(&prefs.base);
     let marks = bookmarks::Marks::load(&prefs.base);
@@ -821,7 +844,6 @@ See Help > Search Syntax and the README for goz-gui's switches."
             ));
         }
 
-        let accel = keys::accelerators();
         let mut msg: MSG = core::mem::zeroed();
         while GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0) > 0 {
             dropdown::click_elsewhere(app, &msg);
@@ -844,7 +866,7 @@ See Help > Search Syntax and the README for goz-gui's switches."
             {
                 continue;
             }
-            if ours && TranslateAcceleratorW(hwnd, accel, &msg) != 0 {
+            if ours && TranslateAcceleratorW(hwnd, keys::table(), &msg) != 0 {
                 continue;
             }
             // Tab and Shift+Tab go round the tab stops: the search box, the
@@ -992,7 +1014,9 @@ impl App {
                 core::ptr::null(),
             );
             let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
-            let dpi = GetDpiForWindow(hwnd);
+            // The UI scale (`dpi`, Options > UI) multiplies the monitor's.
+            let system_dpi = GetDpiForWindow(hwnd);
+            let dpi = crate::custom::scaled(system_dpi);
             let mode = s.theme;
             // The search the window starts with (Home's, or the last one),
             // on one line as the box shows it (a session may hold one of
@@ -1017,7 +1041,7 @@ impl App {
                 list,
                 header,
                 dpi: Cell::new(dpi),
-                fonts: RefCell::new(Fonts::new(dpi, s.zoom)),
+                fonts: RefCell::new(Fonts::with(dpi, s.zoom, &s.custom.colors.result_list_font)),
                 ui_fonts: RefCell::new(Fonts::new(dpi, crate::zoom::DEFAULT)),
                 zoom: Cell::new(s.zoom),
                 wheel: Cell::new(0),
@@ -1110,6 +1134,7 @@ impl App {
                 strip_capture: Cell::new(None),
                 regions: Cell::new(Regions::default()),
                 panes_shown: Cell::new(false),
+                custom: custom::Custom::new(&s.custom, system_dpi),
                 // Wave 1 (FRAMEWORK.md).
 
                 // F1 (preview pane).
@@ -1188,6 +1213,10 @@ impl App {
         // The panes this build has (and the test hook's), opened as the
         // settings left them.
         self.register_panes();
+        // Wave 4 (G2): the search box's own font, the keys in force, the
+        // double-Ctrl hook, the taskbar.
+        self.make_search_fonts();
+        self.start_custom();
         if default_size {
             // SAFETY: sizes the window for its monitor's DPI before it shows.
             unsafe {
@@ -1246,7 +1275,7 @@ impl App {
     }
 
     fn apply_fonts(&self) {
-        let ui = self.ui_font();
+        let ui = self.search_font();
         send(self.edit, WM_SETFONT, ui as usize, 1);
         let font = self.fonts.borrow().normal;
         send(self.list, WM_SETFONT, font as usize, 1);
@@ -1256,7 +1285,8 @@ impl App {
     /// The title bar and taskbar icons at the sizes this DPI wants, which
     /// the class's icons (made for the primary monitor) may not be.
     fn set_window_icons(&self) {
-        let dpi = self.dpi.get();
+        // The monitor's own: the title bar and the taskbar are Windows'.
+        let dpi = self.system_dpi();
         let old = self.window_icons.get();
         // SAFETY: reads metrics; the icons are this module's resource.
         let new = unsafe {
@@ -1319,7 +1349,8 @@ impl App {
 
     fn apply_theme(&self) {
         let dark = self.theme_mode.get().is_dark();
-        let pal = Palette::new(dark);
+        // With Options > Fonts and Colors' result list colours.
+        let pal = self.custom_palette(dark);
         self.pal.set(pal);
         theme::set_titlebar(self.hwnd, dark);
         for h in [self.list, self.header, self.edit] {
@@ -1342,9 +1373,9 @@ impl App {
             }),
         );
         theme::set_class(self.edit, dark.then_some("DarkMode_CFD"));
-        send(self.list, LVM_SETBKCOLOR, 0, pal.bg as isize);
-        send(self.list, LVM_SETTEXTBKCOLOR, 0, pal.bg as isize);
-        send(self.list, LVM_SETTEXTCOLOR, 0, pal.fg as isize);
+        send(self.list, LVM_SETBKCOLOR, 0, pal.list_bg as isize);
+        send(self.list, LVM_SETTEXTBKCOLOR, 0, pal.list_bg as isize);
+        send(self.list, LVM_SETTEXTCOLOR, 0, pal.list_fg as isize);
         syntax::apply_theme(dark);
         dialog::set_app_look(self.dialog_look());
         dropdown::apply_theme(self);
@@ -1384,7 +1415,7 @@ impl App {
         // the strip does when it is there (`tabstrip.rs`).
         let above = self.scale(if tabs_h > 0 { 3 } else { 5 });
         let (side, below) = (self.scale(3), self.scale(3));
-        let fh = self.ui_fonts.borrow().height;
+        let fh = self.ui_fonts.borrow().height.max(self.search_font_height());
         let search_h = fh + self.scale(8);
         // The status bar is the result list's: it zooms with it.
         let status_h = if self.status_visible.get() {
@@ -1692,6 +1723,8 @@ impl App {
                 WM_INITMENUPOPUP => {
                     if hiword(l as usize) == 0 && self.shell_menu.borrow().is_none() {
                         self.init_menu_popup(w as HMENU);
+                        // Options > Keyboard's keys after the items' tabs.
+                        self.relabel_menu(w as HMENU);
                     }
                     0
                 }
@@ -1756,6 +1789,8 @@ impl App {
                         self.memory_rested();
                     } else if slots::is_feature_timer(w) {
                         self.feature_timer(w);
+                    } else if custom::is_timer(w) {
+                        self.custom_timer(w);
                     }
                     0
                 }
@@ -1767,6 +1802,9 @@ impl App {
                 }
                 m if slots::is_feature_message(m) => self
                     .feature_message(m, w, l)
+                    .unwrap_or_else(|| DefWindowProcW(self.hwnd, msg, w, l)),
+                m if custom::is_message(m) => self
+                    .custom_message(m, w, l)
                     .unwrap_or_else(|| DefWindowProcW(self.hwnd, msg, w, l)),
                 WM_EXPORT => {
                     if w == crate::export::ENDED {
@@ -1918,9 +1956,14 @@ impl App {
                     0
                 }
                 WM_DPICHANGED => {
-                    self.on_dpi(u32::from(hiword(w)), &*(l as *const RECT));
+                    let dpi = self.ui_dpi_for(u32::from(hiword(w)));
+                    self.on_dpi(dpi, &*(l as *const RECT));
                     0
                 }
+                // What the window paints itself, for accessibility tools.
+                WM_GETOBJECT if crate::a11y::wants_client(l) => self
+                    .accessible_object(w)
+                    .unwrap_or_else(|| DefWindowProcW(self.hwnd, msg, w, l)),
                 WM_SETTINGCHANGE => {
                     if self.theme_mode.get() == ThemeMode::UserDefault
                         && l != 0
@@ -1998,6 +2041,7 @@ impl App {
                     // what they hold; the settings keep the panes open for
                     // next time.
                     self.exit_features();
+                    self.exit_custom();
                     self.close_all_panes();
                     self.worker.quit();
                     PostQuitMessage(0);
@@ -2839,9 +2883,11 @@ impl App {
         // The user's last widths first, at the old DPI.
         self.sync_columns();
         self.dpi.set(dpi);
-        *self.fonts.borrow_mut() = Fonts::new(dpi, self.zoom.get());
+        *self.fonts.borrow_mut() = self.list_fonts(dpi, self.zoom.get());
         *self.ui_fonts.borrow_mut() = Fonts::new(dpi, crate::zoom::DEFAULT);
         self.apply_fonts();
+        self.make_search_fonts();
+        self.remeasure_rows();
         self.rescale_columns();
         // SAFETY: moves this thread's window to the rectangle Windows chose.
         unsafe {

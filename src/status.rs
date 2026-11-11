@@ -52,6 +52,11 @@ fn buttons_of(app: &App) -> Option<[(ViewButton, RECT); 2]> {
     (side > 0).then(|| view_buttons(&rc, side, app.scale(2), app.scale(4)))
 }
 
+/// The view buttons' places now, for accessibility tools.
+pub fn view_buttons_now(app: &App) -> Option<[(ViewButton, RECT); 2]> {
+    buttons_of(app)
+}
+
 /// The button of `buttons` at `pt`.
 pub fn button_at(buttons: &[(ViewButton, RECT)], pt: POINT) -> Option<ViewButton> {
     buttons
@@ -402,6 +407,8 @@ pub fn paint(app: &App, hdc: HDC) {
         },
         pal.line,
     );
+    // Each text drawn and where, for accessibility tools.
+    let mut spoken: Vec<(String, RECT)> = Vec::new();
     // SAFETY: draws into the paint buffer; the old font is put back.
     unsafe {
         let old = SelectObject(hdc, fonts.normal);
@@ -448,6 +455,14 @@ pub fn paint(app: &App, hdc: HDC) {
             let w = width(hdc, &t);
             x_right -= w;
             draw(x_right, &rc, &t, part.colour);
+            spoken.push((
+                part.text.clone(),
+                RECT {
+                    left: x_right,
+                    right: x_right + w,
+                    ..rc
+                },
+            ));
             if let Some(indicator) = part.indicator {
                 let hit = RECT {
                     left: x_right - pad,
@@ -475,11 +490,28 @@ pub fn paint(app: &App, hdc: HDC) {
             }
             let t: Vec<u16> = text.encode_utf16().collect();
             draw(x, &clip, &t, pal.fg);
-            x += width(hdc, &t) + pad;
+            let w = width(hdc, &t);
+            spoken.insert(
+                i.min(spoken.len()),
+                (
+                    text.clone(),
+                    RECT {
+                        left: x,
+                        right: (x + w).min(clip.right),
+                        ..rc
+                    },
+                ),
+            );
+            x += w + pad;
         }
         SelectObject(hdc, old);
     }
     *app.indicators.borrow_mut() = found;
+    // What accessibility tools read of the bar (`crate::a11y`), left to
+    // right.
+    let mut ordered = spoken;
+    ordered.sort_by_key(|(_, r)| r.left);
+    app.set_status_parts(ordered);
 }
 
 /// The indicator at `pt`, in the main window's client coordinates.

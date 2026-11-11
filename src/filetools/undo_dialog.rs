@@ -21,7 +21,7 @@ use windows_sys::Win32::UI::Controls::{
     LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NM_CUSTOMDRAW, NMHDR,
     NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, IsWindowEnabled, VK_CONTROL,
 };
@@ -243,7 +243,7 @@ fn fit_columns(list: HWND) {
     // width at that DPI.
     let (dpi, bar) = unsafe {
         GetClientRect(list, &mut rc);
-        let dpi = GetDpiForWindow(list).max(96);
+        let dpi = crate::custom::window_dpi(list);
         (dpi as i32, GetSystemMetricsForDpi(SM_CXVSCROLL, dpi))
     };
     for (i, w) in fitted_widths(rc.right - bar, dpi).into_iter().enumerate() {

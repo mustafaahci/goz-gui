@@ -328,6 +328,10 @@ pub struct Settings {
     pub docks: DockSettings,
     /// `options_last_page`: the Options page shown last, by name.
     pub options_page: String,
+    /// Wave 4 (G2): the fonts and colours, the keyboard shortcuts, the UI
+    /// scale, the double-Ctrl action and the color filters
+    /// (`crate::custom`).
+    pub custom: crate::custom::Custom,
     // Wave 1: each feature adds its settings on its own lines below (here,
     // in `Default`, `from_ini` and `to_pairs`), so their changes never meet
     // (FRAMEWORK.md).
@@ -432,6 +436,7 @@ impl Default for Settings {
             view: View::default(),
             docks: DockSettings::default(),
             options_page: String::new(),
+            custom: crate::custom::Custom::default(),
             // Wave 1 (FRAMEWORK.md).
 
             // F1 (preview pane).
@@ -638,6 +643,7 @@ impl Settings {
             view: View::from_keys(|k| ini.get(k)),
             docks: DockSettings::from_keys(|k| ini.get(k)),
             options_page: ini.get("options_last_page").unwrap_or_default().to_owned(),
+            custom: crate::custom::Custom::from_keys(|k| ini.get(k)),
             // Wave 1 (FRAMEWORK.md).
 
             // F1 (preview pane).
@@ -751,6 +757,7 @@ impl Settings {
         out.extend(self.view.to_keys());
         out.extend(self.docks.to_keys());
         out.push(("options_last_page".into(), self.options_page.clone()));
+        out.extend(self.custom.to_keys());
         // Wave 1 (FRAMEWORK.md).
 
         // F1 (preview pane).
@@ -983,6 +990,11 @@ mod tests {
                 d
             },
             options_page: "History".into(),
+            custom: crate::custom::Custom {
+                dpi: 120,
+                double_ctrl: crate::custom::DoubleCtrl::Toggle,
+                ..Default::default()
+            },
             // F1 (preview pane).
             preview: crate::preview::PreviewSettings {
                 fill: true,

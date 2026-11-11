@@ -19,7 +19,6 @@ use windows_sys::Win32::UI::Controls::{
     LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLVCUSTOMDRAW, NMLVDISPINFOW,
     NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows_sys::Win32::UI::Shell::SetWindowSubclass;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -164,8 +163,7 @@ impl Find<'_> {
         let list = Find::list(dlg);
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
         send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
-        // SAFETY: reads this thread's dialog's DPI.
-        let dpi = unsafe { GetDpiForWindow(dlg) }.max(96) as i32;
+        let dpi = crate::custom::window_dpi(dlg) as i32;
         for (i, (title, width)) in COLUMNS.into_iter().enumerate() {
             let mut text = wz(title);
             let col = LVCOLUMNW {
