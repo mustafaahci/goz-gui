@@ -328,8 +328,16 @@ pub fn paint(app: &App, hdc: HDC) {
                 indicator: None,
             });
         }
-        // The open file list's name (wave 4), as Everything shows it.
-        if let Some(name) = app.filelist_indicator() {
+        // The open file list's name (wave 4), as Everything shows it. W8:
+        // the one an `open-filelist:` term opened for the search, in its
+        // place (the term, not a double-click, closes it).
+        if let Some(name) = app.temp_list_indicator() {
+            right.push(Part {
+                text: name,
+                colour: ink.fg,
+                indicator: None,
+            });
+        } else if let Some(name) = app.filelist_indicator() {
             right.push(Part {
                 text: name,
                 colour: ink.fg,

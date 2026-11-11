@@ -210,6 +210,36 @@ const IN_GOZ_GUI: &[(&str, &[&str])] = &[
         ],
     ),
     ("save-filelist0:", &["Puts the search's results in slot 0"]),
+    (
+        "a save-filelist1: new-search: b",
+        &[
+            "Runs a, puts its results in slot 1, then",
+            "runs b as a new search (b may read",
+            "filelist1:); not updated live (F5 is)",
+        ],
+    ),
+    (
+        "include-file-list:\"C:\\l.efu\"",
+        &[
+            "Items a list on the disk names (an EFU or",
+            "CSV's Filename, or a name a line);",
+            "Ctrl+click it to pick the file",
+        ],
+    ),
+    (
+        "open-filelist:\"C:\\l.efu\"",
+        &[
+            "Searches that file list instead, for this",
+            "search; Ctrl+click it to pick the file",
+        ],
+    ),
+    (
+        "filelist-filename:l.efu",
+        &[
+            "Rows of an open file list of that name",
+            "(nothing of gozd's index is in one)",
+        ],
+    ),
 ];
 
 /// The window's text, lines ending in `\n`, as gozd's syntax is now.

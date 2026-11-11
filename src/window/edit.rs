@@ -236,7 +236,9 @@ unsafe fn edit_message(app: &App, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     (&raw mut end) as isize,
                 );
                 let caret = end as usize;
-                if crate::filelist::slots::term_at(&window_text(hwnd), caret).is_some() {
+                if crate::filelist::slots::term_at(&window_text(hwnd), caret)
+                    .is_some_and(|t| t.func.editable())
+                {
                     crate::slotedit::post_edit_at(app.hwnd, caret);
                     return 0;
                 }
@@ -295,7 +297,9 @@ unsafe fn edit_message(app: &App, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     let at = SendMessageW(hwnd, EM_CHARFROMPOS, 0, l);
                     if at != -1 {
                         let unit = (at as usize) & 0xffff;
-                        if crate::filelist::slots::term_at(&window_text(hwnd), unit).is_some() {
+                        if crate::filelist::slots::term_at(&window_text(hwnd), unit)
+                            .is_some_and(|t| t.func.editable())
+                        {
                             crate::slotedit::post_edit_at(app.hwnd, unit);
                             app.click_select.set(false);
                             return r;

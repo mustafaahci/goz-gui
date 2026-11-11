@@ -2406,14 +2406,25 @@ impl App {
         }
         let text = window_text(self.edit);
         let o = self.opts.get();
-        // The Folders pane's folder goes in front of the text (F2).
+        // The Folders pane's folder goes in front of the text (F2). W8: in
+        // front of each part `new-search:` starts, with the filter and Match
+        // Path, as each is a search of its own.
         let scoped = self.scoped_search(&text);
+        let query = crate::filelist::slots::each_part(&text, |part| {
+            filter::query(o.filter, o.match_path, &self.scoped_search(part))
+        });
+        // W8: an `open-filelist:` term's list is searched for this search
+        // instead of the index or the tab's list (or why it cannot be).
+        let (filelist, refused) = match self.search_file_list(&text) {
+            Ok(list) => (list, None),
+            Err(why) => (self.filelist(), Some(why)),
+        };
         let search = Arc::new(Search {
-            query: filter::query(o.filter, o.match_path, &scoped),
+            query,
             sort: o.sort,
             match_case: o.match_case,
             // W4 (G1): an open file list is searched instead of gozd.
-            filelist: self.filelist(),
+            filelist,
             // W5: sorted by its Date Created, when that is the sort.
             created_sort: self.created_sort(),
             // W6: the tab's file-list slots, for filelistN:.
@@ -2424,7 +2435,12 @@ impl App {
         self.model.borrow_mut().pending = Some(Pending {
             epoch,
             search: Arc::clone(&search),
-            highlight: self.highlight_for(&text, o.match_case, o.match_path),
+            // W8: the results are the last part's, and so are its words.
+            highlight: self.highlight_for(
+                crate::filelist::slots::last_part(&text),
+                o.match_case,
+                o.match_path,
+            ),
             keep_place,
         });
         self.worker.begin(epoch);
@@ -2433,7 +2449,22 @@ impl App {
         // file list (W4, G1), as in Everything.
         let hidden =
             self.ui.get().hide_empty && scoped.trim().is_empty() && search.filelist.is_none();
-        if hidden {
+        if let Some(why) = &refused {
+            // W8: answered as gozd's refusal would be, without asking.
+            let failed = Box::into_raw(Box::new(Reply::Failed {
+                epoch,
+                block: 0,
+                failure: Failure::Refused(why.clone()),
+            }));
+            // SAFETY: posts to this thread's window, which owns the box
+            // once the message is queued; if posting fails it is taken
+            // back.
+            unsafe {
+                if PostMessageW(self.hwnd, WM_REPLY, 0, failed as isize) == 0 {
+                    drop(Box::from_raw(failed));
+                }
+            }
+        } else if hidden {
             // Options > Results' "Hide results when the search is empty":
             // gozd is not asked; the empty answer comes as its would, so
             // the window takes it as any other.
@@ -2462,7 +2493,7 @@ impl App {
                 search: Arc::clone(&search),
             });
         }
-        if keep_place && !hidden {
+        if keep_place && !hidden && refused.is_none() {
             // Fetch where the user is looking too, so a refresh repaints in
             // place instead of row by row.
             let top = self.top_index() as u32;
@@ -2476,8 +2507,9 @@ impl App {
             }
         }
         self.last_search.set(Some(Instant::now()));
-        // Everything's title names an open file list too.
-        let list = self.filelist().map(|l| l.name().to_owned());
+        // Everything's title names an open file list too (W8: the one this
+        // search runs over).
+        let list = self.searched_list_name();
         let title = match (text.is_empty(), list) {
             (true, None) => "goz".to_owned(),
             (false, None) => format!("{text} - goz"),
@@ -2813,6 +2845,7 @@ impl App {
                 }
             }
             Reply::Syntax(on) => self.syntax_learned(on),
+            Reply::Saved { epoch, saves } => self.parts_saved(epoch, saves),
         }
     }
 

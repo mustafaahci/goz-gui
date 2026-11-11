@@ -695,7 +695,12 @@ impl App {
             let r = send(edit, EM_CHARFROMPOS, 0, packed as isize);
             (r != -1).then_some((r as usize) & 0xffff)
         };
-        let term = at.and_then(|u| crate::filelist::slots::term_at(&window_text(edit), u));
+        // W8: not on `filelist-filename:` (nothing to edit), nor on a term
+        // whose file Ctrl+click and F2 pick (`include-file-list:`,
+        // `open-filelist:`: no label of Everything's is known for a menu).
+        let term = at
+            .and_then(|u| crate::filelist::slots::term_at(&window_text(edit), u))
+            .filter(|t| t.func.editable() && !t.func.picks_file());
         let mut items = Vec::with_capacity(16);
         if let Some(t) = &term {
             items.push(match t.slot {

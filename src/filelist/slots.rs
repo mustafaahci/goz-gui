@@ -64,15 +64,44 @@
 //!   than answered wrongly, and so is all of it with the deployed v0.6.0
 //!   gozd, which cannot say "any of these". gozd never lists a drive's root
 //!   itself (`C:\`), so `child-`/`descendant-` leave roots out.
+//!
+//! W8: the last of Everything's file-list functions, as voidtools documents
+//! them (the "Search functions" topic, t=10176, and "Combining multiple
+//! searches", t=17882):
+//! - `new-search:` (also `newsearch:`) starts a new search: the search is
+//!   run in parts, left to right ([`parts`], [`resolve`]); a part's results
+//!   are thrown away when the next one starts, so only what its
+//!   `save-filelistN:` terms save to a slot lives on, and the last part's
+//!   results are the answer. Everything's example `*.mp3 save-filelist1:
+//!   new-search: childfilelist1:` is one search: the folders holding an mp3.
+//!   The window runs each part with its filter, Match Path and folder, as a
+//!   search of its own would be run;
+//! - `include-file-list:<file>`: the items named in a list on the disk (an
+//!   EFU or CSV's `Filename` column, or a name a line), matched as
+//!   `filelist:` matches its names ([`include_names`]); the file's full path
+//!   is needed (a relative one is never looked for in goz-gui's current
+//!   folder);
+//! - `open-filelist:<file>`: the search runs over that file list instead of
+//!   the index or the tab's list, for this search only ([`open_list`]; the
+//!   window opens it);
+//! - `filelist-filename:<names>`: the items that belong to a file list of
+//!   that file name (matched as `filelist:` matches a name or a full path; an
+//!   empty value: any file list). Every row of an open file list belongs to
+//!   it; no item of gozd's index belongs to any.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::matcher::name_of;
 use super::wild::{folded, glob, has_wildcard};
 
 /// The number of slots, as Everything's.
 pub const COUNT: usize = 10;
+
+/// W7: the most results `save-filelistN:` puts in a slot (each is kept in
+/// `Session.json` too).
+pub const SAVE_MAX: usize = 100_000;
 
 /// gozd's most terms in one search (the query-language branch's
 /// `MAX_QUERY_TERMS`).
@@ -147,27 +176,62 @@ pub enum Func {
     Stem,
     /// `save-filelistN:`.
     Save,
+    /// W8: `include-file-list:<file>`: the items a list on the disk names.
+    Include,
+    /// W8: `open-filelist:<file>`: the search runs over that file list.
+    Open,
+    /// W8: `filelist-filename:<names>`: items of a file list so named.
+    ListName,
+}
+
+/// Whether a function takes a slot (`filelist1:`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotRule {
+    /// Only with a slot (`parent-filelist1:`).
+    Needed,
+    /// With a slot or a value of its own (`filelist:`, `filelist1:`).
+    Either,
+    /// Never: its value is its own (`include-file-list:x.efu`).
+    Never,
 }
 
 impl Func {
     /// The function a name stands for (any case, hyphens and underscores
-    /// left out), and whether it takes a slot only (`true`) or also a list
-    /// of its own (`false`).
-    fn named(base: &str) -> Option<(Func, bool)> {
+    /// left out), and whether it takes a slot.
+    fn named(base: &str) -> Option<(Func, SlotRule)> {
         Some(match base {
-            "filelist" => (Func::Items, false),
-            "existsinfilelist" => (Func::ExistsIn, true),
-            "parentfilelist" => (Func::Parent, true),
-            "childfilelist" => (Func::Child, false),
-            "siblingfilelist" => (Func::Sibling, true),
-            "ancestorfilelist" => (Func::Ancestor, true),
-            "descendantfilelist" => (Func::Descendant, true),
-            "sizefilelist" => (Func::Size, true),
-            "namefilelist" => (Func::Name, true),
-            "stemfilelist" => (Func::Stem, true),
-            "savefilelist" => (Func::Save, true),
+            "filelist" => (Func::Items, SlotRule::Either),
+            "existsinfilelist" => (Func::ExistsIn, SlotRule::Needed),
+            "parentfilelist" => (Func::Parent, SlotRule::Needed),
+            "childfilelist" => (Func::Child, SlotRule::Either),
+            "siblingfilelist" => (Func::Sibling, SlotRule::Needed),
+            "ancestorfilelist" => (Func::Ancestor, SlotRule::Needed),
+            "descendantfilelist" => (Func::Descendant, SlotRule::Needed),
+            "sizefilelist" => (Func::Size, SlotRule::Needed),
+            "namefilelist" => (Func::Name, SlotRule::Needed),
+            "stemfilelist" => (Func::Stem, SlotRule::Needed),
+            "savefilelist" => (Func::Save, SlotRule::Needed),
+            // W8: Everything.exe's own spellings are `include-filelist`,
+            // `includefilelist:`, `open-filelist` and `filelist-filename`;
+            // its documentation's `include-file-list:` is the same name.
+            "includefilelist" => (Func::Include, SlotRule::Never),
+            "openfilelist" => (Func::Open, SlotRule::Never),
+            "filelistfilename" => (Func::ListName, SlotRule::Never),
             _ => return None,
         })
+    }
+
+    /// W8: whether Ctrl+click and F2 on such a term open something: a
+    /// slot's or a list's names (Edit File List Slot), or a file to pick
+    /// (`include-file-list:`, `open-filelist:`, Everything's "Ctrl + click
+    /// the include-file-list: text in the search box to select a file").
+    pub fn editable(self) -> bool {
+        self != Func::ListName
+    }
+
+    /// W8: whether its value names a file on the disk to pick.
+    pub fn picks_file(self) -> bool {
+        matches!(self, Func::Include | Func::Open)
     }
 }
 
@@ -212,11 +276,11 @@ fn head(b: &[u8]) -> Option<(Func, Option<usize>, usize)> {
         }
         _ => None,
     };
-    let (func, slot_only) = Func::named(&base)?;
-    if slot_only && slot.is_none() {
-        return None;
+    let (func, rule) = Func::named(&base)?;
+    match (rule, slot) {
+        (SlotRule::Needed, None) | (SlotRule::Never, Some(_)) => None,
+        _ => Some((func, slot, colon + 1)),
     }
-    Some((func, slot, colon + 1))
 }
 
 /// The file-list terms of `query`: each where a term may start (the
@@ -393,6 +457,10 @@ pub fn normalize(name: &str) -> Option<String> {
 /// slot's term with a value of its own (but `exists-in-filelistN:`, whose
 /// value is the name it looks for).
 pub fn names(term: &Term, slots: &Slots) -> Result<Vec<String>, String> {
+    // W8: the names in a list on the disk.
+    if term.func == Func::Include {
+        return include_names(term);
+    }
     match term.slot {
         Some(n) if term.func != Func::ExistsIn && !term.value.trim().is_empty() => Err(format!(
             "{} takes no value: it works with the names in file list slot {n} \
@@ -405,6 +473,323 @@ pub fn names(term: &Term, slots: &Slots) -> Result<Vec<String>, String> {
             .filter_map(|n| normalize(n))
             .collect()),
     }
+}
+
+/// W8: the search with `term`'s value made the file `path` (in quotes),
+/// as Ctrl+click on `include-file-list:` or `open-filelist:` picks it.
+pub fn with_file(query: &str, term: &Term, path: &str) -> String {
+    format!(
+        "{}{}\"{path}\"{}",
+        &query[..term.start],
+        term.name,
+        &query[term.end..]
+    )
+}
+
+/// W8: whether `path` is a full path (`C:\x`, `\\server\share\x`).
+fn is_full_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    path.starts_with("\\\\")
+        || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\')
+}
+
+/// W8: a function's file (`include-file-list:`, `open-filelist:`): its
+/// value, `/` made `\`; an error unless it is a full path.
+fn file_of(term: &Term) -> Result<String, String> {
+    let path = term.value.trim().replace('/', "\\");
+    if path.is_empty() {
+        return Err(format!(
+            "{} needs a file list's full path (Ctrl+click it to pick one)",
+            term.name
+        ));
+    }
+    if !is_full_path(&path) {
+        return Err(format!(
+            "{} needs the file list's full path, as C:\\Lists\\{path}: a relative name is \
+             not looked for in goz-gui's current folder",
+            term.name
+        ));
+    }
+    Ok(path)
+}
+
+/// W8: the names `include-file-list:<file>` stands for: each row's
+/// `Filename` of an EFU or CSV (Everything's "CSV and EFU files must be an
+/// Everything File List with the Filename column"), or each line of any
+/// other list ("TXT files must specify a filename on each line"); a name
+/// with a `\` is a full path, any other a whole name, as `filelist:` reads
+/// them (a relative path is not made one under the list's folder).
+fn include_names(term: &Term) -> Result<Vec<String>, String> {
+    let path = file_of(term)?;
+    let cannot = |e: std::io::Error| format!("{} cannot read {path}: {e}", term.name);
+    if std::fs::metadata(&path).map_err(cannot)?.is_dir() {
+        return Err(format!(
+            "{} names the folder {path}, not a file list",
+            term.name
+        ));
+    }
+    let file = std::fs::File::open(&path).map_err(cannot)?;
+    let reader = super::utf8_reader(file).map_err(cannot)?;
+    let mut out = Vec::new();
+    let never = std::sync::atomic::AtomicBool::new(false);
+    super::parse::each_row(reader, "", &|_| None, &never, |p, _, _, _, _| {
+        if let Some(n) = normalize(p) {
+            out.push(n);
+        }
+    })
+    .map_err(cannot)?;
+    Ok(out)
+}
+
+/// W8: the files the search's `include-file-list:` terms read, as their
+/// stamps (length and time last written; `None` when it cannot be read): an
+/// answer kept for the search is good while they are the same.
+pub fn include_stamps(query: &str) -> Vec<Option<(u64, std::time::SystemTime)>> {
+    if !may_hold(query) {
+        return Vec::new();
+    }
+    terms(query)
+        .iter()
+        .filter(|t| t.func == Func::Include)
+        .map(|t| {
+            let m = std::fs::metadata(file_of(t).ok()?).ok()?;
+            Some((m.len(), m.modified().ok()?))
+        })
+        .collect()
+}
+
+/// W8: the file list an `open-filelist:` term of `query` opens for the
+/// search (its full path); `None` without one; an error for a relative or
+/// empty path, or two terms naming two lists.
+pub fn open_list(query: &str) -> Option<Result<String, String>> {
+    if !may_hold(query) {
+        return None;
+    }
+    let mut found: Option<String> = None;
+    for t in terms(query).iter().filter(|t| t.func == Func::Open) {
+        let path = match file_of(t) {
+            Ok(p) => p,
+            Err(why) => return Some(Err(why)),
+        };
+        match &found {
+            Some(p) if !p.eq_ignore_ascii_case(&path) => {
+                return Some(Err(format!(
+                    "{} names a second file list ({path} after {p}); a search runs over one",
+                    t.name
+                )));
+            }
+            Some(_) => {}
+            None => found = Some(path),
+        }
+    }
+    found.map(Ok)
+}
+
+/// W8: whether the search reads a file of the disk (`include-file-list:`)
+/// or runs in parts (`new-search:`): what gozd is asked for it is worked
+/// out once for all its blocks.
+pub fn is_costly(query: &str) -> bool {
+    new_searches(query).is_ok_and(|cuts| !cuts.is_empty())
+        || (may_hold(query) && terms(query).iter().any(|t| t.func == Func::Include))
+}
+
+/// W8: a `new-search:` function at the start of `b` (any case, hyphens
+/// and underscores left out): how long its name is with its colon.
+fn new_search_head(b: &[u8]) -> Option<usize> {
+    let colon = b.iter().take(16).position(|&c| c == b':')?;
+    let base: Vec<u8> = b[..colon]
+        .iter()
+        .filter(|c| !matches!(c, b'-' | b'_'))
+        .map(u8::to_ascii_lowercase)
+        .collect();
+    (base == b"newsearch").then_some(colon + 1)
+}
+
+/// W8: whether `query` may hold a `new-search:` term at all (every
+/// spelling ends `search:`): most searches do not, and cost no more.
+fn has_new_search(query: &str) -> bool {
+    query
+        .as_bytes()
+        .windows(7)
+        .any(|w| w.eq_ignore_ascii_case(b"search:"))
+}
+
+/// W8: where the search's `new-search:` terms are (bytes `start..end`):
+/// each where a term may start, not in quotes; an error for one with a
+/// value, inside `< >`, or after `!` or `|` (a new search is no term of the
+/// search before it).
+fn new_searches(query: &str) -> Result<Vec<(usize, usize)>, String> {
+    let mut out = Vec::new();
+    if !has_new_search(query) {
+        return Ok(out);
+    }
+    let b = query.as_bytes();
+    let mut quoted = false;
+    let mut at_start = true;
+    let mut depth = 0usize;
+    // The last byte outside quotes that is not white space.
+    let mut last = 0u8;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if !quoted
+            && at_start
+            && let Some(len) = new_search_head(&b[i..])
+        {
+            let name = &query[i..i + len];
+            let mut j = i + len;
+            while j < b.len() && !b[j].is_ascii_whitespace() && b[j] != b'|' && b[j] != b'>' {
+                j += 1;
+            }
+            if j > i + len {
+                return Err(format!(
+                    "{name} takes no value: it starts a new search, which the text after it is"
+                ));
+            }
+            if depth > 0 || matches!(last, b'!' | b'|' | b'<') {
+                return Err(format!(
+                    "{name} starts a new search, so it cannot be inside < >, after ! or in an \
+                     OR (|)"
+                ));
+            }
+            out.push((i, j));
+            i = j;
+            at_start = false;
+            last = b':';
+            continue;
+        }
+        if c == b'"' {
+            quoted = !quoted;
+        } else if !quoted {
+            // A group opens where a term may start (`size:<1mb` is no
+            // group), and closes after a term.
+            match c {
+                b'<' if at_start => depth += 1,
+                b'>' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if !quoted && !c.is_ascii_whitespace() {
+            last = c;
+        }
+        at_start = !quoted && (c.is_ascii_whitespace() || matches!(c, b'!' | b'<' | b'|'));
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// W8: the parts of a search that `new-search:` starts anew, in order
+/// (one, the search itself, without one).
+pub fn parts(query: &str) -> Result<Vec<&str>, String> {
+    let cuts = new_searches(query)?;
+    let mut out = Vec::with_capacity(cuts.len() + 1);
+    let mut at = 0;
+    for (start, end) in cuts {
+        out.push(&query[at..start]);
+        at = end;
+    }
+    out.push(&query[at..]);
+    Ok(out)
+}
+
+/// W8: the search's last part, the one whose results show (all of it
+/// without `new-search:`; all of it too when a `new-search:` is misplaced,
+/// which [`resolve`] refuses).
+pub fn last_part(query: &str) -> &str {
+    match parts(query) {
+        Ok(p) => p.last().copied().unwrap_or(query),
+        Err(_) => query,
+    }
+}
+
+/// W8: `text` with each of its parts made into a search by `make` (the
+/// window's filter, Match Path and folder), joined again by `new-search:`;
+/// as `make(text)` without one (or with a misplaced one, which is refused
+/// when it is searched).
+pub fn each_part(text: &str, mut make: impl FnMut(&str) -> String) -> String {
+    match parts(text) {
+        Ok(p) if p.len() > 1 => p
+            .iter()
+            .map(|part| make(part.trim()))
+            .collect::<Vec<_>>()
+            .join(" new-search: "),
+        _ => make(text),
+    }
+}
+
+/// W8: what the parts before a search's last saved: the slots after them,
+/// and each slot saved with how many items it holds now, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartSaves {
+    pub slots: Arc<Slots>,
+    pub saved: Vec<(usize, usize)>,
+}
+
+/// W8: a search made ready to run: its last part, and the slots it reads,
+/// which its earlier parts' `save-filelistN:` terms filled; what they saved
+/// (`None` without an earlier part that saves).
+#[derive(Debug)]
+pub struct Resolved<'a> {
+    pub last: &'a str,
+    pub slots: Arc<Slots>,
+    pub saves: Option<PartSaves>,
+}
+
+/// W8: what answers a part of a search for [`resolve`]: its results' full
+/// paths, with the slots the parts before it left.
+pub type RunPart<'r, E> = dyn FnMut(&str, &Arc<Slots>) -> Result<Vec<String>, NotAsked<E>> + 'r;
+
+/// W8: runs the parts of `query` before its last, left to right, each with
+/// the slots the parts before it left (`slots` first): `run` answers a part
+/// with all its results' full paths (it may stop after [`SAVE_MAX`] + 1),
+/// which go in the slots its `save-filelistN:` terms name. A part that
+/// saves nothing is not run: its results are thrown away by the next one,
+/// as Everything's are. An error when a part cannot be run, or holds more
+/// results than a slot is given.
+pub fn resolve<'a, E>(
+    query: &'a str,
+    slots: &Arc<Slots>,
+    run: &mut RunPart<'_, E>,
+) -> Result<Resolved<'a>, NotAsked<E>> {
+    let all = parts(query)?;
+    let (last, before) = all.split_last().expect("a search has one part at least");
+    let mut now = Arc::clone(slots);
+    let mut saved: Vec<(usize, usize)> = Vec::new();
+    for part in before {
+        let saves = saves(part)?;
+        if saves.is_empty() {
+            continue;
+        }
+        let paths = run(part, &now)?;
+        if paths.len() > SAVE_MAX {
+            return Err(NotAsked::Refused(format!(
+                "{} before new-search: saves at most {} results, and its search has more, so \
+                 the search after it is not run",
+                saves
+                    .iter()
+                    .map(|n| format!("save-filelist{n}:"))
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+                crate::format::grouped(SAVE_MAX as u64)
+            )));
+        }
+        let mut next = (*now).clone();
+        for &n in &saves {
+            next.set(n, paths.clone());
+            saved.retain(|&(s, _)| s != n);
+            saved.push((n, paths.len()));
+        }
+        now = Arc::new(next);
+    }
+    let saves = (!saved.is_empty()).then(|| PartSaves {
+        slots: Arc::clone(&now),
+        saved,
+    });
+    Ok(Resolved {
+        last,
+        slots: now,
+        saves,
+    })
 }
 
 /// The slots the search's `save-filelistN:` terms put its results in, in
@@ -714,7 +1099,9 @@ pub fn split_for_list(query: &str, slots: &Slots) -> Result<(String, Vec<Planned
         rest.push_str(&query[at..t.start]);
         rest.push(' ');
         at = t.end;
-        if t.func == Func::Save {
+        // W8: `open-filelist:` chose the list being searched (the window
+        // opened it), and tests nothing of a row.
+        if matches!(t.func, Func::Save | Func::Open) {
             continue;
         }
         planned.push(Planned {
@@ -771,6 +1158,9 @@ enum Test {
         slot: ListMatcher,
         sizes: HashSet<u64>,
     },
+    /// W8: `filelist-filename:`: every row of the list is in it, so it is
+    /// the same for each (whether the list's file is so named).
+    Each(bool),
 }
 
 /// The tests a search's file-list terms make of each row of an open file
@@ -784,15 +1174,19 @@ pub struct RowTests {
 
 impl RowTests {
     /// The tests of `planned`, the case as the search's (goz's parser said
-    /// it, `case:` and all).
-    pub fn new(planned: &[Planned], case: bool) -> Result<RowTests, String> {
+    /// it, `case:` and all), over the file list at `list` (its full path).
+    pub fn new(planned: &[Planned], case: bool, list: &str) -> Result<RowTests, String> {
         let mut tests = Vec::with_capacity(planned.len());
         for p in planned {
             let slot = || ListMatcher::new(&p.names, case);
             let name_parts =
                 || -> Vec<String> { p.names.iter().map(|n| name_part(n).to_owned()).collect() };
             tests.push(match p.func {
-                Func::Items => Test::Items(slot()),
+                // W8: a list on the disk's names, as `filelist:`'s own.
+                Func::Items | Func::Include => Test::Items(slot()),
+                // W8: an empty value: any file list.
+                Func::ListName => Test::Each(p.names.is_empty() || slot().matches(list.as_bytes())),
+                Func::Open => continue,
                 Func::Name => Test::Name(ListMatcher::new(&name_parts(), case)),
                 Func::Stem => {
                     let (mut whole, mut globs) = (HashSet::new(), Vec::new());
@@ -930,6 +1324,7 @@ impl RowTests {
                     })
             }
             Test::Size { sizes, .. } => !is_dir && size.is_some_and(|s| sizes.contains(&s)),
+            Test::Each(yes) => *yes,
         })
     }
 }
@@ -939,6 +1334,34 @@ pub fn needs_or(func: &str) -> String {
     format!(
         "{func} needs a gozd that reads OR (|), and the gozd running (goz v0.6.0) does not, \
          so it is not asked; {func} works in an open file list (File > Open File List...)"
+    )
+}
+
+/// W8: why a gozd that reads no OR cannot be asked any part of `query`
+/// (all its parts, before any is run); `None` when it can.
+pub fn needs_boolean(query: &str) -> Option<String> {
+    if !may_hold(query) {
+        return None;
+    }
+    let found = terms(query);
+    let t = found
+        .iter()
+        .find(|t| !matches!(t.func, Func::Save | Func::Open))?;
+    Some(if t.func == Func::ListName {
+        needs_syntax(&t.name)
+    } else {
+        needs_or(&t.name)
+    })
+}
+
+/// W8: why gozd cannot be asked `filelist-filename:` when it reads no
+/// `whole:`: nothing in its index belongs to a file list, but v0.6.0 has no
+/// way to say "nothing".
+pub fn needs_syntax(func: &str) -> String {
+    format!(
+        "{func} needs a gozd that reads the newer syntax (whole:), and the gozd running \
+         (goz v0.6.0) does not, so it is not asked; {func} works in an open file list \
+         (File > Open File List...)"
     )
 }
 
@@ -997,8 +1420,22 @@ pub fn for_gozd<'a, E>(
         return Ok(Cow::Borrowed(query));
     }
     saves(query)?;
+    // W8: the window searches the list an `open-filelist:` names; one that
+    // reaches gozd's index was not opened, and gozd is not asked instead.
+    if let Some(t) = found.iter().find(|t| t.func == Func::Open) {
+        return Err(NotAsked::Refused(format!(
+            "{} names a file list goz-gui has not opened, so gozd's index is not searched \
+             in its place",
+            t.name
+        )));
+    }
     if !boolean && let Some(t) = found.iter().find(|t| t.func != Func::Save) {
-        return Err(needs_or(&t.name).into());
+        return Err(if t.func == Func::ListName {
+            needs_syntax(&t.name)
+        } else {
+            needs_or(&t.name)
+        }
+        .into());
     }
     let mut out = String::with_capacity(query.len() + 64);
     let mut at = 0;
@@ -1009,9 +1446,17 @@ pub fn for_gozd<'a, E>(
             out.push(' ');
             continue;
         }
-        let names = names(t, slots)?;
+        // W8: no item of gozd's index belongs to a file list: nothing
+        // (`whole:""`), the file names not even read.
+        let names = if t.func == Func::ListName {
+            Vec::new()
+        } else {
+            names(t, slots)?
+        };
         let terms = match t.func {
-            Func::Items => names.iter().map(|n| item_term(n)).collect(),
+            Func::Items | Func::Include => names.iter().map(|n| item_term(n)).collect(),
+            Func::ListName => Vec::new(),
+            Func::Open => unreachable!("refused above"),
             Func::Name => names.iter().map(|n| item_term(name_part(n))).collect(),
             Func::Stem => stem_terms(t, &names)?,
             Func::Parent => parent_terms(t, &names)?,
@@ -1261,7 +1706,7 @@ mod tests {
         assert_eq!(t[1].name, "FileList3:");
         // An unquoted `|` or `>` ends the value.
         assert_eq!(t[2].value, "x");
-        assert!(terms("myfilelist:x filelistx: filelist12: filelist-filename:a").is_empty());
+        assert!(terms("myfilelist:x filelistx: filelist12: filelist-filename1:a").is_empty());
         assert!(terms(r#""a filelist:x""#).is_empty(), "inside quotes");
     }
 
@@ -1454,7 +1899,7 @@ mod tests {
     /// The rows of [`ROWS`] the search's file-list terms pass.
     fn hits(query: &str, s: &Slots) -> Vec<&'static str> {
         let (_, planned) = split_for_list(query, s).unwrap();
-        let mut t = RowTests::new(&planned, false).unwrap();
+        let mut t = RowTests::new(&planned, false, LIST).unwrap();
         if t.needs_rows() {
             for &(p, d, size) in ROWS {
                 t.see(p.as_bytes(), d, size);
@@ -1879,5 +2324,326 @@ mod tests {
         ] {
             assert_eq!(search_case(q, toggle), want, "{q} (toggle {toggle})");
         }
+    }
+
+    /// The file list [`hits`] searches: its full path.
+    const LIST: &str = r"C:\Lists\Test List.efu";
+
+    /// W8: the new functions in each spelling Everything.exe and its
+    /// documentation have; none takes a slot.
+    #[test]
+    fn w8_functions_in_everythings_spellings() {
+        for (q, want) in [
+            (r"include-file-list:C:\l.efu", Func::Include),
+            (r"include-filelist:C:\l.efu", Func::Include),
+            (r"includefilelist:C:\l.efu", Func::Include),
+            (r#"open-filelist:"C:\a b\l.efu""#, Func::Open),
+            (r"OpenFileList:C:\l.efu", Func::Open),
+            (r"open-file-list:C:\l.efu", Func::Open),
+            ("filelist-filename:l.efu", Func::ListName),
+            ("filelistfilename:l.efu", Func::ListName),
+            ("file-list-filename:", Func::ListName),
+        ] {
+            let t = terms(q);
+            assert_eq!(t.len(), 1, "{q}: {t:?}");
+            assert_eq!((t[0].func, t[0].slot), (want, None), "{q}");
+        }
+        for q in [
+            "include-file-list1:x",
+            "open-filelist2:x",
+            "filelist-filename3:",
+        ] {
+            assert!(terms(q).is_empty(), "{q}");
+        }
+        assert!(Func::Include.picks_file() && Func::Open.picks_file());
+        assert!(!Func::ListName.editable() && Func::Items.editable());
+        let q = r"abc open-filelist:old.efu x";
+        let t = terms(q).remove(0);
+        assert_eq!(
+            with_file(q, &t, r"C:\a b\l.efu"),
+            r#"abc open-filelist:"C:\a b\l.efu" x"#
+        );
+    }
+
+    /// W8: `new-search:` parts a search where a term may start, outside
+    /// quotes, in each spelling; misplaced, it is refused.
+    #[test]
+    fn new_search_parts_a_search() {
+        let q = "*.mp3 save-filelist1: new-search: childfilelist1:";
+        assert_eq!(
+            parts(q).unwrap(),
+            ["*.mp3 save-filelist1: ", " childfilelist1:"]
+        );
+        assert_eq!(last_part(q), " childfilelist1:");
+        assert_eq!(
+            parts("a NewSearch: b new_search:").unwrap(),
+            ["a ", " b ", ""]
+        );
+        assert_eq!(parts(r#""new-search:" a"#).unwrap(), [r#""new-search:" a"#]);
+        assert_eq!(parts("my-new-search: a").unwrap(), ["my-new-search: a"]);
+        // A comparison is no group.
+        assert_eq!(
+            parts("size:<1mb dm:>2024 new-search: <a|b>").unwrap(),
+            ["size:<1mb dm:>2024 ", " <a|b>"]
+        );
+        assert_eq!(parts("abc").unwrap(), ["abc"]);
+        for bad in [
+            "a new-search:b",
+            "<a new-search: b>",
+            "!new-search: b",
+            "a | new-search: b",
+        ] {
+            assert!(parts(bad).unwrap_err().contains("new-search:"), "{bad}");
+            assert_eq!(last_part(bad), bad);
+        }
+        // Each part made a search of its own (the window's filter).
+        assert_eq!(
+            each_part(q, |p| format!("ext:mp3 {p}")),
+            "ext:mp3 *.mp3 save-filelist1: new-search: ext:mp3 childfilelist1:"
+        );
+        assert_eq!(each_part("abc", |p| format!("[{p}]")), "[abc]");
+        assert!(is_costly(q) && !is_costly("research: x") && !is_costly("abc"));
+    }
+
+    /// The paths a part "finds" in [`resolve`]'s tests: its first word's
+    /// letters, each a file in `C:\r`, or the names of slot 1 when it reads
+    /// it (`filelist1:`).
+    fn run_part(part: &str, now: &Arc<Slots>) -> Result<Vec<String>, NotAsked<()>> {
+        if part.contains("filelist1:") && !part.contains("save-filelist1:") {
+            return Ok(now.get(1).to_vec());
+        }
+        let word = part.split_whitespace().next().unwrap_or("");
+        Ok(word.chars().map(|c| format!(r"C:\r\{c}.txt")).collect())
+    }
+
+    /// W8: the parts before the last run left to right, each saving to the
+    /// slots the next ones read; a part that saves nothing is not run.
+    #[test]
+    fn earlier_parts_fill_the_slots_the_later_read() {
+        let start = Arc::new(slots());
+        let mut asked = Vec::new();
+        let mut run = |part: &str, now: &Arc<Slots>| {
+            asked.push(part.trim().to_owned());
+            run_part(part, now)
+        };
+        let r = resolve(
+            "ab save-filelist1: new-search: zz new-search: filelist1: save-filelist2: \
+             new-search: childfilelist2:",
+            &start,
+            &mut run,
+        )
+        .unwrap();
+        assert_eq!(asked, ["ab save-filelist1:", "filelist1: save-filelist2:"]);
+        assert_eq!(r.last, " childfilelist2:");
+        assert_eq!(r.slots.get(1), [r"C:\r\a.txt", r"C:\r\b.txt"]);
+        assert_eq!(r.slots.get(2), r.slots.get(1));
+        // The slots not saved are as they were.
+        assert_eq!(r.slots.get(9), start.get(9));
+        let saves = r.saves.unwrap();
+        assert_eq!(saves.saved, [(1, 2), (2, 2)]);
+        assert!(Arc::ptr_eq(&saves.slots, &r.slots));
+        // Without new-search:, nothing is run and the slots are the same.
+        let r = resolve::<()>("ab save-filelist1:", &start, &mut |_, _| panic!("not run")).unwrap();
+        assert!(Arc::ptr_eq(&r.slots, &start) && r.saves.is_none());
+        assert_eq!(r.last, "ab save-filelist1:");
+        // A part reading the slot it saves, and a misplaced new-search:.
+        let refused = |q: &str| match resolve(q, &start, &mut run_part) {
+            Err(NotAsked::Refused(why)) => why,
+            other => panic!("{q}: {other:?}"),
+        };
+        assert!(
+            refused("filelist1: save-filelist1: new-search: x").contains("reads file list slot 1")
+        );
+        assert!(refused("a new-search:x").contains("takes no value"));
+        // More results than a slot is given: the later part is not run.
+        let mut many = |_: &str, _: &Arc<Slots>| -> Result<Vec<String>, NotAsked<()>> {
+            Ok((0..=SAVE_MAX).map(|i| format!(r"C:\m\{i}")).collect())
+        };
+        let Err(NotAsked::Refused(why)) = resolve(
+            "x save-filelist3: new-search: filelist3:",
+            &start,
+            &mut many,
+        ) else {
+            panic!()
+        };
+        assert!(why.starts_with("save-filelist3: before new-search: saves at most 100,000"));
+        // A stale run ends it.
+        let Err(NotAsked::Lookup(())) = resolve(
+            "x save-filelist3: new-search: filelist3:",
+            &start,
+            &mut |_, _| Err(NotAsked::Lookup(())),
+        ) else {
+            panic!()
+        };
+    }
+
+    /// W8: Everything's example, `save-filelist1: newsearch:
+    /// childfilelist1:`, over a list's rows: the folders holding a `.txt`.
+    #[test]
+    fn everythings_new_search_example_over_rows() {
+        let none = Arc::new(Slots::default());
+        let mut run = |part: &str, now: &Arc<Slots>| -> Result<Vec<String>, NotAsked<()>> {
+            let (rest, planned) = split_for_list(part, now)?;
+            assert_eq!(rest.trim(), "*.txt");
+            let mut t = RowTests::new(&planned, false, LIST)?;
+            Ok(ROWS
+                .iter()
+                .filter(|&&(p, d, s)| {
+                    !d && p.to_ascii_lowercase().ends_with(".txt") && t.matches(p.as_bytes(), d, s)
+                })
+                .map(|r| r.0.to_owned())
+                .collect())
+        };
+        let r = resolve(
+            "*.txt savefilelist1: newsearch: childfilelist1:",
+            &none,
+            &mut run,
+        )
+        .unwrap();
+        assert_eq!(
+            hits(r.last, &r.slots),
+            [r"C:\", r"C:\x", r"C:\x\sub", r"C:\y"]
+        );
+    }
+
+    /// W8: `include-file-list:` reads an EFU's `Filename` column, or a
+    /// name a line, and matches as `filelist:`; its file must be a full
+    /// path that can be read.
+    #[test]
+    fn include_file_list_reads_a_list_on_the_disk() {
+        let dir = crate::store::file::tests::scratch("w8-include");
+        let efu = dir.join("names.efu");
+        std::fs::write(
+            &efu,
+            "Filename,Size\r\nC:\\x\\a.txt,10\r\n\"C:\\x\\sub\\\",\r\nc.log,\r\n",
+        )
+        .unwrap();
+        let txt = dir.join("names.txt");
+        // UTF-16 with its mark, as Notepad may save one.
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in "a.srt\r\n*.TXT\r\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(&txt, bytes).unwrap();
+        let none = Slots::default();
+        let q = format!("include-file-list:\"{}\"", efu.display());
+        assert_eq!(hits(&q, &none), [r"C:\x\a.txt", r"C:\x\sub", r"C:\y\c.log"]);
+        let q = format!("includefilelist:\"{}\" x", txt.display());
+        assert_eq!(
+            hits(&q, &none),
+            [
+                r"C:\x\a.txt",
+                r"C:\x\b.TXT",
+                r"C:\x\a.srt",
+                r"C:\x\sub\deep.txt",
+                r"C:\y\a.txt",
+                r"C:\top.txt"
+            ]
+        );
+        // gozd: the same group as filelist:'s, with a gozd that reads OR.
+        let q = format!("include-file-list:\"{}\"", efu.display());
+        assert_eq!(
+            gozd(&q, &none, true).unwrap(),
+            r#"<whole:"C:\x\a.txt"|whole:"C:\x\sub"|nopath:whole:"c.log">"#
+        );
+        assert_eq!(
+            gozd(&q, &none, false).unwrap_err(),
+            NotAsked::Refused(needs_or("include-file-list:"))
+        );
+        assert!(is_costly(&q));
+        // Its stamp changes with the file.
+        let before = include_stamps(&q);
+        assert!(before[0].is_some());
+        std::fs::write(&efu, "Filename\r\nC:\\x\\b.TXT\r\n").unwrap();
+        assert_ne!(include_stamps(&q), before);
+        let why = |q: &str| split_for_list(q, &none).unwrap_err();
+        assert!(why("include-file-list:names.efu").contains("full path"));
+        assert!(why("include-file-list:").contains("full path"));
+        let missing = format!("include-file-list:\"{}\"", dir.join("gone.efu").display());
+        assert!(why(&missing).starts_with("include-file-list: cannot read"));
+        assert!(why(&format!("include-file-list:\"{}\"", dir.display())).contains("folder"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W8: `filelist-filename:` holds for every row of a list of that name
+    /// (an empty value: any list), and for nothing of gozd's index.
+    #[test]
+    fn filelist_filename_is_the_lists_own_name() {
+        let none = Slots::default();
+        let all: Vec<&str> = ROWS.iter().map(|r| r.0).collect();
+        for q in [
+            "filelist-filename:\"test list.efu\"",
+            r#"filelist-filename:"C:\Lists\Test List.efu""#,
+            "filelist-filename:*.efu",
+            "filelist-filename:a.efu;\"Test List.efu\"",
+            "filelist-filename:",
+        ] {
+            assert_eq!(hits(q, &none), all, "{q}");
+        }
+        for q in [
+            "filelist-filename:other.efu",
+            r"filelist-filename:D:\Lists\Test List.efu",
+            "!filelist-filename:",
+        ] {
+            assert_eq!(
+                hits(q.trim_start_matches('!'), &none).is_empty(),
+                !q.starts_with('!'),
+                "{q}"
+            );
+        }
+        assert_eq!(
+            gozd("a filelist-filename:x.efu", &none, true).unwrap(),
+            "a whole:\"\""
+        );
+        assert_eq!(
+            gozd("!filelist-filename:", &none, true).unwrap(),
+            "!whole:\"\""
+        );
+        assert_eq!(
+            gozd("filelist-filename:x.efu", &none, false).unwrap_err(),
+            NotAsked::Refused(needs_syntax("filelist-filename:"))
+        );
+        assert_eq!(
+            needs_boolean("x save-filelist1: new-search: filelist-filename:a"),
+            Some(needs_syntax("filelist-filename:"))
+        );
+        assert_eq!(needs_boolean("x save-filelist1: new-search: y"), None);
+    }
+
+    /// W8: `open-filelist:` names the list the search runs over; it tests
+    /// nothing of a row, and gozd is never asked in its place.
+    #[test]
+    fn open_filelist_names_the_list_searched() {
+        let none = Slots::default();
+        assert_eq!(
+            open_list(r#"x open-filelist:"C:\a b\l.efu" y"#),
+            Some(Ok(r"C:\a b\l.efu".to_owned()))
+        );
+        assert_eq!(
+            open_list(r"open-filelist:C:/l.efu Open-FileList:c:\L.EFU"),
+            Some(Ok(r"C:\l.efu".to_owned()))
+        );
+        assert!(open_list("abc").is_none() && open_list("filelist:a").is_none());
+        assert!(
+            open_list("open-filelist:l.efu")
+                .unwrap()
+                .unwrap_err()
+                .contains("full path")
+        );
+        assert!(
+            open_list(r"open-filelist:C:\a.efu open-filelist:C:\b.efu")
+                .unwrap()
+                .unwrap_err()
+                .contains("second file list")
+        );
+        let q = r"open-filelist:C:\l.efu *.txt";
+        assert_eq!(hits(q, &none).len(), ROWS.len());
+        assert_eq!(split_for_list(q, &none).unwrap().0.trim(), "*.txt");
+        let NotAsked::Refused(why) = gozd(q, &none, true).unwrap_err() else {
+            panic!()
+        };
+        assert!(why.contains("has not opened"), "{why}");
+        // Not of a gozd that reads no OR either: the same reason.
+        assert!(needs_boolean(q).is_none());
     }
 }

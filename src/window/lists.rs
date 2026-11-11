@@ -30,9 +30,7 @@ use crate::filelist::slots::{self, Func, Slots, Term, cmd};
 use crate::places::{self, Which};
 use crate::slotedit;
 
-/// W7: the most results `save-filelistN:` puts in a slot (each is kept in
-/// `Session.json` too).
-pub const SAVE_MAX: usize = 100_000;
+use crate::filelist::slots::SAVE_MAX;
 
 /// W7: what a `save-filelistN:` search's save thread hands the window: the
 /// search, its slots, and its results' full paths (or why not).
@@ -149,6 +147,13 @@ impl App {
     /// on a file-list term): the slot's names, or the term's own, edited;
     /// on OK they go in the slot, or in the search.
     pub(super) fn edit_file_list_term(&self, term: Term) {
+        if !term.func.editable() {
+            return;
+        }
+        if term.func.picks_file() {
+            self.pick_term_file(&term);
+            return;
+        }
         let text = crate::wide::window_text(self.edit);
         let (title, names) = match term.slot {
             Some(n) => (
@@ -206,6 +211,41 @@ impl App {
         }
     }
 
+    /// W8: Ctrl+click or F2 on `include-file-list:` or `open-filelist:`
+    /// (Everything's "Ctrl + click the include-file-list: text in the
+    /// search box to select a file"): Windows' Open dialog, with Open File
+    /// List...'s types, and the file chosen becomes the term's value (a
+    /// test names it in `GOZ_GUI_EDITOR_FILE` instead).
+    fn pick_term_file(&self, term: &Term) {
+        if !self.may_open_dialog() {
+            return;
+        }
+        let path = match crate::store::location::editor_file() {
+            Some(p) => Some(p),
+            None => {
+                let _quiet = crate::dialog::Quiet::begin();
+                crate::filedlg::open(
+                    self.hwnd,
+                    "Open File List",
+                    super::datatools::LIST_KINDS,
+                    "efu",
+                )
+            }
+        };
+        let Some(path) = path else { return };
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let text = crate::wide::window_text(self.edit);
+        // The box may have changed while the dialog was up: the term is
+        // looked for again where it was.
+        let Some(now) = slots::terms(&text)
+            .into_iter()
+            .find(|t| t.start == term.start && t.func == term.func)
+        else {
+            return;
+        };
+        self.set_search_text(&slots::with_file(&text, &now, &path.display().to_string()));
+    }
+
     /// W7: a search was made (not a refresh of it) and its first rows came:
     /// its `save-filelistN:` terms put all its results in those slots, read
     /// on a thread of its own (a search refused for reading a slot it saves
@@ -213,7 +253,9 @@ impl App {
     pub(super) fn save_to_slots(&self, total: u64) {
         let (search, saves) = {
             let m = self.model.borrow();
-            let Ok(saves) = slots::saves(&m.search.query) else {
+            // W8: the last part's (the parts before a `new-search:` saved
+            // theirs before it ran: `parts_saved`).
+            let Ok(saves) = slots::saves(slots::last_part(&m.search.query)) else {
                 return;
             };
             if saves.is_empty() {
@@ -291,6 +333,40 @@ impl App {
         if spawned.is_err() {
             self.data_tools.saving.borrow_mut().take();
         }
+    }
+
+    /// W8: the parts of search `epoch` before its `new-search:` saved their
+    /// results to slots (the search worker ran them before the last part,
+    /// which read those slots): while that search is the one coming or
+    /// shown, the tab's slots hold them too, as Everything's do. The search
+    /// is not run again for it: it ran with them already.
+    pub(super) fn parts_saved(&self, epoch: u64, saves: slots::PartSaves) {
+        let current = {
+            let m = self.model.borrow();
+            m.pending.as_ref().is_some_and(|p| p.epoch == epoch) || m.shown == epoch
+        };
+        if !current || saves.saved.is_empty() {
+            return;
+        }
+        let mut now = (*self.file_list_slots()).clone();
+        for &(n, _) in &saves.saved {
+            now.set(n, saves.slots.get(n).to_vec());
+        }
+        if now != *self.file_list_slots() {
+            *self.data_tools.slots.borrow_mut() = Arc::new(now);
+            self.session_timer();
+        }
+        let said: Vec<String> = saves
+            .saved
+            .iter()
+            .map(|&(n, count)| {
+                format!(
+                    "save-filelist{n}: saved {} in file list slot {n}",
+                    crate::listedit::items_text(count)
+                )
+            })
+            .collect();
+        self.show_note(format!("{} (before new-search:)", said.join("; ")));
     }
 
     /// W7: a `save-filelistN:` search's results were read: they go in its
