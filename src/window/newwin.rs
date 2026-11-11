@@ -113,7 +113,15 @@ impl App {
     /// Exit: every other window of this goz-gui is asked to close too.
     pub(super) fn exit_other_windows(&self) {
         let key = self.instance_key.borrow().clone();
-        crate::instance::exit_others(&key, self.exit_window.get());
+        crate::instance::exit_others(&key, self.exit_window.get(), false);
+    }
+
+    /// Import or Reset Settings: every other window of this goz-gui is
+    /// asked to close writing nothing more, so none writes its own state
+    /// over the files about to be replaced; their processes, to wait for.
+    pub(super) fn exit_other_windows_unsaved(&self) -> Vec<u32> {
+        let key = self.instance_key.borrow().clone();
+        crate::instance::exit_others(&key, self.exit_window.get(), true)
     }
 
     /// The window's message-only window for Exit (`crate::instance`).
@@ -124,9 +132,14 @@ impl App {
     }
 
     /// F3's WM_APP messages.
-    pub(super) fn window_message(&self, msg: u32, l: isize) -> Option<isize> {
+    pub(super) fn window_message(&self, msg: u32, w: usize, l: isize) -> Option<isize> {
         match msg {
             WM_EXIT_WINDOW => {
+                if w != 0 {
+                    // Another window imports or resets the settings: what
+                    // this one holds is not written over them.
+                    self.writer.close();
+                }
                 // SAFETY: closes this thread's window for good, as -exit
                 // does.
                 unsafe { DestroyWindow(self.hwnd) };

@@ -35,6 +35,20 @@ use crate::store::location;
 /// A file list finished reading: wParam 1 when every row was read, 0 when
 /// reading stopped on an error.
 pub(super) const WM_FILELIST: u32 = MSG_FIRST;
+/// The other windows asked to end for Import or Reset Settings have ended
+/// (or the wait for them is over): the files can be replaced.
+pub(super) const WM_OTHERS_ENDED: u32 = MSG_FIRST + 1;
+
+/// How long Import and Reset wait for the other windows to end, as
+/// `-wait-pid` waits for this one.
+const OTHERS_WAIT_MS: u32 = 10_000;
+
+/// What Import or Reset Settings does once no other window of this
+/// goz-gui is left to write over it.
+enum Replace {
+    Import { data: PathBuf, folder: PathBuf },
+    Reset { data: PathBuf },
+}
 
 /// What the command line asks to be done with no window, before any
 /// (`-create-file-list`, `-install-efu-association`, ...): the exit code
@@ -84,6 +98,8 @@ pub(super) struct DataTools {
     list: RefCell<Option<Arc<FileList>>>,
     /// One of their dialogs is open.
     dialog: Cell<bool>,
+    /// Import or Reset Settings waits for the other windows to end.
+    replacing: RefCell<Option<Replace>>,
 }
 
 impl DataTools {
@@ -91,6 +107,7 @@ impl DataTools {
         DataTools {
             list: RefCell::new(None),
             dialog: Cell::new(false),
+            replacing: RefCell::new(None),
         }
     }
 }
@@ -229,6 +246,11 @@ impl App {
     pub(super) fn data_tools_message(&self, msg: u32, w: WPARAM, _l: LPARAM) {
         if msg == WM_FILELIST {
             self.file_list_read(w != 0);
+        } else if msg == WM_OTHERS_ENDED {
+            let replace = self.data_tools.replacing.take();
+            if let Some(replace) = replace {
+                self.replace_settings(replace);
+            }
         }
     }
 
@@ -395,7 +417,8 @@ impl App {
     /// first page; `GOZ_GUI_SETTINGS_ACTION` names the action instead),
     /// then the folder (`GOZ_GUI_PICK_FOLDER` for tests).
     fn import_export_settings(&self) {
-        if !self.data_dialog_free() {
+        // Not while an Import or Reset waits for the other windows.
+        if !self.data_dialog_free() || self.data_tools.replacing.borrow().is_some() {
             return;
         }
         let Some(data) = location::data_dir().map(Path::to_path_buf) else {
@@ -498,21 +521,10 @@ impl App {
         // Nothing this window holds may be written over the new files.
         self.writer.flush(crate::store::file::WRITE_WAIT);
         self.writer.close();
-        match settings_io::import(folder, data) {
-            Ok(_) => self.restart(),
-            Err(e) => {
-                // The window keeps its own state then, written as before
-                // would be lost: say so and restart all the same, from what
-                // the folder holds now.
-                msgbox::show(
-                    self.hwnd,
-                    &format!("The settings could not all be imported:\n\n{e}"),
-                    "Import Settings",
-                    MB_OK | MB_ICONWARNING,
-                );
-                self.restart();
-            }
-        }
+        self.after_other_windows(Replace::Import {
+            data: data.to_path_buf(),
+            folder: folder.to_path_buf(),
+        });
     }
 
     fn reset_settings(&self, data: &Path, test: bool) {
@@ -525,19 +537,102 @@ impl App {
         }
         self.writer.flush(crate::store::file::WRITE_WAIT);
         self.writer.close();
-        if let Err(e) = settings_io::reset(data) {
-            msgbox::show(
-                self.hwnd,
-                &format!("The settings could not be reset:\n\n{e}"),
-                "Reset Settings",
-                MB_OK | MB_ICONWARNING,
-            );
+        self.after_other_windows(Replace::Reset {
+            data: data.to_path_buf(),
+        });
+    }
+
+    /// Asks the other windows of this goz-gui to end writing nothing (each
+    /// is a process of its own, which would write its settings and session
+    /// as it ends), then does `replace` once they have ended: at once when
+    /// there are none, else when a thread that waits for them (at most
+    /// [`OTHERS_WAIT_MS`]) says so. The window answers meanwhile.
+    fn after_other_windows(&self, replace: Replace) {
+        use windows_sys::Win32::Foundation::{CloseHandle, HWND};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+        let pids = self.exit_other_windows_unsaved();
+        // Opened now, so a process id used again later is not waited for.
+        // SAFETY: opens each process for waiting only; a process gone
+        // already gives no handle.
+        let handles: Vec<usize> = pids
+            .iter()
+            .map(|&pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) } as usize)
+            .filter(|&h| h != 0)
+            .collect();
+        if handles.is_empty() {
+            self.replace_settings(replace);
+            return;
+        }
+        *self.data_tools.replacing.borrow_mut() = Some(replace);
+        self.show_note("Waiting for the other goz-gui windows to close...".into());
+        let hwnd = self.hwnd as usize;
+        let wait = move || {
+            let end = std::time::Instant::now()
+                + std::time::Duration::from_millis(u64::from(OTHERS_WAIT_MS));
+            for &h in &handles {
+                let left = end.saturating_duration_since(std::time::Instant::now());
+                // SAFETY: waits on and closes the handles opened above,
+                // each once.
+                unsafe {
+                    WaitForSingleObject(h as _, left.as_millis() as u32);
+                    CloseHandle(h as _);
+                }
+            }
+            // SAFETY: posts a message with no pointers; a window gone
+            // meanwhile is reported and ignored.
+            unsafe { PostMessageW(hwnd as HWND, WM_OTHERS_ENDED, 0, 0) };
+        };
+        if let Err(e) = std::thread::Builder::new()
+            .name("goz-wait-windows".into())
+            .spawn(wait)
+        {
+            // No thread (the handles stay open until the restart ends
+            // this process): replace now.
+            self.show_note(format!("Could not wait for the other windows: {e}"));
+            let replace = self.data_tools.replacing.take();
+            if let Some(replace) = replace {
+                self.replace_settings(replace);
+            }
+        }
+    }
+
+    /// Replaces the settings as Import or Reset says, then restarts.
+    fn replace_settings(&self, replace: Replace) {
+        match replace {
+            Replace::Import { data, folder } => {
+                if let Err(e) = settings_io::import(&folder, &data) {
+                    // The window keeps its own state then, written as
+                    // before would be lost: say so and restart all the
+                    // same, from what the folder holds now.
+                    msgbox::show(
+                        self.hwnd,
+                        &format!("The settings could not all be imported:\n\n{e}"),
+                        "Import Settings",
+                        MB_OK | MB_ICONWARNING,
+                    );
+                }
+            }
+            Replace::Reset { data } => {
+                if let Err(e) = settings_io::reset(&data) {
+                    msgbox::show(
+                        self.hwnd,
+                        &format!("The settings could not be reset:\n\n{e}"),
+                        "Reset Settings",
+                        MB_OK | MB_ICONWARNING,
+                    );
+                }
+            }
         }
         self.restart();
     }
 
     /// Starts goz-gui again (once this process has ended: `-wait-pid`) and
-    /// closes every window of this one, which writes nothing more.
+    /// closes every window of this one, which writes nothing more (the
+    /// others ended before the files were replaced; one started since ends
+    /// unsaved too).
     fn restart(&self) {
         if let Ok(exe) = std::env::current_exe() {
             let mut command = std::process::Command::new(exe);
@@ -547,7 +642,7 @@ impl App {
             }
             let _ = command.spawn();
         }
-        self.exit_other_windows();
+        self.exit_other_windows_unsaved();
         // SAFETY: destroys this thread's window; the process ends with it.
         unsafe { DestroyWindow(self.hwnd) };
     }

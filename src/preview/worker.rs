@@ -14,6 +14,7 @@
 //! thread is abandoned (`Worker::abandon`), left to finish whenever its call
 //! returns, and a new thread takes over.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -620,7 +621,6 @@ struct State<'a> {
     wic: Option<Wic>,
     handler: Option<Loaded>,
     frame: Option<IPreviewHandlerFrame>,
-    accel: Option<Accel>,
     /// The content's size now.
     size: (i32, i32),
     /// The request shown last, for phases outside a request.
@@ -841,11 +841,9 @@ impl State<'_> {
     /// The frame preview handlers pass keys to.
     fn frame(&mut self) -> Option<IPreviewHandlerFrame> {
         if self.frame.is_none() {
-            let accel = self.accel.get_or_insert_with(Accel::new);
             let frame = Frame {
                 main: self.shared.main,
-                accel: accel.handle as usize,
-                entries: accel.entries.clone(),
+                keys: RefCell::new(Keys::new(crate::keymap::generation(), Accel::new())),
             };
             self.frame = Some(frame.into());
         }
@@ -925,7 +923,6 @@ impl State<'_> {
             self.release(held);
         }
         self.frame = None;
-        self.accel = None;
         self.wic = None;
     }
 }
@@ -1034,6 +1031,38 @@ impl Accel {
     }
 }
 
+/// The table a [`Frame`] passes keys by: made again when Options >
+/// Keyboard changed the keys (`keymap::generation`), as the window's own is
+/// (`keys::table`).
+struct Keys {
+    generation: u32,
+    accel: Accel,
+    /// The tables before: a handler may keep the one GetWindowContext gave
+    /// it, so each lives as long as the frame.
+    old: Vec<Accel>,
+}
+
+impl Keys {
+    fn new(generation: u32, accel: Accel) -> Keys {
+        Keys {
+            generation,
+            accel,
+            old: Vec::new(),
+        }
+    }
+
+    /// The table for the keys of `generation`: this one, or one `make`
+    /// makes when the keys changed since.
+    fn at(&mut self, generation: u32, make: impl FnOnce() -> Accel) -> &Accel {
+        if self.generation != generation {
+            let old = std::mem::replace(&mut self.accel, make());
+            self.old.push(old);
+            self.generation = generation;
+        }
+        &self.accel
+    }
+}
+
 impl Drop for Accel {
     fn drop(&mut self) {
         if !self.handle.is_null() {
@@ -1062,15 +1091,26 @@ pub fn command_for(entries: &[ACCEL], vk: u16, ctrl: bool, shift: bool, alt: boo
 #[implement(IPreviewHandlerFrame)]
 struct Frame {
     main: usize,
-    accel: usize,
-    entries: Vec<ACCEL>,
+    /// Calls come on the preview thread only (an STA), one at a time.
+    keys: RefCell<Keys>,
+}
+
+impl Frame {
+    /// The command `vk` with the modifiers held runs, by the keys in force.
+    fn command(&self, vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<u16> {
+        let mut keys = self.keys.borrow_mut();
+        let accel = keys.at(crate::keymap::generation(), Accel::new);
+        command_for(&accel.entries, vk, ctrl, shift, alt)
+    }
 }
 
 impl IPreviewHandlerFrame_Impl for Frame_Impl {
     fn GetWindowContext(&self) -> windows::core::Result<PREVIEWHANDLERFRAMEINFO> {
+        let mut keys = self.keys.borrow_mut();
+        let accel = keys.at(crate::keymap::generation(), Accel::new);
         Ok(PREVIEWHANDLERFRAMEINFO {
-            haccel: WHACCEL(self.accel as *mut _),
-            cAccelEntries: self.entries.len() as u32,
+            haccel: WHACCEL(accel.handle as *mut _),
+            cAccelEntries: accel.entries.len() as u32,
         })
     }
 
@@ -1086,13 +1126,7 @@ impl IPreviewHandlerFrame_Impl for Frame_Impl {
         // SAFETY: reads the keyboard's state.
         let held = |vk: u16| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
         let alt = msg.message == WM_SYSKEYDOWN || held(VK_MENU);
-        let cmd = command_for(
-            &self.entries,
-            msg.wParam.0 as u16,
-            held(VK_CONTROL),
-            held(VK_SHIFT),
-            alt,
-        );
+        let cmd = self.command(msg.wParam.0 as u16, held(VK_CONTROL), held(VK_SHIFT), alt);
         let Some(cmd) = cmd else {
             return Err(S_FALSE.into());
         };
@@ -1164,7 +1198,6 @@ fn run(shared: &Shared) {
         wic: None,
         handler: None,
         frame: None,
-        accel: None,
         size: (0, 0),
         generation: 0,
         init: None,
@@ -1288,5 +1321,26 @@ mod tests {
             command_for(&accel.entries, u16::from(b'P'), false, false, true),
             Some(crate::menu::VIEW_PANE_PREVIEW)
         );
+    }
+
+    /// The frame's table follows Options > Keyboard: made again when the
+    /// keys' generation moves, the one handed out before kept alive.
+    #[test]
+    fn the_frames_keys_follow_the_keyboard_page() {
+        let table = |cmd: u16| Accel {
+            handle: core::ptr::null_mut(),
+            entries: vec![ACCEL {
+                fVirt: FVIRTKEY,
+                key: 0x76, // F7
+                cmd,
+            }],
+        };
+        let mut keys = Keys::new(4, table(1));
+        let f7 = |a: &Accel| command_for(&a.entries, 0x76, false, false, false);
+        assert_eq!(f7(keys.at(4, || unreachable!())), Some(1));
+        assert_eq!(f7(keys.at(5, || table(2))), Some(2));
+        assert_eq!(f7(keys.at(5, || unreachable!())), Some(2));
+        assert_eq!(keys.old.len(), 1);
+        assert_eq!(f7(&keys.old[0]), Some(1));
     }
 }

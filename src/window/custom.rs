@@ -8,6 +8,7 @@
 //! `300..310` (wave 4's G1 has `WM_APP + 250..300` and `250..300`).
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{HFONT, InvalidateRect};
@@ -55,6 +56,9 @@ pub(super) struct Custom {
     system_dpi: Cell<u32>,
     /// The double-Ctrl hook is in.
     hooked: Cell<bool>,
+    /// The menu items whose shortcut text Options > Keyboard's keys
+    /// rewrote, with what they said before (see [`relabel`]).
+    menu_texts: RefCell<Originals>,
     /// The window's accessible object (`crate::a11y`), made when first
     /// asked for.
     pub(super) accessible: RefCell<Option<Server>>,
@@ -77,6 +81,7 @@ impl Custom {
             filters: RefCell::new(Matcher::new(&c.color_filters)),
             system_dpi: Cell::new(system_dpi),
             hooked: Cell::new(false),
+            menu_texts: RefCell::new(HashMap::new()),
             accessible: RefCell::new(None),
             status_parts: RefCell::new(Vec::new()),
         }
@@ -406,19 +411,29 @@ impl App {
     }
 
     /// A menu is about to open: an item whose command has keys other than
-    /// goz-gui's defaults shows its first (or none) after its tab.
+    /// goz-gui's defaults shows its first (or none) after its tab, and one
+    /// rewritten so before whose keys are the defaults again shows what it
+    /// showed then.
     pub(super) fn relabel_menu(&self, menu: HMENU) {
         let keys = keymap::current();
-        if keys.changed.is_empty() {
-            return;
+        // Out of its cell while the menu calls run.
+        let mut texts = self.custom.menu_texts.take();
+        if !keys.changed.is_empty() || !texts.is_empty() {
+            relabel(menu, &|cmd| keys.menu_key(cmd), &mut texts);
         }
-        relabel(menu, &|cmd| keys.menu_key(cmd));
+        *self.custom.menu_texts.borrow_mut() = texts;
     }
 }
 
+/// What the menu items [`relabel`] rewrote said before, by menu and
+/// command: the label and the text after the tab (none without a tab).
+type Originals = HashMap<(usize, u16), (String, Option<String>)>;
+
 /// Rewrites the shortcut text of `menu`'s items (not its submenus', which
-/// get theirs as they open) as `key` says.
-fn relabel(menu: HMENU, key: &dyn Fn(u16) -> Option<Option<String>>) {
+/// get theirs as they open) as `key` says: `Some` for the keys to show,
+/// `None` for a command whose keys are the defaults, whose item gets back
+/// what it said before it was first rewritten (kept in `originals`).
+fn relabel(menu: HMENU, key: &dyn Fn(u16) -> Option<Option<String>>, originals: &mut Originals) {
     // SAFETY: reads and sets this thread's menu items; the buffers outlive
     // each call.
     unsafe {
@@ -437,14 +452,32 @@ fn relabel(menu: HMENU, key: &dyn Fn(u16) -> Option<Option<String>>) {
             {
                 continue;
             }
-            let Some(new_key) = key(mii.wID as u16) else {
-                continue;
-            };
+            let cmd = mii.wID as u16;
             let text = String::from_utf16_lossy(&buf[..mii.cch as usize]);
-            let label = text.split('\t').next().unwrap_or("");
-            let wanted = match new_key {
-                Some(k) => format!("{label}\t{k}"),
-                None => label.to_owned(),
+            let (label, tail) = match text.split_once('\t') {
+                Some((label, tail)) => (label, Some(tail)),
+                None => (text.as_str(), None),
+            };
+            let slot = (menu as usize, cmd);
+            let wanted = match key(cmd) {
+                Some(new_key) => {
+                    // The first rewrite keeps what the item said; a record
+                    // of another item (a handle used again) gives way.
+                    if originals.get(&slot).is_none_or(|(l, _)| l != label) {
+                        originals.insert(slot, (label.to_owned(), tail.map(str::to_owned)));
+                    }
+                    match new_key {
+                        Some(k) => format!("{label}\t{k}"),
+                        None => label.to_owned(),
+                    }
+                }
+                None => match originals.remove(&slot) {
+                    Some((l, t)) if l == label => match t {
+                        Some(t) => format!("{label}\t{t}"),
+                        None => l,
+                    },
+                    _ => continue,
+                },
             };
             if wanted == text {
                 continue;
@@ -456,5 +489,63 @@ fn relabel(menu: HMENU, key: &dyn Fn(u16) -> Option<Option<String>>) {
             set.dwTypeData = wide.as_mut_ptr();
             SetMenuItemInfoW(menu, i, 1, &set);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuStringW, MF_BYCOMMAND, MF_STRING,
+    };
+
+    fn text(menu: HMENU, cmd: u16) -> String {
+        let mut buf = [0u16; 128];
+        // SAFETY: reads an item of a menu this test made into its buffer.
+        let n =
+            unsafe { GetMenuStringW(menu, u32::from(cmd), buf.as_mut_ptr(), 128, MF_BYCOMMAND) };
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+
+    /// Keys back to the defaults put back the shortcut text a menu built
+    /// once (View > Zoom) was written with.
+    #[test]
+    fn menus_get_their_shortcut_text_back_with_the_default_keys() {
+        // SAFETY: a menu of this thread's, destroyed at the end.
+        let menu = unsafe { CreatePopupMenu() };
+        assert!(!menu.is_null());
+        for (cmd, label) in [(1u16, "Zoom &In\tCtrl+="), (2, "&Status Bar")] {
+            let w: Vec<u16> = label.encode_utf16().chain([0]).collect();
+            // SAFETY: appends an item to the menu made above.
+            unsafe { AppendMenuW(menu, MF_STRING, usize::from(cmd), w.as_ptr()) };
+        }
+        let mut originals = Originals::new();
+        let f7 = |cmd: u16| (cmd == 1).then(|| Some("F7".to_owned()));
+        relabel(menu, &f7, &mut originals);
+        assert_eq!(text(menu, 1), "Zoom &In\tF7");
+        assert_eq!(text(menu, 2), "&Status Bar");
+        // Again, and with no key for the other: what each said first is
+        // what is kept, not the F7.
+        relabel(menu, &f7, &mut originals);
+        let f7_and_none = |cmd: u16| match cmd {
+            1 => Some(Some("F7".to_owned())),
+            _ => Some(None),
+        };
+        relabel(menu, &f7_and_none, &mut originals);
+        assert_eq!(text(menu, 1), "Zoom &In\tF7");
+        assert_eq!(text(menu, 2), "&Status Bar");
+        let defaults = |_: u16| None;
+        relabel(menu, &defaults, &mut originals);
+        assert_eq!(text(menu, 1), "Zoom &In\tCtrl+=");
+        assert_eq!(text(menu, 2), "&Status Bar");
+        assert!(originals.is_empty());
+        // A key with no tab before: the tab goes again.
+        let ctrl_b = |cmd: u16| (cmd == 2).then(|| Some("Ctrl+B".to_owned()));
+        relabel(menu, &ctrl_b, &mut originals);
+        assert_eq!(text(menu, 2), "&Status Bar\tCtrl+B");
+        relabel(menu, &defaults, &mut originals);
+        assert_eq!(text(menu, 2), "&Status Bar");
+        // SAFETY: the menu made above, destroyed once.
+        unsafe { DestroyMenu(menu) };
     }
 }

@@ -672,7 +672,7 @@ See Help > Search Syntax and the README for goz-gui's switches."
     if launch.exit {
         // No first window to hand it to: the windows File > New Window
         // opened (if any) close.
-        crate::instance::exit_others(&key, core::ptr::null_mut());
+        crate::instance::exit_others(&key, core::ptr::null_mut(), false);
         return 0;
     }
     let prefs = prefs::Prefs::load();

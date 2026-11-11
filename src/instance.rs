@@ -34,7 +34,8 @@ const CLASS: &str = "goz-gui-instance";
 /// The class of each window's message-only window, which Exit reaches.
 const WINDOW_CLASS: &str = "goz-gui-window";
 /// Posted to a window's message-only window: its goz-gui is to end, as
-/// Exit was chosen in another window of the instance.
+/// Exit was chosen in another window of the instance. wParam 1: it ends
+/// writing nothing more (see [`exit_others`]); passed on to the window.
 const WM_EXIT_REQUEST: u32 = WM_APP + 1;
 /// WM_COPYDATA's dwData: goz-gui's arguments, version 1.
 const MAGIC: usize = 0x676f_7a31;
@@ -238,11 +239,15 @@ pub fn listen_window(key: &str, main: HWND, msg: u32) -> HWND {
 }
 
 /// Asks every other window of the instance `key` to end (`own` is this
-/// window's message-only window, which is passed over). It only posts, so
-/// a window that hangs holds nothing up.
-pub fn exit_others(key: &str, own: HWND) {
+/// window's message-only window, which is passed over). `discard`: they
+/// end writing nothing more, as the data folder's files are about to be
+/// replaced (Tools > Import and Export Settings...). It only posts, so a
+/// window that hangs holds nothing up; the processes asked are returned,
+/// for a caller that must wait for them to end.
+pub fn exit_others(key: &str, own: HWND, discard: bool) -> Vec<u32> {
     let class = wz(WINDOW_CLASS);
     let title = wz(key);
+    let mut asked = Vec::new();
     let mut after: HWND = core::ptr::null_mut();
     // At most as many as there could be windows: the loop always ends.
     for _ in 0..4096 {
@@ -253,12 +258,24 @@ pub fn exit_others(key: &str, own: HWND) {
             break;
         }
         if found != own {
-            // SAFETY: posts a message with no pointers to a window; one
-            // gone meanwhile is reported and ignored.
-            unsafe { PostMessageW(found, WM_EXIT_REQUEST, 0, 0) };
+            let mut pid = 0u32;
+            // SAFETY: posts a message with no pointers to a window, and
+            // reads the process it belongs to; one gone meanwhile is
+            // reported and ignored.
+            unsafe {
+                GetWindowThreadProcessId(found, &mut pid);
+                if PostMessageW(found, WM_EXIT_REQUEST, usize::from(discard), 0) != 0
+                    && pid != 0
+                    && pid != std::process::id()
+                    && !asked.contains(&pid)
+                {
+                    asked.push(pid);
+                }
+            }
         }
         after = found;
     }
+    asked
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -268,7 +285,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         if msg == WM_EXIT_REQUEST {
             let target = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const (usize, u32);
             if let Some(&(main, post)) = target.as_ref() {
-                PostMessageW(main as HWND, post, 0, 0);
+                PostMessageW(main as HWND, post, w, 0);
             }
             return 0;
         }

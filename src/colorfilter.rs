@@ -175,33 +175,106 @@ const SLASH: u16 = b'\\' as u16;
 /// Whether `text` matches the folded `pat`: `?` one character, `*` any
 /// run, which stays within a folder when `in_path` (`**` crossing them).
 fn wild(pat: &[u16], text: &[u16], in_path: bool) -> bool {
-    // Iterative with one backtrack point per star kind, as is usual for
-    // glob matching; `**` and `*` both backtrack to the last star seen.
+    if in_path {
+        wild_path(pat, text)
+    } else {
+        wild_name(pat, text)
+    }
+}
+
+/// [`wild`] for a name, where every `*` crosses anything: iterative, with
+/// one backtrack point (the last star), as is usual for glob matching.
+fn wild_name(pat: &[u16], text: &[u16]) -> bool {
     let (mut p, mut t) = (0usize, 0usize);
-    let mut star: Option<(usize, usize, bool)> = None;
+    let mut star: Option<(usize, usize)> = None;
     while t < text.len() {
         if p < pat.len() && pat[p] == STAR {
-            let double = in_path && pat.get(p + 1) == Some(&STAR);
-            p += if double { 2 } else { 1 };
-            star = Some((p, t, double || !in_path));
+            p += 1;
+            star = Some((p, t));
             continue;
         }
-        let c = fold(text[t]);
-        if p < pat.len() && (pat[p] == c || (pat[p] == QUESTION && !(in_path && c == SLASH))) {
+        if p < pat.len() && (pat[p] == fold(text[t]) || pat[p] == QUESTION) {
             p += 1;
             t += 1;
             continue;
         }
         match star {
-            Some((sp, st, crosses)) if crosses || text[st] != SLASH => {
-                star = Some((sp, st + 1, crosses));
+            Some((sp, st)) => {
+                star = Some((sp, st + 1));
                 p = sp;
                 t = st + 1;
             }
-            _ => return false,
+            None => return false,
         }
     }
     pat[p..].iter().all(|&c| c == STAR)
+}
+
+/// [`wild`] for a full path, where `*` and `?` stay within a folder and
+/// `**` crosses them. One backtrack point cannot serve both (a `*` after a
+/// `**` that meets a `\` must hand the run back to the `**`), so every place
+/// in the pattern the text so far can reach is followed at once: each
+/// character of the text is read once, with no backtracking.
+fn wild_path(pat: &[u16], text: &[u16]) -> bool {
+    #[derive(Clone, Copy)]
+    enum Tok {
+        Char(u16),
+        One,
+        Star,
+        Deep,
+    }
+    let mut toks = Vec::with_capacity(pat.len());
+    let mut i = 0;
+    while i < pat.len() {
+        toks.push(match pat[i] {
+            STAR if pat.get(i + 1) == Some(&STAR) => {
+                i += 1;
+                Tok::Deep
+            }
+            STAR => Tok::Star,
+            QUESTION => Tok::One,
+            c => Tok::Char(c),
+        });
+        i += 1;
+    }
+    // `at[k]`: the text so far can end before token `k`; a star there may
+    // also match nothing, which reaches the token after it.
+    let close = |at: &mut [bool]| {
+        for (k, tok) in toks.iter().enumerate() {
+            if at[k] && matches!(tok, Tok::Star | Tok::Deep) {
+                at[k + 1] = true;
+            }
+        }
+    };
+    let mut at = vec![false; toks.len() + 1];
+    let mut next = vec![false; toks.len() + 1];
+    at[0] = true;
+    close(&mut at);
+    for &raw in text {
+        let c = fold(raw);
+        next.fill(false);
+        let mut any = false;
+        for (k, tok) in toks.iter().enumerate() {
+            if !at[k] {
+                continue;
+            }
+            let (stay, step) = match *tok {
+                Tok::Char(p) => (false, p == c),
+                Tok::One => (false, c != SLASH),
+                Tok::Star => (c != SLASH, false),
+                Tok::Deep => (true, false),
+            };
+            next[k] |= stay;
+            next[k + 1] |= step;
+            any |= stay || step;
+        }
+        if !any {
+            return false;
+        }
+        std::mem::swap(&mut at, &mut next);
+        close(&mut at);
+    }
+    at[toks.len()]
 }
 
 impl Matcher {
@@ -372,5 +445,29 @@ mod tests {
         assert!(wild(&folded("*"), &w(""), false));
         assert!(wild(&folded("?"), &w("é"), false));
         assert!(wild(&folded("é*"), &w("É.txt"), false));
+    }
+
+    /// A `*` after a `**` keeps to one folder, and the `**` takes as many
+    /// folders as it needs (one backtrack point for both lost them).
+    #[test]
+    fn a_star_after_two_stars_lets_them_take_more_folders() {
+        let m = Matcher::new(&[rule(r"C:\Windows\**\*.dll", 1)]);
+        assert_eq!(hit(&m, r"C:\Windows\System32\x.dll", false), Some(1));
+        assert_eq!(
+            hit(&m, r"C:\Windows\System32\drivers\x.dll", false),
+            Some(1)
+        );
+        assert_eq!(hit(&m, r"C:\Windows\a\b\c\d\X.DLL", false), Some(1));
+        assert_eq!(hit(&m, r"C:\Windows\x.dll", false), None);
+        assert_eq!(hit(&m, r"C:\Windows\a\x.dllx", false), None);
+        assert_eq!(hit(&m, r"C:\Other\a\x.dll", false), None);
+        let p = |pat: &str, text: &str| wild(&folded(pat), &w(text), true);
+        assert!(p(r"C:\**\a*\*.txt", r"C:\x\y\ab\z.txt"));
+        assert!(!p(r"C:\**\a*\*.txt", r"C:\x\ab\y\z.txt"));
+        assert!(p(r"**\?\*", r"C:\x\y\z"));
+        assert!(!p(r"C:\*\*", r"C:\x\y\z"));
+        assert!(p(r"C:\**", r"C:\"));
+        assert!(p(r"C:\*.*", r"C:\a.b"));
+        assert!(!p(r"C:\?", r"C:\\"));
     }
 }

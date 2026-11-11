@@ -151,7 +151,7 @@ impl App {
             m if (F2_MSG..F2_MSG + MSG_RANGE).contains(&m) => None,
 
             // F3.
-            m if (F3_MSG..F3_MSG + MSG_RANGE).contains(&m) => self.window_message(m, l),
+            m if (F3_MSG..F3_MSG + MSG_RANGE).contains(&m) => self.window_message(m, w, l),
 
             // F4.
             m if (F4_MSG..F4_MSG + MSG_RANGE).contains(&m) => self.tools_message(m, w, l),
@@ -516,6 +516,7 @@ mod tests {
             uiopts::WM_FOCUS_SEARCH,
             // Wave 4 (G1).
             datatools::WM_FILELIST,
+            datatools::WM_OTHERS_ENDED,
             // Wave 4 (G2).
             super::super::custom::WM_DOUBLE_CTRL,
         ];

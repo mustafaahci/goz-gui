@@ -118,7 +118,10 @@ fn split(g: u32) -> (usize, usize) {
 }
 
 /// Each row's place in name order and in path order, once the list is read.
+/// The tables are by slot (`chunks.len() << CHUNK_SHIFT`), so `rows` says
+/// how many rows they rank.
 struct Ranks {
+    rows: usize,
     name: Vec<u32>,
     path: Vec<u32>,
 }
@@ -322,8 +325,7 @@ impl FileList {
         if stale() {
             return Ok(None);
         }
-        let ranks = self.ranks.get().filter(|r| r.name.len() == rows);
-        sort_rows(&chunks, ranks, &mut order, sort);
+        sort_rows(&chunks, self.ranks_for(rows), &mut order, sort);
         let matched = Arc::new(Matched {
             query: query.to_owned(),
             sort,
@@ -335,6 +337,12 @@ impl FileList {
         });
         *lock(&self.last) = Some(Arc::clone(&matched));
         Ok(Some(matched))
+    }
+
+    /// The ranks, when they rank the `rows` rows read (they are made once
+    /// the whole list is read).
+    fn ranks_for(&self, rows: usize) -> Option<&Ranks> {
+        self.ranks.get().filter(|r| r.rows == rows)
     }
 
     /// The rows `range` of `matched`, as the results list shows them.
@@ -642,6 +650,7 @@ fn compute_ranks(chunks: &[Arc<Chunk>], stop: &AtomicBool) -> Option<Ranks> {
     }
     debug_assert_eq!(all.len(), n);
     Some(Ranks {
+        rows: n,
         name: name_rank,
         path: path_rank,
     })
@@ -682,7 +691,13 @@ mod tests {
 
     #[test]
     fn sorts_as_gozd_with_ranks_and_without() {
-        for list in [FileList::from_rows(&ROWS), unranked()] {
+        // The ranks are used for a list of any length (they are by slot,
+        // 65,536 a chunk), and only for the rows they rank.
+        let ranked = FileList::from_rows(&ROWS);
+        assert!(ranked.ranks_for(ROWS.len()).is_some());
+        assert!(ranked.ranks_for(ROWS.len() + 1).is_none());
+        assert!(unranked().ranks_for(ROWS.len()).is_none());
+        for list in [ranked, unranked()] {
             assert_eq!(
                 names(&list, "", SortKey::Name, SortDir::Asc),
                 [

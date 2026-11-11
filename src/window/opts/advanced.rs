@@ -59,6 +59,25 @@ pub struct Row {
     pub default: Option<String>,
     /// Changed by the window only.
     pub read_only: bool,
+    /// What the user made or used, not a setting (see [`is_data`]).
+    pub data: bool,
+}
+
+/// Whether `key` holds what the user made or used rather than a setting:
+/// the rename presets, the format histories, the recent file lists, the
+/// folders and the list opened last. Restore Defaults leaves these alone
+/// (their defaults are empty, so it would throw them away); the row's own
+/// Reset still empties one.
+pub fn is_data(key: &str) -> bool {
+    key.ends_with("_format_history")
+        || matches!(
+            key,
+            "rename_presets"
+                | "file_list_history"
+                | "last_open_filelist_filename"
+                | "rename_last_browse_path"
+                | "search_edit_last_located_in"
+        )
 }
 
 /// The keys of the window's own state, which only the window changes.
@@ -104,6 +123,7 @@ pub fn rows_of(current: &Settings) -> Vec<Row> {
         .map(|(key, value)| Row {
             default: defaults.get(&key).cloned(),
             read_only: own.contains(&key),
+            data: is_data(&key),
             was: value.clone(),
             value,
             key,
@@ -130,15 +150,31 @@ fn value_of(s: &Settings, key: &str) -> Option<String> {
         .map(|(_, v)| v)
 }
 
+/// Why [`refused`] refuses a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// It reads as the setting already was: what it reads as.
+    ReadsAs(String),
+    /// goz-gui cannot read it at all (the reader keeps such text as it is,
+    /// so it reads back as typed, but nothing could use it): the reader's
+    /// words.
+    Unreadable(String),
+}
+
 /// The first changed row whose value is not one its key takes: its key and
-/// what it reads as.
-pub fn refused(rows: &[Row]) -> Option<(String, String)> {
+/// why.
+pub fn refused(rows: &[Row]) -> Option<(String, Why)> {
     let changed: Vec<&Row> = rows.iter().filter(|r| r.value != r.was).collect();
     if changed.is_empty() {
         return None;
     }
     let now = read(rows);
     for r in changed {
+        if r.key == "color_filters"
+            && let Err(e) = crate::colorfilter::parse(&r.value)
+        {
+            return Some((r.key.clone(), Why::Unreadable(e)));
+        }
         let got = value_of(&now, &r.key).unwrap_or_default();
         if got == r.value.trim() {
             continue;
@@ -152,7 +188,7 @@ pub fn refused(rows: &[Row]) -> Option<(String, String)> {
         }
         let before = value_of(&read(&alone), &r.key).unwrap_or_default();
         if got == before {
-            return Some((r.key.clone(), got));
+            return Some((r.key.clone(), Why::ReadsAs(got)));
         }
     }
     None
@@ -463,16 +499,21 @@ impl Page for Advanced {
     fn validate(&self, _page: HWND) -> Result<(), Invalid> {
         match refused(&self.rows.borrow()) {
             None => Ok(()),
-            Some((key, reads)) => Err(Invalid {
+            Some((key, why)) => Err(Invalid {
                 control: VALUE,
-                message: format!(
-                    "{key} does not take that value (goz-gui reads it as {}).",
-                    if reads.is_empty() {
-                        "(empty)".to_owned()
-                    } else {
-                        reads
+                message: match why {
+                    Why::ReadsAs(reads) => format!(
+                        "{key} does not take that value (goz-gui reads it as {}).",
+                        if reads.is_empty() {
+                            "(empty)".to_owned()
+                        } else {
+                            reads
+                        }
+                    ),
+                    Why::Unreadable(e) => {
+                        format!("{key} does not take that value: goz-gui cannot read it ({e}).")
                     }
-                ),
+                },
             }),
         }
     }
@@ -566,14 +607,21 @@ impl Page for Advanced {
     }
 
     /// Everything's Restore Defaults: every setting that has a default and
-    /// is not the window's own back to it.
+    /// is not the window's own back to it; the user's data (presets,
+    /// histories) stays.
     fn defaults(&self, page: HWND) {
         for r in self.rows.borrow_mut().iter_mut() {
-            if let (false, Some(d)) = (r.read_only, &r.default) {
-                r.value = d.clone();
-            }
+            restore_default(r);
         }
         self.list_rows(page);
+    }
+}
+
+/// Restore Defaults for one row: a setting that has a default and is not
+/// the window's own nor the user's data goes back to it.
+fn restore_default(r: &mut Row) {
+    if let (false, false, Some(d)) = (r.read_only, r.data, &r.default) {
+        r.value = d.clone();
     }
 }
 
@@ -649,7 +697,10 @@ mod tests {
         assert_eq!(refused(&r), None);
         // Not a number: reads as it was.
         set(&mut r, "search_delay", "soon");
-        assert_eq!(refused(&r), Some(("search_delay".into(), "0".into())));
+        assert_eq!(
+            refused(&r),
+            Some(("search_delay".into(), Why::ReadsAs("0".into())))
+        );
         set(&mut r, "search_delay", "0");
         // `true` for a switch reads as 1.
         set(&mut r, "grid_lines", "true");
@@ -661,6 +712,55 @@ mod tests {
         assert!(refused(&r).is_some());
         set(&mut r, "normal_foreground_color", "#123456");
         assert_eq!(refused(&r), None);
+    }
+
+    /// A color_filters value goz-gui cannot read reads back as typed (the
+    /// reader keeps it) but would drop every filter: it is refused, with
+    /// the reader's words.
+    #[test]
+    fn unreadable_color_filters_are_refused() {
+        let mut r = rows();
+        let good = r##"[{"filter":"*.dll","include_files":1,"include_folders":0,"foreground_color":"#ff0000","foreground_dark_color":""}]"##;
+        set(&mut r, "color_filters", good);
+        assert_eq!(refused(&r), None);
+        set(&mut r, "color_filters", r#"[{"filter":"*.dll""#);
+        assert!(matches!(
+            refused(&r),
+            Some((k, Why::Unreadable(_))) if k == "color_filters"
+        ));
+        set(&mut r, "color_filters", "");
+        assert_eq!(refused(&r), None);
+    }
+
+    /// Restore Defaults leaves the presets, histories and remembered
+    /// folders and lists: their defaults are empty.
+    #[test]
+    fn restore_defaults_keeps_the_users_data() {
+        let mut r = rows();
+        for (k, v) in [
+            ("rename_presets", r#""Swap","a%1","b%1""#),
+            ("file_list_history", r"C:\a.efu"),
+            ("last_open_filelist_filename", r"C:\a.efu"),
+            ("rename_last_browse_path", r"C:\x"),
+            ("search_edit_last_located_in", r"C:\y"),
+            ("rename_old_format_history", "%1"),
+            ("rename_new_format_history", "%1"),
+            ("advanced_copy_to_old_format_history", "%1"),
+            ("advanced_move_to_new_format_history", "%1"),
+            ("search_delay", "250"),
+        ] {
+            set(&mut r, k, v);
+        }
+        for row in r.iter_mut() {
+            restore_default(row);
+        }
+        let value = |k: &str| r.iter().find(|r| r.key == k).unwrap().value.clone();
+        assert_eq!(value("search_delay"), "0");
+        assert_eq!(value("rename_presets"), r#""Swap","a%1","b%1""#);
+        assert_eq!(value("file_list_history"), r"C:\a.efu");
+        assert_eq!(value("advanced_copy_to_old_format_history"), "%1");
+        assert_eq!(value("search_edit_last_located_in"), r"C:\y");
+        assert!(r.iter().filter(|r| r.data).count() >= 10);
     }
 
     #[test]
