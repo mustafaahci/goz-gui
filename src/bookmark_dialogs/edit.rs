@@ -25,9 +25,10 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWi
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, CB_GETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, EN_CHANGE, ES_AUTOHSCROLL,
     ES_AUTOVSCROLL, ES_MULTILINE, EndDialog, GWLP_USERDATA, GetParent, GetWindowRect,
-    GetWindowTextLengthW, IDCANCEL, IDOK, MINMAXINFO, PostMessageW, SetWindowLongPtrW, WM_APP,
-    WM_CHAR, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY,
-    WM_NCPAINT, WM_SIZE, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
+    GetWindowTextLengthW, IDCANCEL, IDOK, KillTimer, MINMAXINFO, SetTimer, SetWindowLongPtrW,
+    USER_TIMER_MINIMUM, WM_CHAR, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG,
+    WM_KEYDOWN, WM_NCDESTROY, WM_NCPAINT, WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE,
+    WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::{enable, item, send, set_text};
@@ -168,9 +169,8 @@ struct Edit {
     last_row: Cell<bool>,
 }
 
-/// Posted to the editor as it opens: the last row's lists are made next,
-/// before it shows.
-const WM_LAST_ROW: u32 = WM_APP + 371;
+/// The editor's timer: it has been drawn, the last row's lists can be made.
+const LAST_ROW: usize = 1;
 
 /// Shows the editor titled `title` over `owner` with `fields`; the fields
 /// as the user left them on OK.
@@ -313,8 +313,7 @@ impl Edit {
         fill_combo(dlg, ID_CASE, tri(), tri_index(f.match_case));
         fill_combo(dlg, ID_PATH, tri(), tri_index(f.match_path));
         enable(dlg, OK, !f.name.is_empty());
-        // The last row's lists come next, before the editor shows
-        // (WM_LAST_ROW).
+        // The last row's lists come once the editor shows (WM_SHOWWINDOW).
         // SAFETY: subclasses this thread's search box; the subclass removes
         // itself when the box goes.
         unsafe { SetWindowSubclass(item(dlg, ID_SEARCH), Some(search_proc), 1, 0) };
@@ -333,18 +332,18 @@ impl Edit {
         anchor(dlg, SIZE, &ANCHORS);
     }
 
-    /// Makes the last row's lists (Filter, Sort and its direction), from a
-    /// message posted as the editor opens (or as soon as they are read).
-    /// Six themed lists took about 35 ms to make as the editor opened (each
-    /// 5 to 7 ms in comctl32, whatever their items), so three are made in a
-    /// message of their own: the window does not wait for all six at once.
-    /// They are made before the editor shows (a modal dialog shows once its
-    /// queue is empty), so its first frame has them: made after its first
-    /// paint (until wave 6), the row came a frame later.
+    /// Makes the last row's lists (Filter, Sort and its direction), once
+    /// the editor has been drawn or as soon as they are read. Six themed
+    /// lists took about 35 ms to make as the editor opened (each 5 to 7 ms
+    /// in comctl32, whatever their items); with three made after its first
+    /// paint, it shows sooner and the rest come a frame later, still in its
+    /// opening animation.
     fn make_last_row(&self, dlg: HWND) {
         if self.last_row.replace(true) {
             return;
         }
+        // SAFETY: a timer of this thread's dialog (fired or not).
+        unsafe { KillTimer(dlg, LAST_ROW) };
         let f = &self.was;
         let filter = make_control(
             dlg,
@@ -560,8 +559,6 @@ unsafe extern "system" fn edit_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
     match msg {
         WM_INITDIALOG => {
             s.init(dlg);
-            // SAFETY: posts to this thread's dialog.
-            unsafe { PostMessageW(dlg, WM_LAST_ROW, 0, 0) };
             // The dialog manager puts the keyboard in the first box, Name,
             // with its text selected.
             1
@@ -570,7 +567,16 @@ unsafe extern "system" fn edit_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
             isize::from(s.command(dlg, id, code))
         }
-        WM_LAST_ROW => {
+        // Shown (a modal dialog shows once its queue is empty): the last
+        // row's lists follow once it has been drawn, as timers come after
+        // the paints waiting. Set before then, the timer would hold the
+        // showing up instead.
+        WM_SHOWWINDOW if w != 0 => {
+            // SAFETY: a timer of this thread's dialog.
+            unsafe { SetTimer(dlg, LAST_ROW, USER_TIMER_MINIMUM, None) };
+            0
+        }
+        WM_TIMER if w == LAST_ROW => {
             s.make_last_row(dlg);
             1
         }
