@@ -12,7 +12,9 @@
 //! folders; a program's, shortcut's or icon file's own icon is extracted
 //! at the size by [`crate::bigicon`] (or, where it is an icon a class of
 //! files shares, such as a shortcut to a help file, named for the view to
-//! draw from the system image lists); every other type shows its type's
+//! draw from the system image lists); a shortcut shows its target's picture
+//! where Explorer does (a shortcut to a picture, with no icon of its own);
+//! every other type shows its type's
 //! icon, which the view draws from the system image list. The factory
 //! would give those icons too, but it keeps each file's own icon in the
 //! process's jumbo image list for good (about 50 KB per program seen).
@@ -226,9 +228,16 @@ enum Source {
     /// A picture of its contents, from the shell's image factory: types
     /// with a thumbnail handler, and folders.
     Shell,
-    /// Its own icon (a program's, a shortcut's, an icon file's), extracted
-    /// at the size.
+    /// Its own icon (a program's, an Internet shortcut's, an icon
+    /// file's), extracted at the size.
     OwnIcon,
+    /// A shortcut (`.lnk`): its target's picture where the shell has one
+    /// for it, as Explorer shows it (a shortcut to a picture or a video,
+    /// with no icon of its own); otherwise its own icon. The shell's
+    /// thumbnail of a shortcut is only ever a picture, never an icon (none
+    /// for one to a program, a folder or a missing file, or one with an
+    /// icon set), so this costs no entry of the system image lists.
+    Shortcut,
     /// Its type's icon, which the view draws itself: nothing to make.
     TypeIcon,
 }
@@ -238,9 +247,9 @@ enum Source {
 /// the type has a thumbnail handler, and is asked only when that decides
 /// it.
 fn source_for(ext: &[u16], handled: impl FnOnce() -> bool) -> Source {
-    if crate::icons::wants_own(ext) {
-        // Shortcuts have a thumbnail handler (the target's picture), but
-        // are shown by their icon, as programs and icon files are.
+    if ext == "lnk".encode_utf16().collect::<Vec<u16>>() {
+        Source::Shortcut
+    } else if crate::icons::wants_own(ext) {
         Source::OwnIcon
     } else if !ext.is_empty() && handled() {
         Source::Shell
@@ -585,6 +594,9 @@ fn make(path: &[u16], side: i32, sources: &mut HashMap<Vec<u16>, Source>) -> Opt
     match source {
         Source::TypeIcon => None,
         Source::OwnIcon => crate::bigicon::own_icon(path, side),
+        Source::Shortcut => shell_thumbnail(&path_z, side, false)
+            .map(Picture::Image)
+            .or_else(|| crate::bigicon::own_icon(path, side)),
         Source::Shell => shell_thumbnail(&path_z, side, is_dir).map(Picture::Image),
     }
 }
@@ -795,11 +807,17 @@ mod tests {
     #[test]
     fn what_a_thumbnail_is_made_from() {
         let ext = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
-        // Programs, shortcuts and icon files: their own icon, whatever
-        // handler their type has (a shortcut's shows its target).
-        for own in ["exe", "lnk", "ico", "url", "cpl"] {
+        // Programs, Internet shortcuts and icon files: their own icon,
+        // whatever handler their type has.
+        for own in ["exe", "ico", "url", "cpl"] {
             assert_eq!(source_for(&ext(own), || true), Source::OwnIcon, "{own}");
         }
+        // A shortcut: its target's picture where there is one, as in
+        // Explorer, else its own icon; never the registry asked.
+        assert_eq!(
+            source_for(&ext("lnk"), || panic!("asked for a shortcut")),
+            Source::Shortcut
+        );
         // A type with a thumbnail handler: the shell's picture.
         assert_eq!(source_for(&ext("jpg"), || true), Source::Shell);
         // Without one, or with no extension: the type's icon, and the
@@ -840,5 +858,93 @@ mod tests {
         let mut px = [[64, 32, 0, 128], [0, 0, 0, 0]];
         fix_alpha(&mut px);
         assert_eq!(px, [[64, 32, 0, 128], [0, 0, 0, 0]]);
+    }
+
+    /// A `w` by `h` 24-bit .bmp file of one colour (blue, green, red).
+    fn bmp(w: u32, h: u32, bgr: [u8; 3]) -> Vec<u8> {
+        let row = (w * 3).div_ceil(4) * 4;
+        let size = 54 + row * h;
+        let mut out = b"BM".to_vec();
+        for v in [size, 0, 54, 40] {
+            out.extend(v.to_le_bytes());
+        }
+        out.extend((w as i32).to_le_bytes());
+        out.extend((h as i32).to_le_bytes());
+        out.extend(1u16.to_le_bytes());
+        out.extend(24u16.to_le_bytes());
+        for v in [0u32, row * h, 2835, 2835, 0, 0] {
+            out.extend(v.to_le_bytes());
+        }
+        for _ in 0..h {
+            let mut line: Vec<u8> = (0..w).flat_map(|_| bgr).collect();
+            line.resize(row as usize, 0);
+            out.extend(line);
+        }
+        out
+    }
+
+    /// The pixel (premultiplied BGRA) at the centre of `b`.
+    fn centre(b: &Bitmap) -> [u8; 4] {
+        use windows_sys::Win32::Graphics::Gdi::{DIBSECTION, GetObjectW};
+        // SAFETY: a DIB section of ours; its pixels are `width * height`
+        // top-down BGRA, alive while `b` is.
+        unsafe {
+            let mut ds: DIBSECTION = core::mem::zeroed();
+            let n = GetObjectW(
+                b.handle(),
+                size_of::<DIBSECTION>() as i32,
+                (&raw mut ds).cast(),
+            );
+            assert!(n > 0 && !ds.dsBm.bmBits.is_null());
+            let px = ds.dsBm.bmBits.cast::<[u8; 4]>();
+            *px.add((b.height / 2 * b.width + b.width / 2) as usize)
+        }
+    }
+
+    /// Explorer's rule: a shortcut to a picture shows the picture; one to
+    /// a program shows the program's icon.
+    #[test]
+    fn a_shortcut_to_a_picture_shows_the_picture() {
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
+        use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+        use windows::core::Interface;
+        assert!(crate::shell::ole_ready());
+        let dir = crate::store::file::tests::fresh_dir("goz-gui-thumbs", "lnk");
+        let picture = dir.join("red.bmp");
+        std::fs::write(&picture, bmp(64, 48, [0, 0, 255])).expect("picture");
+        let link = |name: &str, to: &std::path::Path| {
+            let lnk = dir.join(name);
+            let (t, l) = (wz(&to.to_string_lossy()), wz(&lnk.to_string_lossy()));
+            // SAFETY: COM is ready (OLE); the strings outlive the calls.
+            unsafe {
+                let link: IShellLinkW =
+                    CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).expect("link");
+                link.SetPath(PCWSTR(t.as_ptr())).expect("set path");
+                link.cast::<IPersistFile>()
+                    .expect("persist")
+                    .Save(PCWSTR(l.as_ptr()), true)
+                    .expect("save");
+            }
+            l[..l.len() - 1].to_vec()
+        };
+        let to_picture = link("to picture.lnk", &picture);
+        let to_program = link(
+            "to program.lnk",
+            std::path::Path::new(r"C:\Windows\System32\notepad.exe"),
+        );
+        let mut sources = HashMap::new();
+        match make(&to_picture, 96, &mut sources) {
+            Some(Picture::Image(b)) => {
+                assert_eq!((b.width, b.height), (64, 48));
+                assert_eq!(centre(&b), [0, 0, 255, 255]);
+            }
+            _ => panic!("no picture for a shortcut to one"),
+        }
+        match make(&to_program, 96, &mut sources) {
+            Some(Picture::Image(b)) => assert_ne!(centre(&b), [0, 0, 255, 255]),
+            Some(Picture::Shared(_)) => {}
+            None => panic!("no icon for a shortcut to a program"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

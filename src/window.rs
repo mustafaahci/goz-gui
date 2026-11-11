@@ -450,8 +450,9 @@ pub struct App {
     view: Cell<View>,
     /// The thumbnails made, and the thread making them.
     pub thumbs: Thumbs,
-    /// The system's 48 px and 256 px icon lists (HIMAGELIST), once asked.
-    big_icons: Cell<[usize; 2]>,
+    /// The system's icon lists (HIMAGELIST) by `SHIL_*`: 32, 16, 48 and
+    /// 256 px (and 16 again, by the system's metrics), once asked.
+    big_icons: Cell<[usize; 5]>,
     /// Their icons not loaded yet, loaded on a thread (`bigicons.rs`).
     big_loads: crate::bigicons::BigIcons,
     /// The icon view's layout while the list paints (taken as it starts).
@@ -1138,7 +1139,7 @@ impl App {
                 taskbar_created: crate::tray::taskbar_created(),
                 view: Cell::new(s.view),
                 thumbs: Thumbs::new(hwnd, WM_THUMB),
-                big_icons: Cell::new([0; 2]),
+                big_icons: Cell::new([0; 5]),
                 big_loads: crate::bigicons::BigIcons::new(hwnd, thumbview::WM_BIG_ICONS),
                 thumb_grid: Cell::new(None),
                 view_hot: Cell::new(None),

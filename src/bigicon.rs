@@ -38,6 +38,7 @@ use windows_sys::Win32::System::LibraryLoader::{
 };
 use windows_sys::Win32::UI::Shell::{
     PathCreateFromUrlW, SHGSI_ICONLOCATION, SHGetStockIconInfo, SHSTOCKICONINFO, SIID_APPLICATION,
+    Shell_GetCachedImageIndexW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DI_NORMAL, DestroyIcon, DrawIconEx, GetIconInfo, ICONINFO,
@@ -91,6 +92,17 @@ pub fn own_icon(path: &[u16], side: i32) -> Option<Picture> {
         // handler extracts it, and only at a size the program has), but
         // its icon is still its first, found by the file.
         let in_file = if names_file { index } else { 0 };
+        // shell32.dll by position: Explorer shows the system image lists'
+        // stock entry the shell maps that position to (13 is a monitor
+        // with a drive bar), not the icon at that position in the file (a
+        // globe). The entry is shared, as a type's icon is.
+        if names_file
+            && in_file >= 0
+            && is_shell32(&file)
+            && let Some(slot) = shell32_slot(&file, in_file)
+        {
+            return Some(Picture::Shared(slot));
+        }
         let native = largest(&file, in_file);
         let want = extract_side(native, side);
         let mut icon = HICON::default();
@@ -194,6 +206,30 @@ fn expanded(text: &[u16]) -> Vec<u16> {
         }
         _ => text.to_vec(),
     }
+}
+
+/// Whether `file` (an icon's location) is shell32.dll, whose icons by
+/// position the shell maps onto the system image lists' stock entries.
+fn is_shell32(file: &[u16]) -> bool {
+    let name = file
+        .rsplit(|&c| c == u16::from(b'\\') || c == u16::from(b'/'))
+        .next()
+        .unwrap_or(file);
+    let lower: Vec<u16> = name.iter().map(|&c| crate::highlight::fold(c)).collect();
+    lower == "shell32.dll".encode_utf16().collect::<Vec<u16>>()
+}
+
+/// The system image lists' entry for icon `index` (a position) of
+/// shell32.dll at `file`, as Explorer asks for it
+/// (`Shell_GetCachedImageIndexW`): the stock entry for the positions the
+/// shell preloads, otherwise one entry for that icon, shared by every file
+/// that names it.
+fn shell32_slot(file: &[u16], index: i32) -> Option<i32> {
+    let file = nul(file);
+    // SAFETY: a NUL-terminated path; the call only looks it up (or adds
+    // the icon once to the process's system image lists).
+    let slot = unsafe { Shell_GetCachedImageIndexW(file.as_ptr(), index, 0) };
+    (slot >= 0).then_some(slot)
 }
 
 /// Whether `file` (an icon's location) is a program, whose missing icon
@@ -512,6 +548,23 @@ mod tests {
         // A file's own entry: not drawn from the lists; nor no index.
         assert_eq!(shared_icon(300, 0x0a), None);
         assert_eq!(shared_icon(-1, 0x0c), None);
+    }
+
+    #[test]
+    fn shell32_by_position_is_its_stock_entry() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert!(is_shell32(&w(r"C:\Windows\System32\shell32.dll")));
+        assert!(is_shell32(&w(r"c:\windows\system32\SHELL32.DLL")));
+        assert!(is_shell32(&w("shell32.dll")));
+        assert!(is_shell32(&w("C:/Windows/System32/Shell32.dll")));
+        assert!(!is_shell32(&w(r"C:\Windows\System32\imageres.dll")));
+        assert!(!is_shell32(&w(r"C:\x\notshell32.dll")));
+        assert!(!is_shell32(&w(r"C:\x\shell32.dll.mui")));
+        // The shell's own mapping: the preloaded positions are the stock
+        // entries of the same number, as Explorer shows them.
+        let shell32 = w(r"C:\Windows\System32\shell32.dll");
+        assert_eq!(shell32_slot(&shell32, 3), Some(3));
+        assert_eq!(shell32_slot(&shell32, 13), Some(13));
     }
 
     #[test]

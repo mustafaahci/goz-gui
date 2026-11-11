@@ -47,9 +47,30 @@ use crate::window::Fonts;
 
 /// `IID_IImageList`, which `SHGetImageList` hands the system lists out as.
 const IID_IMAGE_LIST: GUID = GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0950);
-/// `SHIL_EXTRALARGE` (48 px) and `SHIL_JUMBO` (256 px).
+/// `SHIL_LARGE` (32 px), `SHIL_SMALL` (16 px), `SHIL_EXTRALARGE` (48 px)
+/// and `SHIL_JUMBO` (256 px).
+const SHIL_LARGE: i32 = 0;
+const SHIL_SMALL: i32 = 1;
 const SHIL_EXTRALARGE: i32 = 2;
 const SHIL_JUMBO: i32 = 4;
+
+/// The lists a type's icon stands in from while its big one loads, the
+/// largest first.
+const STAND_INS: [i32; 3] = [SHIL_EXTRALARGE, SHIL_LARGE, SHIL_SMALL];
+
+/// The lists to try for a stand-in when the icon wanted is of list
+/// `wanted` (`SHIL_*`): the smaller ones.
+fn stand_ins(wanted: i32) -> impl Iterator<Item = i32> {
+    let below = if wanted == SHIL_JUMBO {
+        0
+    } else {
+        STAND_INS
+            .iter()
+            .position(|&l| l == wanted)
+            .map_or(STAND_INS.len(), |at| at + 1)
+    };
+    STAND_INS.into_iter().skip(below)
+}
 
 /// The big icons' thread (`bigicons.rs`) loaded icons that were drawn
 /// before they were: the thumbnails paint again. Beside `WM_THUMB`.
@@ -115,10 +136,11 @@ impl App {
         self.big_loads.forget_queued();
         self.big_loads.forget_shrunk();
         if v.thumbnails {
-            // The shell's big icon lists, asked for here rather than in
-            // the middle of a paint.
-            self.big_icons(false);
-            self.big_icons(true);
+            // The shell's icon lists, asked for here rather than in the
+            // middle of a paint.
+            for which in [SHIL_JUMBO, SHIL_EXTRALARGE, SHIL_LARGE, SHIL_SMALL] {
+                self.system_list(which);
+            }
             let side = view::side(v.size, dpi);
             let line = self.fonts.borrow().height;
             let (cx, cy) = view::spacing(v.size, dpi, line);
@@ -405,8 +427,11 @@ impl App {
     /// Only an icon already loaded is drawn: one that is not (an icon's
     /// first draw reads it from its file, up to 9 ms) is loaded on a thread
     /// (`bigicons.rs`), and the list paints again when it is. Meanwhile the
-    /// 48 px one stands in for the 256 px one if it is loaded; else the cell
-    /// shows no icon for that moment.
+    /// same icon stands in from the largest smaller list that has it loaded
+    /// (48, 32 or 16 px, centred: a type shown in Details has its 16 px
+    /// one), so the cell is not empty for that moment ([`stand_in`]).
+    ///
+    /// [`stand_in`]: Self::stand_in
     fn draw_big_icon(&self, hdc: HDC, icon: i32, square: &RECT) {
         if icon < 0 {
             return;
@@ -438,6 +463,7 @@ impl App {
                 }
             }
         }
+        let which = if jumbo { SHIL_JUMBO } else { SHIL_EXTRALARGE };
         let list = self.big_icons(jumbo);
         if list == 0 {
             return;
@@ -487,7 +513,46 @@ impl App {
             // SAFETY: the rest of the struct is plain data.
             ..unsafe { core::mem::zeroed() }
         };
-        self.big_loads.draw(&params, wanted);
+        if !self.big_loads.draw(&params, wanted) {
+            self.stand_in(hdc, icon, square, which);
+        }
+    }
+
+    /// Icon `icon` of the list below `wanted` (`SHIL_*`) that has it loaded
+    /// already, the largest first, centred in `square`: drawn while the
+    /// one wanted loads. Only a loaded one is drawn (`ILD_ASYNC`); none is
+    /// loaded here, which could take the UI thread milliseconds (or, for a
+    /// type whose icon handler must be loaded, hundreds).
+    fn stand_in(&self, hdc: HDC, icon: i32, square: &RECT, wanted: i32) {
+        let side = square.right - square.left;
+        for which in stand_ins(wanted) {
+            let list = self.system_list(which);
+            if list == 0 {
+                continue;
+            }
+            let (mut cx, mut cy) = (0, 0);
+            // SAFETY: reads the size of a system image list.
+            unsafe { ImageList_GetIconSize(list, &mut cx, &mut cy) };
+            if cx > side || cy > side {
+                continue;
+            }
+            let params = IMAGELISTDRAWPARAMS {
+                cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
+                himl: list,
+                i: icon,
+                hdcDst: hdc,
+                x: square.left + (side - cx) / 2,
+                y: square.top + (side - cy) / 2,
+                rgbBk: CLR_NONE as u32,
+                rgbFg: CLR_DEFAULT as u32,
+                fStyle: ILD_TRANSPARENT,
+                // SAFETY: the rest of the struct is plain data.
+                ..unsafe { core::mem::zeroed() }
+            };
+            if self.big_loads.draw(&params, false) {
+                return;
+            }
+        }
     }
 
     /// Big icons were loaded on their thread: the thumbnails paint again,
@@ -502,11 +567,17 @@ impl App {
     /// The system image list of 48 px icons, or of 256 px ones (`jumbo`),
     /// asked for once.
     fn big_icons(&self, jumbo: bool) -> HIMAGELIST {
+        self.system_list(if jumbo { SHIL_JUMBO } else { SHIL_EXTRALARGE })
+    }
+
+    /// The system image list `which` (`SHIL_*`), asked for once.
+    fn system_list(&self, which: i32) -> HIMAGELIST {
         let mut lists = self.big_icons.get();
-        let slot = usize::from(jumbo);
+        let Some(slot) = usize::try_from(which).ok().filter(|&s| s < lists.len()) else {
+            return 0;
+        };
         if lists[slot] == 0 {
             let mut ppv: *mut core::ffi::c_void = core::ptr::null_mut();
-            let which = if jumbo { SHIL_JUMBO } else { SHIL_EXTRALARGE };
             // SAFETY: the shell hands out its own image list, which lives as
             // long as the process; it is kept, never released.
             if unsafe { SHGetImageList(which, &IID_IMAGE_LIST, &mut ppv) } >= 0 {
@@ -898,6 +969,15 @@ mod tests {
         assert!(corner_only(128, 128, 256));
         assert!(!corner_only(129, 100, 256));
         assert!(!corner_only(0, 0, 256));
+    }
+
+    #[test]
+    fn a_loading_icon_stands_in_from_the_smaller_lists_the_largest_first() {
+        let all = |wanted| stand_ins(wanted).collect::<Vec<_>>();
+        assert_eq!(all(SHIL_JUMBO), [SHIL_EXTRALARGE, SHIL_LARGE, SHIL_SMALL]);
+        assert_eq!(all(SHIL_EXTRALARGE), [SHIL_LARGE, SHIL_SMALL]);
+        assert_eq!(all(SHIL_LARGE), [SHIL_SMALL]);
+        assert!(all(SHIL_SMALL).is_empty());
     }
 
     #[test]
