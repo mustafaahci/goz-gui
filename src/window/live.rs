@@ -65,6 +65,10 @@ impl App {
 
     /// Whether a live update may run now.
     fn live_idle(&self) -> bool {
+        // An open file list does not change: nothing to update (wave 4).
+        if self.filelist().is_some() {
+            return false;
+        }
         {
             let m = self.model.borrow();
             // A search on its way brings fresh rows anyway; a failed one is

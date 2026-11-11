@@ -104,6 +104,13 @@ pub fn data_dir() -> Option<&'static Path> {
         .map(|(dir, _)| dir.as_path())
 }
 
+/// Why the data folder is the one it is (Help > Troubleshooting
+/// Information).
+pub fn data_source() -> Option<Source> {
+    data_dir()?;
+    DATA_DIR.get()?.as_ref().map(|(_, source)| *source)
+}
+
 /// A file in the data folder.
 pub fn data_file(name: &str) -> Option<PathBuf> {
     data_dir().map(|dir| dir.join(name))

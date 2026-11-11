@@ -33,6 +33,109 @@ pub struct ToolSettings {
     pub undo_ascending: bool,
     /// Where Copy and Move to Folder last went.
     pub last_folder: String,
+    /// Edit > Advanced > Advanced Copy to Folder...'s and Advanced Move to
+    /// Folder...'s switches and formats (wave 4: Everything's
+    /// `advanced_copy_to_*` and `advanced_move_to_*`).
+    pub copy_to: Formats,
+    pub move_to: Formats,
+    /// The named Old/New formats the renamer's Presets button keeps, shared
+    /// by Advanced Rename and Advanced Copy/Move (`rename_presets`).
+    pub presets: Vec<Preset>,
+}
+
+/// A renamer's switches and its formats used, newest first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Formats {
+    pub options: super::rename::Options,
+    pub old_history: Vec<String>,
+    pub new_history: Vec<String>,
+}
+
+impl Formats {
+    fn from_keys<'a>(prefix: &str, get: &impl Fn(&str) -> Option<&'a str>) -> Formats {
+        let flag = |k: &str| {
+            get(&format!("{prefix}_{k}"))
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .is_some_and(|n| n != 0)
+        };
+        Formats {
+            options: super::rename::Options {
+                match_case: flag("match_case"),
+                match_diacritics: flag("match_diacritics"),
+                regex: flag("regex"),
+                ignore_extension: flag("ignore_extension"),
+            },
+            old_history: history_of(get(&format!("{prefix}_old_format_history"))),
+            new_history: history_of(get(&format!("{prefix}_new_format_history"))),
+        }
+    }
+
+    fn to_keys(&self, prefix: &str, out: &mut Vec<(String, String)>) {
+        let bit = |b: bool| u8::from(b).to_string();
+        let o = self.options;
+        for (k, v) in [
+            ("match_case", bit(o.match_case)),
+            ("match_diacritics", bit(o.match_diacritics)),
+            ("regex", bit(o.regex)),
+            ("ignore_extension", bit(o.ignore_extension)),
+            ("old_format_history", history_value(&self.old_history)),
+            ("new_format_history", history_value(&self.new_history)),
+        ] {
+            out.push((format!("{prefix}_{k}"), v));
+        }
+    }
+}
+
+/// A named Old format and New format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preset {
+    pub name: String,
+    pub old_format: String,
+    pub new_format: String,
+}
+
+/// The most presets kept.
+pub const PRESETS: usize = 100;
+
+/// The presets as `rename_presets` holds them: one CSV record of name, old
+/// format and new format, preset after preset.
+fn presets_of(value: Option<&str>) -> Vec<Preset> {
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        return Vec::new();
+    };
+    let fields: Vec<String> = csv::parse(value)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.text)
+        .collect();
+    fields
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .filter(|c| !c[0].is_empty())
+        .map(|c| Preset {
+            name: c[0].clone(),
+            old_format: c[1].clone(),
+            new_format: c[2].clone(),
+        })
+        .take(PRESETS)
+        .collect()
+}
+
+fn presets_value(list: &[Preset]) -> String {
+    if list.is_empty() {
+        return String::new();
+    }
+    let fields: Vec<Field> = list
+        .iter()
+        .flat_map(|p| [&p.name, &p.old_format, &p.new_format])
+        .map(|t| Field::quoted(t.clone()))
+        .collect();
+    let mut out = String::new();
+    csv::write_record(&fields, &mut out);
+    out.trim_end_matches(['\r', '\n']).to_owned()
 }
 
 impl Default for ToolSettings {
@@ -48,6 +151,9 @@ impl Default for ToolSettings {
             undo_sort: 0,
             undo_ascending: false,
             last_folder: String::new(),
+            copy_to: Formats::default(),
+            move_to: Formats::default(),
+            presets: Vec::new(),
         }
     }
 }
@@ -126,6 +232,9 @@ impl ToolSettings {
             last_folder: get("rename_last_browse_path")
                 .unwrap_or_default()
                 .to_owned(),
+            copy_to: Formats::from_keys("advanced_copy_to", &get),
+            move_to: Formats::from_keys("advanced_move_to", &get),
+            presets: presets_of(get("rename_presets")),
         }
     }
 
@@ -167,6 +276,9 @@ impl ToolSettings {
             "undo_history_sort_ascending".to_owned(),
             bit(self.undo_ascending),
         ));
+        self.copy_to.to_keys("advanced_copy_to", &mut out);
+        self.move_to.to_keys("advanced_move_to", &mut out);
+        out.push(("rename_presets".to_owned(), presets_value(&self.presets)));
         out
     }
 }
@@ -209,6 +321,34 @@ mod tests {
         assert_eq!(ToolSettings::from_keys(|k| map.get(k).copied()), s);
         assert!(map.contains_key("set_file_time_date_created_type"));
         assert!(map.contains_key("rename_match_diacritics"));
+    }
+
+    #[test]
+    fn copy_move_formats_and_presets_round_trip() {
+        let pairs = [
+            ("advanced_copy_to_regex", "1"),
+            ("advanced_copy_to_old_format_history", r#""a","b""#),
+            ("advanced_move_to_ignore_extension", "1"),
+            (
+                "rename_presets",
+                r#""Dates","%1-%2","%2 %1","Odd,name","x","""#,
+            ),
+        ];
+        let map: HashMap<&str, &str> = pairs.into_iter().collect();
+        let s = ToolSettings::from_keys(|k| map.get(k).copied());
+        assert!(s.copy_to.options.regex && !s.copy_to.options.match_case);
+        assert_eq!(s.copy_to.old_history, ["a", "b"]);
+        assert!(s.move_to.options.ignore_extension);
+        assert_eq!(s.presets.len(), 2);
+        assert_eq!(s.presets[1].name, "Odd,name");
+        assert_eq!(s.presets[1].new_format, "");
+        let keys = s.to_keys();
+        let map: HashMap<&str, &str> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(ToolSettings::from_keys(|k| map.get(k).copied()), s);
+        assert!(map.contains_key("advanced_move_to_new_format_history"));
+        // A record cut short keeps the whole presets in it.
+        assert_eq!(presets_of(Some(r#""a","b","c","d""#)).len(), 1);
+        assert_eq!(presets_value(&[]), "");
     }
 
     #[test]

@@ -119,6 +119,9 @@ mod file_tools;
 // F6 (integration and the Options pages).
 mod uiopts;
 
+// W4 (G1: data and file tools).
+mod datatools;
+
 pub const WM_REPLY: u32 = WM_APP + 1;
 pub const WM_ICON: u32 = WM_APP + 2;
 /// A Tools > goz Service command finished; wParam is 1 if it ran.
@@ -488,6 +491,9 @@ pub struct App {
     /// A click is putting the keyboard in the search box: its text is
     /// selected once the button is up (`select_search_on_mouse_click`).
     click_select: Cell<bool>,
+    // W4 (G1: data and file tools).
+    /// The open file list, searched instead of gozd (`datatools.rs`).
+    data_tools: datatools::DataTools,
 }
 
 /// How the program that started goz-gui asked for its window to be shown
@@ -625,6 +631,10 @@ See Help > Search Syntax and the README for goz-gui's switches."
             return 2;
         }
     };
+    // W4 (G1): the switches that do their work with no window and end.
+    if let Some(code) = datatools::before_window(&launch) {
+        return code;
+    }
     // One goz-gui per data folder (and -instance name): a second start
     // hands its command line over and ends, unless it is to be a window of
     // its own: File > New Window's (`-new-window`, see `window/newwin.rs`),
@@ -633,8 +643,11 @@ See Help > Search Syntax and the README for goz-gui's switches."
     let key = crate::instance::key(launch.instance.as_deref());
     let first = crate::instance::claim(&key);
     let secondary = !first && (launch.new_window == Some(true) || new_window_on_start(&launch));
-    // If the one holding the instance does not answer, start anyway.
-    if !first && !secondary && crate::instance::forward(&key, &args) {
+    // If the one holding the instance does not answer, start anyway. A
+    // file list named relatively is made absolute here, as the running
+    // goz-gui runs in another folder.
+    let handed = crate::cmdline::absolute_file_lists(&args);
+    if !first && !secondary && crate::instance::forward(&key, &handed) {
         return 0;
     }
     if launch.exit {
@@ -771,6 +784,11 @@ See Help > Search Syntax and the README for goz-gui's switches."
             SetWindowPlacement(hwnd, &wp);
         } else {
             ShowWindow(hwnd, show);
+        }
+        // W4 (G1): -filelist (or a bare .efu): the first search is the
+        // list's.
+        if let Some(list) = &launch.filelist {
+            app.set_file_list(list);
         }
         app.start_search(false);
         if let Some(s) = &restored {
@@ -1015,6 +1033,7 @@ impl App {
                     query: String::new(),
                     sort: SortSpec::default(),
                     match_case: false,
+                    filelist: None,
                 }))),
                 icons: Icons::new(hwnd, WM_ICON, WM_TYPES, WM_TYPES_ASK),
                 scratch: RefCell::new(Scratch::default()),
@@ -1116,6 +1135,8 @@ impl App {
                 search_dirty: Cell::new(false),
                 single_click: Cell::new(false),
                 click_select: Cell::new(false),
+                // W4 (G1: data and file tools).
+                data_tools: datatools::DataTools::new(),
             })
         }
     }
@@ -1689,6 +1710,11 @@ impl App {
                     self.fetch_done();
                     0
                 }
+                // W4 (G1): the data tools' messages.
+                m if (crate::datatools::MSG_FIRST..crate::datatools::MSG_END).contains(&m) => {
+                    self.data_tools_message(m, w, l);
+                    0
+                }
                 WM_SERVICE => {
                     if w != 0 {
                         // gozd stopped or (re)started: search again, which
@@ -2240,6 +2266,8 @@ impl App {
             query: filter::query(o.filter, o.match_path, &scoped),
             sort: o.sort,
             match_case: o.match_case,
+            // W4 (G1): an open file list is searched instead of gozd.
+            filelist: self.filelist(),
         });
         let epoch = self.next_epoch.get() + 1;
         self.next_epoch.set(epoch);
@@ -2251,8 +2279,10 @@ impl App {
         });
         self.worker.begin(epoch);
         // A folder chosen in the Folders pane is a search of its own: the
-        // folder's contents show though the box is empty.
-        let hidden = self.ui.get().hide_empty && scoped.trim().is_empty();
+        // folder's contents show though the box is empty; so does an open
+        // file list (W4, G1), as in Everything.
+        let hidden =
+            self.ui.get().hide_empty && scoped.trim().is_empty() && search.filelist.is_none();
         if hidden {
             // Options > Results' "Hide results when the search is empty":
             // gozd is not asked; the empty answer comes as its would, so
@@ -2296,10 +2326,13 @@ impl App {
             }
         }
         self.last_search.set(Some(Instant::now()));
-        let title = if text.is_empty() {
-            "goz".to_owned()
-        } else {
-            format!("{text} - goz")
+        // Everything's title names an open file list too.
+        let list = self.filelist().map(|l| l.name().to_owned());
+        let title = match (text.is_empty(), list) {
+            (true, None) => "goz".to_owned(),
+            (false, None) => format!("{text} - goz"),
+            (true, Some(list)) => format!("{list} - goz"),
+            (false, Some(list)) => format!("{text} - {list} - goz"),
         };
         // Set only when it changed: a refresh (every live update) would
         // repaint the title bar for nothing.
@@ -2793,6 +2826,8 @@ impl App {
             Indicator::Filter => o.filter = Filter::Everything,
             // The Folders pane's folder (F2), no search option.
             Indicator::Folder => return self.clear_folder(),
+            // W4 (G1): the open file list closes.
+            Indicator::FileList => return self.close_file_list(),
         }
         self.opts.set(o);
         self.start_search(false);

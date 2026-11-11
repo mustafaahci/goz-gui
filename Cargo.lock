@@ -65,6 +65,7 @@ version = "0.1.0"
 dependencies = [
  "goz-core",
  "goz-winfs",
+ "memchr",
  "regex",
  "windows",
  "windows-core",

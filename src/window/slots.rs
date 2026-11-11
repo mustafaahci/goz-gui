@@ -58,6 +58,9 @@ impl App {
         self.start_file_tools();
 
         // F6 (integration and the Options pages).
+
+        // W4 (G1: data and file tools).
+        self.data_tools_start();
     }
 
     /// The window is ending (its settings are saved, its panes still
@@ -78,6 +81,9 @@ impl App {
         // F5 (file tools).
 
         // F6 (integration and the Options pages).
+
+        // W4 (G1: data and file tools).
+        self.data_tools_exit();
     }
 
     /// A menu of the bar (or a submenu) is about to open, after the
@@ -98,6 +104,9 @@ impl App {
         self.file_tools_menu_popup(popup);
 
         // F6 (integration and the Options pages).
+
+        // W4 (G1: data and file tools).
+        self.data_tools_menu_popup(popup);
     }
 
     /// A command in a feature's range (`menu::F1_FIRST`, ...): true when
@@ -123,6 +132,9 @@ impl App {
 
             // F6: 3500..=3599.
             3500..=3599 => false,
+
+            // W4 (G1): 4600..=4699.
+            4600..=4699 => self.data_tools_command(id),
 
             _ => false,
         }
@@ -220,7 +232,7 @@ mod tests {
     use crate::filetools::cmd;
     use crate::filter::Filter;
     use crate::window::{
-        file_tools, findbar, newwin, results, sidebars, tabs as tabs_w, tools, uiopts,
+        datatools, file_tools, findbar, newwin, results, sidebars, tabs as tabs_w, tools, uiopts,
     };
     use crate::{columns, menu, searchtools, tabs};
 
@@ -384,6 +396,13 @@ mod tests {
             sidebars::MARK_EXPAND,
             crate::preview::TAB_OUT,
             crate::preview::TAB_BACK_OUT,
+            crate::datatools::cmd::OPEN_FILE_LIST,
+            crate::datatools::cmd::CLOSE_FILE_LIST,
+            crate::datatools::cmd::CLEAR_RECENT_FILE_LISTS,
+            crate::datatools::cmd::ADVANCED_COPY_TO,
+            crate::datatools::cmd::ADVANCED_MOVE_TO,
+            crate::datatools::cmd::IMPORT_EXPORT_SETTINGS,
+            crate::datatools::cmd::TROUBLESHOOTING,
         ]
     }
 
@@ -400,6 +419,11 @@ mod tests {
                 menu::CUSTOM_FILTERS,
             ),
             ("closed tabs", menu::TAB_ENTRY_FIRST, menu::TAB_ENTRIES),
+            (
+                "recent file lists",
+                crate::datatools::cmd::RECENT_FIRST,
+                crate::filelist::settings::MENU_MAX,
+            ),
             (
                 "shell items",
                 menu::SHELL_FIRST,
@@ -446,6 +470,9 @@ mod tests {
                 Some(menu::F4_FIRST)
             } else if name.starts_with("cmd::") {
                 Some(menu::F5_FIRST)
+            } else if name.starts_with("crate::datatools::") {
+                // W4 (G1): 4600..=4699.
+                Some(crate::datatools::cmd::FIRST)
             } else {
                 None
             };
@@ -487,6 +514,7 @@ mod tests {
             findbar::WM_FIND,
             tools::WM_FULLSCREEN_AT_START,
             uiopts::WM_FOCUS_SEARCH,
+            datatools::WM_FILELIST,
         ];
         for (i, &(a, m)) in messages.iter().enumerate() {
             for &(b, other) in &messages[i + 1..] {

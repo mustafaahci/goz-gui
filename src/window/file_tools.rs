@@ -30,6 +30,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::results::{Act, Then};
 use super::slots::F5_TIMER;
 use super::{App, send};
+use crate::datatools::cmd::{ADVANCED_COPY_TO, ADVANCED_MOVE_TO};
 use crate::dialog::Quiet;
 use crate::fileops::{Job, Outcome, parent};
 use crate::filetools::settings::{ToolSettings, remember};
@@ -203,6 +204,9 @@ impl App {
             ],
         );
         let advanced = menu::submenu(&[
+            // W4 (G1): Everything's first two.
+            MenuItem::Cmd(ADVANCED_COPY_TO, "Advanced Copy to &Folder..."),
+            MenuItem::Cmd(ADVANCED_MOVE_TO, "Advanced Mo&ve to Folder..."),
             MenuItem::Cmd(cmd::ADVANCED_RENAME, "Advanced Rena&me...\tShift+F2"),
             MenuItem::Sep,
             MenuItem::Cmd(cmd::SET_FILE_TIME, "Set File &Time..."),
@@ -249,6 +253,8 @@ impl App {
                 selection,
             ),
             (cmd::SET_FILE_TIME, "Set File &Time...", selection),
+            (ADVANCED_COPY_TO, "Advanced Copy to &Folder...", selection),
+            (ADVANCED_MOVE_TO, "Advanced Mo&ve to Folder...", selection),
             (cmd::NEW_FOLDER, "Ne&w Folder", self.can_make_folder()),
         ] {
             set_item(popup, id, label, on);
@@ -267,6 +273,8 @@ impl App {
             cmd::SET_FILE_TIME => self.set_file_time(),
             cmd::NEW_FOLDER => self.new_folder(),
             cmd::CREATE_SHORTCUT => self.create_shortcut(),
+            ADVANCED_COPY_TO => self.advanced_copy_move(false),
+            ADVANCED_MOVE_TO => self.advanced_copy_move(true),
             _ => return false,
         }
         true
@@ -292,7 +300,7 @@ impl App {
     }
 
     /// Whether a tool may open its dialog: none of goz-gui's dialogs is up.
-    fn may_open_dialog(&self) -> bool {
+    pub(super) fn may_open_dialog(&self) -> bool {
         !self.file_tools.dialog.get()
             && !self.bookmark_dialog.get()
             && !self.run_history_dialog_open()
@@ -421,14 +429,21 @@ impl App {
             options: s.rename,
             old_history: s.old_history.clone(),
             new_history: s.new_history.clone(),
+            mode: rename_dialog::Mode::Rename,
+            folder: String::new(),
+            presets: s.presets.clone(),
         };
         self.file_tools.dialog.set(true);
-        let chosen = {
+        let (chosen, presets) = {
             let _quiet = Quiet::begin();
             rename_dialog::run(self.hwnd, &files, start, self.dialog_look())
         };
         self.file_tools.dialog.set(false);
         super::runs::give_back_memory();
+        if let Some(presets) = presets {
+            s.presets = presets;
+            self.set_tool_settings(s.clone());
+        }
         let Some(chosen) = chosen else { return };
         s.rename = chosen.options;
         remember(&mut s.old_history, &chosen.old_format);
@@ -440,6 +455,96 @@ impl App {
             .map(|(path, name)| Step::Rename { path, name })
             .collect();
         self.run_task(steps, false, Purpose::Do(Action::Rename));
+    }
+
+    /// Edit > Advanced > Advanced Copy to Folder... and Advanced Move to
+    /// Folder... (`moving`, wave 4): the renamer with a To folder; each
+    /// selected item is copied or moved there under its new name, as one
+    /// operation (one undo record: Undo puts moved items back where they
+    /// were, under their old names, and sends copies to the Recycle Bin).
+    fn advanced_copy_move(&self, moving: bool) {
+        if !self.may_open_dialog() {
+            return;
+        }
+        let id = if moving {
+            ADVANCED_MOVE_TO
+        } else {
+            ADVANCED_COPY_TO
+        };
+        let Some(targets) = self.tool_targets(id) else {
+            return;
+        };
+        let files: Vec<(Vec<u16>, bool)> =
+            targets.into_iter().map(|t| (t.path, t.is_dir)).collect();
+        let mut s = self.tool_settings();
+        let formats = if moving {
+            s.move_to.clone()
+        } else {
+            s.copy_to.clone()
+        };
+        let start = rename_dialog::Start {
+            options: formats.options,
+            old_history: formats.old_history.clone(),
+            new_history: formats.new_history.clone(),
+            mode: if moving {
+                rename_dialog::Mode::Move
+            } else {
+                rename_dialog::Mode::Copy
+            },
+            folder: s.last_folder.clone(),
+            presets: s.presets.clone(),
+        };
+        self.file_tools.dialog.set(true);
+        let (chosen, presets) = {
+            let _quiet = Quiet::begin();
+            rename_dialog::run(self.hwnd, &files, start, self.dialog_look())
+        };
+        self.file_tools.dialog.set(false);
+        super::runs::give_back_memory();
+        if let Some(presets) = presets {
+            s.presets = presets;
+        }
+        let Some(chosen) = chosen else {
+            self.set_tool_settings(s);
+            return;
+        };
+        let mut formats = formats;
+        formats.options = chosen.options;
+        remember(&mut formats.old_history, &chosen.old_format);
+        remember(&mut formats.new_history, &chosen.new_format);
+        if moving {
+            s.move_to = formats;
+        } else {
+            s.copy_to = formats;
+        }
+        s.last_folder = text(&chosen.folder);
+        self.set_tool_settings(s);
+        let folder = chosen.folder;
+        let steps = chosen
+            .renames
+            .into_iter()
+            .map(|(path, name)| {
+                // Its own name, as Copy and Move to Folder give it (the
+                // dialog refused a copy into its own folder under it).
+                let keep = crate::filetools::name_of(&path) == name.as_slice();
+                let name = (!keep).then_some(name);
+                if moving {
+                    Step::Move {
+                        path,
+                        folder: folder.clone(),
+                        name,
+                    }
+                } else {
+                    Step::Copy {
+                        path,
+                        folder: folder.clone(),
+                        name,
+                    }
+                }
+            })
+            .collect();
+        let action = if moving { Action::Move } else { Action::Copy };
+        self.run_task(steps, false, Purpose::Do(action));
     }
 
     /// Edit > Advanced > Set File Time...: asks what each time becomes,

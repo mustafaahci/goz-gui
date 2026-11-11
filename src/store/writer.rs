@@ -20,6 +20,8 @@ struct State {
     queue: VecDeque<(PathBuf, Job)>,
     /// A job is running.
     busy: bool,
+    /// Nothing more is written (`Writer::close`).
+    closed: bool,
 }
 
 #[derive(Default)]
@@ -55,15 +57,31 @@ impl Writer {
 
     /// Queues `job` for `file`, in place of any job for it still waiting.
     pub fn submit(&self, file: &Path, job: Job) {
+        let mut state = self.shared.lock();
+        if state.closed {
+            return;
+        }
         if !self.threaded {
+            drop(state);
             job();
             return;
         }
-        let mut state = self.shared.lock();
         match state.queue.iter_mut().find(|(f, _)| f == file) {
             Some(slot) => slot.1 = job,
             None => state.queue.push_back((file.to_owned(), job)),
         }
+        drop(state);
+        self.shared.changed.notify_all();
+    }
+
+    /// Writes nothing more, from now on: what is queued is dropped and
+    /// what is submitted later too. For a data folder about to be replaced
+    /// (Tools > Import and Export Settings..., wave 4), where this process
+    /// is ending and must not write its own state over the new files.
+    pub fn close(&self) {
+        let mut state = self.shared.lock();
+        state.closed = true;
+        state.queue.clear();
         drop(state);
         self.shared.changed.notify_all();
     }
@@ -113,6 +131,19 @@ fn run(shared: &Shared) {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn a_closed_writer_writes_nothing_more() {
+        let writer = Writer::spawn();
+        let (tx, rx) = mpsc::channel::<u8>();
+        let first = tx.clone();
+        writer.submit(Path::new("a"), Box::new(move || first.send(1).unwrap()));
+        assert!(writer.flush(Duration::from_secs(5)));
+        writer.close();
+        writer.submit(Path::new("a"), Box::new(move || tx.send(2).unwrap()));
+        assert!(writer.flush(Duration::from_secs(5)));
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), [1]);
+    }
 
     #[test]
     fn a_waiting_job_is_replaced_by_the_next_for_its_file() {

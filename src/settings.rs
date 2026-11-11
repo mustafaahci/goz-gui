@@ -359,6 +359,11 @@ pub struct Settings {
     /// (`allow_multiple_windows`, `search_as_you_type`, `size_format`, ...;
     /// see `crate::ui_options`).
     pub ui: UiOptions,
+    // W4 (G1: data and file tools).
+    /// File > Recent File Lists and Open File List...'s folder
+    /// (`file_list_history*`, `last_open_filelist_filename`; see
+    /// `crate::filelist::settings`).
+    pub file_lists: crate::filelist::settings::ListSettings,
 }
 
 /// Running in the background, the tray icon and the global hotkeys, under
@@ -441,6 +446,8 @@ impl Default for Settings {
             file_tools: crate::filetools::settings::ToolSettings::default(),
             // F6 (integration and the Options pages).
             ui: UiOptions::default(),
+            // W4 (G1: data and file tools).
+            file_lists: crate::filelist::settings::ListSettings::default(),
         }
     }
 }
@@ -645,6 +652,8 @@ impl Settings {
             file_tools: crate::filetools::settings::ToolSettings::from_keys(|k| ini.get(k)),
             // F6 (integration and the Options pages).
             ui: UiOptions::from_keys(|k| ini.get(k)),
+            // W4 (G1: data and file tools).
+            file_lists: crate::filelist::settings::ListSettings::from_keys(|k| ini.get(k)),
         }
     }
 
@@ -761,6 +770,9 @@ impl Settings {
 
         // F6 (integration and the Options pages).
         out.extend(self.ui.to_keys());
+
+        // W4 (G1: data and file tools).
+        out.extend(self.file_lists.to_keys());
 
         out
     }
@@ -1012,6 +1024,11 @@ mod tests {
                 old_history: vec!["%1.txt".into()],
                 time_kinds: [1, 0, 4],
                 last_folder: r"D:\x".into(),
+                ..Default::default()
+            },
+            // W4 (G1).
+            file_lists: crate::filelist::settings::ListSettings {
+                history: vec![r"C:\lists\a.efu".into()],
                 ..Default::default()
             },
         };

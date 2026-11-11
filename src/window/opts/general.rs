@@ -1,7 +1,8 @@
 //! Options > General: what goz-gui puts in Windows for the user (see
 //! `crate::integration`): starting with Windows, "Search goz..." on folders
 //! in Explorer, the Start menu and Desktop shortcuts and the `goz:` URL
-//! protocol, with Everything's labels ("Start Everything on system
+//! protocol, and (wave 4) the `.efu` file association, with Everything's
+//! labels ("Start Everything on system
 //! startup", "Show Search Everything folder context menu item", "Start
 //! menu shortcut", "Desktop shortcut", "es: URL protocol") and ids. Each
 //! box shows what is there now, not a setting: another program, or a copy
@@ -19,6 +20,7 @@ const FOLDER_ITEM: u16 = 1061;
 const START_MENU: u16 = 1056;
 const DESKTOP: u16 = 1058;
 const URL: u16 = 1062;
+const EFU: u16 = 1063;
 
 pub(super) struct General;
 
@@ -31,7 +33,7 @@ struct Item {
     failed: &'static str,
 }
 
-const ITEMS: [Item; 5] = [
+const ITEMS: [Item; 6] = [
     Item {
         id: STARTUP,
         has: integration::starts_with_windows,
@@ -62,6 +64,13 @@ const ITEMS: [Item; 5] = [
         set: integration::set_url_protocol,
         failed: "The goz: URL protocol could not be changed",
     },
+    // W4 (G1).
+    Item {
+        id: EFU,
+        has: integration::has_efu_association,
+        set: integration::set_efu_association,
+        failed: "The EFU file association could not be changed",
+    },
 ];
 
 impl Page for General {
@@ -81,7 +90,8 @@ impl Page for General {
             )
             .check(START_MENU, "S&tart menu shortcut")
             .check(DESKTOP, "D&esktop shortcut")
-            .check(URL, "goz: URL &protocol");
+            .check(URL, "goz: URL &protocol")
+            .check(EFU, "EFU &file association");
     }
 
     fn fill(&self, _app: &App, page: HWND) {

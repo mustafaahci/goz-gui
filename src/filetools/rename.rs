@@ -862,6 +862,50 @@ where
         .collect()
 }
 
+/// The problem of each file copied or moved (`moving`) into one folder
+/// under its new name (wave 4, Advanced Copy/Move to Folder): `old[i]` is
+/// its name, `new[i]` its new name (`None`: its own), `in_dest[i]` whether
+/// it is in that folder already, and `exists(name)` whether the folder
+/// holds a file of that name (in lower case) now. A file moved into its
+/// own folder under its own name stays as it is: no problem, nothing to
+/// do; copied so, it would meet itself.
+pub fn transfer_problems<F>(
+    old: &[&str],
+    new: &[Option<String>],
+    in_dest: &[bool],
+    moving: bool,
+    exists: F,
+) -> Vec<Option<Problem>>
+where
+    F: Fn(&str) -> bool,
+{
+    let lower = |s: &str| s.to_lowercase();
+    let finals: Vec<String> = (0..old.len())
+        .map(|i| lower(new[i].as_deref().unwrap_or(old[i])))
+        .collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for f in &finals {
+        *counts.entry(f.as_str()).or_default() += 1;
+    }
+    (0..old.len())
+        .map(|i| {
+            let name = new[i].as_deref().unwrap_or(old[i]);
+            let units: Vec<u16> = name.encode_utf16().collect();
+            if let Some(why) = crate::filename::problem(&units) {
+                return Some(Problem::Invalid(why));
+            }
+            if counts.get(finals[i].as_str()).copied().unwrap_or(0) > 1 {
+                return Some(Problem::Duplicate);
+            }
+            let itself = in_dest[i] && finals[i] == lower(old[i]);
+            if exists(&finals[i]) && !(moving && itself) {
+                return Some(Problem::Exists);
+            }
+            None
+        })
+        .collect()
+}
+
 /// Puts renames (a path, and what it becomes) in an order they can be
 /// done in: what a folder holds before the folder, whose renaming would
 /// leave their paths naming nothing. A path inside another is longer than
@@ -874,6 +918,35 @@ pub fn children_first<T>(renames: &mut [(Vec<u16>, T)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copies_and_moves_into_one_folder_meet_its_files() {
+        let old = ["a.txt", "b.txt", "c.txt", "d.txt"];
+        let new = vec![
+            Some("x.txt".to_owned()),
+            Some("X.TXT".to_owned()),
+            None,
+            Some("bad?.txt".to_owned()),
+        ];
+        let there = |n: &str| n == "c.txt";
+        let p = transfer_problems(&old, &new, &[false; 4], false, there);
+        assert_eq!(p[0], Some(Problem::Duplicate));
+        assert_eq!(p[1], Some(Problem::Duplicate));
+        assert_eq!(p[2], Some(Problem::Exists));
+        assert!(matches!(p[3], Some(Problem::Invalid(_))));
+        // c.txt is in that folder already: moved there as it is, nothing
+        // happens; copied, it would meet itself.
+        let new = vec![None, None, None, None];
+        let in_dest = [false, false, true, false];
+        assert_eq!(
+            transfer_problems(&old, &new, &in_dest, true, there),
+            [None, None, None, None]
+        );
+        assert_eq!(
+            transfer_problems(&old, &new, &in_dest, false, there)[2],
+            Some(Problem::Exists)
+        );
+    }
 
     #[test]
     fn what_a_folder_holds_is_renamed_before_it() {

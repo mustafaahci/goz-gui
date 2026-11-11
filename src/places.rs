@@ -56,6 +56,11 @@ pub enum Which {
     Rename,
     /// F5: Edit > Undo History.
     UndoHistory,
+    /// W4 (G1): Edit > Advanced > Advanced Copy to Folder... and Advanced
+    /// Move to Folder... (Everything's `advanced_copy_to_*`,
+    /// `advanced_move_to_*`).
+    AdvancedCopyTo,
+    AdvancedMoveTo,
 }
 
 /// What Everything keeps for a dialog, under which keys.
@@ -77,7 +82,7 @@ struct Keys {
 }
 
 impl Which {
-    pub const ALL: [Which; 11] = [
+    pub const ALL: [Which; 13] = [
         Which::SearchHistory,
         Which::SearchHistorySelect,
         Which::RunHistory,
@@ -89,6 +94,8 @@ impl Which {
         Which::FilterOrganize,
         Which::Rename,
         Which::UndoHistory,
+        Which::AdvancedCopyTo,
+        Which::AdvancedMoveTo,
     ];
 
     fn keys(self) -> Keys {
@@ -162,6 +169,8 @@ impl Which {
             // Everything keeps the renamer's place and size, no columns
             // (its lists are text boxes).
             Which::Rename => k("rename", true, true, "", &[], false),
+            Which::AdvancedCopyTo => k("advanced_copy_to", true, true, "", &[], false),
+            Which::AdvancedMoveTo => k("advanced_move_to", true, true, "", &[], false),
             Which::UndoHistory => k(
                 "undo_history",
                 true,

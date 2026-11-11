@@ -378,6 +378,7 @@ mod tests {
             query: String::new(),
             sort: goz_core::types::SortSpec::default(),
             match_case: false,
+            filelist: None,
         }))
     }
 
