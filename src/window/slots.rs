@@ -530,7 +530,22 @@ mod tests {
                     "{a} is in the features' range"
                 );
             }
+            // Wave 4's streams route their own ranges (G1 WM_APP + 250..300,
+            // G2 + 300..320): nothing else may sit in them.
+            let in_g1 = (crate::datatools::MSG_FIRST..crate::datatools::MSG_END).contains(&m);
+            assert_eq!(in_g1, a.starts_with("datatools::"), "{a} and G1's range");
+            let in_g2 = super::super::custom::is_message(m);
+            assert_eq!(
+                in_g2,
+                a.starts_with("super::super::custom::"),
+                "{a} and G2's range"
+            );
         }
+        assert!(!is_feature_message(crate::datatools::MSG_FIRST));
+        assert!(!is_feature_message(crate::datatools::MSG_END - 1));
+        assert!(!super::super::custom::is_message(
+            crate::datatools::MSG_END - 1
+        ));
         let timers: Vec<(&str, usize)> = named![
             super::super::TIMER_REFRESH,
             super::super::TIMER_RETRY,
@@ -562,5 +577,18 @@ mod tests {
         assert!((F5_TIMER..F5_TIMER + TIMER_RANGE).contains(&file_tools::TIMER_NEW_FOLDER));
         assert!((F6_TIMER..F6_TIMER + TIMER_RANGE).contains(&uiopts::TIMER_SEARCH_DELAY));
         assert!(!is_feature_timer(crate::celltip::TIMER));
+        // G2's timers (300..310) route as a range: only its own sit there.
+        for &(a, t) in &timers {
+            let in_g2 = super::super::custom::is_timer(t);
+            assert_eq!(
+                in_g2,
+                a.starts_with("super::super::custom::"),
+                "{a} and G2's timers"
+            );
+            assert!(
+                !in_g2 || !is_feature_timer(t),
+                "{a} is in the features' timers"
+            );
+        }
     }
 }

@@ -22,6 +22,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{FALT, FCONTROL, FSHIFT};
 
+use crate::datatools::cmd as datatools;
 use crate::filetools::cmd;
 use crate::{keys, menu, searchtools, tabs};
 
@@ -153,6 +154,16 @@ pub const COMMANDS: &[Command] = &[
         menu::BOOKMARK_ORGANIZE,
     ),
     c(
+        "edit_advanced_advanced_copy_to_folder_keys",
+        "Edit | Advanced | Advanced Copy to Folder...",
+        datatools::ADVANCED_COPY_TO,
+    ),
+    c(
+        "edit_advanced_advanced_move_to_folder_keys",
+        "Edit | Advanced | Advanced Move to Folder...",
+        datatools::ADVANCED_MOVE_TO,
+    ),
+    c(
         "edit_advanced_advanced_rename_keys",
         "Edit | Advanced | Advanced Rename...",
         cmd::ADVANCED_RENAME,
@@ -204,6 +215,16 @@ pub const COMMANDS: &[Command] = &[
         "Edit | Undo History...",
         cmd::UNDO_HISTORY,
     ),
+    c(
+        "file_clear_recent_file_lists_keys",
+        "File | Clear Recent File Lists",
+        datatools::CLEAR_RECENT_FILE_LISTS,
+    ),
+    c(
+        "file_close_file_list_keys",
+        "File | Close File List",
+        datatools::CLOSE_FILE_LIST,
+    ),
     c("file_close_tab_keys", "File | Close Tab", tabs::CLOSE_TAB),
     c(
         "file_close_window_keys",
@@ -248,6 +269,11 @@ pub const COMMANDS: &[Command] = &[
     ),
     c("file_next_tab_keys", "File | Next Tab", tabs::NEXT_TAB),
     c("file_open_keys", "File | Open", menu::OPEN),
+    c(
+        "file_open_file_list_keys",
+        "File | Open File List...",
+        datatools::OPEN_FILE_LIST,
+    ),
     c("file_open_path_keys", "File | Open Path", menu::REVEAL),
     c(
         "file_previous_tab_keys",
@@ -281,6 +307,11 @@ pub const COMMANDS: &[Command] = &[
         "help_search_syntax_keys",
         "Help | Search Syntax",
         menu::SEARCH_SYNTAX,
+    ),
+    c(
+        "help_troubleshooting_information_keys",
+        "Help | Troubleshooting Information",
+        datatools::TROUBLESHOOTING,
     ),
     c("history_back_keys", "History | Back", menu::NAV_BACK),
     c(
@@ -378,6 +409,11 @@ pub const COMMANDS: &[Command] = &[
         "search_edit_focus_search_edit_keys",
         "Search Edit | Focus Search Edit",
         menu::FOCUS_SEARCH,
+    ),
+    c(
+        "tools_import_and_export_settings_keys",
+        "Tools | Import and Export Settings...",
+        datatools::IMPORT_EXPORT_SETTINGS,
     ),
     c("tools_options_keys", "Tools | Options...", menu::OPTIONS),
     c(
