@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn a_folder_lists_its_subfolders_only() {
-        let base = std::env::temp_dir().join(format!("goz-gui-foldertree-{}", std::process::id()));
+        let base = crate::store::file::tests::fresh_dir("goz-gui-foldertree", "");
         let _ = std::fs::remove_dir_all(&base);
         for dir in ["b10", "B2", "a\\inner", "empty"] {
             std::fs::create_dir_all(base.join(dir)).expect("make dirs");
@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn a_probe_reads_only_so_far() {
-        let base = std::env::temp_dir().join(format!("goz-gui-probe-{}", std::process::id()));
+        let base = crate::store::file::tests::fresh_dir("goz-gui-probe", "");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("files")).expect("make dir");
         std::fs::create_dir_all(base.join("deep").join("inner")).expect("make dirs");

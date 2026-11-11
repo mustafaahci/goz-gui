@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn reads_efu_csv_and_plain_lists() {
-        let dir = std::env::temp_dir().join(format!("goz-gui-filelist-{}", std::process::id()));
+        let dir = crate::store::file::tests::fresh_dir("goz-gui-filelist", "");
         std::fs::create_dir_all(&dir).unwrap();
         let efu = dir.join("a.efu");
         std::fs::write(
