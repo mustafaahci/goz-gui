@@ -60,6 +60,15 @@ pub const PROBE_QUERY: &str = "goz_gui_probe_a|goz_gui_probe_b";
 /// offered depends on it. Off until a probe says otherwise.
 static BOOLEAN_SYNTAX: AtomicBool = AtomicBool::new(false);
 
+/// What the gozd last greeted said it is (its name and version) and the
+/// protocol version it speaks: Help > Troubleshooting Information's.
+static SERVER: Mutex<Option<(String, u16)>> = Mutex::new(None);
+
+/// gozd's name and version and its protocol, once a connection greeted it.
+pub fn server() -> Option<(String, u16)> {
+    SERVER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Whether gozd reads OR, NOT and groups (see [`PROBE_QUERY`]).
 pub fn boolean_syntax() -> bool {
     BOOLEAN_SYNTAX.load(Ordering::Relaxed)
@@ -85,6 +94,10 @@ pub struct Search {
     pub query: String,
     pub sort: SortSpec,
     pub match_case: bool,
+    /// The file list searched instead of gozd's index (File > Open File
+    /// List..., wave 4): its rows answer every block and stream of the
+    /// search, from the thread that asks.
+    pub filelist: Option<Arc<crate::filelist::FileList>>,
 }
 
 /// One result row, kept as UTF-16 because that is what every draw wants.
@@ -114,6 +127,11 @@ impl Row {
             Some(units) => units.into(),
             None => item.path.encode_utf16().collect(),
         };
+        Row::new(path, item.size, item.mtime_ft, item.is_dir)
+    }
+
+    /// A row for the full path `path` (a file list's, wave 4).
+    pub fn new(path: Box<[u16]>, size: Option<u64>, mtime: Option<i64>, is_dir: bool) -> Row {
         let after_sep = path
             .iter()
             .rposition(|&c| c == u16::from(b'\\'))
@@ -127,9 +145,9 @@ impl Row {
         Row {
             path,
             name_start: name_start as u32,
-            size: item.size,
-            mtime: item.mtime_ft,
-            is_dir: item.is_dir,
+            size,
+            mtime,
+            is_dir,
             icon: Cell::new(crate::icons::UNSET),
         }
     }
@@ -407,6 +425,9 @@ pub fn stream_range(
     range: RowRange,
     mut page: impl FnMut(Vec<Row>, u64) -> Result<bool, String>,
 ) -> Streamed {
+    if let Some(list) = &search.filelist {
+        return list_stream(stop, search, range, list, page);
+    }
     let shared = &*stop.0;
     let mut conn = None;
     let pipe = match connect(&mut conn, shared) {
@@ -523,6 +544,9 @@ fn fetch_block(
     block: u32,
     search: &Search,
 ) -> Option<Reply> {
+    if let Some(list) = &search.filelist {
+        return list_block(shared, epoch, block, search, list);
+    }
     let started = Instant::now();
     let request = Request::Query(QueryRequest {
         query: search.query.clone(),
@@ -605,6 +629,93 @@ fn fetch_block(
     failed(Failure::Other("gozd closed the connection".into()))
 }
 
+/// A block of a search over an open file list (wave 4): its rows, from
+/// the list's answer, made here on the worker's thread (and kept, so the
+/// search's other blocks cost a copy each). `None` when the search went
+/// stale before it was made.
+fn list_block(
+    shared: &Shared,
+    epoch: u64,
+    block: u32,
+    search: &Search,
+    list: &crate::filelist::FileList,
+) -> Option<Reply> {
+    let started = Instant::now();
+    let stale = || shared.is_stale(Some(epoch));
+    match list.answer(&search.query, search.sort, search.match_case, &stale) {
+        Ok(None) => None,
+        Err(why) => Some(Reply::Failed {
+            epoch,
+            block,
+            failure: Failure::Refused(why),
+        }),
+        Ok(Some(m)) => {
+            let from = block as usize * BLOCK_ROWS as usize;
+            let rows = list.rows_of(&m, from..from + BLOCK_ROWS as usize);
+            Some(Reply::Block {
+                epoch,
+                block,
+                rows,
+                total: m.order.len() as u64,
+                // Still being read: the window searches again in a moment,
+                // as while gozd indexes.
+                incomplete: !m.complete,
+                metadata_pending: false,
+                total_size: (block == 0).then_some(m.total_size),
+                elapsed: started.elapsed(),
+            })
+        }
+    }
+}
+
+/// [`stream_range`] over an open file list: its answer, a page at a time.
+fn list_stream(
+    stop: &Stop,
+    search: &Search,
+    range: RowRange,
+    list: &crate::filelist::FileList,
+    mut page: impl FnMut(Vec<Row>, u64) -> Result<bool, String>,
+) -> Streamed {
+    const PAGE: usize = 4096;
+    let stale = || stop.stopped();
+    let m = match list.answer(&search.query, search.sort, search.match_case, &stale) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Streamed::Stopped,
+        Err(why) => return Streamed::Failed(Failure::Refused(why)),
+    };
+    let total = m.order.len();
+    let end = range
+        .limit
+        .map_or(total, |l| {
+            (range.offset as usize).saturating_add(l as usize)
+        })
+        .min(total);
+    let mut at = (range.offset as usize).min(end);
+    if at == end {
+        // Nothing to hand over, but the total, as gozd's empty page says.
+        return match page(Vec::new(), total as u64) {
+            Err(why) => Streamed::Failed(Failure::Other(why)),
+            Ok(_) => Streamed::Done(0),
+        };
+    }
+    let mut done = 0u64;
+    while at < end {
+        if stop.stopped() {
+            return Streamed::Stopped;
+        }
+        let next = (at + PAGE).min(end);
+        let rows = list.rows_of(&m, at..next);
+        done += rows.len() as u64;
+        match page(rows, total as u64) {
+            Err(why) => return Streamed::Failed(Failure::Other(why)),
+            Ok(false) => return Streamed::Done(done),
+            Ok(true) => {}
+        }
+        at = next;
+    }
+    Streamed::Done(done)
+}
+
 fn status(conn: &mut Option<Pipe>, shared: &Shared) -> Result<DaemonStatus, Failure> {
     for attempt in 0..2 {
         let reused = conn.is_some();
@@ -642,7 +753,9 @@ fn connect<'a>(conn: &'a mut Option<Pipe>, shared: &Shared) -> Result<&'a mut Pi
         })
         .map_err(Io::into_failure)?;
         match pipe.response(shared, None).map_err(Io::into_failure)? {
-            Response::Hello { .. } => {}
+            Response::Hello { proto, server, .. } => {
+                *SERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some((server, proto));
+            }
             Response::Error { message, .. } => {
                 return Err(Failure::Other(format!(
                     "gozd refused this client: {message}"
@@ -949,6 +1062,7 @@ mod tests {
                 query: String::new(),
                 sort: SortSpec::default(),
                 match_case: false,
+                filelist: None,
             }),
         }
     }

@@ -258,6 +258,10 @@ impl App {
             unsafe { DestroyWindow(self.hwnd) };
             return;
         }
+        // W4 (G1): -filelist (or a bare .efu) opens a file list.
+        if let Some(list) = &l.filelist {
+            self.open_file_list(list);
+        }
         if l.changes_search() {
             self.apply_launch(&l);
         }

@@ -14,6 +14,13 @@
 //! Options > UI says), and `-x <x>`, `-y <y>`, `-width <w>`, `-height <h>`
 //! (where the window goes, in screen pixels). Anything else is search
 //! text, as if after `-s`.
+//!
+//! Wave 4 (G1): `-filelist <file>` (or a bare `.efu` path) opens a file
+//! list; `-create-file-list <file> <folders>` writes one and ends, with
+//! `-create-file-list-no-subfolders`, `-no-folders` and `-no-files`;
+//! `-install-efu-association` / `-uninstall-efu-association` (and their
+//! `-current-user-` forms) set the `.efu` association and end; `-wait-pid
+//! <pid>` (goz-gui's own, restarting) waits for that process to end first.
 
 use goz_core::types::{SortDir, SortKey};
 
@@ -51,6 +58,16 @@ pub struct Launch {
     pub y: Option<i32>,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    // W4 (G1: data and file tools).
+    /// `-filelist <file>`, or a bare `.efu` path: search that file list.
+    pub filelist: Option<String>,
+    /// `-create-file-list <file> <folders>`: write a file list and end.
+    pub create_file_list: Option<(String, String)>,
+    pub create_options: crate::filelist::create::Options,
+    /// `-install-efu-association` (true) / `-uninstall-efu-association`.
+    pub efu_association: Option<bool>,
+    /// `-wait-pid <pid>`: wait for that process to end before starting.
+    pub wait_pid: Option<u32>,
 }
 
 impl Launch {
@@ -103,6 +120,56 @@ impl Launch {
     }
 }
 
+/// Whether a bare argument names an Everything File List (`*.efu` is a
+/// search).
+fn is_file_list_arg(arg: &str) -> bool {
+    arg.to_ascii_lowercase().ends_with(".efu") && !arg.contains(['*', '?'])
+}
+
+/// `args` with the file lists they name (`-filelist`'s, a bare `.efu`)
+/// made absolute against this process's folder: the goz-gui they are
+/// handed to runs in another.
+pub fn absolute_file_lists(args: &[String]) -> Vec<String> {
+    let absolute = |arg: &String| {
+        std::path::absolute(arg)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| arg.clone())
+    };
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        i += 1;
+        let Some(name) = switch(arg) else {
+            out.push(if is_file_list_arg(arg) {
+                absolute(arg)
+            } else {
+                arg.clone()
+            });
+            continue;
+        };
+        out.push(arg.clone());
+        // The switches that take values, as `parse` reads them.
+        let values = match name.as_str() {
+            // The rest of the line is the link.
+            "url" | "uri" => args.len() - i,
+            "create-file-list" => 2,
+            "s" | "search" | "p" | "path" | "filter" | "sort" | "instance" | "x" | "y"
+            | "width" | "height" | "filelist" | "wait-pid" => 1,
+            _ => 0,
+        };
+        for value in args.iter().skip(i).take(values) {
+            out.push(if name == "filelist" {
+                absolute(value)
+            } else {
+                value.clone()
+            });
+        }
+        i += values;
+    }
+    out
+}
+
 /// The switch's name without its `-` or `/`, lower-cased; `None` for text.
 fn switch(arg: &str) -> Option<String> {
     let rest = arg.strip_prefix('-').or_else(|| arg.strip_prefix('/'))?;
@@ -123,7 +190,13 @@ pub fn parse(args: &[String]) -> Result<Launch, String> {
         let arg = &args[i];
         i += 1;
         let Some(name) = switch(arg) else {
-            text.push(arg);
+            // An Everything File List on its own opens as one (Everything
+            // 1.5, 1419b).
+            if is_file_list_arg(arg) && l.filelist.is_none() {
+                l.filelist = Some(arg.clone());
+            } else {
+                text.push(arg);
+            }
             continue;
         };
         let mut value = |what: &str| -> Result<String, String> {
@@ -188,6 +261,29 @@ pub fn parse(args: &[String]) -> Result<Launch, String> {
             // A link Windows hands over as `-url "%1"`: all that follows
             // the switch is the link, so a link holding quotes and spaces
             // never becomes switches of its own.
+            "filelist" => l.filelist = Some(value("a file list")?),
+            "create-file-list" => {
+                let file = value("a file name and a folder")?;
+                let folders = value("a folder")?;
+                l.create_file_list = Some((file, folders));
+            }
+            "create-file-list-no-subfolders" => l.create_options.subfolders = false,
+            "create-file-list-no-folders" => l.create_options.folders = false,
+            "create-file-list-no-files" => l.create_options.files = false,
+            "install-efu-association" | "install-current-user-efu-association" => {
+                l.efu_association = Some(true);
+            }
+            "uninstall-efu-association" | "uninstall-current-user-efu-association" => {
+                l.efu_association = Some(false);
+            }
+            "wait-pid" => {
+                let v = value("a process id")?;
+                l.wait_pid = Some(
+                    v.trim()
+                        .parse()
+                        .map_err(|_| format!("{arg} needs a process id, not {v}"))?,
+                );
+            }
             "url" | "uri" => {
                 if i >= args.len() {
                     return Err(format!("{arg} needs a goz: link"));
@@ -230,6 +326,56 @@ mod tests {
 
     fn p(args: &[&str]) -> Result<Launch, String> {
         parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn file_list_switches() {
+        let l = p(&["-filelist", r"C:\a b.efu"]).unwrap();
+        assert_eq!(l.filelist.as_deref(), Some(r"C:\a b.efu"));
+        assert!(l.search.is_none());
+        let l = p(&[r"D:\lists\x.EFU"]).unwrap();
+        assert_eq!(l.filelist.as_deref(), Some(r"D:\lists\x.EFU"));
+        assert!(l.search.is_none(), "a bare .efu is no search");
+        let l = p(&[
+            "-create-file-list",
+            "out.efu",
+            r"C:\a;D:\b",
+            "-create-file-list-no-subfolders",
+            "-create-file-list-no-files",
+        ])
+        .unwrap();
+        assert_eq!(
+            l.create_file_list,
+            Some(("out.efu".into(), r"C:\a;D:\b".into()))
+        );
+        assert!(!l.create_options.subfolders && !l.create_options.files);
+        assert!(l.create_options.folders);
+        assert!(p(&["-create-file-list", "out.efu"]).is_err());
+        assert_eq!(
+            p(&["-install-current-user-efu-association"])
+                .unwrap()
+                .efu_association,
+            Some(true)
+        );
+        assert_eq!(
+            p(&["/uninstall-efu-association"]).unwrap().efu_association,
+            Some(false)
+        );
+        assert_eq!(p(&["-wait-pid", "1234"]).unwrap().wait_pid, Some(1234));
+        // A pattern is a search, not a list.
+        let l = p(&["*.efu"]).unwrap();
+        assert!(l.filelist.is_none() && l.search.as_deref() == Some("*.efu"));
+        // Lists named relatively are made absolute before a hand-over.
+        let args: Vec<String> = ["-filelist", "a.efu", "b.EFU", "-s", "x.efu"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let abs = absolute_file_lists(&args);
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(abs[1], here.join("a.efu").display().to_string());
+        assert_eq!(abs[2], here.join("b.EFU").display().to_string());
+        assert_eq!(abs[4], "x.efu", "a search stays as typed");
+        assert!(p(&["-wait-pid", "x"]).is_err());
     }
 
     #[test]

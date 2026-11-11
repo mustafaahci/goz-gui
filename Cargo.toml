@@ -25,6 +25,9 @@ windows-core = "0.62.2"
 
 # Advanced Rename (wave 1, F5): its regular expressions.
 regex = { version = "1.12", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
+# File lists (wave 4): a list's rows are searched in process with the
+# substring finder goz-core already builds.
+memchr = "2.7"
 
 [dependencies.windows-sys]
 version = "0.61"
@@ -45,6 +48,8 @@ features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Pipes",
+    # Help > Troubleshooting Information: the process's memory.
+    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",

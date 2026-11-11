@@ -1573,6 +1573,7 @@ mod tests {
             query: q.into(),
             sort: Default::default(),
             match_case: false,
+            filelist: None,
         };
         assert!(same_search(&s("a"), &s("a")));
         assert!(!same_search(&s("a"), &s("b")));

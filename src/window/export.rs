@@ -62,6 +62,7 @@ impl App {
                 query: m.search.query.clone(),
                 sort: m.search.sort,
                 match_case: m.search.match_case,
+                filelist: m.search.filelist.clone(),
             }
         };
         let bom = self.prefs.borrow().base.utf8_bom;

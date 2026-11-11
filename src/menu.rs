@@ -437,6 +437,21 @@ pub fn add_items(menu: HMENU, after: Option<u16>, items: &[Item<'_>]) {
     }
 }
 
+/// Puts `items` in `menu` right before the item that runs `before` (at
+/// the end if none does): a command added in Everything's place ahead of
+/// one another feature put there.
+pub fn add_items_before(menu: HMENU, before: u16, items: &[Item<'_>]) {
+    let at = position_of(menu, before);
+    for (i, item) in items.iter().enumerate() {
+        insert(menu, at.map_or(u32::MAX, |p| p + i as u32), item);
+    }
+}
+
+/// Whether `menu` (not its submenus) has an item that runs `cmd`.
+pub fn has_item(menu: HMENU, cmd: u16) -> bool {
+    position_of(menu, cmd).is_some()
+}
+
 /// The position of the item that runs `cmd` in `menu` (not its submenus).
 fn position_of(menu: HMENU, cmd: u16) -> Option<u32> {
     // SAFETY: reads the items of a menu of this thread.

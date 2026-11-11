@@ -121,6 +121,9 @@ const ACCELERATORS: &[(u8, u16, u16)] = &[
     // Global); Undo, Redo and Advanced Rename are the list's own keys.
     (CTRL | SHIFT, key(b'Z'), crate::filetools::cmd::UNDO_HISTORY),
     // F6 (integration).
+
+    // W4 (G1). Everything's `file_open_file_list_keys=335` (Ctrl+O).
+    (CTRL, key(b'O'), crate::datatools::cmd::OPEN_FILE_LIST),
 ];
 
 pub fn accelerators() -> HACCEL {

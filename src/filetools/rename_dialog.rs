@@ -14,6 +14,14 @@
 //! thread of their own, as the dialog opens.
 //!
 //! OK hands back the renames, done as one operation (one undo record).
+//!
+//! Wave 4: the same dialog is Edit > Advanced > Advanced Copy to Folder...
+//! and Advanced Move to Folder... ([`Mode`]): a To folder box (and
+//! Browse...) above the formats, and every file goes to that folder under
+//! its new name (a name the old format does not match keeps its own); the
+//! names already in that folder are read on a thread of their own, again
+//! a moment after the folder changes. The Presets button keeps named Old
+//! and New formats (shared by the three), to put in the boxes again later.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -35,16 +43,17 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN,
-    CBN_EDITCHANGE, CBN_SELCHANGE, CBS_AUTOHSCROLL, CBS_DROPDOWN, DWLP_MSGRESULT, EndDialog,
-    FindWindowExW, GWLP_USERDATA, GetWindowRect, IDCANCEL, IDOK, KillTimer, MINMAXINFO,
-    PostMessageW, SetTimer, SetWindowLongPtrW, SetWindowTextW, WM_APP, WM_CHAR, WM_COMMAND,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY,
-    WM_NOTIFY, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
-    WS_VSCROLL,
+    CBN_EDITCHANGE, CBN_SELCHANGE, CBS_AUTOHSCROLL, CBS_DROPDOWN, DWLP_MSGRESULT, EN_CHANGE,
+    ES_AUTOHSCROLL, EndDialog, FindWindowExW, GWLP_USERDATA, GetWindowRect, IDCANCEL, IDOK, IDYES,
+    KillTimer, MB_ICONQUESTION, MB_YESNO, MINMAXINFO, PostMessageW, SetTimer, SetWindowLongPtrW,
+    SetWindowTextW, WM_APP, WM_CHAR, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_GETMINMAXINFO,
+    WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY, WM_NOTIFY, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE,
+    WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::name_of;
 use super::rename::{self, FormatError, Options, Problem, Subject};
+use super::settings::{PRESETS, Preset};
 use super::ui::{self, checked, copy_text, enable, error_colour, item, send, set_check};
 use crate::dialog::{
     self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner, common,
@@ -54,10 +63,43 @@ use crate::fileops::parent;
 use crate::places::{self, Which};
 use crate::theme::Palette;
 use crate::wide::{window_text, wz};
-use crate::{menu, popup};
+use crate::{menu, msgbox, popup};
 
-/// Everything's caption for it.
-const TITLE: &str = "Rename";
+/// What the dialog does with the new names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Renames each file where it is (Advanced Rename).
+    Rename,
+    /// Copies or moves each file into one folder under its new name
+    /// (Advanced Copy to Folder / Advanced Move to Folder).
+    Copy,
+    Move,
+}
+
+impl Mode {
+    /// The caption: Everything's for the renamer.
+    fn title(self) -> &'static str {
+        match self {
+            Mode::Rename => "Rename",
+            Mode::Copy => "Advanced Copy to Folder",
+            Mode::Move => "Advanced Move to Folder",
+        }
+    }
+
+    /// Where its place is kept.
+    fn place(self) -> Which {
+        match self {
+            Mode::Rename => Which::Rename,
+            Mode::Copy => Which::AdvancedCopyTo,
+            Mode::Move => Which::AdvancedMoveTo,
+        }
+    }
+
+    /// How far the controls under the To folder row move down.
+    fn dy(self) -> i16 {
+        if self == Mode::Rename { 0 } else { 18 }
+    }
+}
 
 /// What the window hands the dialog: the switches and format histories
 /// kept from last time.
@@ -65,6 +107,11 @@ pub struct Start {
     pub options: Options,
     pub old_history: Vec<String>,
     pub new_history: Vec<String>,
+    pub mode: Mode,
+    /// Copy and Move: the folder the To folder box starts with.
+    pub folder: String,
+    /// The presets kept.
+    pub presets: Vec<Preset>,
 }
 
 /// What OK chose.
@@ -73,8 +120,11 @@ pub struct Chosen {
     pub options: Options,
     pub old_format: String,
     pub new_format: String,
-    /// Each file to rename and its new name.
+    /// Each file to rename and its new name; for Copy and Move, each file
+    /// to copy or move and its name in the folder.
     pub renames: Vec<(Vec<u16>, Vec<u16>)>,
+    /// Copy and Move: the folder.
+    pub folder: Vec<u16>,
 }
 
 // Everything's control ids.
@@ -87,12 +137,16 @@ const ID_REGEX: u16 = 1011;
 const ID_DIACRITICS: u16 = 1070;
 const ID_EXTENSION: u16 = 1083;
 const ID_LIST: u16 = 1009;
+const ID_PRESETS: u16 = 1084;
 const ID_STATUS: u16 = 1100;
+// The To folder box and its Browse... (goz-gui's ids).
+const ID_FOLDER: u16 = 1090;
+const ID_BROWSE: u16 = 1091;
 const STATIC: u16 = 0xffff;
 const OK: u16 = IDOK as u16;
 const CANCEL: u16 = IDCANCEL as u16;
 
-/// The folders' names came: lParam is a `Box<Scan>`.
+/// The folders' names came: lParam is a `Box<Scanned>`.
 const WM_SCANNED: u32 = WM_APP + 2;
 /// Make the new names again (after a pick in a format's list, which sets
 /// the box's text only once its notification is done).
@@ -111,6 +165,9 @@ const RECOMPUTE_MS: u32 = 120;
 /// turns out to be taken.
 const TIMER_SCAN: usize = 2;
 const SCAN_MS: u32 = 3000;
+/// The To folder's names are read again this long after it last changed.
+const TIMER_FOLDER: usize = 3;
+const FOLDER_MS: u32 = 300;
 /// More files than this are renamed in preview after the typing stops.
 const MANY: usize = 1000;
 /// The subclass id of the format boxes.
@@ -122,29 +179,33 @@ const SIZE: (i16, i16) = (300, 250);
 const fn rect(x: i16, y: i16, w: i16, h: i16) -> Units {
     (x, y, w, h)
 }
-const PLACES: [(u16, Units, u8); 8] = [
-    (ID_OLD, rect(52, 7, SIZE.0 - 52 - 27, 150), GROW_X),
-    (ID_OLD_MENU, rect(SIZE.0 - 25, 6, 18, 14), MOVE_X),
-    (ID_NEW, rect(52, 25, SIZE.0 - 52 - 27, 150), GROW_X),
-    (ID_NEW_MENU, rect(SIZE.0 - 25, 24, 18, 14), MOVE_X),
-    (
-        ID_LIST,
-        rect(7, 82, SIZE.0 - 14, SIZE.1 - 82 - 29),
-        GROW_X | GROW_Y,
-    ),
-    // Two lines: a problem's words can take more than one.
-    (
-        ID_STATUS,
-        rect(7, SIZE.1 - 23, SIZE.0 - 7 - 120, 18),
-        MOVE_Y | GROW_X,
-    ),
-    (OK, rect(SIZE.0 - 111, SIZE.1 - 21, 50, 14), MOVE_X | MOVE_Y),
-    (
-        CANCEL,
-        rect(SIZE.0 - 57, SIZE.1 - 21, 50, 14),
-        MOVE_X | MOVE_Y,
-    ),
-];
+/// The controls that follow the dialog's size, with the rows under the To
+/// folder row `dy` lower (Copy and Move), in a dialog `dy` taller.
+fn places(dy: i16) -> [(u16, Units, u8); 11] {
+    let h = SIZE.1 + dy;
+    [
+        (ID_FOLDER, rect(52, 7, SIZE.0 - 52 - 57, 13), GROW_X),
+        (ID_BROWSE, rect(SIZE.0 - 55, 6, 48, 14), MOVE_X),
+        (ID_OLD, rect(52, 7 + dy, SIZE.0 - 52 - 27, 150), GROW_X),
+        (ID_OLD_MENU, rect(SIZE.0 - 25, 6 + dy, 18, 14), MOVE_X),
+        (ID_NEW, rect(52, 25 + dy, SIZE.0 - 52 - 27, 150), GROW_X),
+        (ID_NEW_MENU, rect(SIZE.0 - 25, 24 + dy, 18, 14), MOVE_X),
+        (
+            ID_LIST,
+            rect(7, 82 + dy, SIZE.0 - 14, SIZE.1 - 82 - 29),
+            GROW_X | GROW_Y,
+        ),
+        (ID_PRESETS, rect(7, h - 21, 50, 14), MOVE_Y),
+        // Two lines: a problem's words can take more than one.
+        (
+            ID_STATUS,
+            rect(61, h - 23, SIZE.0 - 61 - 116, 18),
+            MOVE_Y | GROW_X,
+        ),
+        (OK, rect(SIZE.0 - 111, h - 21, 50, 14), MOVE_X | MOVE_Y),
+        (CANCEL, rect(SIZE.0 - 57, h - 21, 50, 14), MOVE_X | MOVE_Y),
+    ]
+}
 
 /// A file to rename.
 struct File {
@@ -157,6 +218,31 @@ struct File {
 /// case): what a new name may run into.
 type Scan = HashMap<String, HashSet<String>>;
 
+/// What a scanning thread found: for Copy and Move, of which To folder
+/// (as [`folder_key`] makes it) and whether it is one.
+struct Scanned {
+    folder: Option<String>,
+    exists: bool,
+    scan: Scan,
+}
+
+/// A folder as typed, as the scans key it: without a trailing `\` (but a
+/// drive's root keeps it), lower case.
+fn folder_key(folder: &str) -> String {
+    trim_folder(folder).to_lowercase()
+}
+
+/// A folder as typed, without spaces around it or a trailing `\` (but a
+/// drive's root keeps its own).
+fn trim_folder(folder: &str) -> &str {
+    let t = folder.trim();
+    if t.len() > 3 {
+        t.trim_end_matches('\\')
+    } else {
+        t
+    }
+}
+
 /// The new names as the formats make them, and what is wrong.
 #[derive(Default)]
 struct Preview {
@@ -164,6 +250,9 @@ struct Preview {
     problems: Vec<Option<Problem>>,
     /// What is wrong with a format.
     error: Option<String>,
+    /// Copy and Move: the files to leave out (moved into their own folder
+    /// under their own name: nothing to do).
+    skip: Vec<bool>,
 }
 
 struct Dlg {
@@ -177,11 +266,23 @@ struct Dlg {
     out: RefCell<Option<Chosen>>,
     /// The first formats and names are still to be made (`WM_REGENERATE`).
     regenerating: Cell<bool>,
+    mode: Mode,
+    /// Copy and Move: whether the To folder (as last scanned) is a folder;
+    /// `None` while it is being read.
+    dest: Cell<Option<bool>>,
+    presets: RefCell<Vec<Preset>>,
+    presets_changed: Cell<bool>,
 }
 
 /// Shows the renamer over `owner` for `files` (each path, and whether it
-/// is a folder); what OK chose, `None` for Cancel or nothing to rename.
-pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) -> Option<Chosen> {
+/// is a folder); what OK chose, `None` for Cancel or nothing to rename,
+/// and the presets when they were changed (kept whatever the answer).
+pub fn run(
+    owner: HWND,
+    files: &[(Vec<u16>, bool)],
+    start: Start,
+    look: Look,
+) -> (Option<Chosen>, Option<Vec<Preset>>) {
     let list: Vec<File> = files
         .iter()
         .map(|(path, _)| File {
@@ -195,6 +296,8 @@ pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) ->
         .zip(files)
         .map(|(f, (_, is_dir))| Subject::new(&f.name, *is_dir))
         .collect();
+    let mode = start.mode;
+    let presets = RefCell::new(start.presets.clone());
     let state = Dlg {
         look: Cell::new(look),
         files: list,
@@ -205,29 +308,73 @@ pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) ->
         min: Cell::new((0, 0)),
         out: RefCell::new(None),
         regenerating: Cell::new(false),
+        mode,
+        dest: Cell::new(None),
+        presets,
+        presets_changed: Cell::new(false),
     };
-    let mut t = Template::new(TITLE, WS_THICKFRAME | WS_MAXIMIZEBOX, SIZE.0, SIZE.1);
+    let dy = mode.dy();
+    let places = places(dy);
+    let mut t = Template::new(
+        mode.title(),
+        WS_THICKFRAME | WS_MAXIMIZEBOX,
+        SIZE.0,
+        SIZE.1 + dy,
+    );
     let combo = WS_TABSTOP | WS_VSCROLL | (CBS_DROPDOWN | CBS_AUTOHSCROLL) as u32;
-    t.control(Class::Static, "Old &format:", STATIC, 0, 0, (7, 9, 44, 8))
-        .control(Class::Named("ComboBox"), "", ID_OLD, combo, 0, PLACES[0].1)
-        .control(
-            Class::Button,
-            "\u{25B8}",
-            ID_OLD_MENU,
-            WS_TABSTOP,
-            0,
-            PLACES[1].1,
-        )
-        .control(Class::Static, "New for&mat:", STATIC, 0, 0, (7, 27, 44, 8))
-        .control(Class::Named("ComboBox"), "", ID_NEW, combo, 0, PLACES[2].1)
-        .control(
-            Class::Button,
-            "\u{25B8}",
-            ID_NEW_MENU,
-            WS_TABSTOP,
-            0,
-            PLACES[3].1,
-        );
+    if mode != Mode::Rename {
+        t.control(Class::Static, "&To folder:", STATIC, 0, 0, (7, 9, 44, 8))
+            .control(
+                Class::Edit,
+                "",
+                ID_FOLDER,
+                WS_TABSTOP | ES_AUTOHSCROLL as u32,
+                WS_EX_CLIENTEDGE,
+                places[0].1,
+            )
+            .control(
+                Class::Button,
+                "&Browse...",
+                ID_BROWSE,
+                WS_TABSTOP,
+                0,
+                places[1].1,
+            );
+    }
+    t.control(
+        Class::Static,
+        "Old &format:",
+        STATIC,
+        0,
+        0,
+        (7, 9 + dy, 44, 8),
+    )
+    .control(Class::Named("ComboBox"), "", ID_OLD, combo, 0, places[2].1)
+    .control(
+        Class::Button,
+        "\u{25B8}",
+        ID_OLD_MENU,
+        WS_TABSTOP,
+        0,
+        places[3].1,
+    )
+    .control(
+        Class::Static,
+        "New for&mat:",
+        STATIC,
+        0,
+        0,
+        (7, 27 + dy, 44, 8),
+    )
+    .control(Class::Named("ComboBox"), "", ID_NEW, combo, 0, places[4].1)
+    .control(
+        Class::Button,
+        "\u{25B8}",
+        ID_NEW_MENU,
+        WS_TABSTOP,
+        0,
+        places[5].1,
+    );
     let check = WS_TABSTOP | BS_AUTOCHECKBOX as u32;
     t.control(
         Class::Button,
@@ -235,7 +382,7 @@ pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) ->
         ID_CASE,
         check,
         0,
-        (52, 43, 110, 10),
+        (52, 43 + dy, 110, 10),
     )
     .control(
         Class::Button,
@@ -243,7 +390,7 @@ pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) ->
         ID_DIACRITICS,
         check,
         0,
-        (166, 43, 110, 10),
+        (166, 43 + dy, 110, 10),
     )
     .control(
         Class::Button,
@@ -251,7 +398,7 @@ pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) ->
         ID_REGEX,
         check,
         0,
-        (52, 55, 110, 10),
+        (52, 55 + dy, 110, 10),
     )
     .control(
         Class::Button,
@@ -259,7 +406,7 @@ pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) ->
         ID_EXTENSION,
         check,
         0,
-        (166, 55, 110, 10),
+        (166, 55 + dy, 110, 10),
     )
     .control(
         Class::Static,
@@ -267,7 +414,7 @@ pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) ->
         STATIC,
         0,
         0,
-        (7, 72, 100, 8),
+        (7, 72 + dy, 100, 8),
     )
     .control(
         Class::Named("SysListView32"),
@@ -275,20 +422,32 @@ pub fn run(owner: HWND, files: &[(Vec<u16>, bool)], start: Start, look: Look) ->
         ID_LIST,
         WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS,
         WS_EX_CLIENTEDGE,
-        PLACES[4].1,
+        places[6].1,
     )
-    .control(Class::Static, "", ID_STATUS, 0, 0, PLACES[5].1)
+    .control(
+        Class::Button,
+        "&Presets",
+        ID_PRESETS,
+        WS_TABSTOP,
+        0,
+        places[7].1,
+    )
+    .control(Class::Static, "", ID_STATUS, 0, 0, places[8].1)
     .control(
         Class::Button,
         "OK",
         OK,
         WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
         0,
-        PLACES[6].1,
+        places[9].1,
     )
-    .control(Class::Button, "Cancel", CANCEL, WS_TABSTOP, 0, PLACES[7].1);
+    .control(Class::Button, "Cancel", CANCEL, WS_TABSTOP, 0, places[10].1);
     t.run(owner, Some(dialog_proc), (&raw const state) as LPARAM);
-    state.out.into_inner()
+    let presets = state
+        .presets_changed
+        .get()
+        .then(|| state.presets.into_inner());
+    (state.out.into_inner(), presets)
 }
 
 /// The names in each of `folders` (lower case), read on another thread;
@@ -517,29 +676,27 @@ impl Dlg {
         // SAFETY: reads this thread's dialog.
         unsafe { GetWindowRect(dlg, &mut wr) };
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
-        places::restore(dlg, Which::Rename, core::ptr::null_mut(), self.min.get());
-        dialog::anchor(dlg, SIZE, &PLACES);
-        // The folders' names, read (and sorted) off this thread.
-        let folders: Vec<String> = self.files.iter().map(|f| f.folder.clone()).collect();
-        let to = dlg as usize;
-        let spawned = std::thread::Builder::new()
-            .name("goz-rename-scan".into())
-            .spawn(move || {
-                let raw = Box::into_raw(Box::new(scan(folders)));
-                // SAFETY: posts to the dialog; when it is gone the box is
-                // taken back.
-                unsafe {
-                    if PostMessageW(to as HWND, WM_SCANNED, 0, raw as isize) == 0 {
-                        drop(Box::from_raw(raw));
-                    }
-                }
-            });
-        if spawned.is_err() {
-            // Without the names, nothing is said to be taken.
-            *self.scan.borrow_mut() = Some(Scan::new());
+        places::restore(
+            dlg,
+            self.mode.place(),
+            core::ptr::null_mut(),
+            self.min.get(),
+        );
+        let dy = self.mode.dy();
+        dialog::anchor(dlg, (SIZE.0, SIZE.1 + dy), &places(dy));
+        if self.mode == Mode::Rename {
+            // The folders' names, read (and sorted) off this thread.
+            let folders: Vec<String> = self.files.iter().map(|f| f.folder.clone()).collect();
+            self.start_scan(dlg, folders, None);
         } else {
-            // SAFETY: a timer of this thread's dialog.
-            unsafe { SetTimer(dlg, TIMER_SCAN, SCAN_MS, None) };
+            let z = wz(&self.start.folder);
+            // SAFETY: NUL-terminated text for this thread's box; its
+            // EN_CHANGE comes before the dialog is shown, and the names
+            // are read below.
+            unsafe { SetWindowTextW(item(dlg, ID_FOLDER), z.as_ptr()) };
+            // SAFETY: a timer of this thread's dialog (set by EN_CHANGE).
+            unsafe { KillTimer(dlg, TIMER_FOLDER) };
+            self.scan_folder(dlg);
         }
         if self.files.len() > MANY {
             // Many files: the formats and names are made from a message of
@@ -555,6 +712,79 @@ impl Dlg {
             enable(dlg, OK, false);
         } else {
             self.regenerate(dlg);
+        }
+    }
+
+    /// Reads the names in `folders` on a thread of its own (`folder`: the
+    /// To folder they are of); OK waits for them, at most `SCAN_MS`.
+    fn start_scan(&self, dlg: HWND, folders: Vec<String>, folder: Option<String>) {
+        let to = dlg as usize;
+        let spawned = std::thread::Builder::new()
+            .name("goz-rename-scan".into())
+            .spawn(move || {
+                let exists = folders
+                    .first()
+                    .is_some_and(|f| std::path::Path::new(f).is_dir());
+                let scanned = Scanned {
+                    folder,
+                    exists,
+                    scan: scan(folders),
+                };
+                let raw = Box::into_raw(Box::new(scanned));
+                // SAFETY: posts to the dialog; when it is gone the box is
+                // taken back.
+                unsafe {
+                    if PostMessageW(to as HWND, WM_SCANNED, 0, raw as isize) == 0 {
+                        drop(Box::from_raw(raw));
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // Without the names, nothing is said to be taken.
+            *self.scan.borrow_mut() = Some(Scan::new());
+            self.dest.set(Some(true));
+        } else {
+            // SAFETY: a timer of this thread's dialog.
+            unsafe { SetTimer(dlg, TIMER_SCAN, SCAN_MS, None) };
+        }
+    }
+
+    /// The To folder as typed.
+    fn folder(dlg: HWND) -> String {
+        window_text(item(dlg, ID_FOLDER)).trim().to_owned()
+    }
+
+    /// Reads the To folder's names again (it changed): OK waits meanwhile.
+    fn scan_folder(&self, dlg: HWND) {
+        let folder = Dlg::folder(dlg);
+        *self.scan.borrow_mut() = None;
+        if folder.is_empty() {
+            self.dest.set(Some(false));
+            self.recompute(dlg);
+            return;
+        }
+        self.dest.set(None);
+        let trimmed = trim_folder(&folder).to_owned();
+        self.start_scan(dlg, vec![trimmed], Some(folder_key(&folder)));
+        self.recompute(dlg);
+    }
+
+    /// The scanning thread's names came.
+    fn scanned(&self, dlg: HWND, s: Scanned) {
+        if let Some(folder) = &s.folder
+            && *folder != folder_key(&Dlg::folder(dlg))
+        {
+            // The folder changed since: its own scan comes.
+            return;
+        }
+        // SAFETY: a timer of this thread's dialog.
+        unsafe { KillTimer(dlg, TIMER_SCAN) };
+        self.dest.set(Some(s.folder.is_none() || s.exists));
+        *self.scan.borrow_mut() = Some(s.scan);
+        // The first names, still to be made, take the scan into account
+        // then.
+        if !self.regenerating.get() {
+            self.recompute(dlg);
         }
     }
 
@@ -598,6 +828,33 @@ impl Dlg {
         let (old, new) = (Dlg::format(dlg, ID_OLD), Dlg::format(dlg, ID_NEW));
         let n = self.files.len();
         let preview = match rename::rename_all(&self.subjects, &old, &new, o) {
+            Ok(names) if self.mode != Mode::Rename => {
+                let dest = folder_key(&Dlg::folder(dlg));
+                let olds: Vec<&str> = self.files.iter().map(|f| f.name.as_str()).collect();
+                let in_dest: Vec<bool> = self
+                    .files
+                    .iter()
+                    .map(|f| folder_key(&f.folder) == dest)
+                    .collect();
+                let moving = self.mode == Mode::Move;
+                let scan = self.scan.borrow();
+                let there = scan.as_ref().and_then(|s| s.get(&dest));
+                let problems = rename::transfer_problems(&olds, &names, &in_dest, moving, |n| {
+                    there.is_some_and(|names| names.contains(n))
+                });
+                let skip = (0..n)
+                    .map(|i| {
+                        let name = names[i].as_deref().unwrap_or(olds[i]);
+                        moving && in_dest[i] && name.to_lowercase() == olds[i].to_lowercase()
+                    })
+                    .collect();
+                Preview {
+                    new: names,
+                    problems,
+                    error: None,
+                    skip,
+                }
+            }
             Ok(names) => {
                 let folders: Vec<&str> = self.files.iter().map(|f| f.folder.as_str()).collect();
                 let olds: Vec<&str> = self.files.iter().map(|f| f.name.as_str()).collect();
@@ -612,6 +869,7 @@ impl Dlg {
                     new: names,
                     problems,
                     error: None,
+                    skip: Vec::new(),
                 }
             }
             Err(e) => Preview {
@@ -620,6 +878,7 @@ impl Dlg {
                 error: Some(match e {
                     FormatError::Old(_) | FormatError::New(_) => e.to_string(),
                 }),
+                skip: Vec::new(),
             },
         };
         *self.preview.borrow_mut() = preview;
@@ -632,7 +891,16 @@ impl Dlg {
     fn show_status(&self, dlg: HWND) {
         let (text, ok) = {
             let p = self.preview.borrow();
-            status(&self.files, &p, self.scan.borrow().is_some())
+            match self.mode {
+                Mode::Rename => status(&self.files, &p, self.scan.borrow().is_some()),
+                mode => transfer_status(
+                    &self.files,
+                    &p,
+                    mode == Mode::Move,
+                    Dlg::folder(dlg).is_empty(),
+                    self.dest.get(),
+                ),
+            }
         };
         let z = wz(&text);
         // SAFETY: NUL-terminated text for this thread's static.
@@ -643,7 +911,9 @@ impl Dlg {
     /// Whether the status line says something is wrong (it is red then).
     fn status_is_bad(&self) -> bool {
         let p = self.preview.borrow();
-        p.error.is_some() || p.problems.iter().any(Option::is_some)
+        p.error.is_some()
+            || p.problems.iter().any(Option::is_some)
+            || (self.mode != Mode::Rename && self.dest.get() == Some(false))
     }
 
     /// OK: the renames, when there are any and nothing is wrong. The names
@@ -668,6 +938,33 @@ impl Dlg {
         {
             return false;
         }
+        if self.mode != Mode::Rename {
+            if self.dest.get() != Some(true) {
+                return false;
+            }
+            let moves: Vec<(Vec<u16>, Vec<u16>)> = self
+                .files
+                .iter()
+                .zip(&p.new)
+                .zip(&p.skip)
+                .filter(|(_, skip)| !**skip)
+                .map(|((f, new), _)| {
+                    let name = new.as_deref().unwrap_or(&f.name);
+                    (f.path.clone(), name.encode_utf16().collect())
+                })
+                .collect();
+            if !moves.is_empty() {
+                let folder = Dlg::folder(dlg);
+                *self.out.borrow_mut() = Some(Chosen {
+                    options,
+                    old_format,
+                    new_format,
+                    renames: moves,
+                    folder: trim_folder(&folder).encode_utf16().collect(),
+                });
+            }
+            return true;
+        }
         let mut renames: Vec<(Vec<u16>, Vec<u16>)> = self
             .files
             .iter()
@@ -685,6 +982,7 @@ impl Dlg {
                 old_format,
                 new_format,
                 renames,
+                folder: Vec::new(),
             });
         }
         true
@@ -785,6 +1083,135 @@ impl Dlg {
         self.recompute(dlg);
     }
 
+    /// Browse... beside the To folder: a folder picker, starting there.
+    fn browse(&self, dlg: HWND) {
+        let now: Vec<u16> = Dlg::folder(dlg).encode_utf16().collect();
+        let title = if self.mode == Mode::Move {
+            "Move To"
+        } else {
+            "Copy To"
+        };
+        let Some(folder) = super::folder_pick::pick(dlg, title, "Select Folder", Some(&now)) else {
+            return;
+        };
+        let z = crate::wide::nul(&folder);
+        // SAFETY: NUL-terminated text for this thread's box (its EN_CHANGE
+        // reads the folder's names again).
+        unsafe { SetWindowTextW(item(dlg, ID_FOLDER), z.as_ptr()) };
+    }
+
+    /// The Presets button's menu: each preset (puts its formats in the
+    /// boxes), Save Preset... (the formats as they are, under a name) and
+    /// Delete Preset > (asks first).
+    fn presets_menu(&self, dlg: HWND) {
+        const SAVE: u32 = 500;
+        const DELETE: u32 = 1000;
+        let list = self.presets.borrow().clone();
+        let names: Vec<String> = list.iter().map(|p| menu::label(&p.name)).collect();
+        let m = menu::empty();
+        if list.is_empty() {
+            menu::add_items(m, Some(u16::MAX), &[menu::Item::Greyed("(No presets)")]);
+        }
+        let delete = menu::empty();
+        for (i, name) in names.iter().enumerate() {
+            menu::add_items(m, Some(u16::MAX), &[menu::Item::Cmd(1 + i as u16, name)]);
+            menu::add_items(
+                delete,
+                Some(u16::MAX),
+                &[menu::Item::Cmd((DELETE as usize + i) as u16, name)],
+            );
+        }
+        menu::add_items(
+            m,
+            Some(u16::MAX),
+            &[
+                menu::Item::Sep,
+                menu::Item::Cmd(SAVE as u16, "&Save Preset..."),
+            ],
+        );
+        if list.is_empty() {
+            menu::add_items(m, Some(u16::MAX), &[menu::Item::Greyed("&Delete Preset")]);
+            // SAFETY: a menu this function made and put nowhere.
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu(delete) };
+        } else {
+            menu::add_items(
+                m,
+                Some(u16::MAX),
+                &[menu::Item::Sub("&Delete Preset", delete)],
+            );
+        }
+        let mut rc = RECT::default();
+        // SAFETY: reads this thread's button.
+        unsafe { GetWindowRect(item(dlg, ID_PRESETS), &mut rc) };
+        let pt = POINT {
+            x: rc.left,
+            y: rc.bottom,
+        };
+        let id = popup::track(m, dlg, pt, "rename presets menu", &|_| None);
+        // SAFETY: the menu this function made (its submenu goes with it).
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu(m) };
+        match id {
+            0 => {}
+            SAVE => self.save_preset(dlg),
+            n if n >= DELETE => {
+                let Some(p) = list.get((n - DELETE) as usize) else {
+                    return;
+                };
+                let ask = format!("Delete the preset \"{}\"?", p.name);
+                if msgbox::show(dlg, &ask, "Presets", MB_YESNO | MB_ICONQUESTION) == IDYES {
+                    self.presets.borrow_mut().retain(|q| q.name != p.name);
+                    self.presets_changed.set(true);
+                }
+            }
+            n => {
+                let Some(p) = list.get((n - 1) as usize) else {
+                    return;
+                };
+                for (id, text) in [(ID_OLD, &p.old_format), (ID_NEW, &p.new_format)] {
+                    let z = wz(text);
+                    // SAFETY: NUL-terminated text for this thread's box.
+                    unsafe { SetWindowTextW(item(dlg, id), z.as_ptr()) };
+                }
+                self.recompute(dlg);
+            }
+        }
+    }
+
+    /// Save Preset...: the formats in the boxes, under a name asked for
+    /// (one of that name already is replaced, after asking).
+    fn save_preset(&self, dlg: HWND) {
+        let Some(name) = ask_name(dlg, self.look.get()) else {
+            return;
+        };
+        let taken = self
+            .presets
+            .borrow()
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case(&name));
+        if taken {
+            let ask = format!("A preset named \"{name}\" already exists. Replace it?");
+            if msgbox::show(dlg, &ask, "Presets", MB_YESNO | MB_ICONQUESTION) != IDYES {
+                return;
+            }
+        }
+        let preset = Preset {
+            name,
+            old_format: Dlg::format(dlg, ID_OLD),
+            new_format: Dlg::format(dlg, ID_NEW),
+        };
+        let mut list = self.presets.borrow_mut();
+        let at = list
+            .iter()
+            .position(|p| p.name.eq_ignore_ascii_case(&preset.name));
+        match at {
+            Some(i) => list[i] = preset,
+            None if list.len() < PRESETS => list.push(preset),
+            None => return,
+        }
+        drop(list);
+        self.presets_changed.set(true);
+    }
+
     /// The text of a cell, for the list.
     fn disp_info(&self, info: &mut NMLVDISPINFOW) {
         if info.item.mask & LVIF_TEXT == 0 {
@@ -796,9 +1223,13 @@ impl Dlg {
             match (row.and_then(|r| self.files.get(r)), info.item.iSubItem) {
                 (Some(f), 0) => f.name.clone(),
                 (Some(f), 2) => f.folder.clone(),
-                (Some(_), 1) => {
+                (Some(f), 1) => {
                     let r = row.unwrap_or(0);
-                    new_cell(&p, r)
+                    if self.mode == Mode::Rename {
+                        new_cell(&p, r)
+                    } else {
+                        transfer_cell(&p, r, &f.name)
+                    }
                 }
                 _ => String::new(),
             }
@@ -857,6 +1288,77 @@ fn new_cell(p: &Preview, r: usize) -> String {
         (Some(Some(name)), _) => name.clone(),
         _ => "<Old filename does not match old format>".to_owned(),
     }
+}
+
+/// The New Name cell of row `r` for Copy and Move: the name it gets there,
+/// its own (`old`) when the old format does not match it, and what is
+/// wrong with it.
+fn transfer_cell(p: &Preview, r: usize, old: &str) -> String {
+    if p.error.is_some() {
+        return String::new();
+    }
+    let name = p.new.get(r).cloned().flatten();
+    let name = name.as_deref().unwrap_or(old);
+    match p.problems.get(r) {
+        Some(Some(problem)) => format!("{name}   <{}>", problem.text()),
+        _ => name.to_owned(),
+    }
+}
+
+/// The status line for Copy and Move (`moving`): how many files go to the
+/// folder and how many of them get a new name, or what is wrong; and
+/// whether OK may run. `dest`: whether the To folder is one (`None`:
+/// still reading it).
+fn transfer_status(
+    files: &[File],
+    p: &Preview,
+    moving: bool,
+    no_folder: bool,
+    dest: Option<bool>,
+) -> (String, bool) {
+    if let Some(error) = &p.error {
+        return (error.clone(), false);
+    }
+    let verb = if moving { "move" } else { "copy" };
+    if no_folder {
+        return (
+            format!("Type or browse for the folder to {verb} to."),
+            false,
+        );
+    }
+    if dest == Some(false) {
+        return ("The To folder does not exist.".into(), false);
+    }
+    let going = files.len() - p.skip.iter().filter(|s| **s).count();
+    let renamed = files
+        .iter()
+        .zip(&p.new)
+        .filter(|(f, new)| new.as_deref().is_some_and(|n| n != f.name))
+        .count();
+    let bad: Vec<Problem> = p.problems.iter().flatten().copied().collect();
+    let count = |k: usize, one: &str, many: &str| {
+        format!(
+            "{} {}",
+            crate::format::grouped(k as u64),
+            if k == 1 { one } else { many }
+        )
+    };
+    let mut text = format!(
+        "{}: {} to {verb}, {} renamed",
+        count(files.len(), "file", "files"),
+        crate::format::grouped(going as u64),
+        crate::format::grouped(renamed as u64)
+    );
+    if let Some(first) = bad.first() {
+        text.push_str(&format!(
+            "; {} ({})",
+            count(bad.len(), "problem", "problems"),
+            first.text().replace('\n', " ")
+        ));
+    } else if dest.is_none() {
+        text.push_str("; checking the folder...");
+    }
+    (text, bad.is_empty() && dest == Some(true) && going > 0)
 }
 
 /// The status line for `files` renamed as `p` says, and whether OK may
@@ -966,18 +1468,9 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
             0
         }
         WM_SCANNED => {
-            // SAFETY: the box the scanning thread posted, taken once; then
-            // a timer of this thread's dialog.
-            let scan = unsafe {
-                KillTimer(dlg, TIMER_SCAN);
-                Box::from_raw(l as *mut Scan)
-            };
-            *s.scan.borrow_mut() = Some(*scan);
-            // The first names, still to be made, take the scan into
-            // account then.
-            if !s.regenerating.get() {
-                s.recompute(dlg);
-            }
+            // SAFETY: the box the scanning thread posted, taken once.
+            let scanned = unsafe { Box::from_raw(l as *mut Scanned) };
+            s.scanned(dlg, *scanned);
             1
         }
         WM_RECOMPUTE => {
@@ -1002,12 +1495,20 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 s.recompute(dlg);
             } else if w == TIMER_SCAN && s.scan.borrow().is_none() {
                 *s.scan.borrow_mut() = Some(Scan::new());
+                if s.dest.get().is_none() {
+                    // A To folder that does not answer: Windows' own
+                    // questions come if a name is taken there.
+                    s.dest.set(Some(true));
+                }
                 s.recompute(dlg);
+            } else if w == TIMER_FOLDER {
+                s.scan_folder(dlg);
             }
             1
         }
         WM_SIZE => {
-            dialog::anchor(dlg, SIZE, &PLACES);
+            let dy = s.mode.dy();
+            dialog::anchor(dlg, (SIZE.0, SIZE.1 + dy), &places(dy));
             fill_last_column(item(dlg, ID_LIST));
             1
         }
@@ -1080,6 +1581,15 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
                     // SAFETY: posts to this thread's dialog.
                     unsafe { PostMessageW(dlg, WM_RECOMPUTE, 0, 0) };
                 }
+                (ID_FOLDER, EN_CHANGE) => {
+                    // SAFETY: a timer of this thread's dialog; set again,
+                    // it starts again.
+                    unsafe { SetTimer(dlg, TIMER_FOLDER, FOLDER_MS, None) };
+                    s.dest.set(None);
+                    s.show_status(dlg);
+                }
+                (ID_BROWSE, BN_CLICKED) => s.browse(dlg),
+                (ID_PRESETS, BN_CLICKED) => s.presets_menu(dlg),
                 (ID_OLD_MENU, BN_CLICKED) => s.format_menu(dlg, ID_OLD),
                 (ID_NEW_MENU, BN_CLICKED) => s.format_menu(dlg, ID_NEW),
                 // Everything makes the formats again for these two.
@@ -1090,8 +1600,101 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
             1
         }
         WM_DESTROY => {
-            places::keep(dlg, Which::Rename, core::ptr::null_mut());
+            places::keep(dlg, s.mode.place(), core::ptr::null_mut());
             0
+        }
+        _ => 0,
+    }
+}
+
+/// Save Preset...'s question: the preset's name.
+struct AskName {
+    look: Cell<Look>,
+    name: RefCell<Option<String>>,
+}
+
+const ID_NAME: u16 = 1000;
+
+/// Asks for a preset's name over `owner`; `None` for Cancel.
+fn ask_name(owner: HWND, look: Look) -> Option<String> {
+    let state = AskName {
+        look: Cell::new(look),
+        name: RefCell::new(None),
+    };
+    let mut t = Template::new("Save Preset", 0, 186, 62);
+    t.control(Class::Static, "&Name:", STATIC, 0, 0, (7, 9, 30, 8))
+        .control(
+            Class::Edit,
+            "",
+            ID_NAME,
+            WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            WS_EX_CLIENTEDGE,
+            (40, 7, 139, 13),
+        )
+        .control(
+            Class::Button,
+            "OK",
+            OK,
+            WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+            0,
+            (75, 41, 50, 14),
+        )
+        .control(
+            Class::Button,
+            "Cancel",
+            CANCEL,
+            WS_TABSTOP,
+            0,
+            (129, 41, 50, 14),
+        );
+    t.run(owner, Some(name_proc), (&raw const state) as LPARAM);
+    state.name.into_inner()
+}
+
+unsafe extern "system" fn name_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
+    if msg == WM_INITDIALOG {
+        // SAFETY: `l` is the `AskName` that `ask_name` keeps alive until
+        // the dialog has ended.
+        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
+    }
+    // SAFETY: GWLP_USERDATA is the `AskName` from `ask_name`, or null.
+    let Some(s) = (unsafe { state::<AskName>(dlg) }) else {
+        return 0;
+    };
+    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+        return answer;
+    }
+    match msg {
+        WM_INITDIALOG => {
+            dialog::apply_theme(dlg, s.look.get().dark);
+            center_on_owner(dlg);
+            enable(dlg, OK, false);
+            // SAFETY: focuses this thread's box.
+            unsafe { SetFocus(item(dlg, ID_NAME)) };
+            0
+        }
+        WM_COMMAND => {
+            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            match (id, code) {
+                (ID_NAME, EN_CHANGE) => {
+                    let typed = !window_text(item(dlg, ID_NAME)).trim().is_empty();
+                    enable(dlg, OK, typed);
+                }
+                (OK, _) => {
+                    let name = window_text(item(dlg, ID_NAME)).trim().to_owned();
+                    if !name.is_empty() {
+                        *s.name.borrow_mut() = Some(name);
+                        // SAFETY: ends this modal dialog.
+                        unsafe { EndDialog(dlg, 1) };
+                    }
+                }
+                // SAFETY: ends this modal dialog.
+                (CANCEL, _) => unsafe {
+                    EndDialog(dlg, 0);
+                },
+                _ => return 0,
+            }
+            1
         }
         _ => 0,
     }
@@ -1116,6 +1719,7 @@ mod tests {
             new: vec![Some("x.txt".into()), Some("b.txt".into()), None],
             problems: vec![None; 3],
             error: None,
+            skip: Vec::new(),
         };
         assert_eq!(
             status(&files, &p, true),
@@ -1128,6 +1732,7 @@ mod tests {
             new: vec![Some("x.txt".into()), Some("x.txt".into()), None],
             problems: vec![Some(Problem::Duplicate), Some(Problem::Duplicate), None],
             error: None,
+            skip: Vec::new(),
         };
         assert_eq!(
             status(&files, &p, true),
@@ -1143,6 +1748,7 @@ mod tests {
             new: vec![None; 3],
             problems: vec![None; 3],
             error: None,
+            skip: Vec::new(),
         };
         assert!(!status(&files, &p, true).1);
         let p = Preview {
@@ -1153,6 +1759,46 @@ mod tests {
             status(&files, &p, true),
             ("New format: a function has no closing )".into(), false)
         );
+    }
+
+    #[test]
+    fn copy_and_move_say_where_the_files_go() {
+        let files = [file("a.txt"), file("b.txt"), file("c.txt")];
+        let p = Preview {
+            new: vec![Some("x.txt".into()), None, None],
+            problems: vec![None; 3],
+            error: None,
+            skip: vec![false, false, true],
+        };
+        assert_eq!(
+            transfer_status(&files, &p, true, false, Some(true)),
+            ("3 files: 2 to move, 1 renamed".into(), true)
+        );
+        assert!(
+            !transfer_status(&files, &p, false, false, None).1,
+            "not before the folder is read"
+        );
+        assert!(
+            transfer_status(&files, &p, false, false, None)
+                .0
+                .ends_with("checking the folder...")
+        );
+        assert_eq!(
+            transfer_status(&files, &p, false, true, None).0,
+            "Type or browse for the folder to copy to."
+        );
+        assert_eq!(
+            transfer_status(&files, &p, false, false, Some(false)),
+            ("The To folder does not exist.".into(), false)
+        );
+        assert_eq!(transfer_cell(&p, 0, "a.txt"), "x.txt");
+        assert_eq!(
+            transfer_cell(&p, 1, "b.txt"),
+            "b.txt",
+            "unmatched keeps its name"
+        );
+        assert_eq!(folder_key(r" D:\Copies\ "), r"d:\copies");
+        assert_eq!(folder_key(r"C:\"), r"c:\");
     }
 
     #[test]

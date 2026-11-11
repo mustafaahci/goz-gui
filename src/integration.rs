@@ -1,8 +1,9 @@
 //! What goz-gui puts in the user's registry and folders when asked in
 //! Options > General: starting with Windows (a `Run` value), the "Search
-//! goz..." item on folders in Explorer, the `goz:` URL protocol, and the
-//! Start menu and Desktop shortcuts; all for the current user, and each
-//! removed again when turned off.
+//! goz..." item on folders in Explorer, the `goz:` URL protocol, the
+//! Start menu and Desktop shortcuts, and (wave 4) the `.efu` file
+//! association; all for the current user, and each removed again when
+//! turned off.
 //!
 //! `GOZ_GUI_REG_ROOT` (tests) moves the registry's under `HKCU\<root>`, and
 //! `GOZ_GUI_SHORTCUT_DIR` the shortcuts under `<dir>\Programs` and
@@ -246,6 +247,103 @@ pub fn set_url_protocol(on: bool) -> bool {
     }
 }
 
+/// The `.efu` file association's own key: Everything File Lists open in
+/// goz-gui as file lists (`-filelist "%1"`).
+const EFU_PROG_ID: &str = "goz-gui.FileList";
+/// Where `.efu`'s program was before goz-gui took it, to give it back.
+const EFU_PREVIOUS: &str = "goz-gui.previous";
+
+fn efu_key() -> String {
+    format!(r"{}\.efu", classes())
+}
+
+fn efu_prog_key() -> String {
+    format!(r"{}\{EFU_PROG_ID}", classes())
+}
+
+/// The command Windows runs to open a file list.
+fn efu_command() -> Option<String> {
+    Some(format!("{} -filelist \"%1\"", exe()?))
+}
+
+/// Whether a command is goz-gui's file list command (this copy's or
+/// another's).
+fn is_efu_command(cmd: &str) -> bool {
+    cmd.starts_with('"') && cmd.ends_with("\" -filelist \"%1\"")
+}
+
+/// Whether `.efu` files open in goz-gui.
+pub fn has_efu_association() -> bool {
+    get(&efu_key(), None).as_deref() == Some(EFU_PROG_ID)
+        && get(&format!(r"{}\shell\open\command", efu_prog_key()), None)
+            .is_some_and(|c| is_efu_command(&c))
+}
+
+/// Tells Explorer that a file association changed (not for a test's keys,
+/// which Windows does not read).
+fn associations_changed() {
+    if root().is_some() {
+        return;
+    }
+    use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+    // SAFETY: a notification with no items.
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST,
+            core::ptr::null(),
+            core::ptr::null(),
+        )
+    };
+}
+
+/// Makes `.efu` files (Everything File Lists) open in this goz-gui as file
+/// lists, or gives them back to the program they had before (only when
+/// they are goz-gui's).
+pub fn set_efu_association(on: bool) -> bool {
+    let (ext, prog) = (efu_key(), efu_prog_key());
+    if on {
+        let Some(cmd) = efu_command() else {
+            return false;
+        };
+        let icon = std::env::current_exe()
+            .map(|p| format!("{},0", p.display()))
+            .unwrap_or_default();
+        // The program `.efu` had (Everything's, say) is kept to give back.
+        let previous = get(&ext, None).filter(|p| p != EFU_PROG_ID && !p.is_empty());
+        let ok = set(&prog, None, "Everything File List")
+            && set(&format!(r"{prog}\DefaultIcon"), None, &icon)
+            && set(&format!(r"{prog}\shell\open\command"), None, &cmd)
+            && previous.is_none_or(|p| set(&ext, Some(EFU_PREVIOUS), &p))
+            && set(&ext, None, EFU_PROG_ID);
+        associations_changed();
+        ok && has_efu_association()
+    } else {
+        if get(&ext, None).as_deref() == Some(EFU_PROG_ID) {
+            let previous = get(&ext, Some(EFU_PREVIOUS)).unwrap_or_default();
+            set(&ext, None, &previous);
+            let k = wz(&ext);
+            let v = wz(EFU_PREVIOUS);
+            // SAFETY: NUL-terminated names under HKCU; a value already gone
+            // is fine.
+            unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), v.as_ptr()) };
+        }
+        let is_ours =
+            get(&format!(r"{prog}\shell\open\command"), None).is_some_and(|c| is_efu_command(&c));
+        if is_ours {
+            let k = wz(&prog);
+            // SAFETY: NUL-terminated paths under HKCU: the key's subkeys
+            // and values, then the key.
+            unsafe {
+                RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr());
+                RegDeleteKeyW(HKEY_CURRENT_USER, k.as_ptr());
+            }
+        }
+        associations_changed();
+        !has_efu_association()
+    }
+}
+
 /// The shortcuts Options > General makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shortcut {
@@ -379,6 +477,20 @@ mod tests {
         assert!(!has_url_protocol());
         assert!(set_url_protocol(false));
         assert!(get(&format!(r"{key}\shell\open\command"), None).is_some());
+        // The .efu association (wave 4): Everything's taken over, then
+        // given back.
+        assert!(!has_efu_association());
+        assert!(set(&efu_key(), None, "Everything.FileList"));
+        assert!(set_efu_association(true) && has_efu_association());
+        let open = get(&format!(r"{}\shell\open\command", efu_prog_key()), None).unwrap();
+        assert!(open.ends_with("\" -filelist \"%1\""), "{open}");
+        assert!(set_efu_association(false) && !has_efu_association());
+        assert_eq!(
+            get(&efu_key(), None).as_deref(),
+            Some("Everything.FileList"),
+            "the program before is back"
+        );
+        assert_eq!(get(&efu_prog_key(), None), None);
         let k = wz(&root);
         // SAFETY: deletes the throwaway key made above.
         unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr()) };

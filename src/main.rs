@@ -101,6 +101,10 @@ mod filetools;
 mod ui_options;
 mod url;
 
+// W4 (G1: data and file tools).
+mod datatools;
+mod filelist;
+
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };

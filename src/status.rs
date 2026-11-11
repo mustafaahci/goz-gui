@@ -168,6 +168,8 @@ pub enum Indicator {
     Filter,
     /// The Folders pane's folder, which keeps the search inside it.
     Folder,
+    /// The open file list (wave 4), searched instead of gozd's index.
+    FileList,
 }
 
 /// `text` (a path) cut to `max` px wide in `hdc`'s font with an ellipsis in
@@ -301,7 +303,9 @@ pub fn paint(app: &App, hdc: HDC) {
     let mut right: Vec<Part> = Vec::new();
     {
         let m = app.model.borrow();
-        let state = if m.incomplete {
+        let state = if m.incomplete && m.search.filelist.is_some() {
+            Some("Loading file list…")
+        } else if m.incomplete {
             Some("Indexing…")
         } else if m.metadata_pending {
             Some("Reading sizes and dates…")
@@ -313,6 +317,14 @@ pub fn paint(app: &App, hdc: HDC) {
                 text: text.into(),
                 colour: pal.dim,
                 indicator: None,
+            });
+        }
+        // The open file list's name (wave 4), as Everything shows it.
+        if let Some(name) = app.filelist_indicator() {
+            right.push(Part {
+                text: name,
+                colour: pal.fg,
+                indicator: Some(Indicator::FileList),
             });
         }
         // The Folders pane's folder (F2), left of the options: Everything
@@ -426,7 +438,10 @@ pub fn paint(app: &App, hdc: HDC) {
         }
         for part in right.iter().rev() {
             let mut t: Vec<u16> = part.text.encode_utf16().collect();
-            if part.indicator == Some(Indicator::Folder) {
+            if matches!(
+                part.indicator,
+                Some(Indicator::Folder | Indicator::FileList)
+            ) {
                 // A long folder takes at most a third of the bar.
                 t = elide_path(hdc, &t, (rc.right - rc.left) / 3);
             }
