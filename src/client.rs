@@ -10,6 +10,7 @@
 use std::cell::Cell;
 use std::io;
 use std::os::windows::io::BorrowedHandle;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,37 @@ const SILENCE_MS: u32 = 30_000;
 /// (and gozd) free of abandoned work; dropping the connection instead leaves
 /// gozd to finish each one anyway, so a burst of keystrokes would queue up.
 const STALE_GRACE: Duration = Duration::from_millis(200);
+
+/// The search each new connection sends after its greeting to learn
+/// whether gozd reads the new query language (Everything 1.5's OR, NOT
+/// and groups): a gozd that does answers it (no rows asked for), an older
+/// one refuses the `|`.
+pub const PROBE_QUERY: &str = "goz_gui_probe_a|goz_gui_probe_b";
+
+/// Whether the gozd last spoken to reads the new query language; set by
+/// the window from [`Reply::Syntax`], read wherever the search syntax
+/// offered depends on it. Off until a probe says otherwise.
+static BOOLEAN_SYNTAX: AtomicBool = AtomicBool::new(false);
+
+/// Whether gozd reads OR, NOT and groups (see [`PROBE_QUERY`]).
+pub fn boolean_syntax() -> bool {
+    BOOLEAN_SYNTAX.load(Ordering::Relaxed)
+}
+
+/// Records what the probe learned; `true` when that changed it.
+pub fn set_boolean_syntax(on: bool) -> bool {
+    BOOLEAN_SYNTAX.swap(on, Ordering::Relaxed) != on
+}
+
+/// What gozd's answer to [`PROBE_QUERY`] says of its syntax: results, the
+/// new one; a refusal, the old; anything else, nothing.
+fn probe_verdict(response: &Response) -> Option<bool> {
+    match response {
+        Response::Results(_) => Some(true),
+        Response::Error { .. } => Some(false),
+        _ => None,
+    }
+}
 
 /// What the user searched for.
 pub struct Search {
@@ -142,6 +174,11 @@ pub enum Reply {
         failure: Failure,
     },
     Status(Result<DaemonStatus, Failure>),
+    /// What a new connection's probe learned of gozd's syntax, posted when
+    /// it differs from what was learned before (the first time, and when
+    /// gozd was restarted as another build): whether it reads OR, NOT and
+    /// groups.
+    Syntax(bool),
 }
 
 struct Event(HANDLE);
@@ -188,6 +225,9 @@ struct Shared {
     cancel: Event,
     hwnd: usize,
     msg: u32,
+    /// What the probe last learned: 0 nothing yet, 1 the old syntax, 2
+    /// the new.
+    syntax: AtomicU8,
 }
 
 impl Shared {
@@ -230,6 +270,7 @@ impl Worker {
             cancel: Event::new(),
             hwnd: hwnd as usize,
             msg,
+            syntax: AtomicU8::new(0),
         });
         let thread_shared = Arc::clone(&shared);
         std::thread::Builder::new()
@@ -305,6 +346,7 @@ impl Stop {
             cancel: Event::new(),
             hwnd: 0,
             msg: 0,
+            syntax: AtomicU8::new(0),
         }))
     }
 
@@ -608,9 +650,42 @@ fn connect<'a>(conn: &'a mut Option<Pipe>, shared: &Shared) -> Result<&'a mut Pi
             }
             _ => return Err(Failure::Other("unexpected reply from gozd".into())),
         }
+        // Only the worker's connections ask (a stream's has nobody to tell).
+        if shared.msg != 0 {
+            probe(&mut pipe, shared).map_err(Io::into_failure)?;
+        }
         *conn = Some(pipe);
     }
     Ok(conn.as_mut().expect("connected above"))
+}
+
+/// Sends [`PROBE_QUERY`] on a new connection and posts what it learned
+/// when that is news. A refusal leaves the connection as good as before.
+fn probe(pipe: &mut Pipe, shared: &Shared) -> Result<(), Io> {
+    pipe.send(&Request::Query(QueryRequest {
+        query: PROBE_QUERY.into(),
+        scope: None,
+        sort: SortSpec::default(),
+        offset: 0,
+        limit: Some(0),
+        want_size: false,
+        want_mtime: false,
+        match_case: false,
+        want_total_size: false,
+    }))?;
+    let verdict = loop {
+        match pipe.response(shared, None)? {
+            Response::Results(page) if page.more => {}
+            other => break probe_verdict(&other),
+        }
+    };
+    if let Some(on) = verdict {
+        let code = if on { 2 } else { 1 };
+        if shared.syntax.swap(code, Ordering::Relaxed) != code {
+            shared.post(Reply::Syntax(on));
+        }
+    }
+    Ok(())
 }
 
 enum Io {
@@ -904,5 +979,39 @@ mod tests {
         // Another search's blocks are its own business.
         assert_eq!(trim_jobs(&mut jobs, 7, |_| false), Vec::<u32>::new());
         assert_eq!(jobs.len(), 5);
+    }
+
+    #[test]
+    fn the_probe_tells_the_syntax_apart() {
+        use goz_core::proto::{ProtoError, QueryResults};
+        let answered = Response::Results(QueryResults {
+            total: 0,
+            items: vec![],
+            more: false,
+            volumes_incomplete: false,
+            metadata_pending: false,
+            generation: 0,
+            total_size: None,
+        });
+        assert_eq!(probe_verdict(&answered), Some(true));
+        let refused = Response::Error {
+            code: ProtoError::BadQuery,
+            message: "'|' is not supported".into(),
+        };
+        assert_eq!(probe_verdict(&refused), Some(false));
+        let hello = Response::Hello {
+            proto: PROTO_VERSION,
+            server: "gozd".into(),
+            ready: true,
+        };
+        assert_eq!(probe_verdict(&hello), None);
+        // The probe is what an older gozd refuses: goz-core v0.6.0's parser,
+        // the one an old gozd runs, rejects it.
+        assert!(goz_core::query::parse_query(PROBE_QUERY).is_err());
+        // Learning the same thing twice is no news.
+        let before = boolean_syntax();
+        assert!(set_boolean_syntax(!before));
+        assert!(!set_boolean_syntax(!before));
+        set_boolean_syntax(before);
     }
 }

@@ -2615,6 +2615,7 @@ impl App {
                     self.message_box(&text, "Index Status");
                 }
             }
+            Reply::Syntax(on) => self.syntax_learned(on),
         }
     }
 

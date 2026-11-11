@@ -29,10 +29,12 @@
 //!   results' row menu has it. Properties and Delete go through goz-gui's
 //!   own paths (a test's dry run, the file operations thread); the folder's
 //!   parent is listed again after a command that may have changed it.
-//! - **Subfolders.** Everything's Subfolders box under the tree, shown on
-//!   and greyed: goz can only search a folder with its subfolders (gozd's
-//!   `parent:` would allow the folder's own items alone); its tooltip says
-//!   so.
+//! - **Subfolders.** Everything's Subfolders box under the tree. With a
+//!   gozd that reads the new query language (`client::boolean_syntax`) it
+//!   is a box to tick: unticked, the search keeps to the folder's own
+//!   items (`parent:`, `sidebars::scoped_with`). An older gozd can only
+//!   search a folder with its subfolders: the box shows on and greyed, and
+//!   its tooltip says so.
 //!
 //! Re-entrancy: the tree sends this pane notifications from inside the
 //! messages sent to it (selecting, deleting or opening an item), so no
@@ -57,10 +59,10 @@ use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
     HTREEITEM, NMHDR, NMTREEVIEWW, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW,
-    TTM_SETMAXTIPWIDTH, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, TVC_BYMOUSE, TVE_EXPAND,
-    TVM_DELETEITEM, TVM_SETEXTENDEDSTYLE, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW, TVS_EX_AUTOHSCROLL,
-    TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_LINESATROOT, TVS_NOHSCROLL,
-    TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT, WC_TREEVIEWW,
+    TTM_SETMAXTIPWIDTH, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, TVC_BYMOUSE,
+    TVE_EXPAND, TVM_DELETEITEM, TVM_SETEXTENDEDSTYLE, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW,
+    TVS_EX_AUTOHSCROLL, TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_LINESATROOT,
+    TVS_NOHSCROLL, TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT, WC_TREEVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -71,8 +73,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DeleteMenu, DestroyMenu, DestroyWindow, GetMenuDefaultItem,
     HMENU, HWND_MESSAGE, KillTimer, MB_ICONWARNING, MF_BYCOMMAND, MSG, MoveWindow, PostMessageW,
     SM_CXSMICON, SW_HIDE, SendMessageW, SetParent, SetTimer, ShowWindow, WM_APP, WM_CONTEXTMENU,
-    WM_KEYDOWN, WM_NOTIFY, WM_SETFOCUS, WM_SYSKEYDOWN, WM_TIMER, WS_CHILD, WS_EX_TOPMOST, WS_POPUP,
-    WS_TABSTOP, WS_VISIBLE,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NOTIFY, WM_SETFOCUS, WM_SYSKEYDOWN, WM_TIMER,
+    WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 use super::sidebars::{FOLDER_COPY_PATH, FOLDER_EXPAND, FOLDER_OPEN, FOLDER_OPEN_PATH};
@@ -137,6 +139,18 @@ const TOP: u32 = 0;
 /// What the Subfolders box's tooltip says.
 const SUBFOLDERS_TIP: &str = "goz searches a folder with its subfolders. Searching only the \
                               folder's own items needs a newer gozd.";
+/// The same with a gozd that reads `parent:`.
+const SUBFOLDERS_TIP_ON: &str = "Search the folder's subfolders too. Unticked, only the \
+                                 folder's own items (parent:).";
+
+/// The tooltip as gozd's syntax says.
+fn subfolders_tip() -> &'static str {
+    if crate::client::boolean_syntax() {
+        SUBFOLDERS_TIP_ON
+    } else {
+        SUBFOLDERS_TIP
+    }
+}
 
 /// How far a node's subfolders are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1077,8 +1091,27 @@ impl FoldersPane {
         self.relist_soon(&again);
     }
 
-    /// Paints the Subfolders bar: Everything's box, ticked and greyed, and
-    /// its label.
+    /// gozd's syntax or the Subfolders setting changed: the box and its
+    /// tooltip follow.
+    pub(super) fn syntax_changed(&self, app: &App) {
+        let pane = self.pane.get();
+        let tip = self.tip.get();
+        let rc = crate::pane::content_rect(app, pane);
+        let bar = Self::bar(app, &rc);
+        // SAFETY: updates this pane's tooltip (which copies the text) and
+        // repaints its bar.
+        unsafe {
+            if !tip.is_null() {
+                let mut text = wz(subfolders_tip());
+                let info = self.tool(Self::subfolders_rect(app, &bar), &mut text);
+                SendMessageW(tip, TTM_UPDATETIPTEXTW, 0, (&raw const info) as isize);
+            }
+            InvalidateRect(pane, &bar, 0);
+        }
+    }
+
+    /// Paints the Subfolders bar: Everything's box and its label; ticked
+    /// and greyed while gozd cannot leave the subfolders out.
     fn paint_bar(&self, app: &App, hdc: HDC, bar: &RECT) {
         let pal = app.pal.get();
         fill(hdc, bar, pal.chrome);
@@ -1093,7 +1126,9 @@ impl FoldersPane {
         let side = app.scale(13);
         let left = bar.left + app.scale(4);
         let top = bar.top + 1 + (bar.bottom - bar.top - 1 - side) / 2;
-        let colour = pal.dim;
+        let live = crate::client::boolean_syntax();
+        let ticked = !live || app.sidebar_settings().subfolders;
+        let colour = if live { pal.fg } else { pal.dim };
         let edge = |l: i32, t: i32, r: i32, b: i32| {
             fill(
                 hdc,
@@ -1114,14 +1149,16 @@ impl FoldersPane {
         // The tick: down to the bottom third, then up to the right.
         let s = |v: i32| app.scale(v);
         // SAFETY: a pen made and deleted here, selected out again before.
-        unsafe {
-            let pen = CreatePen(PS_SOLID, s(2).max(1), colour);
-            let old = SelectObject(hdc, pen);
-            MoveToEx(hdc, left + s(3), top + s(6), core::ptr::null_mut());
-            LineTo(hdc, left + s(5), top + s(9));
-            LineTo(hdc, left + s(10), top + s(3));
-            SelectObject(hdc, old);
-            DeleteObject(pen);
+        if ticked {
+            unsafe {
+                let pen = CreatePen(PS_SOLID, s(2).max(1), colour);
+                let old = SelectObject(hdc, pen);
+                MoveToEx(hdc, left + s(3), top + s(6), core::ptr::null_mut());
+                LineTo(hdc, left + s(5), top + s(9));
+                LineTo(hdc, left + s(10), top + s(3));
+                SelectObject(hdc, old);
+                DeleteObject(pen);
+            }
         }
         let mut text: Vec<u16> = "Subfolders".encode_utf16().collect();
         let mut rc = RECT {
@@ -1388,7 +1425,7 @@ impl crate::pane::PaneContent for FoldersPane {
         self.fit_dpi(app);
         treeview::apply_theme(tree, &app.pal.get());
         if !tip.is_null() {
-            let mut text = wz(SUBFOLDERS_TIP);
+            let mut text = wz(subfolders_tip());
             let info = self.tool(RECT::default(), &mut text);
             // SAFETY: the tooltip copies the tool and its text.
             unsafe {
@@ -1433,7 +1470,7 @@ impl crate::pane::PaneContent for FoldersPane {
             );
             let tip = self.tip.get();
             if !tip.is_null() {
-                let mut text = wz(SUBFOLDERS_TIP);
+                let mut text = wz(subfolders_tip());
                 let info = self.tool(Self::subfolders_rect(app, &bar), &mut text);
                 SendMessageW(tip, TTM_NEWTOOLRECTW, 0, (&raw const info) as isize);
             }
@@ -1517,6 +1554,19 @@ impl crate::pane::PaneContent for FoldersPane {
             WM_CONTEXTMENU if w as HWND == self.tree.get() => {
                 self.menu(app, l);
                 Some(0)
+            }
+            // A click on the Subfolders box ticks it or not, with a gozd
+            // that reads parent:.
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if crate::client::boolean_syntax() => {
+                let rc = crate::pane::content_rect(app, _pane);
+                let hit = Self::subfolders_rect(app, &Self::bar(app, &rc));
+                let pt = point(l);
+                if (hit.left..hit.right).contains(&pt.x) && (hit.top..hit.bottom).contains(&pt.y) {
+                    app.toggle_subfolders();
+                    Some(0)
+                } else {
+                    None
+                }
             }
             WM_FOUND => {
                 // SAFETY: a thread's reply, posted with `foldertree::spawn`;

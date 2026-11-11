@@ -4,8 +4,10 @@
 //! Match path per term), located in (a folder and Browse...), the size
 //! from and to, the date modified from and to, the filter, and the
 //! extensions. Everything's "any of these words" and "none of these
-//! words" need OR and NOT, which gozd refuses, and its other fields
-//! (content, attributes, ...) what goz does not index; they are not here.
+//! words" need OR and NOT: they are there (under the exact phrase) only
+//! with a gozd that reads them (`client::boolean_syntax`), an OR group
+//! `<a|b>` and `!a` terms. Everything's other fields (content, attributes,
+//! ...) are what goz does not index; they are not here.
 //!
 //! [`query`] writes exactly what goz's parser takes (its tests parse every
 //! form with `goz_core::query`).
@@ -85,6 +87,11 @@ pub struct Form {
     pub date_from: Option<Day>,
     pub date_to: Option<Day>,
     pub extensions: String,
+    /// Any of these words (an OR group) and none of them (`!` terms): only
+    /// read with `boolean`, a gozd that reads the new query language.
+    pub any_words: String,
+    pub none_words: String,
+    pub boolean: bool,
 }
 
 /// Why the fields make no search, and which field to fix.
@@ -102,9 +109,10 @@ pub enum Field {
 }
 
 /// Whether `word`, as a term on its own, would be read as something else
-/// than text: an operator gozd refuses (`|`, `!`), or a `name:` function.
-fn needs_quotes(word: &str) -> bool {
-    if word.contains(['|', '!']) {
+/// than text: an operator (`|`, `!`; `<` and `>` too when gozd reads
+/// groups), or a `name:` function.
+fn needs_quotes(word: &str, boolean: bool) -> bool {
+    if word.contains(['|', '!']) || (boolean && word.contains(['<', '>'])) {
         return true;
     }
     match word.find(':') {
@@ -117,8 +125,8 @@ fn needs_quotes(word: &str) -> bool {
 }
 
 /// A text term: quoted when it must be, a full path term with Match path.
-fn text_term(text: &str, quoted: bool, path: bool) -> String {
-    let body = if quoted || needs_quotes(text) || text.contains(char::is_whitespace) {
+fn text_term(text: &str, quoted: bool, path: bool, boolean: bool) -> String {
+    let body = if quoted || needs_quotes(text, boolean) || text.contains(char::is_whitespace) {
         format!("\"{text}\"")
     } else {
         text.to_owned()
@@ -126,27 +134,47 @@ fn text_term(text: &str, quoted: bool, path: bool) -> String {
     if path { format!("path:{body}") } else { body }
 }
 
+/// The words of a box, its quotes taken out.
+fn words_of(text: &str) -> Vec<String> {
+    text.replace('"', " ")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The search the fields make, in goz's syntax: the folder, the words, the
-/// phrase, the extensions, the size, the date, then `case:`. Quotes cannot
-/// be searched for (goz has no escape for them): they are left out.
+/// phrase, any of the words (`<a|b>`) and none of them (`!c`, with a gozd
+/// that reads them), the extensions, the size, the date, then `case:`.
+/// Quotes cannot be searched for (goz has no escape for them): they are
+/// left out.
 pub fn query(form: &Form) -> Result<String, Problem> {
     let mut terms: Vec<String> = Vec::new();
+    let b = form.boolean;
     let folder = form.located_in.trim();
     if !folder.is_empty() {
         terms.push(folder_term(&folder.replace('"', "")));
     }
-    for word in form
-        .words
-        .replace('"', " ")
-        .split_whitespace()
-        .filter(|w| !w.is_empty())
-    {
-        terms.push(text_term(word, false, form.match_path));
+    for word in words_of(&form.words) {
+        terms.push(text_term(&word, false, form.match_path, b));
     }
     let phrase = form.phrase.replace('"', "");
     let phrase = phrase.trim();
     if !phrase.is_empty() {
-        terms.push(text_term(phrase, true, form.match_path));
+        terms.push(text_term(phrase, true, form.match_path, b));
+    }
+    if b {
+        let any: Vec<String> = words_of(&form.any_words)
+            .iter()
+            .map(|w| text_term(w, false, form.match_path, b))
+            .collect();
+        match any.len() {
+            0 => {}
+            1 => terms.push(any[0].clone()),
+            _ => terms.push(format!("<{}>", any.join("|"))),
+        }
+        for word in words_of(&form.none_words) {
+            terms.push(format!("!{}", text_term(&word, false, form.match_path, b)));
+        }
     }
     let exts: Vec<String> = form
         .extensions
@@ -250,6 +278,8 @@ pub fn pick_folder(owner: HWND, start: &str) -> Option<String> {
 const STATIC: u16 = 0xffff;
 const ID_WORDS: u16 = 1004;
 const ID_PHRASE: u16 = 1009;
+const ID_ANY: u16 = 1006;
+const ID_NONE: u16 = 1007;
 const ID_CASE: u16 = 1005;
 const ID_PATH: u16 = 1145;
 const ID_FOLDER: u16 = 1032;
@@ -263,8 +293,14 @@ const ID_DATE_TO: u16 = 1038;
 const ID_FILTER_LABEL: u16 = 1056;
 const ID_FILTER: u16 = 1057;
 const ID_EXT: u16 = 1059;
-/// Where the Filter list goes (it is made once the dialog shows).
-const FILTER_AT: crate::dialog::Units = (7, 183, 286, 160);
+/// Where the Filter list goes (it is made once the dialog shows), `dy`
+/// lower with the any and none rows.
+fn filter_at(dy: i16) -> crate::dialog::Units {
+    (7, 183 + dy, 286, 160)
+}
+/// How much lower everything under the exact phrase is with the any and
+/// none rows.
+const BOOLEAN_ROWS: i16 = 36;
 /// The dialog's timer: it has been drawn, the Filter list can be made.
 const MAKE_FILTER: usize = 1;
 const OK: u16 = IDOK as u16;
@@ -277,6 +313,8 @@ pub struct Start {
     pub filter: usize,
     /// Where Browse... starts.
     pub last_folder: String,
+    /// gozd reads OR and NOT: the any and none rows are there.
+    pub boolean_syntax: bool,
 }
 
 /// What the dialog ended with.
@@ -295,6 +333,8 @@ struct Dlg<'a> {
     result: RefCell<Option<Done>>,
     /// Whether the Filter list is made yet (`make_filter`).
     filter_made: Cell<bool>,
+    /// How much lower the rows under the phrase are (`BOOLEAN_ROWS`).
+    dy: i16,
 }
 
 fn item(dlg: HWND, id: u16) -> HWND {
@@ -324,7 +364,13 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         browsed: RefCell::new(None),
         result: RefCell::new(None),
         filter_made: Cell::new(false),
+        dy: if start.boolean_syntax {
+            BOOLEAN_ROWS
+        } else {
+            0
+        },
     };
+    let dy = state.dy;
     let label = SS_LEFT;
     let edit = WS_TABSTOP | ES_AUTOHSCROLL as u32;
     // Five units need no scroll bar, which costs a themed list a few
@@ -333,7 +379,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
     let check = WS_TABSTOP | BS_AUTOCHECKBOX as u32;
     let picker = WS_TABSTOP | DTS_SHORTDATEFORMAT | DTS_SHOWNONE;
     let (lx, fx, right) = (7, 82, 293);
-    let mut t = Template::new("Advanced Search", 0, 300, 262);
+    let mut t = Template::new("Advanced Search", 0, 300, 262 + dy);
     t.control(
         Class::Static,
         "Filenames containing...",
@@ -373,14 +419,48 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         edit,
         WS_EX_CLIENTEDGE,
         (fx, 39, right - fx, 14),
-    )
-    .control(
+    );
+    if start.boolean_syntax {
+        t.control(
+            Class::Static,
+            "an&y of these words:",
+            STATIC,
+            label,
+            0,
+            (lx + 6, 59, 70, 8),
+        )
+        .control(
+            Class::Edit,
+            "",
+            ID_ANY,
+            edit,
+            WS_EX_CLIENTEDGE,
+            (fx, 57, right - fx, 14),
+        )
+        .control(
+            Class::Static,
+            "&none of these words:",
+            STATIC,
+            label,
+            0,
+            (lx + 6, 77, 74, 8),
+        )
+        .control(
+            Class::Edit,
+            "",
+            ID_NONE,
+            edit,
+            WS_EX_CLIENTEDGE,
+            (fx, 75, right - fx, 14),
+        );
+    }
+    t.control(
         Class::Button,
         "Match &case",
         ID_CASE,
         check,
         0,
-        (fx, 57, 70, 10),
+        (fx, 57 + dy, 70, 10),
     )
     .control(
         Class::Button,
@@ -388,7 +468,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         ID_PATH,
         check,
         0,
-        (fx + 76, 57, 70, 10),
+        (fx + 76, 57 + dy, 70, 10),
     )
     .control(
         Class::Static,
@@ -396,7 +476,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         STATIC,
         label,
         0,
-        (lx, 76, 200, 8),
+        (lx, 76 + dy, 200, 8),
     )
     .control(
         Class::Edit,
@@ -404,7 +484,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         ID_FOLDER,
         edit,
         WS_EX_CLIENTEDGE,
-        (lx, 87, 232, 14),
+        (lx, 87 + dy, 232, 14),
     )
     .control(
         Class::Button,
@@ -412,9 +492,16 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         ID_BROWSE,
         WS_TABSTOP,
         0,
-        (243, 86, 50, 16),
+        (243, 86 + dy, 50, 16),
     )
-    .control(Class::Static, "&Size:", STATIC, label, 0, (lx, 108, 100, 8))
+    .control(
+        Class::Static,
+        "&Size:",
+        STATIC,
+        label,
+        0,
+        (lx, 108 + dy, 100, 8),
+    )
     // The size boxes are as tall as the unit lists beside them (whose
     // height is the font's): 12 units, the row's edges in line.
     .control(
@@ -423,7 +510,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         ID_SIZE_FROM,
         edit | ES_NUMBER as u32,
         WS_EX_CLIENTEDGE,
-        (lx, 119, 60, 12),
+        (lx, 119 + dy, 60, 12),
     )
     .control(
         Class::Named("ComboBox"),
@@ -431,16 +518,23 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         ID_SIZE_FROM_UNIT,
         units,
         0,
-        (71, 119, 44, 120),
+        (71, 119 + dy, 44, 120),
     )
-    .control(Class::Static, "to", STATIC, label, 0, (121, 121, 12, 8))
+    .control(
+        Class::Static,
+        "to",
+        STATIC,
+        label,
+        0,
+        (121, 121 + dy, 12, 8),
+    )
     .control(
         Class::Edit,
         "",
         ID_SIZE_TO,
         edit | ES_NUMBER as u32,
         WS_EX_CLIENTEDGE,
-        (135, 119, 60, 12),
+        (135, 119 + dy, 60, 12),
     )
     .control(
         Class::Named("ComboBox"),
@@ -448,7 +542,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         ID_SIZE_TO_UNIT,
         units,
         0,
-        (199, 119, 44, 120),
+        (199, 119 + dy, 44, 120),
     )
     .control(
         Class::Static,
@@ -456,7 +550,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         STATIC,
         label,
         0,
-        (lx, 140, 100, 8),
+        (lx, 140 + dy, 100, 8),
     )
     .control(
         Class::Named("SysDateTimePick32"),
@@ -464,16 +558,23 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         ID_DATE_FROM,
         picker,
         0,
-        (lx, 151, 108, 14),
+        (lx, 151 + dy, 108, 14),
     )
-    .control(Class::Static, "to", STATIC, label, 0, (121, 154, 12, 8))
+    .control(
+        Class::Static,
+        "to",
+        STATIC,
+        label,
+        0,
+        (121, 154 + dy, 12, 8),
+    )
     .control(
         Class::Named("SysDateTimePick32"),
         "",
         ID_DATE_TO,
         picker,
         0,
-        (135, 151, 108, 14),
+        (135, 151 + dy, 108, 14),
     )
     .control(
         Class::Static,
@@ -481,7 +582,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         ID_FILTER_LABEL,
         label,
         0,
-        (lx, 172, 100, 8),
+        (lx, 172 + dy, 100, 8),
     )
     // The Filter list comes once the dialog shows (`make_filter`).
     .control(
@@ -490,7 +591,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         STATIC,
         label,
         0,
-        (lx, 204, 100, 8),
+        (lx, 204 + dy, 100, 8),
     )
     .control(
         Class::Edit,
@@ -498,7 +599,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         ID_EXT,
         edit,
         WS_EX_CLIENTEDGE,
-        (lx, 215, right - lx, 14),
+        (lx, 215 + dy, right - lx, 14),
     )
     .control(
         Class::Button,
@@ -506,7 +607,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         OK,
         WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
         0,
-        (189, 241, 50, 14),
+        (189, 241 + dy, 50, 14),
     )
     .control(
         Class::Button,
@@ -514,7 +615,7 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         CANCEL,
         WS_TABSTOP,
         0,
-        (243, 241, 50, 14),
+        (243, 241 + dy, 50, 14),
     );
     t.run(owner, Some(proc), (&raw const state) as LPARAM);
     state.result.into_inner()
@@ -589,7 +690,7 @@ impl Dlg<'_> {
             "ComboBox",
             ID_FILTER,
             WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
-            FILTER_AT,
+            filter_at(self.dy),
             item(dlg, ID_FILTER_LABEL),
         );
         fill_combo(
@@ -619,7 +720,19 @@ impl Dlg<'_> {
             date_from: day_of(dlg, ID_DATE_FROM),
             date_to: day_of(dlg, ID_DATE_TO),
             extensions: window_text(item(dlg, ID_EXT)),
+            any_words: self.boolean_text(dlg, ID_ANY),
+            none_words: self.boolean_text(dlg, ID_NONE),
+            boolean: self.start.boolean_syntax,
         })
+    }
+
+    /// An any or none box's text; nothing when the dialog has none.
+    fn boolean_text(&self, dlg: HWND, id: u16) -> String {
+        if self.start.boolean_syntax {
+            window_text(item(dlg, id))
+        } else {
+            String::new()
+        }
     }
 
     fn ok(&self, dlg: HWND) {
@@ -955,6 +1068,74 @@ mod tests {
         assert_eq!(flip_lightness(0x0000_78d7), 0x0028_a0ff);
     }
 
+    /// The shape of a search in the new query language, as its grammar
+    /// documents it (goz-core v0.6.0 cannot parse it): `<` and `>` balanced
+    /// outside quotes, quotes paired, and every `!` right before its term.
+    fn well_formed(q: &str) -> bool {
+        let (mut depth, mut quoted) = (0i32, false);
+        let chars: Vec<char> = q.chars().collect();
+        for (i, &c) in chars.iter().enumerate() {
+            match c {
+                '"' => quoted = !quoted,
+                _ if quoted => {}
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return false;
+                    }
+                }
+                '!' if chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => return false,
+                _ => {}
+            }
+        }
+        depth == 0 && !quoted
+    }
+
+    #[test]
+    fn any_and_none_make_an_or_group_and_not_terms() {
+        let form = Form {
+            words: "report".into(),
+            any_words: "pdf  docx".into(),
+            none_words: "draft old".into(),
+            boolean: true,
+            ..Form::default()
+        };
+        let q = query(&form).expect("a search");
+        assert_eq!(q, "report <pdf|docx> !draft !old");
+        assert!(well_formed(&q));
+        // One word needs no group; words the syntax would read are quoted;
+        // Match path reaches every term.
+        let form = Form {
+            any_words: "a|b".into(),
+            none_words: "<x> y!".into(),
+            match_path: true,
+            boolean: true,
+            ..Form::default()
+        };
+        let q = query(&form).expect("a search");
+        assert_eq!(q, r#"path:"a|b" !path:"<x>" !path:"y!""#);
+        assert!(well_formed(&q));
+        let form = Form {
+            any_words: "a\"b c".into(),
+            phrase: "x <y>".into(),
+            boolean: true,
+            ..Form::default()
+        };
+        let q = query(&form).expect("a search");
+        assert_eq!(q, r#""x <y>" <a|b|c>"#);
+        assert!(well_formed(&q));
+        // Without a gozd that reads them, the boxes are not read at all,
+        // and `<` stays text.
+        let form = Form {
+            words: "<a>".into(),
+            any_words: "pdf docx".into(),
+            none_words: "draft".into(),
+            ..Form::default()
+        };
+        assert_eq!(query(&form).as_deref(), Ok("<a>"));
+    }
+
     #[test]
     fn nothing_filled_is_every_result() {
         assert_eq!(query(&Form::default()).as_deref(), Ok(""));
@@ -973,6 +1154,7 @@ mod tests {
             date_from: Some((2024, 5, 1)),
             date_to: Some((2024, 6, 30)),
             extensions: ".pdf; *.docx,txt".into(),
+            ..Form::default()
         };
         let q = query(&form).expect("a search");
         assert_eq!(

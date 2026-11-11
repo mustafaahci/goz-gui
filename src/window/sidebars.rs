@@ -161,7 +161,7 @@ impl App {
     /// folder's path term in front of it while a folder scopes the search.
     pub(super) fn scoped_search(&self, text: &str) -> String {
         let scope = self.folder_scope();
-        let query = sidebars::scoped(scope.as_deref(), text);
+        let query = sidebars::scoped_with(scope.as_deref(), text, self.subfolders());
         *self.sidebars.applied.borrow_mut() = scope;
         query
     }
@@ -196,6 +196,64 @@ impl App {
     fn move_to_folder(&self, folder: Option<String>) {
         self.choose_folder(folder);
         self.folders_follow();
+    }
+
+    /// Whether the folder scopes the search with its subfolders: always,
+    /// unless gozd reads `parent:` and the Subfolders box is unticked.
+    pub(super) fn subfolders(&self) -> bool {
+        !crate::client::boolean_syntax() || self.prefs.borrow().base.sidebars.subfolders
+    }
+
+    /// A click on the Subfolders box (with a gozd that reads `parent:`):
+    /// ticked or not, kept, and the search runs again when a folder
+    /// scopes it.
+    pub(super) fn toggle_subfolders(&self) {
+        if !crate::client::boolean_syntax() {
+            return;
+        }
+        {
+            let mut prefs = self.prefs.borrow_mut();
+            let on = &mut prefs.base.sidebars.subfolders;
+            *on = !*on;
+        }
+        self.settings_changed();
+        self.folders_pane_syntax();
+        if self.folder_scope().is_some() {
+            self.start_search(false);
+        }
+    }
+
+    /// gozd's syntax was learned anew (`client::Reply::Syntax`): the
+    /// highlight reads the search again, the Subfolders box and Help >
+    /// Search Syntax follow, and a search scoped to a folder's own items
+    /// runs again (its `parent:` comes or goes).
+    pub(super) fn syntax_learned(&self, on: bool) {
+        let changed = crate::client::set_boolean_syntax(on);
+        if std::env::var("GOZ_GUI_SYNTAX_LOG").is_ok_and(|v| !v.trim().is_empty() && v != "0") {
+            crate::store::location::append_data_file(
+                "syntax.log",
+                &format!("boolean_syntax\t{}\r\n", u8::from(on)),
+            );
+        }
+        if !changed {
+            return;
+        }
+        self.rehighlight_now();
+        self.folders_pane_syntax();
+        crate::syntax::refresh();
+        if self.folder_scope().is_some() && !self.prefs.borrow().base.sidebars.subfolders {
+            self.start_search(false);
+        }
+    }
+
+    /// The Folders pane, if open, shows its Subfolders box as gozd's syntax
+    /// and the setting say.
+    fn folders_pane_syntax(&self) {
+        if let Some(content) = self.pane_content(PaneId::Folders)
+            && let Some(pane) = content.as_any().downcast_ref::<FoldersPane>()
+        {
+            pane.syntax_changed(self);
+        }
     }
 
     /// The Folders pane, if open, shows the folder kept.

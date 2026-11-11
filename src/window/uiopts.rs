@@ -123,11 +123,19 @@ impl App {
         m.highlight = self.highlight_for(&text, o.match_case, o.match_path);
     }
 
+    /// [`Self::rehighlight`], and the rows drawn again with it (gozd's
+    /// syntax changed what the search's terms are).
+    pub(super) fn rehighlight_now(&self) {
+        self.rehighlight();
+        // SAFETY: repaints this thread's list.
+        unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
+    }
+
     /// What a search for `text` highlights: nothing while highlighted
     /// search terms are off.
     pub(super) fn highlight_for(&self, text: &str, case: bool, path: bool) -> Highlight {
         if self.ui.get().highlight {
-            Highlight::new(text, case, path)
+            Highlight::with_syntax(text, case, path, crate::client::boolean_syntax())
         } else {
             Highlight::new("", case, path)
         }

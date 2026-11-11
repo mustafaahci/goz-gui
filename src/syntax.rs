@@ -4,6 +4,10 @@
 //! The list of search terms is goz's own help text (goz-core renders it from
 //! the same tables its tests run through the parser), so it describes
 //! exactly what gozd accepts; goz-gui adds what its menus do to a search.
+//! A gozd that reads Everything 1.5's syntax (`client::boolean_syntax`)
+//! gets its operators, modifiers and functions listed too (from the
+//! query-language branch's own help); an older one, a line saying a newer
+//! gozd adds them.
 
 use std::cell::Cell;
 
@@ -46,8 +50,87 @@ const NOT_SUPPORTED: &[(&str, &[&str])] = &[(
     &[
         "OR and NOT are refused; quote them to search",
         "for them as text, as in \"a|b\"",
+        "A newer gozd adds OR, NOT and < > grouping",
     ],
 )];
+/// What a gozd that reads Everything 1.5's syntax adds, from the
+/// query-language branch's help (`escompat/help.rs`).
+const NEW_SYNTAX: &[(&str, &[&str])] = &[
+    ("a b", &["AND: names that contain both, in any order"]),
+    (
+        "a|b",
+        &[
+            "OR: either; it binds tighter than AND, so",
+            "a b|c is a and (b or c); or: is the word",
+        ],
+    ),
+    (
+        "!a",
+        &[
+            "NOT: names without a, where a term starts",
+            "(wow!.txt is a name); not: is the word",
+        ],
+    ),
+    ("<a b>|c", &["A group: a and b, or c; !<a|b> is neither"]),
+    ("\"a|b\"", &["In quotes | ! < > are text"]),
+    (
+        r"src\*.rs",
+        &[
+            "With a \\, * and ? stay inside one folder: the",
+            ".rs files right in a folder named src",
+        ],
+    ),
+    (
+        r"src\**\*.rs",
+        &["** crosses folders: any folder below src"],
+    ),
+    (
+        "case:, nocase:",
+        &["Match case, or not, for one term or <group>"],
+    ),
+    (
+        "path:, nopath:",
+        &["Match the full path, or the name alone"],
+    ),
+    (
+        "ww:, prefix:, suffix:",
+        &["Whole words; at a word's start or end"],
+    ),
+    (
+        "startwith:, endwith:",
+        &["The name starts or ends with the text"],
+    ),
+    ("whole:, exact:", &["The text is the whole name"]),
+    (
+        "file:, folder:",
+        &["Only files, or only folders; files:, folders:"],
+    ),
+    (r"parent:C:\src", &[r"Entries right in C:\src (infolder:)"]),
+    ("len:>40", &["Names longer than 40 characters"]),
+    (
+        "ext:mp?;doc*",
+        &["Files whose extension matches one in the list"],
+    ),
+    (
+        "size:<1kb|2kb>",
+        &["A function's value may be a ; list or a <group>"],
+    ),
+    (
+        "audio:, doc:, exe:",
+        &[
+            "Everything's filters by extension, as are",
+            "image:, video: and zip:",
+        ],
+    ),
+    (
+        "dm:lastweek",
+        &["The last 7 days; also dm:prevweek, dm:<30days"],
+    ),
+    (
+        "?case:",
+        &["A leading ? applies a modifier to every later term"],
+    ),
+];
 const IN_GOZ_GUI: &[(&str, &[&str])] = &[
     ("Search > Match Case", &["Matches case, as case: does"]),
     (
@@ -71,8 +154,13 @@ const IN_GOZ_GUI: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// The window's text, lines ending in `\n`.
+/// The window's text, lines ending in `\n`, as gozd's syntax is now.
 pub fn text() -> String {
+    text_for(crate::client::boolean_syntax())
+}
+
+/// The window's text; `boolean`: gozd reads OR, NOT and groups.
+pub fn text_for(boolean: bool) -> String {
     let full = help(HelpScreen::Full);
     let terms = section(&full, "Search text").unwrap_or(&full);
     let column = text_column(terms);
@@ -84,7 +172,12 @@ pub fn text() -> String {
          \n",
     );
     out.push_str(terms);
-    for (title, rows) in [("Not supported", NOT_SUPPORTED), ("In goz-gui", IN_GOZ_GUI)] {
+    let first = if boolean {
+        ("Operators, modifiers and functions (this gozd)", NEW_SYNTAX)
+    } else {
+        ("Not supported", NOT_SUPPORTED)
+    };
+    for (title, rows) in [first, ("In goz-gui", IN_GOZ_GUI)] {
         out.push('\n');
         out.push_str(title);
         out.push('\n');
@@ -223,6 +316,17 @@ pub fn show(owner: HWND, dark: bool) {
         }
         SetFocus(edit);
     }
+}
+
+/// Shows the text as gozd's syntax is now, if the window is open.
+pub fn refresh() {
+    let hwnd = OPEN.get();
+    if hwnd.is_null() {
+        return;
+    }
+    let body = wz(&text().replace('\n', "\r\n"));
+    // SAFETY: a NUL-terminated text for this thread's text box.
+    unsafe { SetWindowTextW(text_box(hwnd), body.as_ptr()) };
 }
 
 /// Keeps where the window is, if it is open (the settings are about to be
@@ -428,10 +532,35 @@ mod tests {
         ] {
             assert!(terms.contains(term), "{term}");
         }
-        let text = text();
-        assert!(text.contains(terms));
-        // goz's help wraps at 79 columns; goz-gui's own lines do too.
-        assert!(text.lines().all(|l| l.chars().count() <= 79));
+        for boolean in [false, true] {
+            let text = text_for(boolean);
+            assert!(text.contains(terms));
+            // goz's help wraps at 79 columns; goz-gui's own lines do too.
+            assert!(
+                text.lines().all(|l| l.chars().count() <= 79),
+                "{boolean}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_newer_gozd_gets_its_syntax_listed() {
+        let old = text_for(false);
+        assert!(old.contains("A newer gozd adds OR, NOT and < > grouping"));
+        assert!(!old.contains("ww:"));
+        let new = text_for(true);
+        assert!(!new.contains("Not supported"));
+        for usage in [
+            "a|b",
+            "!a",
+            "<a b>|c",
+            r"src\**\*.rs",
+            "ww:",
+            "parent:",
+            "len:",
+        ] {
+            assert!(new.contains(usage), "{usage}");
+        }
     }
 
     #[test]
