@@ -65,8 +65,14 @@ impl App {
 
     /// Whether a live update may run now.
     fn live_idle(&self) -> bool {
-        // An open file list does not change: nothing to update (wave 4).
-        if self.filelist().is_some() {
+        // An open file list does not change: nothing to update (wave 4; W8:
+        // nor one an `open-filelist:` term opened). W8: nor a search run in
+        // parts (`new-search:`), as Everything's "New results are not added
+        // when using ... new-search:" (F5 runs it again).
+        if self.searches_a_list()
+            || crate::filelist::slots::parts(&self.model.borrow().search.query)
+                .is_ok_and(|p| p.len() > 1)
+        {
             return false;
         }
         {

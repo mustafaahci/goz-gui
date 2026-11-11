@@ -118,16 +118,41 @@ impl Search {
     /// `crate::filelist::slots::for_gozd`). W7: `child-`, `descendant-`,
     /// `sibling-` and `size-filelistN:` look the slot's items up in gozd's
     /// index first, on `pipe` (a request of their own, before the search's).
-    /// The second of the pair says whether one was looked up.
+    /// The second of the pair says whether one was looked up. W8: the
+    /// parts before a `new-search:` run first, on `pipe` too, each saving
+    /// its results to the slots the next ones read (the third: what they
+    /// saved); the second says so too, as it does for a search that reads a
+    /// list on the disk (`include-file-list:`): what gozd is asked is then
+    /// worked out once for all the search's blocks.
     fn gozd_query(
         &self,
         pipe: &mut Pipe,
         shared: &Shared,
         epoch: Option<u64>,
         boolean: bool,
-    ) -> Result<(String, bool), NotAsked> {
+    ) -> Result<(String, bool, Option<crate::filelist::slots::PartSaves>), NotAsked> {
         use crate::filelist::slots::{self, NotAsked as Why};
-        let mut looked = false;
+        let refused = |why| NotAsked::Failed(Failure::Refused(why));
+        // W8: a gozd that reads no OR is asked no part, rather than some.
+        if !boolean && let Some(why) = slots::needs_boolean(&self.query) {
+            return Err(refused(why));
+        }
+        let mut looked = slots::is_costly(&self.query);
+        let resolved = {
+            let mut run = |part: &str, now: &Arc<crate::filelist::slots::Slots>| {
+                let query =
+                    slots::for_gozd(part, now, boolean, self.match_case, &mut |q, case| {
+                        look_up(pipe, shared, epoch, q, case)
+                    })?;
+                all_paths(pipe, shared, epoch, &query, self.match_case).map_err(Why::Lookup)
+            };
+            slots::resolve(&self.query, &self.slots, &mut run)
+        };
+        let resolved = match resolved {
+            Ok(r) => r,
+            Err(Why::Refused(why)) => return Err(refused(why)),
+            Err(Why::Lookup(e)) => return Err(e),
+        };
         let answer = {
             // W7: the look-up matches case as the search does (Match Case,
             // or a `case:` in it), as an open file list's answer does.
@@ -136,8 +161,8 @@ impl Search {
                 look_up(pipe, shared, epoch, query, match_case)
             };
             slots::for_gozd(
-                &self.query,
-                &self.slots,
+                resolved.last,
+                &resolved.slots,
                 boolean,
                 self.match_case,
                 &mut lookup,
@@ -145,8 +170,8 @@ impl Search {
             .map(std::borrow::Cow::into_owned)
         };
         match answer {
-            Ok(q) => Ok((q, looked)),
-            Err(Why::Refused(why)) => Err(NotAsked::Failed(Failure::Refused(why))),
+            Ok(q) => Ok((q, looked, resolved.saves)),
+            Err(Why::Refused(why)) => Err(refused(why)),
             Err(Why::Lookup(e)) => Err(e),
         }
     }
@@ -260,6 +285,12 @@ pub enum Reply {
     /// gozd was restarted as another build): whether it reads OR, NOT and
     /// groups.
     Syntax(bool),
+    /// W8: the parts of search `epoch` before its `new-search:` saved their
+    /// results to these slots (posted before its block 0).
+    Saved {
+        epoch: u64,
+        saves: crate::filelist::slots::PartSaves,
+    },
 }
 
 struct Event(HANDLE);
@@ -501,7 +532,7 @@ pub fn stream_range(
     // W6: what the window's probe learned of gozd's syntax (this
     // connection is not probed).
     let query = match search.gozd_query(pipe, shared, None, boolean_syntax()) {
-        Ok((q, _)) => q,
+        Ok((q, _, _)) => q,
         Err(NotAsked::Failed(f)) => return Streamed::Failed(f),
         Err(NotAsked::Io(Io::Cancelled)) => return Streamed::Stopped,
         Err(NotAsked::Io(Io::Lost(_))) if stop.stopped() => return Streamed::Stopped,
@@ -560,7 +591,7 @@ fn run(shared: &Shared) {
     let mut conn: Option<Pipe> = None;
     // W7: the last search whose file-list terms looked something up in the
     // index, and gozd's words for it: its other blocks ask no more.
-    let mut looked: Option<(u64, String)> = None;
+    let mut looked: Option<Asked> = None;
     loop {
         let job = loop {
             {
@@ -664,6 +695,76 @@ fn look_up(
     }
 }
 
+/// W7: what a search's blocks ask gozd, once it was worked out with a
+/// look-up in the index (W8: or parts run before its `new-search:`, or a
+/// list read from the disk), and what those parts saved to slots.
+struct Asked {
+    epoch: u64,
+    query: String,
+    saves: Option<crate::filelist::slots::PartSaves>,
+}
+
+/// W8: with search `epoch`'s block 0, the window hears what the parts
+/// before its `new-search:` saved (once a search, as block 0 is asked once).
+fn post_saves(
+    shared: &Shared,
+    epoch: u64,
+    block: u32,
+    saves: Option<crate::filelist::slots::PartSaves>,
+) {
+    if block == 0
+        && let Some(saves) = saves
+    {
+        shared.post(Reply::Saved { epoch, saves });
+    }
+}
+
+/// W8: the full paths of `query`'s results (a part of a search before its
+/// `new-search:`, in gozd's words) on `pipe`: at most `slots::SAVE_MAX` +
+/// 1, which says there are more than a slot is given.
+fn all_paths(
+    pipe: &mut Pipe,
+    shared: &Shared,
+    epoch: Option<u64>,
+    query: &str,
+    match_case: bool,
+) -> Result<Vec<String>, NotAsked> {
+    use crate::filelist::slots::SAVE_MAX;
+    let request = Request::Query(QueryRequest {
+        query: query.to_owned(),
+        scope: None,
+        sort: SortSpec::default(),
+        offset: 0,
+        limit: Some(SAVE_MAX as u32 + 1),
+        want_size: false,
+        want_mtime: false,
+        match_case,
+        want_total_size: false,
+    });
+    pipe.give_up_at.set(None);
+    pipe.send(&request).map_err(NotAsked::Io)?;
+    let mut out = Vec::new();
+    loop {
+        match pipe.response(shared, epoch).map_err(NotAsked::Io)? {
+            Response::Results(page) => {
+                out.extend(page.items.into_iter().map(|item| match item.path_u16 {
+                    Some(units) => String::from_utf16_lossy(&units),
+                    None => item.path,
+                }));
+                if !page.more {
+                    return Ok(out);
+                }
+            }
+            Response::Error { message, .. } => {
+                return Err(NotAsked::Failed(Failure::Refused(message)));
+            }
+            _ => {
+                return Err(NotAsked::Io(Io::Lost("unexpected reply from gozd".into())));
+            }
+        }
+    }
+}
+
 /// Runs one block of a search. `None` means the search went stale and its
 /// answer is not wanted.
 fn fetch_block(
@@ -672,7 +773,7 @@ fn fetch_block(
     epoch: u64,
     block: u32,
     search: &Search,
-    looked: &mut Option<(u64, String)>,
+    looked: &mut Option<Asked>,
 ) -> Option<Reply> {
     if let Some(list) = &search.filelist {
         return list_block(shared, epoch, block, search, list);
@@ -717,15 +818,23 @@ fn fetch_block(
         };
         let kept = looked
             .as_ref()
-            .filter(|(e, _)| *e == epoch)
-            .map(|(_, q)| q.clone());
+            .filter(|l| l.epoch == epoch)
+            .map(|l| (l.query.clone(), l.saves.clone()));
         let request = match kept {
-            Some(q) => request(q),
+            Some((q, saves)) => {
+                post_saves(shared, epoch, block, saves);
+                request(q)
+            }
             None => match search.gozd_query(pipe, shared, Some(epoch), boolean) {
-                Ok((q, did_look)) => {
+                Ok((q, did_look, saves)) => {
                     if did_look {
-                        *looked = Some((epoch, q.clone()));
+                        *looked = Some(Asked {
+                            epoch,
+                            query: q.clone(),
+                            saves: saves.clone(),
+                        });
                     }
+                    post_saves(shared, epoch, block, saves);
                     request(q)
                 }
                 Err(NotAsked::Failed(f)) => return failed(f),
@@ -822,6 +931,7 @@ fn list_block(
             failure: Failure::Refused(why),
         }),
         Ok(Some(m)) => {
+            post_saves(shared, epoch, block, m.saves.clone());
             let from = block as usize * BLOCK_ROWS as usize;
             let rows = list.rows_of(&m, from..from + BLOCK_ROWS as usize);
             Some(Reply::Block {

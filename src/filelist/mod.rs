@@ -46,7 +46,7 @@ use goz_winfs::TimeZone;
 
 use crate::client::Row;
 use matcher::{Candidate, Matcher, name_of};
-use slots::{RowTests, Slots};
+use slots::{NotAsked, RowTests, Slots};
 
 /// Rows in a chunk: the row's number in the list is its chunk's number
 /// times this, plus its place in the chunk.
@@ -170,6 +170,10 @@ pub struct Matched {
     pub order: Vec<u32>,
     /// The summed size of the matching files.
     pub total_size: u64,
+    /// W8: the files its `include-file-list:` terms read, as they were.
+    stamps: Vec<Option<(u64, std::time::SystemTime)>>,
+    /// W8: what the parts before its `new-search:` saved to slots.
+    pub saves: Option<slots::PartSaves>,
 }
 
 /// An open file list.
@@ -372,6 +376,8 @@ impl FileList {
         let complete = self.loaded();
         let chunks = lock(&self.chunks).clone();
         let rows: usize = chunks.iter().map(|c| c.len()).sum();
+        // W8: a kept answer is good while the lists it read are the same.
+        let stamps = slots::include_stamps(query);
         if let Some(last) = lock(&self.last).as_ref()
             && last.query == query
             && last.sort == sort
@@ -379,19 +385,79 @@ impl FileList {
             && last.rows == rows
             && last.complete == complete
             && (Arc::ptr_eq(&last.slots, slots) || last.slots == *slots)
+            && last.stamps == stamps
         {
             return Ok(Some(Arc::clone(last)));
         }
+        // W8: the parts before a `new-search:` first, each saving its
+        // results to the slots the next ones read (a stale search ends
+        // there: `Lookup(())`).
+        let mut run = |part: &str, now: &Arc<Slots>| -> Result<Vec<String>, NotAsked<()>> {
+            let Some((order, _)) = self.scan(&chunks, part, match_case, now, stale)? else {
+                return Err(NotAsked::Lookup(()));
+            };
+            Ok(order
+                .iter()
+                .take(slots::SAVE_MAX + 1)
+                .filter_map(|&g| {
+                    let (c, i) = split(g);
+                    let chunk = chunks.get(c)?;
+                    Some(String::from_utf8_lossy(chunk.path(i)).into_owned())
+                })
+                .collect())
+        };
+        let resolved = match slots::resolve(query, slots, &mut run) {
+            Ok(r) => r,
+            Err(NotAsked::Refused(why)) => return Err(why),
+            Err(NotAsked::Lookup(())) => return Ok(None),
+        };
+        let Some((mut order, total_size)) =
+            self.scan(&chunks, resolved.last, match_case, &resolved.slots, stale)?
+        else {
+            return Ok(None);
+        };
+        if stale() {
+            return Ok(None);
+        }
+        sort_rows(&chunks, self.ranks_for(rows), &mut order, sort);
+        let matched = Arc::new(Matched {
+            query: query.to_owned(),
+            sort,
+            match_case,
+            slots: Arc::clone(slots),
+            rows,
+            complete,
+            order,
+            total_size,
+            stamps,
+            saves: resolved.saves,
+        });
+        *lock(&self.last) = Some(Arc::clone(&matched));
+        Ok(Some(matched))
+    }
+
+    /// The rows of `chunks` that match `query` (one search, no
+    /// `new-search:` in it), in the list's order, with their files' summed
+    /// size; `Ok(None)` when `stale` said it is not wanted any more.
+    fn scan(
+        &self,
+        chunks: &[Arc<Chunk>],
+        query: &str,
+        match_case: bool,
+        slots: &Slots,
+        stale: &dyn Fn() -> bool,
+    ) -> Result<Option<(Vec<u32>, u64)>, String> {
         // W6: the file-list terms are goz-gui's; the rest is goz's.
         let (rest, planned) = slots::split_for_list(query, slots)?;
         let parsed =
             parse_query_at(&rest, match_case, &MachineClock::read()).map_err(|e| e.to_string())?;
-        let mut lists = RowTests::new(&planned, parsed.match_case)?;
+        let list = self.path.to_string_lossy();
+        let mut lists = RowTests::new(&planned, parsed.match_case, &list)?;
         let mut tested = 0usize;
         // W7: `child-`, `descendant-`, `sibling-` and `size-filelistN:` look
         // at every row first, for the list's items the slot names.
         if lists.needs_rows() {
-            for chunk in &chunks {
+            for chunk in chunks {
                 for i in 0..chunk.len() {
                     tested += 1;
                     if tested.is_multiple_of(STALE_EVERY) && stale() {
@@ -421,22 +487,7 @@ impl FileList {
                 }
             }
         }
-        if stale() {
-            return Ok(None);
-        }
-        sort_rows(&chunks, self.ranks_for(rows), &mut order, sort);
-        let matched = Arc::new(Matched {
-            query: query.to_owned(),
-            sort,
-            match_case,
-            slots: Arc::clone(slots),
-            rows,
-            complete,
-            order,
-            total_size,
-        });
-        *lock(&self.last) = Some(Arc::clone(&matched));
-        Ok(Some(matched))
+        Ok(Some((order, total_size)))
     }
 
     /// The ranks, when they rank the `rows` rows read (they are made once
@@ -805,6 +856,75 @@ mod tests {
         assert!(found("filelist2:x", &s).is_err());
         // `|` outside quotes is goz's, which v0.6.0 refuses.
         assert!(found("filelist:a|b", &none).is_err());
+    }
+
+    /// W8: a search in parts over a list is one answer: its earlier parts'
+    /// saves are in the slots its last part reads, and said with it; a list
+    /// on the disk it reads is read again once changed.
+    #[test]
+    fn new_search_and_include_over_a_list() {
+        let list = FileList::from_rows(&ROWS);
+        let spec = Order::Gozd(SortSpec::default());
+        let none = no_slots();
+        let answer = |q: &str| list.answer(q, spec, false, &none, &|| false);
+        let paths = |m: &Matched| -> Vec<String> {
+            list.rows_of(m, 0..m.order.len())
+                .iter()
+                .map(|r| String::from_utf16_lossy(&r.path))
+                .collect()
+        };
+        // Everything's example: the folders holding a file of the first
+        // part's.
+        let q = "*.txt save-filelist1: new-search: childfilelist1:";
+        let m = answer(q).unwrap().unwrap();
+        // (C:\a is the only one of their folders the list holds.)
+        assert_eq!(paths(&m), [r"C:\a"]);
+        let saves = m.saves.clone().expect("the first part saved");
+        assert_eq!(saves.saved, [(1, 5)]);
+        assert_eq!(saves.slots.get(1).len(), 5);
+        // The same search again: the kept answer.
+        assert!(Arc::ptr_eq(&m, &answer(q).unwrap().unwrap()));
+        // The parts chained: the files beside the first part's.
+        let m = answer("alpha save-filelist2: new-search: sibling-filelist2:")
+            .unwrap()
+            .unwrap();
+        assert_eq!(paths(&m), [r"C:\a\beta.txt"]);
+        // A search of one part saves nothing before it.
+        assert!(answer("alpha").unwrap().unwrap().saves.is_none());
+        assert!(
+            answer("x new-search:y")
+                .err()
+                .unwrap()
+                .contains("takes no value")
+        );
+        // include-file-list: over the list, read again when it changes.
+        let dir = crate::store::file::tests::scratch("w8-list-include");
+        let file = dir.join("names.txt");
+        std::fs::write(&file, "beta.txt\r\n").unwrap();
+        let q = format!("include-file-list:\"{}\"", file.display());
+        assert_eq!(paths(&answer(&q).unwrap().unwrap()), [r"C:\a\beta.txt"]);
+        std::fs::write(&file, "zeta.txt\r\nC:\\a\r\n").unwrap();
+        assert_eq!(
+            paths(&answer(&q).unwrap().unwrap()),
+            [r"C:\a", r"C:\b\zeta.txt"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // filelist-filename: the list's own name.
+        assert_eq!(
+            answer("filelist-filename:test.efu")
+                .unwrap()
+                .unwrap()
+                .order
+                .len(),
+            7
+        );
+        assert!(
+            answer("filelist-filename:x.efu")
+                .unwrap()
+                .unwrap()
+                .order
+                .is_empty()
+        );
     }
 
     fn ordered(list: &FileList, query: &str, order: Order) -> Vec<String> {

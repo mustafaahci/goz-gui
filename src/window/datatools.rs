@@ -137,6 +137,10 @@ pub(super) struct DataTools {
     /// W7: the search shown was made, and its save-filelistN: terms save
     /// its results once they are all there.
     pub(super) save_due: Cell<bool>,
+    /// W8: the list an `open-filelist:` term of the search opened, for the
+    /// searches while the term is there (Everything's "Temporarily open the
+    /// specified filelist"); the tab's own list stays as it is.
+    temp: RefCell<Option<Arc<FileList>>>,
 }
 
 /// Whose a list whose reading ended is (its WM_FILELIST).
@@ -146,6 +150,8 @@ enum Reader {
     Shown,
     /// Another tab's, held: kept to say when that tab shows.
     Held,
+    /// W8: the one an `open-filelist:` term opened.
+    Temp,
     /// No tab's any more.
     Gone,
 }
@@ -156,6 +162,8 @@ impl DataTools {
     fn read_ended(&self, id: u64) -> Reader {
         if self.list.borrow().as_ref().is_some_and(|l| l.id() == id) {
             Reader::Shown
+        } else if self.temp.borrow().as_ref().is_some_and(|l| l.id() == id) {
+            Reader::Temp
         } else if self.held.borrow().iter().any(|l| l.id() == id) {
             self.unsaid.borrow_mut().push(id);
             Reader::Held
@@ -201,6 +209,7 @@ impl DataTools {
             editor_alone: Cell::new(false),
             saving: RefCell::new(None),
             save_due: Cell::new(false),
+            temp: RefCell::new(None),
         }
     }
 }
@@ -228,7 +237,7 @@ pub(super) fn efu_drop(paths: &[Vec<u16>], is_dir: impl Fn(&[u16]) -> bool) -> O
 }
 
 /// Open File List...'s file types: Everything's.
-const LIST_KINDS: &[crate::filedlg::Kind] = &[
+pub(super) const LIST_KINDS: &[crate::filedlg::Kind] = &[
     ("Everything File List (*.efu)", "*.efu"),
     ("Text Files (*.txt)", "*.txt"),
     ("CSV Files (*.csv)", "*.csv"),
@@ -244,6 +253,64 @@ impl App {
     /// What the status bar shows for the open file list: its name.
     pub fn filelist_indicator(&self) -> Option<String> {
         self.filelist().map(|l| l.name().to_owned())
+    }
+
+    /// W8: the name of the list an `open-filelist:` term opened for the
+    /// search, which the status bar shows in the tab's list's place (no
+    /// double-click closes it: the term does, taken out of the search).
+    pub fn temp_list_indicator(&self) -> Option<String> {
+        self.data_tools
+            .temp
+            .borrow()
+            .as_ref()
+            .map(|l| l.name().to_owned())
+    }
+
+    /// W8: the name of the list the search runs over (the title's).
+    pub(super) fn searched_list_name(&self) -> Option<String> {
+        self.temp_list_indicator()
+            .or_else(|| self.filelist().map(|l| l.name().to_owned()))
+    }
+
+    /// W8: whether the search runs over a file list: the tab's, or one an
+    /// `open-filelist:` term opened.
+    pub(super) fn searches_a_list(&self) -> bool {
+        self.filelist().is_some() || self.data_tools.temp.borrow().is_some()
+    }
+
+    /// W8: the list the search with `text` runs over: the one its
+    /// `open-filelist:` term names (opened once, then kept while a search
+    /// names it, read in the background as File > Open File List... reads
+    /// one), else the tab's; an error, which the search shows as its
+    /// refusal, when the term's list cannot be opened. A search without the
+    /// term lets a list it opened go.
+    pub(super) fn search_file_list(&self, text: &str) -> Result<Option<Arc<FileList>>, String> {
+        let Some(wanted) = crate::filelist::slots::open_list(text) else {
+            let old = self.data_tools.temp.borrow_mut().take();
+            if let Some(old) = old {
+                old.close();
+                self.invalidate_status();
+            }
+            return Ok(self.filelist());
+        };
+        let path = wanted?;
+        let kept = self.data_tools.temp.borrow().clone();
+        if let Some(list) = kept.filter(|l| is_list(l, &path)) {
+            return Ok(Some(list));
+        }
+        let notify = Notify {
+            hwnd: self.hwnd as usize,
+            msg: WM_FILELIST,
+        };
+        let opened = FileList::open(Path::new(&path), Some(notify));
+        let old = self.data_tools.temp.replace(opened.as_ref().ok().cloned());
+        if let Some(old) = old {
+            old.close();
+        }
+        self.invalidate_status();
+        opened
+            .map(Some)
+            .map_err(|e| format!("open-filelist: cannot open the file list {path}: {e}"))
     }
 
     /// The window starts: Tools and Help get their items, in Everything's
@@ -278,6 +345,9 @@ impl App {
     /// The window is ending: a list still being read stops.
     pub(super) fn data_tools_exit(&self) {
         if let Some(list) = self.data_tools.list.borrow_mut().take() {
+            list.close();
+        }
+        if let Some(list) = self.data_tools.temp.borrow_mut().take() {
             list.close();
         }
         for list in self.data_tools.held.take() {
@@ -612,8 +682,10 @@ impl App {
         if msg == WM_FILELIST {
             // Only the shown list's end shows now (W5R-5); a held list's is
             // said when its tab shows.
-            if self.data_tools.read_ended(l as u64) == Reader::Shown {
-                self.file_list_read();
+            match self.data_tools.read_ended(l as u64) {
+                Reader::Shown => self.file_list_read(),
+                Reader::Temp => self.temp_list_read(),
+                Reader::Held | Reader::Gone => {}
             }
         } else if msg == WM_OTHERS_ENDED {
             let replace = self.data_tools.replacing.take();
@@ -693,6 +765,17 @@ impl App {
         }
         self.say_how_read(&list);
         self.refresh_created_column();
+        self.start_search(true);
+        self.invalidate_status();
+    }
+
+    /// W8: the list an `open-filelist:` term opened was read (or stopped
+    /// short): the search shows all of it now.
+    fn temp_list_read(&self) {
+        let Some(list) = self.data_tools.temp.borrow().clone() else {
+            return;
+        };
+        self.say_how_read(&list);
         self.start_search(true);
         self.invalidate_status();
     }
