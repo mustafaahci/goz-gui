@@ -24,7 +24,7 @@ goz-gui is a native Windows front end for **goz**, the open-source instant file 
 ## Highlights
 
 - **Instant.** gozd answers from its in-memory index while you type. Results go into a virtual list that fetches rows 1,024 at a time, so a million matches scroll as smoothly, and cost as little memory, as ten.
-- **Native and small.** Plain Win32 and the common controls in Rust: no UI framework, no web view, no runtime to install. One exe of about 5 MB that idles at about 5 MB of private memory.
+- **Native and small.** Plain Win32 and the common controls in Rust: no UI framework, no web view, no runtime to install. One exe of about 5 MB that idles at about 6 MB of private memory.
 - **Everything 1.5's search syntax.** Wildcards, path terms, `ext:`, `size:`, `dm:` and, with gozd v0.7.0, OR (`a|b`), NOT (`!draft`), groups, modifiers and macros. `content:` searches inside files, read by goz-gui under your own account.
 - **Everything's window.** Tabs and windows, Folders, Filters and Bookmarks sidebars, a Preview pane (pictures, text and Windows' preview handlers), thumbnail views, Explorer's context menu, Advanced Rename with undo, and Everything file lists (`.efu`) with an editor.
 - **Live.** New, changed and deleted files appear without searching again, and the scroll position and selection stay. gozd v0.7.0 says when something changed; with an older gozd the results refresh every 2 seconds.

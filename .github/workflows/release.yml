@@ -70,8 +70,9 @@ jobs:
           & "$tools\wix.exe" --version
           Add-Content -Path $env:GITHUB_PATH -Value $tools
 
-      # goz-gui-vX.Y.Z-windows-x86_64.zip (the exe with its license and
-      # readme) and goz-gui-vX.Y.Z-x64.msi (validated with the ICE suite),
+      # goz-gui-vX.Y.Z-windows-x86_64.zip (the exe with its license, readme
+      # and docs/, so the readme's links work offline) and
+      # goz-gui-vX.Y.Z-x64.msi (validated with the ICE suite),
       # then SHA256SUMS.txt in `sha256sum -c` format.
       - name: Package
         run: |
@@ -80,7 +81,8 @@ jobs:
           Compress-Archive -Force -DestinationPath "dist/goz-gui-$env:TAG-windows-x86_64.zip" -Path `
             target/release/goz-gui.exe, `
             LICENSE, `
-            README.md
+            README.md, `
+            docs
           ./installer/build-msi.ps1 -Exe target/release/goz-gui.exe -OutDir dist `
             -Version ($env:TAG -replace '^v', '') -Validate | Out-Null
           $sums = Get-ChildItem dist -File -Filter 'goz-gui-*' | Sort-Object Name | ForEach-Object {
