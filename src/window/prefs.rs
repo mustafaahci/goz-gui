@@ -129,7 +129,17 @@ impl Prefs {
             }
         };
         let base = Settings::from_ini(&ini);
-        let written = base.to_pairs().into_iter().collect();
+        // What the file holds, as written: a value read differently (a
+        // width of 0 read as the default, a number out of range) differs
+        // from the window's, so the next write puts the corrected one back.
+        let written = base
+            .to_pairs()
+            .into_iter()
+            .map(|(k, v)| {
+                let raw = ini.get(&k).map(str::to_owned).unwrap_or(v);
+                (k, raw)
+            })
+            .collect();
         Prefs {
             base,
             written,
@@ -143,6 +153,22 @@ impl Prefs {
 }
 
 impl App {
+    /// Column widths the settings file holds that could not be used (0, from
+    /// an older build or a hand edit) were read as their defaults: write the
+    /// defaults back, so the file says what the window shows.
+    pub(super) fn heal_column_widths(&self) {
+        let layout = self.layout.get();
+        let stale = {
+            let prefs = self.prefs.borrow();
+            layout.to_keys().iter().any(|(k, v)| {
+                k.ends_with("_column_width") && prefs.written.get(k).is_some_and(|old| old != v)
+            })
+        };
+        if stale {
+            self.settings_changed();
+        }
+    }
+
     /// A setting changed: the file is written once they stop changing.
     pub(super) fn settings_changed(&self) {
         // SAFETY: a timer of this window; setting it again restarts it.

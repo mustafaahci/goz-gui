@@ -39,6 +39,20 @@ const DEFAULT_SHOWN: [bool; COLS] = [true, true, true, false, false, true];
 
 /// The widest a column is kept; wider values in the file are taken as this.
 const MAX_WIDTH: i32 = 8192;
+/// The narrowest a column is kept, at 96 DPI. A saved width below it (0
+/// from a damaged or hand-edited file, or one recorded while the list could
+/// not say) is not a choice anyone made: the column takes its default.
+pub const MIN_WIDTH: i32 = 16;
+
+/// A width read from a file or session for column `id`: as saved, or the
+/// default when it is too narrow to be a real one.
+fn read_width(id: usize, width: i64) -> i32 {
+    if width < i64::from(MIN_WIDTH) {
+        DEFAULT_WIDTHS[id]
+    } else {
+        width.min(i64::from(MAX_WIDTH)) as i32
+    }
+}
 
 /// The shown columns, left to right, and every column's width.
 #[derive(Clone, Copy, Debug, Eq)]
@@ -87,7 +101,7 @@ impl Layout {
         let mut shown: Vec<(i32, usize)> = Vec::new();
         for (id, key) in KEYS.into_iter().enumerate() {
             if let Some(w) = number(get(&format!("{key}_column_width"))) {
-                layout.widths[id] = w.clamp(0, MAX_WIDTH);
+                layout.widths[id] = read_width(id, w.into());
             }
             if visible[id] {
                 // Without one, its place among the shown columns in the
@@ -150,7 +164,7 @@ impl Layout {
 
     pub fn set_width(&mut self, id: usize, width: i32) {
         if id < COLS {
-            self.widths[id] = width.clamp(0, MAX_WIDTH);
+            self.widths[id] = width.clamp(MIN_WIDTH, MAX_WIDTH);
         }
     }
 
@@ -198,7 +212,7 @@ impl Layout {
             if id >= COLS || layout.shown().contains(&id) {
                 continue;
             }
-            layout.widths[id] = width.clamp(0, MAX_WIDTH);
+            layout.widths[id] = read_width(id, width.into());
             layout.order[layout.shown] = id;
             layout.shown += 1;
         }
@@ -451,5 +465,27 @@ mod tests {
             }
         }
         assert_eq!(unscale(230, 144), 153);
+    }
+
+    /// A file (or session) whose widths were saved as 0 shows its columns at
+    /// their defaults, not zero pixels wide.
+    #[test]
+    fn zero_widths_read_as_defaults() {
+        let l = read(&[
+            ("name_column_width", "0"),
+            ("path_column_width", "3"),
+            ("size_column_width", "120"),
+            ("last_write_time_column_width", "-5"),
+        ]);
+        assert_eq!(l.width(COL_NAME), DEFAULT_WIDTHS[COL_NAME]);
+        assert_eq!(l.width(COL_PATH), DEFAULT_WIDTHS[COL_PATH]);
+        assert_eq!(l.width(COL_SIZE), 120);
+        assert_eq!(l.width(COL_DATE), DEFAULT_WIDTHS[COL_DATE]);
+        let tab = Layout::from_shown(Layout::default(), &[(COL_NAME, 0), (COL_PATH, 300)]);
+        assert_eq!(tab.width(COL_NAME), DEFAULT_WIDTHS[COL_NAME]);
+        assert_eq!(tab.width(COL_PATH), 300);
+        let mut l = Layout::default();
+        l.set_width(COL_SIZE, 0);
+        assert_eq!(l.width(COL_SIZE), MIN_WIDTH);
     }
 }

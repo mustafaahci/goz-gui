@@ -1146,6 +1146,7 @@ impl App {
         self.apply_list_style();
         crate::format::set_size_format(self.ui.get().size_format);
         self.apply_columns(self.layout.get());
+        self.heal_column_widths();
         // The dialogs open where they were; one that moved asks for the
         // settings to be written.
         let places = self.prefs.borrow().base.places.clone();

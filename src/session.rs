@@ -839,7 +839,8 @@ mod tests {
         );
         assert_eq!(
             (l.width(columns::COL_PATH), l.width(columns::COL_NAME)),
-            (120, 0)
+            // A width too narrow to be real (here -4) is the column's default.
+            (120, columns::DEFAULT_WIDTHS[columns::COL_NAME])
         );
         assert_eq!(
             l.width(columns::COL_SIZE),

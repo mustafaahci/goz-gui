@@ -157,8 +157,10 @@ impl App {
         for (index, &id) in cols.ids().iter().enumerate() {
             let px = send(self.list, LVM_GETCOLUMNWIDTH, index, 0) as i32;
             // A width goz-gui set reads back as it was; only the user's
-            // own changes it, so it never drifts through rounding.
-            if px != self.column_px(id) {
+            // own changes it, so it never drifts through rounding. A list
+            // that cannot say (0: not in report view, or between rebuilding
+            // its columns) changes nothing.
+            if px > 0 && px != self.column_px(id) {
                 layout.set_width(id, columns::unscale(px, self.dpi.get()));
             }
         }
