@@ -103,8 +103,10 @@ unsafe extern "system" fn subclass_proc(
     // removed or replaced; the handler is cloned, so it lives through a
     // call that removes the subclass or destroys the window.
     let handler = Rc::clone(unsafe { &*(data as *const Handler) });
+    let drop_hold = super::dropfiles::Delivery::enter(msg, w);
     // SAFETY: the parameters the system delivered, for this call.
     let answer = handler(&unsafe { Msg::delivered(hwnd, msg, w, l, Via::Subclass) });
+    drop(drop_hold);
     if msg == WM_NCDESTROY {
         remove_id(hwnd, id);
     }

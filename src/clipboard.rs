@@ -6,13 +6,9 @@
 //! OpenClipboard/CloseClipboard so a paste never sees half of them. A paste
 //! reads them back the same way ([`files`]), whoever put them there.
 
-// `dropped_files` is still called by files not yet on `crate::win`; it
-// goes, and this with it, once they are.
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_MOVE};
-use windows_sys::Win32::UI::Shell::{DROPFILES, HDROP};
+use windows_sys::Win32::UI::Shell::DROPFILES;
 
 use crate::win::ext::b8::{self, Clipboard};
 
@@ -167,15 +163,6 @@ pub fn text(hwnd: HWND) -> Option<String> {
         .map(|&c| u16::from_ne_bytes(c))
         .collect();
     Some(String::from_utf16_lossy(crate::win::until_nul(&units)))
-}
-
-/// The paths of a CF_HDROP block (a drop's, or the clipboard's).
-///
-/// # Safety
-/// `drop` must be a valid HDROP for as long as the call runs.
-pub unsafe fn dropped_files(drop: HDROP) -> Vec<Vec<u16>> {
-    // SAFETY: as the caller promises.
-    unsafe { b8::hdrop_paths(drop) }
 }
 
 /// A paste moved the files read with sequence number `sequence`: the

@@ -42,6 +42,7 @@ pub mod class;
 pub mod com;
 pub mod combo;
 pub mod dlg;
+pub mod dropfiles;
 pub mod edit;
 pub mod gdi;
 pub mod header;

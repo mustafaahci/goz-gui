@@ -15,16 +15,10 @@
 //! the renamed row (and those of what a renamed folder holds) shows the new
 //! path in place until that search confirms it.
 
-// Only `end_rename` and `drop_files` (a raw pointer and a raw HDROP, as
-// the window passes them still) read what they are given themselves;
-// `end_rename_text` and `drop_paths` replace them.
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows_sys::Win32::UI::Controls::{LVIR_BOUNDS, LVIS_FOCUSED, LVIS_SELECTED, LVNI_FOCUSED};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
-use windows_sys::Win32::UI::Shell::{DragFinish, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_ICONWARNING, MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     WM_WINDOWPOSCHANGING,
@@ -605,26 +599,12 @@ impl App {
         false
     }
 
-    /// LVN_ENDLABELEDIT: `text` is the name typed (null: Esc). A name
+    /// LVN_ENDLABELEDIT: `text` is the name typed (`None`: Esc). A name
     /// Windows would refuse, or one taken in that folder, is said why and
     /// the box opens again with it; a good one is renamed on the file
     /// operations thread. The list's own text is never set (the row
     /// changes once the rename is done).
-    pub(super) fn end_rename(&self, text: *const u16) {
-        let new = (!text.is_null()).then(|| {
-            // SAFETY: the list's NUL-terminated text, read before this
-            // returns.
-            unsafe {
-                let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-                core::slice::from_raw_parts(text, len).to_vec()
-            }
-        });
-        self.end_rename_text(new);
-    }
-
-    /// [`App::end_rename`] of the text the notification brought (`None`:
-    /// Esc), as `View<NMLVDISPINFOW>::text` gives it.
-    pub(super) fn end_rename_text(&self, text: Option<Vec<u16>>) {
+    pub(super) fn end_rename(&self, text: Option<Vec<u16>>) {
         let Some(mut r) = self.renaming.borrow_mut().take() else {
             return;
         };
@@ -752,19 +732,7 @@ impl App {
     /// a gozd that reads OR; an older one searches one path at a time, so
     /// of several items the first is taken and the status bar says so. A
     /// drop of goz-gui's own rows on itself does nothing.
-    pub(super) fn drop_files(&self, drop: HDROP) {
-        // SAFETY: the HDROP WM_DROPFILES brought, read whole, then freed.
-        let paths = unsafe {
-            let paths = clipboard::dropped_files(drop);
-            DragFinish(drop);
-            paths
-        };
-        self.drop_paths(paths);
-    }
-
-    /// [`App::drop_files`] of the paths read from the drop (which is freed
-    /// already).
-    pub(super) fn drop_paths(&self, paths: Vec<Vec<u16>>) {
+    pub(super) fn drop_files(&self, paths: Vec<Vec<u16>>) {
         let Some(first) = paths.first() else {
             return;
         };

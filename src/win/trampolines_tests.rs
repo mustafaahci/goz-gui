@@ -227,3 +227,86 @@ fn a_hook_sees_the_windows_made_and_goes_when_dropped() {
     super::destroy(hwnd);
     super::destroy(other);
 }
+
+/// A real drop of `paths` (a DROPFILES in moveable global memory, as the
+/// shell makes one), for a test to post.
+fn make_drop(paths: &[&str]) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
+    };
+    use windows_sys::Win32::UI::Shell::DROPFILES;
+    let mut units: Vec<u16> = Vec::new();
+    for p in paths {
+        units.extend(p.encode_utf16());
+        units.push(0);
+    }
+    units.push(0);
+    let head = size_of::<DROPFILES>();
+    let bytes = head + units.len() * 2;
+    // SAFETY: a block of `bytes`, locked to write the header and the paths
+    // after it, then unlocked.
+    unsafe {
+        let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        assert!(!h.is_null());
+        let p = GlobalLock(h).cast::<u8>();
+        let df = DROPFILES {
+            pFiles: head as u32,
+            fWide: 1,
+            ..Default::default()
+        };
+        core::ptr::write_unaligned(p.cast::<DROPFILES>(), df);
+        core::ptr::copy_nonoverlapping(units.as_ptr().cast::<u8>(), p.add(head), units.len() * 2);
+        GlobalUnlock(h);
+        h as usize
+    }
+}
+
+static DROP_KEY: subclass::Key = subclass::Key::new("test drop");
+
+#[test]
+fn a_drop_is_read_while_it_is_delivered_and_finished_once_after() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_DROPFILES};
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let s = Rc::clone(&seen);
+    let hwnd = window(move |m| {
+        if let Some(paths) = m.dropped_files() {
+            s.borrow_mut().push(("window", paths));
+            return 0;
+        }
+        m.def()
+    });
+    // A subclass reads it too, then passes it on: both see it, and the
+    // drop is finished once, after the subclass returns.
+    let s = Rc::clone(&seen);
+    subclass::set(hwnd, &DROP_KEY, move |m| {
+        if let Some(paths) = m.dropped_files() {
+            s.borrow_mut().push(("subclass", paths));
+            let r = m.def();
+            // Still in flight: the window's call has returned, this one has
+            // not.
+            assert!(m.dropped_files().is_some());
+            // Not passed on to other windows.
+            assert_eq!(m.forward(m.hwnd), 0);
+            return r;
+        }
+        m.def()
+    });
+    let drop = make_drop(&[r"C:\a.txt", r"C:\b c"]);
+    // SAFETY: posts the drop as the shell does, to this thread's window.
+    assert!(unsafe { PostMessageW(hwnd, WM_DROPFILES, drop, 0) } != 0);
+    pump(hwnd);
+    let want: Vec<Vec<u16>> = [r"C:\a.txt", r"C:\b c"]
+        .iter()
+        .map(|p| p.encode_utf16().collect())
+        .collect();
+    assert_eq!(
+        *seen.borrow(),
+        vec![("subclass", want.clone()), ("window", want)]
+    );
+    // Delivered and finished: nothing reads it now.
+    assert!(super::dropfiles::paths(drop).is_none());
+    // A drop made up in Rust is never read.
+    let made = Msg::new(hwnd, WM_DROPFILES, drop, 0);
+    assert!(made.dropped_files().is_none());
+    super::destroy(hwnd);
+}

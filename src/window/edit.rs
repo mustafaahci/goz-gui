@@ -293,7 +293,9 @@ fn edit_message(app: &App, m: &Msg) -> LRESULT {
         }
         // A drop on the box is a drop on the window.
         WM_DROPFILES => {
-            app.drop_files(w as _);
+            if let Some(paths) = m.dropped_files() {
+                app.drop_files(paths);
+            }
             return 0;
         }
         // The wheel goes to the focus, which stays here while the

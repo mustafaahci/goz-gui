@@ -45,6 +45,7 @@ use windows_sys::Win32::UI::Controls::{
     LVS_SHOWSELALWAYS, NM_CUSTOMDRAW, NM_DBLCLK, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_DELETE, VK_F2, VK_INSERT};
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_DROPFILES;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, IDCANCEL, IDOK, MB_ICONWARNING, MB_OK, WM_APP, WM_COMMAND, WM_CTLCOLOREDIT,
     WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE,
@@ -58,8 +59,7 @@ use crate::listedit::scan::{Job, Source};
 use crate::listedit::{Entry, Export, items_text};
 use crate::places::{self, Which};
 use crate::store::location;
-use crate::win::ext::b6;
-use crate::win::{self, Msg, dlg, lv, parcel, subclass, sys};
+use crate::win::{self, Msg, dlg, lv, subclass, sys};
 
 /// W7's commands, 4950..=4999.
 pub mod cmd {
@@ -312,10 +312,10 @@ impl Dlg {
         let dark = self.look.get().dark;
         dialog::theme_new(dlg, dark);
         // The list's subclass (it goes with the list), and files may be
-        // dropped on the dialog (each drop comes as WM_DROPPED).
+        // dropped on the dialog.
         let look = Rc::clone(&self.look);
         subclass::set(list, &LIST_SUBCLASS, move |m| list_proc(m, &look));
-        b6::accept_files(dlg, WM_DROPPED);
+        win::dropfiles::accept(dlg, true);
         dialog::center_on_owner(dlg);
         let wr = win::window_rect(dlg);
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
@@ -791,9 +791,10 @@ fn dialog_proc(s: &Dlg, m: &Msg) -> isize {
             1
         }
         WM_COMMAND => isize::from(s.command(dlg, win::loword(m.w))),
-        WM_DROPPED => {
-            // The paths of files dropped on the dialog (`b6::accept_files`).
-            if let Some(paths) = parcel::take::<Vec<Vec<u16>>>(m) {
+        WM_DROPFILES => {
+            // The paths of files dropped on the dialog (the drop is finished
+            // once this returns).
+            if let Some(paths) = m.dropped_files() {
                 s.dropped(dlg, paths);
             }
             1

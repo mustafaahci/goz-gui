@@ -28,9 +28,10 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, HELPINFO};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, MINMAXINFO, MSG, NCCALCSIZE_PARAMS, STYLESTRUCT, WINDOWPOS,
-    WM_APP, WM_COPYDATA, WM_CREATE, WM_DPICHANGED, WM_DRAWITEM, WM_GETDLGCODE, WM_GETMINMAXINFO,
-    WM_HELP, WM_MEASUREITEM, WM_NCCALCSIZE, WM_NCCREATE, WM_NOTIFY, WM_SETTINGCHANGE,
-    WM_STYLECHANGED, WM_STYLECHANGING, WM_USER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+    WM_APP, WM_COPYDATA, WM_CREATE, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES, WM_GETDLGCODE,
+    WM_GETMINMAXINFO, WM_HELP, WM_MEASUREITEM, WM_NCCALCSIZE, WM_NCCREATE, WM_NOTIFY,
+    WM_SETTINGCHANGE, WM_STYLECHANGED, WM_STYLECHANGING, WM_USER, WM_WINDOWPOSCHANGED,
+    WM_WINDOWPOSCHANGING,
 };
 
 use super::class_is;
@@ -141,7 +142,9 @@ impl Msg {
     pub fn forward(&self, to: HWND) -> LRESULT {
         assert!(!self.lent.get(), "a view of the message is still out");
         let own = (WM_APP..APP_END).contains(&self.id);
-        let system = self.id < WM_USER && self.via != Via::Made;
+        // A drop is finished by goz-gui's procedures once they are done
+        // with it (`super::dropfiles`): no other window gets it to free.
+        let system = self.id < WM_USER && self.via != Via::Made && self.id != WM_DROPFILES;
         if !own && !system {
             return 0;
         }
@@ -314,6 +317,25 @@ impl Msg {
     /// Whether this is `WM_SETTINGCHANGE` for the setting `name`.
     pub fn setting_is(&self, name: &str) -> bool {
         self.setting().is_some_and(|s| s == name)
+    }
+
+    /// The paths of the files a `WM_DROPFILES` brings, while it is being
+    /// delivered (goz-gui frees the drop once its procedures are done with
+    /// it, see [`super::dropfiles`]).
+    pub fn dropped_files(&self) -> Option<Vec<Vec<u16>>> {
+        if self.id != WM_DROPFILES || self.via == Via::Made {
+            return None;
+        }
+        super::dropfiles::paths(self.w)
+    }
+
+    /// Where a `WM_DROPFILES`'s files were dropped (client coordinates),
+    /// and whether in the client area.
+    pub fn drop_point(&self) -> Option<(POINT, bool)> {
+        if self.id != WM_DROPFILES || self.via == Via::Made {
+            return None;
+        }
+        super::dropfiles::point(self.w)
     }
 
     /// `WM_COPYDATA`'s value and a copy of its data.

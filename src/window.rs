@@ -28,7 +28,6 @@ use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT, VK_TAB,
 };
-use windows_sys::Win32::UI::Shell::HDROP;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::celltip::{self, CellTip};
@@ -1898,7 +1897,9 @@ impl App {
                 0
             }
             WM_DROPFILES => {
-                self.drop_files(w as HDROP);
+                if let Some(paths) = m.dropped_files() {
+                    self.drop_files(paths);
+                }
                 0
             }
             WM_REPLY => {
@@ -2120,13 +2121,9 @@ impl App {
                 return item.map_or(0, |item| LRESULT::from(self.begin_rename(item)));
             }
             LVN_ENDLABELEDITW => {
-                // The text typed (none when the edit was cancelled), as a
-                // NUL-terminated copy.
-                let text = n
-                    .get::<NMLVDISPINFOW>()
-                    .and_then(|info| info.text())
-                    .map(|t| win::wz_units(&t));
-                self.end_rename(text.as_ref().map_or(core::ptr::null(), |t| t.as_ptr()));
+                // The text typed (none when the edit was cancelled).
+                let text = n.get::<NMLVDISPINFOW>().and_then(|info| info.text());
+                self.end_rename(text);
                 // The row changes once the rename is done.
                 return 0;
             }

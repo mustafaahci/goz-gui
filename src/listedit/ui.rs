@@ -70,6 +70,7 @@ use windows_sys::Win32::UI::Controls::{
     NMLVDISPINFOW, NMLVKEYDOWN,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_DELETE, VK_SHIFT};
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_DROPFILES;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     HMENU, IDCANCEL, IDNO, IDOK, IDYES, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNOCANCEL,
     MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, SIZE_MAXIMIZED, SIZE_RESTORED, SW_RESTORE, SWP_NOACTIVATE,
@@ -80,8 +81,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::scan::{Job, Saving, Source};
 use super::{
-    COLUMNS, Column, EXPORT_DIALOG, Entry, Export, IMPORT_DIALOG, WM_DROPPED, WM_EDITOR_CLOSED,
-    WM_EDITOR_LOOK, WM_EDITOR_OPEN, WM_FOUND, WM_SAVED, cmd, items_text,
+    COLUMNS, Column, EXPORT_DIALOG, Entry, Export, IMPORT_DIALOG, WM_EDITOR_CLOSED, WM_EDITOR_LOOK,
+    WM_EDITOR_OPEN, WM_FOUND, WM_SAVED, cmd, items_text,
 };
 use crate::dialog::{self, Class, Look, Quiet, Template, common, list_custom_draw};
 use crate::filetools::ui::{item, set_state, units};
@@ -94,7 +95,7 @@ use crate::theme::Palette;
 use crate::win::com::Apartment;
 use crate::win::ext::b1;
 use crate::win::ext::b6::{self, OpenDialog};
-use crate::win::{self, Msg, View, dlg, header, lv, parcel, subclass, sys};
+use crate::win::{self, Msg, View, dlg, header, lv, subclass, sys};
 
 const TITLE: &str = "File List Editor";
 const ID_LIST: u16 = 100;
@@ -496,10 +497,9 @@ impl Editor {
                 ],
             ),
         ]);
-        // The dialog's menu bar; files may be dropped on it (each drop comes
-        // as WM_DROPPED).
+        // The dialog's menu bar; files may be dropped on it.
         b6::set_menu(dlg, bar);
-        b6::accept_files(dlg, WM_DROPPED);
+        win::dropfiles::accept(dlg, true);
         let dark = self.look.get().dark;
         dialog::theme_new(dlg, dark);
         // The subclass removes itself as the dialog goes.
@@ -1745,9 +1745,10 @@ fn dialog_proc(s: &Editor, m: &Msg) -> isize {
             s.close(dlg);
             1
         }
-        WM_DROPPED => {
-            // The paths of files dropped on the editor (`b6::accept_files`).
-            if let Some(paths) = parcel::take::<Vec<Vec<u16>>>(m) {
+        WM_DROPFILES => {
+            // The paths of files dropped on the editor (the drop is
+            // finished once this returns).
+            if let Some(paths) = m.dropped_files() {
                 s.dropped(dlg, paths);
             }
             1
