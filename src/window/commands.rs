@@ -2,24 +2,16 @@
 //! show as they open. The navigation history is `nav.rs`; the result
 //! actions are `results.rs`; the bookmarks are `bookmarks.rs`.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use goz_core::types::{SortDir, SortKey, SortSpec};
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::UI::Controls::{
-    EM_GETSEL, EM_SETSEL, LVIS_FOCUSED, LVIS_SELECTED, LVM_ENSUREVISIBLE, LVM_GETEDITCONTROL,
-    LVM_GETITEMCOUNT, LVM_GETITEMSTATE, LVM_GETNEXTITEM, LVM_SETSELECTIONMARK, LVNI_FOCUSED,
-    LVNI_SELECTED,
-};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_SHIFT};
+use windows_sys::Win32::UI::Controls::{LVIS_FOCUSED, LVIS_SELECTED, LVNI_FOCUSED, LVNI_SELECTED};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GWL_EXSTYLE, GetWindowLongPtrW, GetWindowTextLengthW, HMENU, HWND_NOTOPMOST,
-    HWND_TOPMOST, MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, SetWindowTextW,
-    WM_COPY, WM_CUT, WM_PASTE, WS_EX_TOPMOST,
+    HMENU, HWND_NOTOPMOST, HWND_TOPMOST, MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_COPY,
+    WM_CUT, WM_PASTE, WS_EX_TOPMOST,
 };
 
-use super::{App, WM_SERVICE, key_down, send};
+use super::{App, WM_SERVICE, key_down};
 use crate::actions::{self, Service};
 use crate::client::Job;
 use crate::clipboard::{self, Effect};
@@ -28,7 +20,7 @@ use crate::filter::Filter;
 use crate::settings::OnTop;
 use crate::theme::ThemeMode;
 use crate::view::{self, View};
-use crate::wide::wz;
+use crate::win::{self, edit, lv, sys};
 use crate::{menu, syntax};
 
 /// The View menu item that shows `v`: a size between Everything's three
@@ -138,9 +130,8 @@ impl App {
     /// the box of a rename in progress (the list's own edit control), or a
     /// pane's or strip's.
     fn text_box(&self) -> Option<HWND> {
-        // SAFETY: reads this thread's focus.
-        let focus = unsafe { GetFocus() };
-        let rename = send(self.list, LVM_GETEDITCONTROL, 0, 0) as HWND;
+        let focus = win::focus();
+        let rename = lv::edit_control(self.list);
         (!focus.is_null() && (focus == self.edit || focus == rename || self.frame_text_box(focus)))
             .then_some(focus)
     }
@@ -157,7 +148,7 @@ impl App {
         if let Some(text) = self.text_box()
             && let Some(msg) = edit_message(id)
         {
-            send(text, msg, 0, 0);
+            win::send_plain(text, msg, 0, 0);
             return;
         }
         self.command(id);
@@ -198,11 +189,10 @@ impl App {
             // too), as Everything's Exit ends all of its windows.
             menu::EXIT => {
                 self.exit_other_windows();
-                // SAFETY: destroys this thread's window.
-                unsafe { DestroyWindow(self.hwnd) };
+                win::destroy(self.hwnd);
             }
             menu::SELECT_ALL => {
-                if send(self.list, LVM_GETITEMCOUNT, 0, 0) > 0 {
+                if lv::item_count(self.list) > 0 {
                     self.set_state(usize::MAX, LVIS_SELECTED, LVIS_SELECTED);
                     // After the list's report of the change, which ends
                     // any Select All (`reselect.rs`): every row is chosen.
@@ -210,14 +200,13 @@ impl App {
                 }
             }
             menu::FOCUS_SEARCH => {
-                // SAFETY: focuses a child of this thread's window.
-                unsafe { SetFocus(self.edit) };
-                send(self.edit, EM_SETSEL, 0, -1);
+                win::set_focus(self.edit);
+                edit::set_sel(self.edit, 0, -1);
             }
             // The clear button.
             menu::CLEAR_SEARCH => {
-                // SAFETY: clears the search field; EN_CHANGE searches again.
-                unsafe { SetWindowTextW(self.edit, wz("").as_ptr()) };
+                // Clears the search field; EN_CHANGE searches again.
+                win::set_text(self.edit, "");
                 self.focus_box();
             }
             menu::NEXT_SELECTED => self.jump_selected(true),
@@ -342,13 +331,7 @@ impl App {
         };
         let can_copy = match text {
             Some(text) => {
-                let (mut start, mut end) = (0u32, 0u32);
-                send(
-                    text,
-                    EM_GETSEL,
-                    (&raw mut start) as usize,
-                    (&raw mut end) as isize,
-                );
+                let (start, end) = edit::sel(text);
                 start != end
             }
             None => selection,
@@ -417,27 +400,19 @@ impl App {
     /// Keeps the window above others or not, as View > On Top says; the
     /// search calls it on every change of the search text.
     pub(super) fn apply_on_top(&self) {
-        // SAFETY: reads this thread's windows.
-        let (searching, topmost) = unsafe {
-            (
-                GetWindowTextLengthW(self.edit) > 0,
-                GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0,
-            )
-        };
+        let (searching, topmost) = (
+            win::text_len(self.edit) > 0,
+            win::ex_style(self.hwnd) & WS_EX_TOPMOST != 0,
+        );
         let want = self.on_top.get().topmost(searching);
         if want != topmost {
-            // SAFETY: changes only the z-order of this thread's window.
-            unsafe {
-                SetWindowPos(
-                    self.hwnd,
-                    if want { HWND_TOPMOST } else { HWND_NOTOPMOST },
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
+            // Changes only the window's z-order.
+            win::set_pos(
+                self.hwnd,
+                if want { HWND_TOPMOST } else { HWND_NOTOPMOST },
+                (0, 0, 0, 0),
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
         }
     }
 
@@ -487,22 +462,15 @@ impl App {
     /// keeping the selection; past the last one it wraps round, with a beep.
     fn jump_selected(&self, forward: bool) {
         let list = self.list;
-        let count = send(list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
-        let focus = usize::try_from(send(
-            list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        ))
-        .ok();
-        // GETNEXTITEM looks after the row given; -1 (usize::MAX) is the top.
+        let count = lv::item_count(list);
+        let focus = usize::try_from(lv::next_item(list, -1, LVNI_FOCUSED)).ok();
+        // GETNEXTITEM looks after the row given; -1 is the top.
         let next_selected = |after: Option<usize>| {
-            let at = after.unwrap_or(usize::MAX);
-            usize::try_from(send(list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize)).ok()
+            let at = after.map_or(-1, |i| i as i32);
+            usize::try_from(lv::next_item(list, at, LVNI_SELECTED)).ok()
         };
-        let is_selected = |i: usize| {
-            send(list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED != 0
-        };
+        let is_selected =
+            |i: usize| lv::item_state(list, i as i32, LVIS_SELECTED) & LVIS_SELECTED != 0;
         let found = if forward {
             next_selected(focus)
         } else {
@@ -519,15 +487,14 @@ impl App {
                 // Nothing selected: nowhere to go.
                 let Some(row) = wrapped else { return };
                 if focus.is_some() {
-                    // SAFETY: plays a system sound.
-                    unsafe { MessageBeep(MB_OK) };
+                    sys::beep(MB_OK);
                 }
                 row
             }
         };
         self.set_state(target, LVIS_FOCUSED, LVIS_FOCUSED);
-        send(list, LVM_SETSELECTIONMARK, 0, target as isize);
-        send(list, LVM_ENSUREVISIBLE, target, 0);
+        lv::set_selection_mark(list, target as i32);
+        lv::ensure_visible(list, target as i32, false);
     }
 }
 

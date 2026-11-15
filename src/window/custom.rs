@@ -7,16 +7,13 @@
 //! G2's main-window messages are `WM_APP + 300..320` and its timers
 //! `300..310` (wave 4's G1 has `WM_APP + 250..300` and `250..300`).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{HFONT, InvalidateRect};
+use windows_sys::Win32::Graphics::Gdi::HFONT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetMenuItemCount, GetMenuItemInfoW, GetWindowRect, HMENU, MENUITEMINFOW, MFT_SEPARATOR,
-    MIIM_FTYPE, MIIM_ID, MIIM_STRING, MIIM_SUBMENU, SetMenuItemInfoW, SetTimer, WM_APP,
+    HMENU, MENUITEMINFOW, MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID, MIIM_STRING, MIIM_SUBMENU, WM_APP,
 };
 
 use super::{App, Fonts};
@@ -26,6 +23,7 @@ use crate::colors::{Colors, FontSpec};
 use crate::custom::DoubleCtrl;
 use crate::keymap::{self, Bindings};
 use crate::theme::Palette;
+use crate::win::{self, ext::b3};
 
 /// Posted by the double-Ctrl hook (`crate::dblctrl`): Ctrl was pressed
 /// twice.
@@ -192,8 +190,7 @@ impl App {
             prefs.base.custom.color_filters = rules;
             prefs.base.custom.color_filters_raw = None;
         }
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
+        win::invalidate(self.list, None, false);
         self.settings_changed();
     }
 
@@ -212,9 +209,7 @@ impl App {
         self.prefs.borrow_mut().base.custom.dpi = setting;
         let dpi = crate::custom::scaled_dpi(self.custom.system_dpi.get(), setting);
         if dpi != self.dpi.get() {
-            let mut rc = RECT::default();
-            // SAFETY: reads this thread's window's place.
-            unsafe { GetWindowRect(self.hwnd, &mut rc) };
+            let rc = win::window_rect(self.hwnd);
             self.on_dpi(dpi, &rc);
         }
         self.settings_changed();
@@ -290,8 +285,8 @@ impl App {
         if self.is_new_window() {
             return;
         }
-        // SAFETY: a timer of this window; setting it again restarts it.
-        unsafe { SetTimer(self.hwnd, TIMER_JUMP_LIST, JUMP_LIST_DELAY_MS, None) };
+        // Setting the timer again restarts it.
+        win::set_timer(self.hwnd, TIMER_JUMP_LIST, JUMP_LIST_DELAY_MS);
     }
 
     /// The jump list's entries: recent searches, then the bookmarks.
@@ -394,90 +389,69 @@ type Originals = HashMap<(usize, u16), (String, Option<String>)>;
 /// `None` for a command whose keys are the defaults, whose item gets back
 /// what it said before it was first rewritten (kept in `originals`).
 fn relabel(menu: HMENU, key: &dyn Fn(u16) -> Option<Option<String>>, originals: &mut Originals) {
-    // SAFETY: reads and sets this thread's menu items; the buffers outlive
-    // each call.
-    unsafe {
-        let n = GetMenuItemCount(menu);
-        for i in 0..n.max(0) as u32 {
-            let mut buf = [0u16; 256];
-            let mut mii: MENUITEMINFOW = core::mem::zeroed();
-            mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
-            mii.fMask = MIIM_FTYPE | MIIM_ID | MIIM_STRING | MIIM_SUBMENU;
-            mii.dwTypeData = buf.as_mut_ptr();
-            mii.cch = buf.len() as u32;
-            if GetMenuItemInfoW(menu, i, 1, &mut mii) == 0
-                || mii.fType & MFT_SEPARATOR != 0
-                || !mii.hSubMenu.is_null()
-                || mii.wID > u32::from(u16::MAX)
-            {
-                continue;
-            }
-            let cmd = mii.wID as u16;
-            let text = String::from_utf16_lossy(&buf[..mii.cch as usize]);
-            let (label, tail) = match text.split_once('\t') {
-                Some((label, tail)) => (label, Some(tail)),
-                None => (text.as_str(), None),
-            };
-            let slot = (menu as usize, cmd);
-            let wanted = match key(cmd) {
-                Some(new_key) => {
-                    // The first rewrite keeps what the item said; a record
-                    // of another item (a handle used again) gives way.
-                    if originals.get(&slot).is_none_or(|(l, _)| l != label) {
-                        originals.insert(slot, (label.to_owned(), tail.map(str::to_owned)));
-                    }
-                    match new_key {
-                        Some(k) => format!("{label}\t{k}"),
-                        None => label.to_owned(),
-                    }
-                }
-                None => match originals.remove(&slot) {
-                    Some((l, t)) if l == label => match t {
-                        Some(t) => format!("{label}\t{t}"),
-                        None => l,
-                    },
-                    _ => continue,
-                },
-            };
-            if wanted == text {
-                continue;
-            }
-            let mut wide: Vec<u16> = wanted.encode_utf16().chain([0]).collect();
-            let mut set: MENUITEMINFOW = core::mem::zeroed();
-            set.cbSize = size_of::<MENUITEMINFOW>() as u32;
-            set.fMask = MIIM_STRING;
-            set.dwTypeData = wide.as_mut_ptr();
-            SetMenuItemInfoW(menu, i, 1, &set);
+    let n = b3::menu_item_count(menu);
+    for i in 0..n.max(0) as u32 {
+        let mask = MIIM_FTYPE | MIIM_ID | MIIM_STRING | MIIM_SUBMENU;
+        let Some((mii, Some(text))) = b3::menu_item_info(menu, i, true, mask, 256) else {
+            continue;
+        };
+        if mii.fType & MFT_SEPARATOR != 0
+            || !mii.hSubMenu.is_null()
+            || mii.wID > u32::from(u16::MAX)
+        {
+            continue;
         }
+        let cmd = mii.wID as u16;
+        let (label, tail) = match text.split_once('\t') {
+            Some((label, tail)) => (label, Some(tail)),
+            None => (text.as_str(), None),
+        };
+        let slot = (menu as usize, cmd);
+        let wanted = match key(cmd) {
+            Some(new_key) => {
+                // The first rewrite keeps what the item said; a record
+                // of another item (a handle used again) gives way.
+                if originals.get(&slot).is_none_or(|(l, _)| l != label) {
+                    originals.insert(slot, (label.to_owned(), tail.map(str::to_owned)));
+                }
+                match new_key {
+                    Some(k) => format!("{label}\t{k}"),
+                    None => label.to_owned(),
+                }
+            }
+            None => match originals.remove(&slot) {
+                Some((l, t)) if l == label => match t {
+                    Some(t) => format!("{label}\t{t}"),
+                    None => l,
+                },
+                _ => continue,
+            },
+        };
+        if wanted == text {
+            continue;
+        }
+        b3::set_menu_item_info(menu, i, true, MENUITEMINFOW::default(), Some(&wanted));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuStringW, MF_BYCOMMAND, MF_STRING,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MF_BYCOMMAND, MF_STRING};
 
     fn text(menu: HMENU, cmd: u16) -> String {
-        let mut buf = [0u16; 128];
-        // SAFETY: reads an item of a menu this test made into its buffer.
-        let n =
-            unsafe { GetMenuStringW(menu, u32::from(cmd), buf.as_mut_ptr(), 128, MF_BYCOMMAND) };
-        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+        b3::menu_string(menu, u32::from(cmd), MF_BYCOMMAND)
     }
 
     /// Keys back to the defaults put back the shortcut text a menu built
     /// once (View > Zoom) was written with.
     #[test]
     fn menus_get_their_shortcut_text_back_with_the_default_keys() {
-        // SAFETY: a menu of this thread's, destroyed at the end.
-        let menu = unsafe { CreatePopupMenu() };
+        // A menu of this thread's, destroyed at the end.
+        let menu = b3::create_popup_menu();
         assert!(!menu.is_null());
         for (cmd, label) in [(1u16, "Zoom &In\tCtrl+="), (2, "&Status Bar")] {
-            let w: Vec<u16> = label.encode_utf16().chain([0]).collect();
-            // SAFETY: appends an item to the menu made above.
-            unsafe { AppendMenuW(menu, MF_STRING, usize::from(cmd), w.as_ptr()) };
+            b3::append_menu(menu, MF_STRING, usize::from(cmd), label);
         }
         let mut originals = Originals::new();
         let f7 = |cmd: u16| (cmd == 1).then(|| Some("F7".to_owned()));
@@ -505,7 +479,6 @@ mod tests {
         assert_eq!(text(menu, 2), "&Status Bar\tCtrl+B");
         relabel(menu, &defaults, &mut originals);
         assert_eq!(text(menu, 2), "&Status Bar");
-        // SAFETY: the menu made above, destroyed once.
-        unsafe { DestroyMenu(menu) };
+        b3::destroy_menu(menu);
     }
 }

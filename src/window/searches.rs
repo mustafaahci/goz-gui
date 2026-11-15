@@ -16,16 +16,11 @@
 //!   searches are kept and its deletions stick; this window then takes the
 //!   file as written for its own history.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    KillTimer, MB_ICONWARNING, PostMessageW, SetTimer,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONWARNING;
 
 use super::runs::give_back_memory;
 use super::{App, TIMER_HISTORY, WM_HISTORY, prefs};
@@ -36,6 +31,7 @@ use crate::history_file::{self, FILE_NAME, HistoryFile, Written};
 use crate::settings::Settings;
 use crate::store::location;
 use crate::wide::window_text;
+use crate::win::{self, parcel, sys};
 use crate::{clipboard, dropdown};
 
 /// How long after the last change the history is written.
@@ -88,16 +84,10 @@ impl Searches {
     }
 }
 
-/// Posts `value` to the window as `msg`'s lParam; freed again if the window
-/// is gone.
-fn post<T>(hwnd: usize, msg: u32, value: T) {
-    let raw = Box::into_raw(Box::new(value));
-    // SAFETY: posts to the window; if that fails the box is taken back.
-    unsafe {
-        if PostMessageW(hwnd as HWND, msg, 0, raw as isize) == 0 {
-            drop(Box::from_raw(raw));
-        }
-    }
+/// Posts `value` to the window with `msg`, as a parcel (`win::parcel`);
+/// freed again if the window is gone.
+fn post<T: Send + 'static>(hwnd: usize, msg: u32, value: T) {
+    parcel::post(hwnd as HWND, msg, 0, value);
 }
 
 impl App {
@@ -120,15 +110,14 @@ impl App {
         for op in ops {
             file.log(op);
         }
-        // SAFETY: a timer of this window; setting it again restarts it.
-        unsafe { SetTimer(self.hwnd, TIMER_HISTORY, SAVE_DELAY_MS, None) };
+        // Setting the timer again restarts it.
+        win::set_timer(self.hwnd, TIMER_HISTORY, SAVE_DELAY_MS);
     }
 
     /// Hands the changes made to the history to the store thread, if any
     /// are waiting (new ones, or those of a write that failed).
     pub(super) fn save_history(&self) {
-        // SAFETY: a timer of this window.
-        unsafe { KillTimer(self.hwnd, TIMER_HISTORY) };
+        win::kill_timer(self.hwnd, TIMER_HISTORY);
         let Some(file) = self.searches.file.clone() else {
             return;
         };
@@ -307,8 +296,7 @@ impl Host for App {
         let ok = clipboard::put_text(self.hwnd, &wide);
         if !ok {
             self.show_note(clipboard::BUSY.into());
-            // SAFETY: plays a system sound.
-            unsafe { MessageBeep(MB_ICONWARNING) };
+            sys::beep(MB_ICONWARNING);
         }
         ok
     }
