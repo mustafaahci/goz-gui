@@ -174,13 +174,16 @@ pub fn exit_others(key: &str, own: HWND, discard: bool) -> Vec<u32> {
         }
         if found != own {
             // Reads the process it belongs to, and posts it a message with
-            // no pointers; one gone meanwhile is reported and ignored.
+            // no pointers (to a window of this process, one of goz-gui's
+            // own, or of another); one gone meanwhile is reported and
+            // ignored.
             let pid = win::process_of(found);
-            if win::post_app(found, WM_EXIT_REQUEST, usize::from(discard), 0)
-                && pid != 0
-                && pid != std::process::id()
-                && !asked.contains(&pid)
-            {
+            let posted = if pid == std::process::id() {
+                win::post_app(found, WM_EXIT_REQUEST, usize::from(discard), 0)
+            } else {
+                win::post_app_to_other_process(found, WM_EXIT_REQUEST, usize::from(discard), 0)
+            };
+            if posted && pid != 0 && pid != std::process::id() && !asked.contains(&pid) {
                 asked.push(pid);
             }
         }

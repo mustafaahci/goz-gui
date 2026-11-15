@@ -696,3 +696,48 @@ fn a_callback_item_s_text_is_copied_never_followed() {
     assert_eq!(lv::item_text(view, 0, 0, 4), "cal");
     super::destroy(host);
 }
+
+#[test]
+fn private_messages_go_only_to_goz_gui_s_own_windows() {
+    let seen = Rc::new(Cell::new(0));
+    let s = Rc::clone(&seen);
+    let ours = window(move |m| {
+        if m.id == WM_APP + 5 {
+            s.set(s.get() + 1);
+            return 9;
+        }
+        m.def()
+    });
+    assert_eq!(super::send_app(ours, WM_APP + 5, 0, 0), 9);
+    // A window of another class of this process (here a list view, which
+    // reads WM_APP's numbers as nothing of goz-gui's): nothing sent.
+    let (list, parent) = hidden_control(super::lv::CLASS, 0);
+    assert_eq!(super::send_app(list, WM_APP + 5, 0, 0x1234), 0);
+    assert!(!super::post_app(list, WM_APP + 5, 0, 0x1234));
+    assert!(!parcel::post(list, WM_APP + 5, 0, String::from("lost")));
+    // A window of this process is no other process's.
+    assert!(!super::post_app_to_other_process(ours, WM_APP + 5, 0, 0));
+    // A child dialog of a template is goz-gui's own.
+    let s = Rc::clone(&seen);
+    let page = template(WS_CHILD).create_child(parent, move |m| {
+        if m.id == WM_APP + 6 {
+            s.set(s.get() + 10);
+            return 1;
+        }
+        0
+    });
+    super::send_app(page, WM_APP + 6, 0, 0);
+    // A thread whose loop is not goz-gui's: nothing posted.
+    assert!(!queue::post_thread(0, WM_APP + 5, 0, 0));
+    queue::ensure();
+    assert!(queue::post_thread(
+        super::sys::thread_id(),
+        WM_APP + 7,
+        0,
+        0
+    ));
+    assert!(queue::take(core::ptr::null_mut(), (WM_APP + 7, WM_APP + 7)).is_some());
+    assert_eq!(seen.get(), 11);
+    super::destroy(parent);
+    super::destroy(ours);
+}

@@ -573,26 +573,64 @@ fn is_app(msg: u32) -> bool {
     (WM_APP..APP_END).contains(&msg)
 }
 
+/// Whether `hwnd` is one of goz-gui's own windows: of this process, and
+/// handled by one of the trampolines (its class's procedure the window
+/// trampoline, or a dialog whose procedure is a template's). Only to those
+/// does a private message mean goz-gui's, with no pointer in it: another
+/// window may read the same number as one of its own messages, its
+/// parameters as addresses.
+pub(crate) fn is_goz_window(hwnd: HWND) -> bool {
+    process_of(hwnd) == super::sys::process_id()
+        && (super::class::is_trampoline_window(hwnd) || super::dlg::is_trampoline_dialog(hwnd))
+}
+
 /// Posts goz-gui's private message `msg` (`WM_APP` up to the registered
 /// messages) to one of its windows; false if it could not (the window has
-/// gone, the queue is full). A value that has to go with it goes as a
+/// gone, the queue is full), or `hwnd` is not one of goz-gui's own windows
+/// ([`is_goz_window`]). A value that has to go with it goes as a
 /// [`super::parcel`].
 ///
 /// # Panics
 /// If `msg` is not in that range.
 pub fn post_app(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
     assert!(is_app(msg), "not one of goz-gui's private messages");
-    // SAFETY: goz-gui's own messages carry integers, never pointers.
+    if !is_goz_window(hwnd) {
+        return false;
+    }
+    // SAFETY: goz-gui's own messages carry integers, never pointers, and
+    // go only to its own windows, which read them so.
+    unsafe { PostMessageW(hwnd, msg, w, l) != 0 }
+}
+
+/// Posts goz-gui's private message `msg` to a window of another process
+/// (another goz-gui's, found by its class): false if it could not, or
+/// `hwnd` is a window of this process. Whatever the window makes of the
+/// message is its own process's: nothing of this one reads it.
+///
+/// # Panics
+/// If `msg` is not one of goz-gui's private messages.
+pub fn post_app_to_other_process(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
+    assert!(is_app(msg), "not one of goz-gui's private messages");
+    let pid = process_of(hwnd);
+    if pid == 0 || pid == super::sys::process_id() {
+        return false;
+    }
+    // SAFETY: integers, posted to a window of another process, whose
+    // procedure runs there: no pointer of this process is read.
     unsafe { PostMessageW(hwnd, msg, w, l) != 0 }
 }
 
 /// Sends goz-gui's private message `msg` to one of its windows and waits for
-/// the answer.
+/// the answer; 0 without sending if `hwnd` is not one of goz-gui's own
+/// windows ([`is_goz_window`]).
 ///
 /// # Panics
 /// If `msg` is not one of goz-gui's private messages.
 pub fn send_app(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     assert!(is_app(msg), "not one of goz-gui's private messages");
+    if !is_goz_window(hwnd) {
+        return 0;
+    }
     // SAFETY: as in `post_app`.
     unsafe { super::send_raw(hwnd, msg, w, l) }
 }

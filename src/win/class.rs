@@ -236,6 +236,15 @@ pub fn create(c: &Create, handler: impl Fn(&Msg) -> LRESULT + 'static) -> HWND {
     // `pending`.
 }
 
+/// Whether `hwnd`'s class's procedure is the trampoline here: a window
+/// of a class [`Class::register`] registered in this process.
+pub(crate) fn is_trampoline_window(hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GCLP_WNDPROC, GetClassLongPtrW};
+    // SAFETY: no pointers: the address of the window's class's procedure.
+    let class = unsafe { GetClassLongPtrW(hwnd, GCLP_WNDPROC) };
+    class != 0 && class == window_proc as *const () as usize
+}
+
 /// The trampoline every class registered here has as its procedure.
 ///
 /// A window's GWLP_USERDATA is a `Box<Handler>` from WM_NCCREATE until

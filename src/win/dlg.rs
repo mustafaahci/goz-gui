@@ -252,6 +252,21 @@ unsafe extern "system" fn child_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) 
     answer
 }
 
+/// Whether `hwnd` is a dialog whose procedure is one of the trampolines
+/// here (a [`Template`]'s, modal or child) in this process.
+pub(crate) fn is_trampoline_dialog(hwnd: HWND) -> bool {
+    // DWLP_DLGPROC: after DWLP_MSGRESULT's LRESULT (winuser.h).
+    const DWLP_DLGPROC: i32 = DWLP_MSGRESULT as i32 + size_of::<isize>() as i32;
+    if !super::class_is(hwnd, DIALOG) {
+        return false;
+    }
+    // SAFETY: no pointers: a dialog's procedure's address, kept in its
+    // extra bytes at DWLP_DLGPROC.
+    let proc = unsafe { GetWindowLongPtrW(hwnd, DWLP_DLGPROC) } as usize;
+    proc != 0
+        && (proc == modal_proc as *const () as usize || proc == child_proc as *const () as usize)
+}
+
 /// The dialog's control `id` (null if there is none).
 pub fn item(dlg: HWND, id: u16) -> HWND {
     // SAFETY: no pointers.

@@ -19,6 +19,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TranslateAcceleratorW, TranslateMessage,
 };
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use super::sync::Event;
 
 /// A message the system queued for this thread, taken off the queue: not
@@ -77,9 +80,42 @@ pub fn peek(filter: HWND, (min, max): (u32, u32), flags: PEEK_MESSAGE_REMOVE_TYP
     (got != 0).then_some(msg)
 }
 
-/// Makes sure this thread has a message queue (a peek makes one).
+/// The threads of this process whose queue goz-gui's own loop takes
+/// messages from ([`ensure`]), which alone are posted its private
+/// messages ([`post_thread`]); each taken out as its thread ends, before
+/// its id can be another thread's.
+static LOOPS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+
+/// This thread's place in [`LOOPS`], taken out as the thread ends.
+struct Loop(u32);
+
+impl Drop for Loop {
+    fn drop(&mut self) {
+        let mut loops = LOOPS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = loops.as_mut() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+thread_local! {
+    static THIS_LOOP: Loop = {
+        let id = super::sys::thread_id();
+        LOOPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashSet::new)
+            .insert(id);
+        Loop(id)
+    };
+}
+
+/// Makes sure this thread has a message queue (a peek makes one), as one
+/// whose messages goz-gui's own loop takes: from now on until it ends,
+/// [`post_thread`] may post it goz-gui's private messages.
 pub fn ensure() {
     let _ = peek(core::ptr::null_mut(), (0, 0), 0);
+    THIS_LOOP.with(|_| ());
 }
 
 /// Turns a key message into its characters (TranslateMessage).
@@ -160,7 +196,10 @@ pub fn post_quit(code: i32) {
 }
 
 /// Posts goz-gui's private message `msg` (WM_APP and up, see
-/// [`super::post_app`]) to thread `thread`'s queue; false if it could not.
+/// [`super::post_app`]) to thread `thread`'s queue; false if it could not,
+/// or `thread` is not one whose messages goz-gui's own loop takes
+/// ([`ensure`]): another thread's loop may read the number as a message
+/// of its own.
 ///
 /// # Panics
 /// If `msg` is not one of goz-gui's private messages.
@@ -169,8 +208,14 @@ pub fn post_thread(thread: u32, msg: u32, w: usize, l: isize) -> bool {
         (windows_sys::Win32::UI::WindowsAndMessaging::WM_APP..super::msg::APP_END).contains(&msg),
         "not one of goz-gui's private messages"
     );
-    // SAFETY: goz-gui's own messages carry integers, never pointers.
-    unsafe { PostThreadMessageW(thread, msg, w, l) != 0 }
+    let ours = LOOPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&thread));
+    // SAFETY: goz-gui's own messages carry integers, never pointers, and
+    // go only to a thread of goz-gui's own loop, which reads them so.
+    ours && unsafe { PostThreadMessageW(thread, msg, w, l) != 0 }
 }
 
 /// What [`msg_wait`] woke for.
