@@ -83,7 +83,7 @@ use super::{
     COLUMNS, Column, EXPORT_DIALOG, Entry, Export, IMPORT_DIALOG, WM_DROPPED, WM_EDITOR_CLOSED,
     WM_EDITOR_LOOK, WM_EDITOR_OPEN, WM_FOUND, WM_SAVED, cmd, items_text,
 };
-use crate::dialog::{self, Class, Look, Quiet, Template, common_msg, list_custom_draw};
+use crate::dialog::{self, Class, Look, Quiet, Template, common, list_custom_draw};
 use crate::filetools::ui::{item, set_state, units};
 use crate::menu::{self, Item};
 use crate::msgbox;
@@ -92,6 +92,7 @@ use crate::places::{self, Place, Which};
 use crate::store::location;
 use crate::theme::Palette;
 use crate::win::com::Apartment;
+use crate::win::ext::b1;
 use crate::win::ext::b6::{self, OpenDialog};
 use crate::win::{self, Msg, View, dlg, header, lv, parcel, subclass, sys};
 
@@ -1634,23 +1635,14 @@ fn frame_proc(m: &Msg, dark: bool) -> isize {
     if dark {
         let pal = Palette::new(true);
         match m.id {
-            b6::WM_UAHDRAWMENU => {
-                if let Some(um) = b6::uah_draw_menu(m) {
-                    paint::menubar_of(hwnd, &pal, &uah_menu(um));
+            paint::WM_UAHDRAWMENU => {
+                if let Some(um) = b1::uah_menu(m) {
+                    paint::menubar_of(hwnd, &pal, &um);
                 }
                 return 1;
             }
-            b6::WM_UAHDRAWMENUITEM => {
-                if let Some(item) = b6::uah_draw_menu_item(m) {
-                    let item = paint::UahDrawMenuItem {
-                        dis: item.dis,
-                        um: uah_menu(item.um),
-                        umi: paint::UahMenuItem {
-                            position: item.umi.position,
-                            metrics: item.umi.metrics,
-                            popup: item.umi.popup,
-                        },
-                    };
+            paint::WM_UAHDRAWMENUITEM => {
+                if let Some(item) = b1::uah_draw_menu_item(m) {
                     paint::menubar_item_of(&pal, &item);
                 }
                 return 1;
@@ -1670,18 +1662,10 @@ fn frame_proc(m: &Msg, dark: bool) -> isize {
 }
 
 /// The menu bar's UAHMENU as `paint` takes it.
-fn uah_menu(um: b6::UahMenu) -> paint::UahMenu {
-    paint::UahMenu {
-        hmenu: um.hmenu,
-        hdc: um.hdc,
-        flags: um.flags,
-    }
-}
-
 fn dialog_proc(s: &Editor, m: &Msg) -> isize {
     let (dlg, msg, w, l) = (m.hwnd, m.id, m.w, m.l);
     let dark = s.look.get().dark;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         if msg == WM_SETTINGCHANGE && s.look.get().dark != dark {
             // The system's theme changed, and the editor follows it: the
             // menu bar too (the dialog's frame subclass anew, its menu bar

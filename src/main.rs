@@ -49,7 +49,6 @@ mod jumplist;
 mod keymap;
 mod keys;
 mod layout;
-mod legacy;
 mod menu;
 mod model;
 mod msgbox;

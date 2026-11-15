@@ -36,7 +36,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common_msg, list_custom_draw,
+    Class, Look, Template, apply_theme, center_on_owner, common, list_custom_draw,
 };
 use crate::filedlg::{self, Check};
 use crate::format;
@@ -709,7 +709,7 @@ impl Dlg<'_> {
 
 fn dialog_proc(s: &Dlg, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

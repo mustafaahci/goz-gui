@@ -51,7 +51,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
 };
 
-use crate::dialog::{self, Class, Look, Template, common_msg, list_custom_draw};
+use crate::dialog::{self, Class, Look, Template, common, list_custom_draw};
 use crate::filelist::settings::{SLOT_EXPORT_KINDS, SlotKept};
 use crate::filetools::ui::{item, set_state, units};
 use crate::listedit::scan::{Job, Source};
@@ -758,7 +758,7 @@ fn list_proc(m: &Msg, look: &Cell<Look>) -> isize {
 
 fn dialog_proc(s: &Dlg, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

@@ -31,7 +31,7 @@ use super::ui::{enable, item, set_state, units};
 use super::undo::{Action, Record};
 use super::{name_of, ui};
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common_msg, list_custom_draw,
+    Class, Look, Template, apply_theme, center_on_owner, common, list_custom_draw,
 };
 use crate::fileops::parent;
 use crate::places::{self, Which};
@@ -499,7 +499,7 @@ impl Dlg<'_> {
 
 fn dialog_proc(s: &Dlg<'_>, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

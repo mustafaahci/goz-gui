@@ -17,7 +17,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::{Icons, enable, fill_tree, tree_select, tree_selected, warn};
 use crate::bookmarks::FolderPath;
 use crate::bookmarks::tree::Tree;
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common_msg};
+use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common};
 use crate::win::{self, Msg, dlg, tv};
 
 const STATIC: u16 = 0xffff;
@@ -83,7 +83,7 @@ pub fn folder_name(
 
 fn name_proc(s: &Name<'_>, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {
@@ -198,7 +198,7 @@ impl Pick<'_> {
 
 fn pick_proc(s: &Pick<'_>, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

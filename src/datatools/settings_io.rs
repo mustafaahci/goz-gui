@@ -22,7 +22,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_TABSTOP,
 };
 
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common_msg};
+use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common};
 use crate::store::location::SETTINGS_FILE;
 use crate::win::{self, Msg, dlg};
 
@@ -252,7 +252,7 @@ pub fn ask(owner: HWND, look: Look) -> Option<Action> {
 
 fn proc(s: &Wizard, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

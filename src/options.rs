@@ -40,7 +40,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::dialog::{
     self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, anchor, apply_theme,
-    center_on_owner, common_msg,
+    center_on_owner, common,
 };
 use crate::places::{self, Which};
 use crate::theme::Palette;
@@ -849,12 +849,12 @@ fn frame_proc(d: &Rc<Dialog>, nested: &[bool], start: usize, m: &Msg) -> isize {
         return 1;
     }
     if m.id == WM_SETTINGCHANGE {
-        if let Some(new) = d.look.get().after_setting_change_msg(m) {
+        if let Some(new) = d.look.get().after_setting_change(m) {
             d.retheme(new);
         }
         return 1;
     }
-    if let Some(answer) = common_msg(m, &d.look) {
+    if let Some(answer) = common(m, &d.look) {
         return answer;
     }
     match m.id {
@@ -931,7 +931,7 @@ fn page_proc(d: &Dialog, index: usize, m: &Msg) -> isize {
     if let Some(answer) = held.page.message_msg(d.app, page, m) {
         return answer;
     }
-    if let Some(answer) = common_msg(m, &d.look) {
+    if let Some(answer) = common(m, &d.look) {
         return answer;
     }
     if m.id == WM_COMMAND && !d.filling.get() {
@@ -1053,14 +1053,6 @@ fn paint_dark_tab(hwnd: HWND, d: &Dialog) {
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     );
 }
-
-// The old raw-procedure bridges this batch was the last to use (the pages
-// were made with `legacy::create_child`; this dialog and the message box
-// read WM_SETTINGCHANGE with `Look::after_setting_change`): referenced
-// here so they are not dead code until `legacy.rs` goes, and this with it.
-const _: fn(&Template, HWND, windows_sys::Win32::UI::WindowsAndMessaging::DLGPROC, LPARAM) -> HWND =
-    crate::legacy::create_child;
-const _: fn(Look, LPARAM) -> Option<Look> = Look::after_setting_change;
 
 #[cfg(test)]
 mod tests {

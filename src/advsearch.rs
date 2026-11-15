@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_TIMER, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
 };
 
-use crate::dialog::{Class, Look, Template, center_on_owner, common_msg, theme_new};
+use crate::dialog::{Class, Look, Template, center_on_owner, common, theme_new};
 use crate::msgbox;
 use crate::searchtools::folder_term;
 use crate::win::ext::b5;
@@ -839,7 +839,7 @@ fn picker_proc(m: &Msg, look: &Cell<Look>) -> LRESULT {
 
 fn proc(s: &Dlg, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

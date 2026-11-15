@@ -15,11 +15,9 @@
 //! Up, Down, Page Up and Page Down in the filter box move in the list, so
 //! the keyboard can stay in the box.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Controls::{
     HDF_SORTDOWN, HDF_SORTUP, HDI_FORMAT, HDITEMW, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT,
     LVCFMT_RIGHT, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVN_COLUMNCLICK,
@@ -31,17 +29,15 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_DELETE, VK_DOWN, VK_NEXT, VK_PRIOR, VK_UP,
 };
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, EN_CHANGE, ES_AUTOHSCROLL, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2,
-    MB_ICONWARNING, MB_OK, MB_YESNO, SendMessageW, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO,
-    WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX,
-    WS_TABSTOP, WS_THICKFRAME,
+    MB_ICONWARNING, MB_OK, MB_YESNO, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG,
+    WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
 };
 
 use crate::bookmarks::one_line;
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common_msg, list_custom_draw,
+    Class, Look, Template, apply_theme, center_on_owner, common, list_custom_draw,
 };
 use crate::filedlg::{self, Check};
 use crate::format;
@@ -764,36 +760,9 @@ pub(crate) fn filter_keys(filter: HWND, list: HWND) {
     });
 }
 
-/// [`filter_keys`] as a raw subclass procedure (`list`, the subclass's
-/// data), for the dialogs not yet moved onto `crate::win`.
-pub(crate) unsafe extern "system" fn filter_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    list: usize,
-) -> LRESULT {
-    // SAFETY: `list` is the dialog's list, alive as long as this box;
-    // `w` and `l` are passed on as they came.
-    unsafe {
-        match msg {
-            WM_KEYDOWN if matches!(w as u16, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT) => {
-                SendMessageW(list as HWND, WM_KEYDOWN, w, l);
-                return 0;
-            }
-            WM_NCDESTROY => {
-                RemoveWindowSubclass(hwnd, Some(filter_proc), 1);
-            }
-            _ => {}
-        }
-        DefSubclassProc(hwnd, msg, w, l)
-    }
-}
-
 fn dialog_proc(s: &Dlg, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

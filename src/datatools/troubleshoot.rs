@@ -17,7 +17,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::dialog::{
-    self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner, common_msg,
+    self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner, common,
 };
 use crate::store::location::Source;
 use crate::win::ext::b4::{self as ext, Hive};
@@ -220,7 +220,7 @@ pub fn show(owner: HWND, text: &str, look: Look) {
 
 fn proc(s: &Window, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

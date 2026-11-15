@@ -512,7 +512,7 @@ fn proc(s: &MsgBox, m: &Msg) -> isize {
             1
         }
         WM_SETTINGCHANGE => {
-            if let Some(new) = s.look.get().after_setting_change_msg(m) {
+            if let Some(new) = s.look.get().after_setting_change(m) {
                 s.look.set(new);
                 apply_theme(dlg, new.dark);
             }

@@ -15,7 +15,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::times::{Local, Set, parse_iso};
 use super::ui::{checked, enable, item, set_check};
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common_msg};
+use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common};
 use crate::history::filetime_now;
 use crate::msgbox;
 use crate::win::{self, Msg, dlg, edit};
@@ -246,7 +246,7 @@ impl Dlg {
 /// The dialog's procedure: `s` its state, `out` where OK puts its answer.
 fn dialog_proc(s: &Dlg, out: &RefCell<Option<Chosen>>, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

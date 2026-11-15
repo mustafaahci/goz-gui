@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::colorfilter::ColorFilter;
 use crate::colors::{format_color, parse_color};
-use crate::dialog::{Class, LIST_BOX, Look, Template, apply_theme, center_on_owner, common_msg};
+use crate::dialog::{Class, LIST_BOX, Look, Template, apply_theme, center_on_owner, common};
 use crate::win::ext::b4 as ext;
 use crate::win::{self, Msg, button, dlg, listbox};
 
@@ -352,7 +352,7 @@ impl Edit {
 
 fn proc(s: &Edit, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

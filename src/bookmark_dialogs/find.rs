@@ -27,8 +27,7 @@ use super::{Host, WM_REFRESH, enable};
 use crate::bookmarks::tree::{TOP, Tree};
 use crate::bookmarks::{Bookmarks, Settings, one_line};
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common_msg, fill_last_column,
-    list_custom_draw,
+    Class, Look, Template, apply_theme, center_on_owner, common, fill_last_column, list_custom_draw,
 };
 use crate::history_dialogs::filter_keys;
 use crate::places::{self, Which};
@@ -349,7 +348,7 @@ impl Find<'_> {
 
 fn find_proc(s: &Find<'_>, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

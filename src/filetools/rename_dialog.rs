@@ -52,8 +52,8 @@ use super::rename::{self, FormatError, Options, Problem, Subject};
 use super::settings::{PRESETS, Preset};
 use super::ui::{self, checked, enable, error_colour, item, set_check};
 use crate::dialog::{
-    self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner,
-    common_msg, fill_last_column, list_custom_draw,
+    self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner, common,
+    fill_last_column, list_custom_draw,
 };
 use crate::fileops::parent;
 use crate::places::{self, Which};
@@ -1413,7 +1413,7 @@ fn dialog_proc(s: &Dlg, m: &Msg) -> isize {
     if msg == WM_CTLCOLORSTATIC && m.l as HWND == item(dlg, ID_STATUS) && s.status_is_bad() {
         return status_colour(s, w as HDC, msg);
     }
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match msg {
@@ -1605,7 +1605,7 @@ fn ask_name(owner: HWND, look: Look) -> Option<String> {
 
 fn name_proc(s: &AskName, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

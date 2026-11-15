@@ -45,8 +45,7 @@ use crate::bookmarks::ops::{Id, Op, Target};
 use crate::bookmarks::tree::{Item, TOP, Tree};
 use crate::bookmarks::{Bookmark, Bookmarks, FolderPath, Kind, one_line, same_path, within};
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common_msg, fill_last_column,
-    list_custom_draw,
+    Class, Look, Template, apply_theme, center_on_owner, common, fill_last_column, list_custom_draw,
 };
 use crate::filedlg::{self, Check};
 use crate::history_dialogs::filter_keys;
@@ -986,7 +985,7 @@ impl Organize<'_> {
 
 fn organize_proc(s: &Organize<'_>, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

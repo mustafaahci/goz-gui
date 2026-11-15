@@ -34,8 +34,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::enable;
 use crate::bookmarks::{Fields, SORT_KEYS, one_line, sort_name};
 use crate::dialog::{
-    Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, anchor, center_on_owner,
-    common_msg, fill_later, make_control, placed, theme_control, theme_new,
+    Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, anchor, center_on_owner, common,
+    fill_later, make_control, placed, theme_control, theme_new,
 };
 use crate::filter::Filter;
 use crate::places::{self, Which};
@@ -573,7 +573,7 @@ fn search_proc(m: &Msg) -> LRESULT {
 
 fn edit_proc(s: &Edit, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

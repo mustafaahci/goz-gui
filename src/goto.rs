@@ -12,7 +12,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_INITDIALOG, WS_EX_CLIENTEDGE, WS_TABSTOP,
 };
 
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common_msg};
+use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common};
 use crate::format;
 use crate::msgbox;
 use crate::searchtools::result_number;
@@ -84,7 +84,7 @@ pub fn ask(owner: HWND, count: u64, initial: u64, look: Look) -> Option<u64> {
 
 fn proc(s: &Ask, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {

@@ -7,7 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
     DT_CALCRECT, DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
@@ -26,10 +26,10 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_3STATE, BS_AUTO3STATE, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_CHECKBOX, BS_GROUPBOX,
-    BS_RADIOBUTTON, BS_TYPEMASK, CB_GETEDITSEL, CB_MSGMAX, DLGPROC, DS_CONTROL, DS_MODALFRAME,
-    DS_SETFONT, ES_MULTILINE, GW_OWNER, LBS_HASSTRINGS, LBS_OWNERDRAWFIXED, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, UISF_HIDEACCEL,
-    UISF_HIDEFOCUS, USER_TIMER_MINIMUM, WM_CHAR, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT,
+    BS_RADIOBUTTON, BS_TYPEMASK, CB_GETEDITSEL, CB_MSGMAX, DS_CONTROL, DS_MODALFRAME, DS_SETFONT,
+    ES_MULTILINE, GW_OWNER, LBS_HASSTRINGS, LBS_OWNERDRAWFIXED, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, UISF_HIDEACCEL, UISF_HIDEFOCUS,
+    USER_TIMER_MINIMUM, WM_CHAR, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT,
     WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ENABLE, WM_ERASEBKGND, WM_INITDIALOG,
     WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCPAINT, WM_NOTIFY, WM_PAINT,
     WM_QUERYUISTATE, WM_SETTINGCHANGE, WM_SHOWWINDOW, WM_SYSKEYDOWN, WM_TIMER,
@@ -47,7 +47,6 @@ use crate::win::{
     sys, tv,
 };
 
-pub use crate::legacy::state;
 pub use crate::win::dlg::{Class, Template};
 
 impl Template {
@@ -77,12 +76,6 @@ impl Template {
         let ended = self.modal(owner, handler);
         crate::trace::mark("dialog ended");
         ended
-    }
-
-    /// The old raw-procedure form of [`Template::show`], for the dialogs not
-    /// yet moved onto `crate::win`.
-    pub fn run(&self, owner: HWND, proc: DLGPROC, param: LPARAM) -> isize {
-        crate::legacy::run(self, owner, proc, param)
     }
 }
 
@@ -118,18 +111,12 @@ pub struct Look {
 impl Look {
     /// The look after `m`, if it changes it: only a `WM_SETTINGCHANGE` of
     /// the app theme, when the look follows the system.
-    pub fn after_setting_change_msg(self, m: &Msg) -> Option<Look> {
+    pub fn after_setting_change(self, m: &Msg) -> Option<Look> {
         if !self.follow_system || !m.setting_is("ImmersiveColorSet") {
             return None;
         }
         let dark = theme::system_dark();
         (dark != self.dark).then_some(Look { dark, ..self })
-    }
-
-    /// The old form of [`Look::after_setting_change_msg`], for a raw
-    /// WM_SETTINGCHANGE lParam.
-    pub fn after_setting_change(self, l: LPARAM) -> Option<Look> {
-        crate::legacy::after_setting_change(self, core::ptr::null_mut(), l)
     }
 }
 
@@ -1103,7 +1090,7 @@ pub fn paint_check(button: HWND, cd: &NMCUSTOMDRAW, kind: Check, ink: CheckInk) 
 /// and the lists [`fill_later`] put off, once it shows (`WM_SHOWWINDOW`).
 /// `Some` is the dialog procedure's answer. Its start and its showing are
 /// marks of `GOZ_GUI_TRACE`'s timeline (`crate::trace`).
-pub fn common_msg(m: &Msg, look: &Cell<Look>) -> Option<isize> {
+pub fn common(m: &Msg, look: &Cell<Look>) -> Option<isize> {
     let dlg = m.hwnd;
     match m.id {
         WM_CTLCOLORDLG | WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN
@@ -1116,7 +1103,7 @@ pub fn common_msg(m: &Msg, look: &Cell<Look>) -> Option<isize> {
             Some(1)
         }
         WM_SETTINGCHANGE => {
-            if let Some(new) = look.get().after_setting_change_msg(m) {
+            if let Some(new) = look.get().after_setting_change(m) {
                 look.set(new);
                 apply_theme(dlg, new.dark);
             }
@@ -1141,11 +1128,6 @@ pub fn common_msg(m: &Msg, look: &Cell<Look>) -> Option<isize> {
         }
         _ => None,
     }
-}
-
-/// The old form of [`common_msg`], for a raw dialog procedure's message.
-pub fn common(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM, look: &Cell<Look>) -> Option<isize> {
-    crate::legacy::common(dlg, msg, w, l, look)
 }
 
 /// The style a dialog's list box takes (with `WS_TABSTOP`, `LBS_NOTIFY`

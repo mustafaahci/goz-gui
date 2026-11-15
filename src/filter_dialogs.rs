@@ -27,8 +27,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common_msg, fill_last_column,
-    list_custom_draw,
+    Class, Look, Template, apply_theme, center_on_owner, common, fill_last_column, list_custom_draw,
 };
 use crate::filedlg;
 use crate::filter::Filter;
@@ -214,7 +213,7 @@ impl Editor<'_> {
 
 fn edit_proc(s: &Editor<'_>, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {
@@ -733,7 +732,7 @@ impl Organize {
 
 fn organize_proc(s: &Organize, m: &Msg) -> isize {
     let dlg = m.hwnd;
-    if let Some(answer) = common_msg(m, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match m.id {
