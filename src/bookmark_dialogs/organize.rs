@@ -856,11 +856,11 @@ impl Organize<'_> {
         let list = self.list.borrow();
         let tree = self.tree.borrow();
         if info.item.mask & LVIF_IMAGE != 0 && info.item.iSubItem == 0 {
-            info.item.iImage = match item {
+            info.set_image(match item {
                 Item::Folder(_) => self.icons.folder,
                 Item::Row(r) if list.rows()[r].kind() == Kind::Bookmark => self.icons.bookmark,
                 Item::Row(_) => I_IMAGENONE,
-            };
+            });
         }
         if info.item.mask & LVIF_TEXT == 0
             || info.item.pszText.is_null()

@@ -9,11 +9,11 @@ use core::ptr::NonNull;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, LVN_BEGINDRAG, LVN_BEGINLABELEDITW, LVN_BEGINRDRAG, LVN_COLUMNCLICK,
-    LVN_DELETEALLITEMS, LVN_DELETEITEM, LVN_ENDLABELEDITW, LVN_GETDISPINFOW, LVN_HOTTRACK,
-    LVN_INSERTITEM, LVN_ITEMACTIVATE, LVN_ITEMCHANGED, LVN_ITEMCHANGING, LVN_KEYDOWN,
-    LVN_MARQUEEBEGIN, LVN_ODCACHEHINT, LVN_ODSTATECHANGED, LVN_SETDISPINFOW, MEASUREITEMSTRUCT,
-    NM_CLICK, NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, NM_RDBLCLK, NMCUSTOMDRAW, NMHDR, NMITEMACTIVATE,
+    DRAWITEMSTRUCT, LVIF_IMAGE, LVIF_TEXT, LVN_BEGINDRAG, LVN_BEGINLABELEDITW, LVN_BEGINRDRAG,
+    LVN_COLUMNCLICK, LVN_DELETEALLITEMS, LVN_DELETEITEM, LVN_ENDLABELEDITW, LVN_GETDISPINFOW,
+    LVN_HOTTRACK, LVN_INSERTITEM, LVN_ITEMACTIVATE, LVN_ITEMCHANGED, LVN_ITEMCHANGING, LVN_KEYDOWN,
+    LVN_ODCACHEHINT, LVN_ODSTATECHANGED, LVN_SETDISPINFOW, MEASUREITEMSTRUCT, NM_CLICK,
+    NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, NM_RDBLCLK, NMCUSTOMDRAW, NMHDR, NMITEMACTIVATE,
     NMLISTVIEW, NMLVCACHEHINT, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN, NMLVODSTATECHANGE,
     NMTREEVIEWW, NMTTDISPINFOW, NMTVCUSTOMDRAW, NMTVGETINFOTIPW, NMTVKEYDOWN, TTN_GETDISPINFOW,
     TVN_BEGINDRAGW, TVN_BEGINRDRAGW, TVN_DELETEITEMW, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW,
@@ -308,12 +308,49 @@ impl<T> Deref for View<'_, T> {
     }
 }
 
-impl<T> DerefMut for View<'_, T> {
+impl<T: Writable> DerefMut for View<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: as for `deref`; `&mut self` makes this the only borrow.
+        // `T` has no pointer field (`Writable`), so nothing safe code writes
+        // is followed by Windows or by this layer.
         unsafe { self.ptr.as_mut() }
     }
 }
+
+mod sealed {
+    /// Only the structures [`super::Writable`] lists.
+    pub trait Sealed {}
+}
+
+/// A structure a message's `lParam` points at that safe code may write
+/// whole through a [`View`]: none of its fields is a pointer (or a
+/// buffer's length) that Windows or this layer follows. Sealed: only the
+/// structures listed here. The others are read through [`View`]'s `Deref`
+/// and written through typed setters (`set_text` and the like), which
+/// write only what the notification asks of its procedure, through the
+/// pointers the system gave.
+pub trait Writable: sealed::Sealed {}
+
+macro_rules! writable {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl sealed::Sealed for $t {}
+            impl Writable for $t {}
+        )+
+    };
+}
+
+// Handles and integers only. A custom draw structure's `dwItemSpec` (an
+// index, or a tree's item) is not read back by its control, and nothing
+// here makes a tree item of it; its `hdc` is a handle GDI checks.
+writable!(
+    WINDOWPOS,
+    MINMAXINFO,
+    MEASUREITEMSTRUCT,
+    NMCUSTOMDRAW,
+    NMLVCUSTOMDRAW,
+    NMTVCUSTOMDRAW,
+);
 
 impl<T> Drop for View<'_, T> {
     fn drop(&mut self) {
@@ -426,7 +463,6 @@ notify_struct!(
         LVN_BEGINDRAG,
         LVN_BEGINRDRAG,
         LVN_HOTTRACK,
-        LVN_MARQUEEBEGIN,
         LVN_ITEMACTIVATE,
         NM_CLICK,
         NM_DBLCLK,
@@ -465,7 +501,7 @@ notify_struct!(NMTTDISPINFOW, TOOLTIP, [TTN_GETDISPINFOW]);
 ///
 /// # Safety
 /// `buf` is null or valid for writes of `cap` units.
-pub(crate) unsafe fn write_text(buf: *mut u16, cap: i32, text: &[u16]) {
+unsafe fn write_text(buf: *mut u16, cap: i32, text: &[u16]) {
     let Ok(cap) = usize::try_from(cap) else {
         return;
     };
@@ -481,30 +517,87 @@ pub(crate) unsafe fn write_text(buf: *mut u16, cap: i32, text: &[u16]) {
     }
 }
 
+/// LPSTR_TEXTCALLBACKW: a marker in a text pointer's place, not a pointer.
+const TEXT_CALLBACK: isize = -1;
+
 impl View<'_, NMLVDISPINFOW> {
-    /// Puts `text` in the list's buffer for the item's text (LVIF_TEXT),
-    /// cut to the buffer's length.
+    /// Puts `text` in the list's buffer for the item's text, cut to the
+    /// buffer's length: for an LVN_GETDISPINFOW that asks for the text
+    /// (LVIF_TEXT); nothing for any other notification.
     pub fn set_text(&mut self, text: &[u16]) {
-        let item = self.item;
-        // SAFETY: LVN_GETDISPINFOW's pszText is the list's buffer of
-        // cchTextMax units.
+        let (code, item) = (self.hdr.code, self.item);
+        if code != LVN_GETDISPINFOW
+            || item.mask & LVIF_TEXT == 0
+            || item.pszText as isize == TEXT_CALLBACK
+        {
+            return;
+        }
+        // SAFETY: an LVN_GETDISPINFOW asking for the text: its pszText is
+        // the list's buffer of cchTextMax units. Both are as the list gave
+        // them (a view of this structure is read-only to safe code).
         unsafe { write_text(item.pszText, item.cchTextMax, text) };
     }
 
-    /// The text of LVN_ENDLABELEDITW (`None` when editing was cancelled).
+    /// Gives the item image `image`: for an LVN_GETDISPINFOW that asks
+    /// for it (LVIF_IMAGE); nothing for any other notification.
+    pub fn set_image(&mut self, image: i32) {
+        if self.hdr.code != LVN_GETDISPINFOW || self.item.mask & LVIF_IMAGE == 0 {
+            return;
+        }
+        // SAFETY: the structure the view lends (see `Msg::view_lparam`),
+        // the only view of it; an integer field.
+        unsafe { (*self.as_ptr()).item.iImage = image };
+    }
+
+    /// The text of an LVN_ENDLABELEDITW (`None` when editing was
+    /// cancelled, and for any other notification).
     pub fn text(&self) -> Option<Vec<u16>> {
-        // SAFETY: a list's pszText, when not null, is NUL-terminated.
-        unsafe { read_nul(self.item.pszText) }
+        let p = self.item.pszText;
+        if self.hdr.code != LVN_ENDLABELEDITW || p as isize == TEXT_CALLBACK {
+            return None;
+        }
+        // SAFETY: an LVN_ENDLABELEDITW's pszText is null or the edited
+        // text, NUL-terminated, as the list gave it.
+        unsafe { read_nul(p) }
     }
 }
 
 impl View<'_, NMTVGETINFOTIPW> {
-    /// Puts `text` in the tree's buffer for the item's tip.
+    /// Puts `text` in the tree's buffer for the item's tip (cut to the
+    /// buffer's length); nothing for any other notification.
     pub fn set_text(&mut self, text: &[u16]) {
+        if self.hdr.code != TVN_GETINFOTIPW {
+            return;
+        }
         let (buf, cap) = (self.pszText, self.cchTextMax);
-        // SAFETY: TVN_GETINFOTIPW's pszText is the tree's buffer of
-        // cchTextMax units.
+        // SAFETY: a TVN_GETINFOTIPW's pszText is the tree's buffer of
+        // cchTextMax units, both as the tree gave them (a view of this
+        // structure is read-only to safe code).
         unsafe { write_text(buf, cap, text) };
+    }
+}
+
+impl View<'_, NMTTDISPINFOW> {
+    /// Gives the tip `text` (cut to the 79 units its own buffer holds):
+    /// written into the structure's `szText`, which `lpszText` then points
+    /// at (no resource: `hinst` null). Nothing for any other notification.
+    pub fn set_text(&mut self, text: &[u16]) {
+        if self.hdr.code != TTN_GETDISPINFOW {
+            return;
+        }
+        let p = self.as_ptr();
+        // SAFETY: the structure the view lends (see `Msg::view_lparam`),
+        // the only view of it: its own buffer is filled, NUL-terminated,
+        // and the text pointer set to it, which the tooltip reads before
+        // the structure goes.
+        unsafe {
+            let buf = &mut (*p).szText;
+            buf.fill(0);
+            let n = text.len().min(buf.len() - 1);
+            buf[..n].copy_from_slice(&text[..n]);
+            (*p).lpszText = buf.as_mut_ptr();
+            (*p).hinst = core::ptr::null_mut();
+        }
     }
 }
 
@@ -568,6 +661,103 @@ mod tests {
         assert!(again.is_err());
         drop(v);
         assert_eq!(m.measure_item().unwrap().itemHeight, 5);
+    }
+
+    /// A WM_NOTIFY as delivered, its lParam `l`.
+    fn notify_of<T>(l: &mut T) -> Msg {
+        // SAFETY: the structure the test lends, alive while the message is.
+        unsafe {
+            Msg::delivered(
+                core::ptr::null_mut(),
+                WM_NOTIFY,
+                0,
+                core::ptr::from_mut(l) as LPARAM,
+                Via::Dialog,
+            )
+        }
+    }
+
+    #[test]
+    fn a_view_writes_only_what_its_notification_asks_for() {
+        use windows_sys::Win32::UI::Controls::LVITEMW;
+        // Read-only: no DerefMut (the call would be ambiguous if there
+        // were one, as `static_assertions` checks a type has no trait).
+        trait Ambiguous<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> Ambiguous<()> for T {}
+        impl<T: ?Sized + DerefMut> Ambiguous<u8> for T {}
+        <View<'_, NMLVDISPINFOW> as Ambiguous<_>>::check();
+        <View<'_, NMTVGETINFOTIPW> as Ambiguous<_>>::check();
+        <View<'_, NMTTDISPINFOW> as Ambiguous<_>>::check();
+        <View<'_, NMTREEVIEWW> as Ambiguous<_>>::check();
+        <View<'_, DRAWITEMSTRUCT> as Ambiguous<_>>::check();
+
+        let mut buf = [7u16; 4];
+        let mut info = NMLVDISPINFOW {
+            hdr: NMHDR {
+                code: LVN_ENDLABELEDITW,
+                ..Default::default()
+            },
+            item: LVITEMW {
+                mask: LVIF_TEXT,
+                pszText: buf.as_mut_ptr(),
+                cchTextMax: 4,
+                ..Default::default()
+            },
+        };
+        // Not an LVN_GETDISPINFOW: nothing written.
+        {
+            let m = notify_of(&mut info);
+            // SAFETY: an NMLVDISPINFOW, as above.
+            let mut v = unsafe { m.view_lparam::<NMLVDISPINFOW>() }.unwrap();
+            v.set_text(&[1, 2]);
+        }
+        assert_eq!(buf, [7; 4]);
+        // An LVN_GETDISPINFOW that does not ask for the text: neither.
+        info.hdr.code = LVN_GETDISPINFOW;
+        info.item.mask = LVIF_IMAGE;
+        {
+            let m = notify_of(&mut info);
+            // SAFETY: as above.
+            let mut v = unsafe { m.view_lparam::<NMLVDISPINFOW>() }.unwrap();
+            v.set_text(&[1, 2]);
+            v.set_image(3);
+            // Its buffer is no NUL-terminated text to read.
+            assert_eq!(v.text(), None);
+        }
+        assert_eq!((buf, info.item.iImage), ([7; 4], 3));
+        // One that does: cut to the list's buffer.
+        info.item.mask = LVIF_TEXT;
+        {
+            let m = notify_of(&mut info);
+            // SAFETY: as above.
+            let mut v = unsafe { m.view_lparam::<NMLVDISPINFOW>() }.unwrap();
+            v.set_text(&[1, 2, 3, 4, 5]);
+        }
+        assert_eq!(buf, [1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn a_tooltip_s_text_goes_in_its_own_buffer() {
+        let mut info = NMTTDISPINFOW {
+            hdr: NMHDR {
+                code: TTN_GETDISPINFOW,
+                ..Default::default()
+            },
+            szText: [9; 80],
+            ..Default::default()
+        };
+        let long: Vec<u16> = (1..200).collect();
+        {
+            let m = notify_of(&mut info);
+            // SAFETY: an NMTTDISPINFOW, as above.
+            let mut v = unsafe { m.view_lparam::<NMTTDISPINFOW>() }.unwrap();
+            v.set_text(&long);
+        }
+        assert_eq!(&info.szText[..79], &long[..79]);
+        assert_eq!(info.szText[79], 0);
+        assert!(core::ptr::eq(info.lpszText, info.szText.as_ptr()));
     }
 
     #[test]

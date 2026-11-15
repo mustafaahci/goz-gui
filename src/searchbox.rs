@@ -21,7 +21,7 @@ use crate::colors::{Item, State};
 use crate::paint::fill;
 use crate::theme::{self, Palette};
 use crate::win::class::{Create, create_plain};
-use crate::win::{self, gdi, tip};
+use crate::win::{self, View, gdi, tip};
 use crate::window::App;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -633,7 +633,7 @@ pub fn theme_tooltip(app: &App, dark: bool) {
 
 /// The text of a button's tooltip about to show: none over the magnifier,
 /// which has nothing to clear.
-pub fn tooltip_text(app: &App, info: &mut NMTTDISPINFOW) {
+pub fn tooltip_text(app: &App, info: &mut View<'_, NMTTDISPINFOW>) {
     let empty = win::text_len(app.edit) == 0;
     let text = match info.hdr.idFrom {
         1 if !empty => "Clear",
@@ -642,13 +642,9 @@ pub fn tooltip_text(app: &App, info: &mut NMTTDISPINFOW) {
         4 => "Go forward one search",
         _ => "",
     };
-    info.szText = [0; 80];
-    for (dst, src) in info.szText.iter_mut().zip(text.encode_utf16()) {
-        *dst = src;
-    }
-    // The tooltip shows what this points at; the buffer is in `info`, which
-    // the tooltip reads before it goes.
-    info.lpszText = info.szText.as_mut_ptr();
+    // Into the notification's own buffer, which the tooltip shows.
+    let units: Vec<u16> = text.encode_utf16().collect();
+    info.set_text(&units);
 }
 
 /// The filter bar (View > Filter Bar) right of the search frame, `rc`: a
