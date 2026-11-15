@@ -12,6 +12,8 @@
 //! Wrapping round the end and finding nothing say so in the status bar, in
 //! Everything's words.
 
+// Left: `Strip::message` (crate::strip) hands the bar a raw lParam, which
+// its NM_CUSTOMDRAW is read from until the trait takes a `win::Msg`.
 #![allow(unsafe_code)] // Not yet moved onto `crate::win`.
 
 use std::any::Any;
@@ -22,33 +24,24 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    DC_BRUSH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, GetDC,
-    GetStockObject, HDC, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode,
-    SetDCBrushColor, SetTextColor, TRANSPARENT,
+    DC_BRUSH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, TRANSPARENT,
 };
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::Controls::{
-    BST_CHECKED, BST_UNCHECKED, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_SKIPDEFAULT, EM_SETCUEBANNER,
-    EM_SETSEL, LVIS_FOCUSED, LVIS_SELECTED, LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT, LVM_GETNEXTITEM,
-    LVM_SETSELECTIONMARK, LVNI_FOCUSED, NM_CUSTOMDRAW, NMCUSTOMDRAW, WM_MOUSELEAVE,
+    BST_CHECKED, BST_UNCHECKED, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_SKIPDEFAULT, LVIS_FOCUSED,
+    LVIS_SELECTED, LVNI_FOCUSED, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, WM_MOUSELEAVE,
 };
-use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetActiveWindow, GetCapture, GetFocus, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
-    TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_RETURN,
-    VK_SHIFT,
+    VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_RETURN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, CreateWindowExW, EN_CHANGE,
-    ES_AUTOHSCROLL, GetWindowTextLengthW, HMENU, IsWindowVisible, KillTimer, MB_OK, MSG,
-    PostMessageW, SM_CXMENUCHECK, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowPos, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND,
-    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFONT, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WS_CHILD, WS_TABSTOP,
+    BN_CLICKED, BS_AUTOCHECKBOX, EN_CHANGE, ES_AUTOHSCROLL, MB_OK, MSG, SM_CXMENUCHECK,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WS_CHILD, WS_TABSTOP,
 };
 
-use super::{App, Fonts, key_down, send, slots};
+use super::{App, Fonts, key_down, slots};
 use crate::client::{self, RowRange, Search, Stop, Streamed};
 use crate::colors::{Item as ColorItem, State as ColorState};
 use crate::find::{self, Gate, Needle, Part, Side, Walked};
@@ -56,7 +49,10 @@ use crate::highlight::Span;
 use crate::paint::fill;
 use crate::strip::{Strip, StripSlot};
 use crate::theme::{self, Ink, Palette, rgb};
-use crate::wide::{window_text, wz};
+use crate::wide::window_text;
+use crate::win::class::{self, Create};
+use crate::win::gdi::{self, Selected, WindowDc};
+use crate::win::{self, button, edit, lv, parcel, sys};
 use crate::{hover, searchbox};
 
 /// The find bar's controls, children of the main window (F4's ids).
@@ -64,7 +60,7 @@ const ID_EDIT: usize = 0x5200;
 const ID_HIGHLIGHT: usize = 0x5201;
 const ID_CASE: usize = 0x5202;
 
-/// A find's thread reports here: a `Box<Reply>` in lParam.
+/// A find's thread reports here: a `Report`, as a parcel.
 pub(super) const WM_FIND: u32 = slots::F4_MSG;
 /// The text has stopped changing for a moment: find it.
 pub(super) const TIMER_TYPED: usize = slots::F4_TIMER;
@@ -165,12 +161,11 @@ impl FindBar {
 
     fn has_text(&self) -> bool {
         let edit = self.edit.get();
-        // SAFETY: reads the length of this thread's box.
-        !edit.is_null() && unsafe { GetWindowTextLengthW(edit) } > 0
+        !edit.is_null() && win::text_len(edit) > 0
     }
 
     fn checked(&self, hwnd: HWND) -> bool {
-        !hwnd.is_null() && send(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED as isize
+        !hwnd.is_null() && button::check(hwnd) == BST_CHECKED
     }
 
     /// Makes the controls, hidden, the first time the bar shows.
@@ -178,48 +173,39 @@ impl FindBar {
         if !self.edit.get().is_null() {
             return;
         }
-        // SAFETY: creates child controls of this thread's main window; the
-        // strings live across the calls.
-        unsafe {
-            let make = |class: &str, text: &str, style: u32, id: usize| {
-                CreateWindowExW(
-                    0,
-                    wz(class).as_ptr(),
-                    wz(text).as_ptr(),
-                    WS_CHILD | WS_TABSTOP | style,
-                    0,
-                    0,
-                    0,
-                    0,
-                    app.hwnd,
-                    id as HMENU,
-                    core::ptr::null_mut(),
-                    core::ptr::null(),
-                )
-            };
-            self.edit
-                .set(make("EDIT", "", ES_AUTOHSCROLL as u32, ID_EDIT));
-            self.highlight.set(make(
-                "BUTTON",
-                "Highlight &All",
-                BS_AUTOCHECKBOX as u32,
-                ID_HIGHLIGHT,
-            ));
-            self.case.set(make(
-                "BUTTON",
-                "Match &Case",
-                BS_AUTOCHECKBOX as u32,
-                ID_CASE,
-            ));
-        }
-        let cue = wz("Find in results");
-        send(self.edit.get(), EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+        // Child controls of this thread's main window.
+        let make = |class: &str, text: &str, style: u32, id: usize| {
+            class::create_plain(&Create {
+                ex_style: 0,
+                class,
+                title: text,
+                style: WS_CHILD | WS_TABSTOP | style,
+                rect: (0, 0, 0, 0),
+                parent: app.hwnd,
+                menu: class::id_menu(id),
+            })
+        };
+        self.edit
+            .set(make("EDIT", "", ES_AUTOHSCROLL as u32, ID_EDIT));
+        self.highlight.set(make(
+            "BUTTON",
+            "Highlight &All",
+            BS_AUTOCHECKBOX as u32,
+            ID_HIGHLIGHT,
+        ));
+        self.case.set(make(
+            "BUTTON",
+            "Match &Case",
+            BS_AUTOCHECKBOX as u32,
+            ID_CASE,
+        ));
+        edit::set_cue_banner(self.edit.get(), "Find in results", true);
         for (hwnd, on) in [
             (self.highlight.get(), highlight_all),
             (self.case.get(), match_case),
         ] {
             let state = if on { BST_CHECKED } else { BST_UNCHECKED };
-            send(hwnd, BM_SETCHECK, state as usize, 0);
+            button::set_check(hwnd, state);
         }
         self.set_fonts(app);
         self.theme(app, app.pal.get().dark);
@@ -229,7 +215,7 @@ impl FindBar {
         let font = app.part_font(ColorItem::FindBar, false);
         for hwnd in self.controls() {
             if !hwnd.is_null() {
-                send(hwnd, WM_SETFONT, font as usize, 1);
+                win::set_font(hwnd, font, true);
             }
         }
     }
@@ -237,25 +223,20 @@ impl FindBar {
     /// A check box's width for its label in the bar's font.
     fn check_width(app: &App, hwnd: HWND) -> i32 {
         let text: Vec<u16> = window_text(hwnd).replace('&', "").encode_utf16().collect();
-        // SAFETY: a DC of this thread's window, measured in and given back
-        // with its old font.
-        let w = unsafe {
-            let dc = GetDC(app.hwnd);
-            let old = SelectObject(dc, app.part_font(ColorItem::FindBar, false));
-            let w = crate::paint::width(dc, &text);
-            SelectObject(dc, old);
-            ReleaseDC(app.hwnd, dc);
-            w
+        // A DC of this thread's window, measured in and given back with its
+        // old font (the guards drop in turn).
+        let w = {
+            let dc = WindowDc::get(app.hwnd);
+            let _font = Selected::new(dc.hdc(), app.part_font(ColorItem::FindBar, false));
+            crate::paint::width(dc.hdc(), &text)
         };
-        // SAFETY: reads a metric.
-        let check = unsafe { GetSystemMetricsForDpi(SM_CXMENUCHECK, app.dpi.get()) };
+        let check = sys::metric_for_dpi(SM_CXMENUCHECK, app.dpi.get());
         check + app.scale(6) + w
     }
 
     fn invalidate(&self, app: &App, rc: &RECT) {
         if !empty(rc) {
-            // SAFETY: repaints part of this thread's window.
-            unsafe { InvalidateRect(app.hwnd, rc, 0) };
+            win::invalidate(app.hwnd, Some(rc), false);
         }
     }
 
@@ -308,8 +289,7 @@ impl FindBar {
             self.invalidate(app, &self.geo.get().frame);
             let edit = self.edit.get();
             if !edit.is_null() {
-                // SAFETY: repaints this thread's box.
-                unsafe { InvalidateRect(edit, core::ptr::null(), 1) };
+                win::invalidate(edit, None, true);
             }
         }
     }
@@ -324,18 +304,12 @@ impl FindBar {
         for hwnd in self.controls() {
             if !hwnd.is_null() {
                 let flag = if show { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW };
-                // SAFETY: shows or hides a control of this thread's window.
-                unsafe {
-                    SetWindowPos(
-                        hwnd,
-                        core::ptr::null_mut(),
-                        0,
-                        0,
-                        0,
-                        0,
-                        flag | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE,
-                    )
-                };
+                win::set_pos(
+                    hwnd,
+                    core::ptr::null_mut(),
+                    (0, 0, 0, 0),
+                    flag | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE,
+                );
             }
         }
     }
@@ -351,18 +325,17 @@ fn put(hwnd: HWND, rc: RECT) {
     } else {
         SWP_SHOWWINDOW
     };
-    // SAFETY: moves a control of this thread's window.
-    unsafe {
-        SetWindowPos(
-            hwnd,
-            core::ptr::null_mut(),
+    win::set_pos(
+        hwnd,
+        core::ptr::null_mut(),
+        (
             rc.left,
             rc.top,
             (rc.right - rc.left).max(0),
             (rc.bottom - rc.top).max(0),
-            show | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-    }
+        ),
+        show | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
 }
 
 /// Sizes along the bar, in pixels at the window's DPI.
@@ -533,12 +506,10 @@ impl Strip for FindBar {
         // A control that went keeps no keyboard: it goes to the results
         // (now, or when the window is active again).
         let gone = |h: HWND| !h.is_null() && placed.iter().any(|&(c, rc)| c == h && empty(&rc));
-        // SAFETY: reads the focus of this thread; it is only moved while
-        // it is in this window (so the window is the active one).
-        unsafe {
-            if gone(GetFocus()) {
-                SetFocus(app.list);
-            }
+        // The focus is only moved while it is in this window (so the window
+        // is the active one).
+        if gone(win::focus()) {
+            win::set_focus(app.list);
         }
         if gone(app.last_focus.get()) {
             app.last_focus.set(app.list);
@@ -592,23 +563,19 @@ impl Strip for FindBar {
         if let Some(text) = self.progress.borrow().as_deref()
             && !empty(&g.status)
         {
-            let mut t: Vec<u16> = text.encode_utf16().collect();
+            let t: Vec<u16> = text.encode_utf16().collect();
             let mut r = g.status;
-            // SAFETY: draws into the paint buffer; the old font is put
-            // back.
-            unsafe {
-                let old = SelectObject(hdc, app.part_font(ColorItem::FindBar, false));
-                SetBkMode(hdc, TRANSPARENT as i32);
-                SetTextColor(hdc, pal.dim);
-                DrawTextW(
-                    hdc,
-                    t.as_mut_ptr(),
-                    t.len() as i32,
-                    &mut r,
-                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-                );
-                SelectObject(hdc, old);
-            }
+            // Drawn into the paint buffer; the old font goes back as this
+            // drops.
+            let _font = Selected::new(hdc, app.part_font(ColorItem::FindBar, false));
+            gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+            gdi::set_text_color(hdc, pal.dim);
+            gdi::draw_text(
+                hdc,
+                &t,
+                &mut r,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
         }
     }
 
@@ -626,14 +593,8 @@ impl Strip for FindBar {
                     None => over,
                 };
                 if hot.is_some() {
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: app.hwnd,
-                        dwHoverTime: 0,
-                    };
-                    // SAFETY: asks for WM_MOUSELEAVE on this thread's window.
-                    unsafe { TrackMouseEvent(&mut tme) };
+                    // WM_MOUSELEAVE, when the mouse leaves this window.
+                    win::track_leave(app.hwnd);
                 }
                 self.set_hot(app, hot);
                 false
@@ -656,16 +617,14 @@ impl Strip for FindBar {
                     Some(b) if b == Button::Close || self.has_text() => {
                         self.pressed.set(Some(b));
                         self.set_hot(app, Some(b));
-                        // SAFETY: takes the mouse for this thread's window.
-                        unsafe { SetCapture(app.hwnd) };
+                        win::set_capture(app.hwnd);
                         app.capture_strip(Some(StripSlot::FindBar));
                         self.invalidate(app, &self.button_rect(b));
                     }
                     Some(_) => {}
                     None if inside(&self.geo.get().frame, pt) => {
                         // The frame round the text is the box too.
-                        // SAFETY: focuses a control of this thread's window.
-                        unsafe { SetFocus(self.edit.get()) };
+                        win::set_focus(self.edit.get());
                     }
                     None => {}
                 }
@@ -676,11 +635,9 @@ impl Strip for FindBar {
                     return inside(&row, pt);
                 };
                 app.capture_strip(None);
-                // SAFETY: lets go of the mouse this bar took.
-                unsafe {
-                    if GetCapture() == app.hwnd {
-                        ReleaseCapture();
-                    }
+                // Lets go of the mouse this bar took.
+                if win::capture() == app.hwnd {
+                    win::release_capture();
                 }
                 let over = self.button_at(pt) == Some(b);
                 self.set_hot(app, over.then_some(b));
@@ -714,10 +671,7 @@ impl Strip for FindBar {
         let stops: Vec<HWND> = self
             .controls()
             .into_iter()
-            .filter(|&h| {
-                // SAFETY: asks about this thread's controls.
-                !h.is_null() && unsafe { IsWindowVisible(h) } != 0
-            })
+            .filter(|&h| !h.is_null() && win::is_visible(h))
             .collect();
         let Some(at) = stops.iter().position(|&h| h == from) else {
             return false;
@@ -729,8 +683,7 @@ impl Strip for FindBar {
         };
         match next {
             Some(&h) => {
-                // SAFETY: focuses a control of this thread's window.
-                unsafe { SetFocus(h) };
+                win::set_focus(h);
                 true
             }
             None => false,
@@ -743,11 +696,17 @@ impl Strip for FindBar {
             // At a UI scale the check boxes are drawn here, their marks at
             // the scale (Windows draws them at the monitor's size).
             WM_NOTIFY if l != 0 => {
-                // SAFETY: WM_NOTIFY's lParam is an NMHDR; an
-                // NM_CUSTOMDRAW's is an NMCUSTOMDRAW.
+                // SAFETY: what `App::strip_message` hands on is a message
+                // the main window was delivered: WM_NOTIFY's lParam is an
+                // NMHDR (read alone first, for its code).
+                let hdr = unsafe { &*(l as *const NMHDR) };
+                if hdr.code != NM_CUSTOMDRAW {
+                    return None;
+                }
+                // SAFETY: as above; an NM_CUSTOMDRAW's is an NMCUSTOMDRAW.
                 let cd = unsafe { &*(l as *const NMCUSTOMDRAW) };
                 let button = cd.hdr.hwndFrom;
-                if cd.hdr.code != NM_CUSTOMDRAW || !crate::dialog::ui_scaled(button) {
+                if !crate::dialog::ui_scaled(button) {
                     return None;
                 }
                 let kind = crate::dialog::check_kind(button)?;
@@ -774,24 +733,22 @@ impl Strip for FindBar {
             }
             WM_CTLCOLOREDIT => {
                 let colour = self.field_colour(app);
-                // SAFETY: the DC the box is about to draw with; the DC
-                // brush takes the colour set on that DC.
-                unsafe {
-                    SetTextColor(w as HDC, field_ink(&pal).fg);
-                    SetBkColor(w as HDC, colour);
-                    SetDCBrushColor(w as HDC, colour);
-                    Some(GetStockObject(DC_BRUSH) as LRESULT)
-                }
+                // wParam is the DC the box is about to draw with (a handle
+                // GDI checks); the DC brush takes the colour set on it.
+                let dc = w as HDC;
+                gdi::set_text_color(dc, field_ink(&pal).fg);
+                gdi::set_bk_color(dc, colour);
+                gdi::set_dc_brush_color(dc, colour);
+                Some(gdi::stock_object(DC_BRUSH) as LRESULT)
             }
             WM_CTLCOLORSTATIC => {
-                // SAFETY: as above, for a check box on the bar's chrome.
+                // As above, for a check box on the bar's chrome.
                 let bar = pal.ink(ColorItem::FindBar, ColorState::Normal);
-                unsafe {
-                    SetTextColor(w as HDC, bar.fg);
-                    SetBkColor(w as HDC, bar.bg);
-                    SetDCBrushColor(w as HDC, bar.bg);
-                    Some(GetStockObject(DC_BRUSH) as LRESULT)
-                }
+                let dc = w as HDC;
+                gdi::set_text_color(dc, bar.fg);
+                gdi::set_bk_color(dc, bar.bg);
+                gdi::set_dc_brush_color(dc, bar.bg);
+                Some(gdi::stock_object(DC_BRUSH) as LRESULT)
             }
             _ => None,
         }
@@ -838,7 +795,7 @@ impl Strip for FindBar {
                 } else {
                     BST_CHECKED
                 };
-                send(target, BM_SETCHECK, state as usize, 0);
+                button::set_check(target, state);
                 app.find_options_changed();
                 true
             }
@@ -859,8 +816,7 @@ impl Strip for FindBar {
             theme::set_class(hwnd, dark.then_some("DarkMode_Explorer"));
         }
         for hwnd in self.controls() {
-            // SAFETY: repaints this thread's controls.
-            unsafe { InvalidateRect(hwnd, core::ptr::null(), 1) };
+            win::invalidate(hwnd, None, true);
         }
         app.invalidate_strip(StripSlot::FindBar);
     }
@@ -947,17 +903,15 @@ impl App {
             return;
         }
         let edit = bar.edit.get();
-        // SAFETY: moves the keyboard within this thread's window; while
-        // the window is not the active one the box is where it goes when
-        // it is (focusing would activate it, which only the user should).
-        unsafe {
-            if GetActiveWindow() == self.hwnd {
-                SetFocus(edit);
-            } else {
-                self.last_focus.set(edit);
-            }
+        // While the window is not the active one the box is where the
+        // keyboard goes when it is (focusing would activate it, which only
+        // the user should).
+        if win::active() == self.hwnd {
+            win::set_focus(edit);
+        } else {
+            self.last_focus.set(edit);
         }
-        send(edit, EM_SETSEL, 0, -1);
+        edit::select_all(edit);
     }
 
     /// The × or Esc: the bar goes, and the keyboard to the results if it
@@ -968,8 +922,7 @@ impl App {
             return;
         }
         self.cancel_find();
-        // SAFETY: reads this thread's focus.
-        let had_focus = bar.contains(unsafe { GetFocus() });
+        let had_focus = bar.contains(win::focus());
         bar.visible.set(false);
         bar.hot.set(None);
         bar.show_controls(false);
@@ -1009,8 +962,8 @@ impl App {
         bar.set_not_found(self, false);
         self.invalidate_strip(StripSlot::FindBar);
         self.update_lit();
-        // SAFETY: a timer of this window; setting it again restarts it.
-        unsafe { SetTimer(self.hwnd, TIMER_TYPED, TYPED_MS, None) };
+        // A timer of this window; setting it again restarts it.
+        win::set_timer(self.hwnd, TIMER_TYPED, TYPED_MS);
     }
 
     /// The typing paused: the text is found from the focused row on.
@@ -1053,8 +1006,7 @@ impl App {
             changed
         };
         if changed {
-            // SAFETY: repaints the list.
-            unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
+            win::invalidate(self.list, None, false);
         }
     }
 
@@ -1069,8 +1021,7 @@ impl App {
                 return;
             }
         }
-        // SAFETY: a timer of this window.
-        unsafe { KillTimer(self.hwnd, TIMER_TYPED) };
+        win::kill_timer(self.hwnd, TIMER_TYPED);
         self.start_find(forward, false);
     }
 
@@ -1094,14 +1045,8 @@ impl App {
         let Some(needle) = self.find_needle() else {
             return;
         };
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as u64;
-        let focus = u64::try_from(send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        ))
-        .ok();
+        let count = lv::item_count(self.list) as u64;
+        let focus = u64::try_from(lv::next_item(self.list, -1, LVNI_FOCUSED)).ok();
         let parts = find::plan(count, focus, forward, inclusive);
         let (walked, search, anchor) = {
             let m = self.model.borrow();
@@ -1209,7 +1154,7 @@ impl App {
     /// Selects the match at `index` alone, as a click on it would, and
     /// brings it into view; the keyboard stays where it is.
     fn found(&self, index: u64, wrapped: bool, forward: bool) {
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as u64;
+        let count = lv::item_count(self.list) as u64;
         if index >= count {
             return;
         }
@@ -1221,8 +1166,8 @@ impl App {
             LVIS_SELECTED | LVIS_FOCUSED,
             LVIS_SELECTED | LVIS_FOCUSED,
         );
-        send(self.list, LVM_SETSELECTIONMARK, 0, index as isize);
-        send(self.list, LVM_ENSUREVISIBLE, index, 0);
+        lv::set_selection_mark(self.list, index as i32);
+        lv::ensure_visible(self.list, index as i32, false);
         hover::scrolled(self);
         self.wrap_note(wrapped, forward);
     }
@@ -1232,7 +1177,7 @@ impl App {
     /// as its rows come (`reselect.rs`), so a file that came or went above
     /// it meanwhile does not put another one under the selection.
     fn found_far(&self, index: u64, path: Box<[u16]>, wrapped: bool, forward: bool) {
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as u64;
+        let count = lv::item_count(self.list) as u64;
         if count == 0 {
             return;
         }
@@ -1249,7 +1194,7 @@ impl App {
             vec![path.clone()],
             Some(path),
         ));
-        send(self.list, LVM_ENSUREVISIBLE, index, 0);
+        lv::ensure_visible(self.list, index as i32, false);
         // Asked for now, not when the list paints them: a window not on
         // screen paints nothing, and the file is selected as they come.
         self.request_rows(index.saturating_sub(64), index + 64);
@@ -1274,8 +1219,7 @@ impl App {
         let bar = self.find_bar();
         bar.set_not_found(self, true);
         self.show_note(find::not_found(&bar.text()));
-        // SAFETY: plays a system sound.
-        unsafe { MessageBeep(MB_OK) };
+        sys::beep(MB_OK);
     }
 
     /// Lights the find's matches in a name being drawn (Highlight All):
@@ -1327,9 +1271,9 @@ fn prefix_width(hdc: HDC, text: &[u16], bold: &[Span], fonts: &Fonts, end: usize
     let mut w = 0;
     let mut measure = |s: usize, e: usize, font| {
         if e > s {
-            // SAFETY: selects one of the row's fonts into the row's DC to
-            // measure; the caller puts its own back as it draws.
-            unsafe { SelectObject(hdc, font) };
+            // One of the row's fonts into the row's DC to measure; the
+            // caller puts its own back as it draws.
+            gdi::select(hdc, font);
             w += crate::paint::width(hdc, &text[s..e]);
         }
     };
@@ -1346,20 +1290,15 @@ fn prefix_width(hdc: HDC, text: &[u16], bold: &[Span], fonts: &Fonts, end: usize
     if at < end {
         measure(at, end, fonts.normal);
     }
-    // SAFETY: as above: the normal font back, which the row draws in.
-    unsafe { SelectObject(hdc, fonts.normal) };
+    // As above: the normal font back, which the row draws in.
+    gdi::select(hdc, fonts.normal);
     w
 }
 
-/// Posts `reply` to the window; if the window is gone, it is freed here.
+/// Posts `reply` to the window (`hwnd`, a number: an HWND is not Send),
+/// as a parcel; if the window is gone, it is dropped.
 fn post(hwnd: usize, generation: u64, reply: Reply) {
-    let raw = Box::into_raw(Box::new(Report { generation, reply }));
-    // SAFETY: the window owns the box once posted; else it is taken back.
-    unsafe {
-        if PostMessageW(hwnd as HWND, WM_FIND, 0, raw as isize) == 0 {
-            drop(Box::from_raw(raw));
-        }
-    }
+    parcel::post(hwnd as HWND, WM_FIND, 0, Report { generation, reply });
 }
 
 /// What a find's thread looks through.
