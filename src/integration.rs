@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs};
 use windows_sys::core::GUID;
 
-use crate::win::ext::b9::reg::{self, Hive};
-use crate::win::ext::b9::shell::{self, ShellLink};
+use crate::win::reg::{self, Hive};
+use crate::win::shell::{self, ShellLink};
 
 /// The test override of where the keys go.
 pub const REG_ROOT_VAR: &str = "GOZ_GUI_REG_ROOT";

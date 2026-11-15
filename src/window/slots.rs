@@ -6,10 +6,11 @@
 //! below, so their changes merge without touching each other's lines. Ids
 //! outside every range never get here.
 
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::LRESULT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{HMENU, WM_APP};
 
 use super::App;
+use crate::win::Msg;
 
 /// The WM_APP messages each feature may post to the main window: 20 each,
 /// from `WM_APP + 120` (the framework's own are `WM_APP + 100..120`).
@@ -151,29 +152,29 @@ impl App {
 
     /// A feature's WM_APP message (its range above): the answer, or `None`
     /// for DefWindowProc.
-    pub(super) fn feature_message(&self, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
-        match msg {
+    pub(super) fn feature_message(&self, m: &Msg) -> Option<LRESULT> {
+        match m.id {
             // F1.
-            m if (F1_MSG..F1_MSG + MSG_RANGE).contains(&m) => self.preview_message(m, w, l),
+            id if (F1_MSG..F1_MSG + MSG_RANGE).contains(&id) => self.preview_message(m),
 
             // F2.
-            m if (F2_MSG..F2_MSG + MSG_RANGE).contains(&m) => None,
+            id if (F2_MSG..F2_MSG + MSG_RANGE).contains(&id) => None,
 
             // F3.
-            m if (F3_MSG..F3_MSG + MSG_RANGE).contains(&m) => self.window_message(m, w, l),
+            id if (F3_MSG..F3_MSG + MSG_RANGE).contains(&id) => self.window_message(m),
 
             // F4.
-            m if (F4_MSG..F4_MSG + MSG_RANGE).contains(&m) => self.tools_message(m, w, l),
+            id if (F4_MSG..F4_MSG + MSG_RANGE).contains(&id) => self.tools_message(m),
 
             // F5.
-            m if (F5_MSG..F5_MSG + MSG_RANGE).contains(&m) => None,
+            id if (F5_MSG..F5_MSG + MSG_RANGE).contains(&id) => None,
 
             // F6: the keyboard to the search box after an activation.
             super::uiopts::WM_FOCUS_SEARCH => {
                 self.focus_search_activated();
                 Some(0)
             }
-            m if (F6_MSG..F6_MSG + MSG_RANGE).contains(&m) => None,
+            id if (F6_MSG..F6_MSG + MSG_RANGE).contains(&id) => None,
 
             _ => None,
         }

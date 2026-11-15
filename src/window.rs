@@ -52,9 +52,7 @@ use crate::theme::{Palette, ThemeMode};
 use crate::thumbs::{ThumbReply, Thumbs};
 use crate::typeahead::TypeAhead;
 use crate::view::View;
-use crate::wide::window_text;
 use crate::win::class::{self, Class, Create};
-use crate::win::ext::b1;
 use crate::win::{self, Msg, gdi, lv, parcel, queue, subclass, sys};
 use crate::{
     dialog, dropdown, format, header, hover, keys, menu, msgbox, paint, places, searchbox, shell,
@@ -516,7 +514,7 @@ pub struct App {
 /// How the program that started goz-gui asked for its window to be shown
 /// (a shortcut's Run: Normal, Minimized, Maximized; a test's no-activate).
 fn startup_show() -> i32 {
-    match b1::startup_show_window() {
+    match win::process::startup_show_window() {
         Some(show) => i32::from(show),
         None => SW_SHOWNORMAL,
     }
@@ -845,7 +843,13 @@ See Help > Search Syntax and the README for goz-gui's switches."
         ));
     }
 
-    while let Some(q) = queue::get(core::ptr::null_mut()) {
+    let code = loop {
+        let q = match queue::get(core::ptr::null_mut()) {
+            queue::Got::Message(q) => q,
+            queue::Got::Quit(code) => break code,
+            // As at WM_QUIT: the loop ends (with no code of its own).
+            queue::Got::Failed => break 0,
+        };
         let msg = q.msg();
         dropdown::click_elsewhere(app, &msg);
         // A pane or strip takes the keys its controls keep first.
@@ -884,7 +888,7 @@ See Help > Search Syntax and the README for goz-gui's switches."
         }
         queue::translate(&q);
         queue::dispatch(&q);
-    }
+    };
     crate::trace::finish();
     // W5: the File List Editor is asked to close (it asks about unsaved
     // changes), and goz-gui ends once it has.
@@ -895,8 +899,8 @@ See Help > Search Syntax and the README for goz-gui's switches."
     app.fileops.finish();
     crate::actions::wait_for_launches(Duration::from_secs(10));
     shell::ole_done();
-    // WM_QUIT's code: the only one this thread posts is WM_DESTROY's 0.
-    0
+    // WM_QUIT's code.
+    code
 }
 
 thread_local! {
@@ -915,13 +919,8 @@ pub fn app_of(main: HWND) -> Option<&'static App> {
 pub fn app_icon(size: i32) -> HICON {
     // A resource of this module by its id; a missing one is reported as
     // null, which callers accept.
-    b1::module_icon(1, size)
+    win::icon::from_module(1, size)
 }
-
-// `wide::is_wide` had its one caller here (WM_SETTINGCHANGE, which reads
-// its setting with `Msg::setting_is` now). Named, not called, until it goes
-// from `wide.rs`, so the build stays free of warnings meanwhile.
-const _: unsafe fn(*const u16, &str) -> bool = crate::wide::is_wide;
 
 fn loword(v: usize) -> u16 {
     (v & 0xffff) as u16
@@ -1163,8 +1162,8 @@ impl App {
             header::subclass_proc(self, m)
         });
         // Files dropped on the window or the search box become the search.
-        b1::drag_accept_files(self.hwnd, true);
-        b1::drag_accept_files(self.edit, true);
+        win::dropfiles::accept(self.hwnd, true);
+        win::dropfiles::accept(self.edit, true);
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
         lv::set_extended_style(self.list, ex, ex);
         // Full row select and one-click opening as Options > Results says,
@@ -1366,7 +1365,7 @@ impl App {
         self.docks_theme(dark);
         theme::flush_menus();
         // Repaints this thread's windows.
-        b1::draw_menu_bar(self.hwnd);
+        win::menu::draw_bar(self.hwnd);
         win::redraw(
             self.hwnd,
             None,
@@ -1513,7 +1512,7 @@ impl App {
                 | WM_CTLCOLORBTN
                 | WM_CTLCOLORLISTBOX
                 | WM_DRAWITEM
-        ) && let Some(answer) = self.strip_message(msg, w, l)
+        ) && let Some(answer) = self.strip_message(m)
         {
             return answer;
         }
@@ -1531,7 +1530,7 @@ impl App {
                 | WM_RBUTTONUP
                 | WM_MBUTTONDOWN
                 | WM_MBUTTONUP
-        ) && self.strip_mouse(msg, w, point(l))
+        ) && self.strip_mouse(m)
         {
             return 0;
         }
@@ -1741,24 +1740,24 @@ impl App {
             }
             // W4 (G1): the data tools' messages.
             id if (crate::datatools::MSG_FIRST..crate::datatools::MSG_END).contains(&id) => {
-                self.data_tools_message(id, w, l);
+                self.data_tools_message(m);
                 0
             }
             // W6 (C): the File List Editor closed.
             id if (crate::listedit::WM_EDITOR_CLOSED..crate::listedit::W6_MSG_END)
                 .contains(&id) =>
             {
-                self.lists_message(id, w, l);
+                self.lists_message(m);
                 0
             }
             // W7 (C): a file-list term to edit, a slot's saved results.
             id if (crate::slotedit::MSG_FIRST..crate::slotedit::MSG_END).contains(&id) => {
-                self.w7_message(id, w, l);
+                self.w7_message(m);
                 0
             }
             // W9 (B1): the disk's column values, the content search.
             id if w9a::is_message(id) => {
-                self.w9_message(id, w, l);
+                self.w9_message(m);
                 0
             }
             WM_SERVICE => {
@@ -1818,11 +1817,9 @@ impl App {
                 0
             }
             id if slots::is_feature_message(id) => {
-                self.feature_message(id, w, l).unwrap_or_else(|| m.def())
+                self.feature_message(m).unwrap_or_else(|| m.def())
             }
-            id if custom::is_message(id) => {
-                self.custom_message(id, w, l).unwrap_or_else(|| m.def())
-            }
+            id if custom::is_message(id) => self.custom_message(m).unwrap_or_else(|| m.def()),
             WM_EXPORT => {
                 if w == crate::export::ENDED {
                     if let Some(ended) = parcel::take::<crate::export::Ended>(m) {
@@ -1968,7 +1965,7 @@ impl App {
                     // mouse click), though the box had the keyboard.
                     if u32::from(loword(w)) == WA_CLICKACTIVE
                         && self.ui.get().select_on_click
-                        && b1::cursor_pos().is_some_and(|pt| win::from_point(pt) == self.edit)
+                        && win::sys::cursor_pos().is_some_and(|pt| win::from_point(pt) == self.edit)
                     {
                         self.click_select.set(true);
                     }
@@ -2013,14 +2010,14 @@ impl App {
                 }
                 0
             }
-            paint::WM_UAHDRAWMENU if paint::draws_menubar(&self.pal.get()) => {
-                if let Some(um) = b1::uah_menu(m) {
+            win::menubar::WM_UAHDRAWMENU if paint::draws_menubar(&self.pal.get()) => {
+                if let Some(um) = win::menubar::draw_menu(m) {
                     paint::menubar(self, &um);
                 }
                 1
             }
-            paint::WM_UAHDRAWMENUITEM if paint::draws_menubar(&self.pal.get()) => {
-                if let Some(item) = b1::uah_draw_menu_item(m) {
+            win::menubar::WM_UAHDRAWMENUITEM if paint::draws_menubar(&self.pal.get()) => {
+                if let Some(item) = win::menubar::draw_menu_item(m) {
                     paint::menubar_item(self, &item);
                 }
                 1
@@ -2051,7 +2048,7 @@ impl App {
                 0
             }
             WM_TRAY => {
-                self.on_tray(w, l);
+                self.on_tray(m);
                 0
             }
             WM_LAUNCH => {
@@ -2343,7 +2340,7 @@ impl App {
             // are settings.
             self.settings_changed();
         }
-        let text = window_text(self.edit);
+        let text = win::text(self.edit);
         let o = self.opts.get();
         // The Folders pane's folder goes in front of the text (F2). W8: in
         // front of each part `new-search:` starts, with the filter and Match
@@ -2474,7 +2471,7 @@ impl App {
         };
         // Set only when it changed: a refresh (every live update) would
         // repaint the title bar for nothing.
-        if window_text(self.hwnd) != title {
+        if win::text(self.hwnd) != title {
             win::set_text(self.hwnd, &title);
         }
         self.apply_on_top();

@@ -29,7 +29,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::dialog::{Class, Look, Template, center_on_owner, common, theme_new};
 use crate::msgbox;
 use crate::searchtools::folder_term;
-use crate::win::ext::b5;
+use crate::win::dib::Canvas;
+use crate::win::shell::FileDialog;
 use crate::win::{self, Msg, button, combo, dlg, gdi, subclass, sys};
 
 /// A size's unit: Everything's list, 1024-based as goz's.
@@ -230,7 +231,28 @@ pub fn query(form: &Form) -> Result<String, Problem> {
 /// Asks for a folder, starting in `start` (if any); its path, or `None`
 /// when cancelled.
 pub fn pick_folder(owner: HWND, start: &str) -> Option<String> {
-    b5::pick_folder(owner, start, "Select a folder")
+    use windows::Win32::UI::Shell::{
+        FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
+    };
+    // The system's folder picker (the Open dialog, picking folders), made,
+    // shown modal and read on this thread (making it fails on a thread
+    // without COM).
+    let dialog = FileDialog::open()?;
+    let options = dialog.options()?;
+    let folders = FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR;
+    if !dialog.set_options(options | folders.0) {
+        return None;
+    }
+    let start = start.trim();
+    if !start.is_empty() {
+        let start: Vec<u16> = start.encode_utf16().collect();
+        dialog.set_folder(&start);
+    }
+    dialog.set_title("Select a folder");
+    if !dialog.show(owner) {
+        return None;
+    }
+    String::from_utf16(&dialog.result()?.file_system_path()?).ok()
 }
 
 const STATIC: u16 = 0xffff;
@@ -599,7 +621,7 @@ fn size_of_box(dlg: HWND, id: u16, unit: u16) -> Result<Option<Size>, ()> {
 
 /// A date picker's day, `None` while its box is unticked.
 fn day_of(dlg: HWND, id: u16) -> Option<Day> {
-    b5::picker_time(dlg::item(dlg, id)).map(|st| (st.wYear, st.wMonth, st.wDay))
+    win::datetime::time(dlg::item(dlg, id)).map(|st| (st.wYear, st.wMonth, st.wDay))
 }
 
 impl Dlg<'_> {
@@ -609,7 +631,7 @@ impl Dlg<'_> {
         fill_combo(dlg, ID_SIZE_TO_UNIT, units(), DEFAULT_UNIT);
         // No date until one is ticked.
         for id in [ID_DATE_FROM, ID_DATE_TO] {
-            b5::set_picker_time(dlg::item(dlg, id), None);
+            win::datetime::set_time(dlg::item(dlg, id), None);
         }
         theme_new(dlg, self.look.get().dark);
         for id in [ID_DATE_FROM, ID_DATE_TO] {
@@ -739,32 +761,25 @@ fn flip_lightness(bgra: u32) -> u32 {
 /// picker's WM_PAINT, as its subclass has it.
 fn paint_dark_picker(m: &Msg) {
     use windows_sys::Win32::Graphics::Gdi::SRCCOPY;
-    // The picker's own procedure draws into a bitmap of the client's size
-    // (32-bit, top-down), whose pixels are copied out, changed and copied
-    // back; every GDI object made is let go as it drops (the bitmap out of
-    // the memory DC, the DC, the bitmap, then the painting ends).
+    // The picker's own procedure draws into a canvas of the client's size,
+    // whose pixels are copied out, changed and copied back; the canvas is
+    // let go as it drops, then the painting ends.
     let hwnd = m.hwnd;
     let paint = gdi::Paint::begin(hwnd);
     let hdc = paint.hdc();
     let rc = win::client_rect(hwnd);
     let (w, h) = (rc.right, rc.bottom);
-    if w > 0 && h > 0 {
-        let dib = gdi::Owned::new(b5::create_dib_32(hdc, w, h));
-        if !dib.get().is_null() {
-            let mem = gdi::MemDc::compatible(hdc);
-            {
-                let _drawn = gdi::Selected::new(mem.hdc(), dib.get());
-                b5::paint_next_into(m, mem.hdc());
-            }
-            gdi::flush();
-            // Read and written out of the DC, as GDI wants.
-            if let Some(px) = b5::dib_pixels(mem.hdc(), dib.get(), w, h) {
-                let px: Vec<u32> = px.into_iter().map(flip_lightness).collect();
-                b5::set_dib_pixels(mem.hdc(), dib.get(), w, h, &px);
-            }
-            let _shown = gdi::Selected::new(mem.hdc(), dib.get());
-            gdi::bit_blt(hdc, (0, 0, w, h), mem.hdc(), (0, 0), SRCCOPY);
+    if w > 0
+        && h > 0
+        && let Some(canvas) = Canvas::new(w, h)
+    {
+        m.paint_next_into(canvas.hdc());
+        if let Some(px) = canvas.pixels() {
+            let flip = |p: [u8; 4]| flip_lightness(u32::from_le_bytes(p)).to_le_bytes();
+            let px: Vec<[u8; 4]> = px.into_iter().map(flip).collect();
+            canvas.set_pixels(&px);
         }
+        gdi::bit_blt(hdc, (0, 0, w, h), canvas.hdc(), (0, 0), SRCCOPY);
     }
 }
 
@@ -874,7 +889,7 @@ fn proc(s: &Dlg, m: &Msg) -> isize {
                 && n.code() == DTN_DROPDOWN
                 && s.look.get().dark
             {
-                let calendar = b5::picker_calendar(n.from());
+                let calendar = win::datetime::calendar(n.from());
                 if !calendar.is_null() {
                     // The subclass goes with the calendar.
                     let look = Rc::clone(&s.look);

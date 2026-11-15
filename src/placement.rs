@@ -10,7 +10,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::settings::WindowPos;
-use crate::win::ext::b8;
 use crate::win::{self, sys};
 
 /// A rectangle as left, top, width, height.
@@ -136,7 +135,7 @@ pub fn fit(saved: &WindowPos, monitors: &[Monitor]) -> Option<Rect> {
 
 /// The monitors as Windows has them now.
 pub fn monitors() -> Vec<Monitor> {
-    b8::display_monitors()
+    win::sys::display_monitors()
         .into_iter()
         .filter_map(monitor)
         .collect()
@@ -147,7 +146,7 @@ fn monitor(mon: HMONITOR) -> Option<Monitor> {
     Some(Monitor {
         area: Rect::from_win(&info.rcMonitor),
         work: Rect::from_win(&info.rcWork),
-        dpi: b8::monitor_dpi(mon).unwrap_or(96),
+        dpi: win::sys::monitor_dpi(mon).unwrap_or(96),
     })
 }
 

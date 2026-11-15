@@ -12,23 +12,19 @@
 //! Wrapping round the end and finding nothing say so in the status bar, in
 //! Everything's words.
 
-// Left: `Strip::message` (crate::strip) hands the bar a raw lParam, which
-// its NM_CUSTOMDRAW is read from until the trait takes a `win::Msg`.
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     DC_BRUSH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_SKIPDEFAULT, LVIS_FOCUSED,
-    LVIS_SELECTED, LVNI_FOCUSED, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, WM_MOUSELEAVE,
+    LVIS_SELECTED, LVNI_FOCUSED, NMCUSTOMDRAW, WM_MOUSELEAVE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_RETURN, VK_SHIFT,
@@ -49,10 +45,9 @@ use crate::highlight::Span;
 use crate::paint::fill;
 use crate::strip::{Strip, StripSlot};
 use crate::theme::{self, Ink, Palette, rgb};
-use crate::wide::window_text;
 use crate::win::class::{self, Create};
 use crate::win::gdi::{self, Selected, WindowDc};
-use crate::win::{self, button, edit, lv, parcel, sys};
+use crate::win::{self, Msg, button, edit, lv, parcel, sys};
 use crate::{hover, searchbox};
 
 /// The find bar's controls, children of the main window (F4's ids).
@@ -155,7 +150,7 @@ impl FindBar {
         if edit.is_null() {
             String::new()
         } else {
-            window_text(edit)
+            win::text(edit)
         }
     }
 
@@ -222,7 +217,7 @@ impl FindBar {
 
     /// A check box's width for its label in the bar's font.
     fn check_width(app: &App, hwnd: HWND) -> i32 {
-        let text: Vec<u16> = window_text(hwnd).replace('&', "").encode_utf16().collect();
+        let text: Vec<u16> = win::text(hwnd).replace('&', "").encode_utf16().collect();
         // A DC of this thread's window, measured in and given back with its
         // old font (the guards drop in turn).
         let w = {
@@ -690,21 +685,15 @@ impl Strip for FindBar {
         }
     }
 
-    fn message(&self, app: &App, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
+    fn message(&self, app: &App, m: &Msg) -> Option<LRESULT> {
         let pal = app.pal.get();
-        match msg {
+        let w = m.w;
+        match m.id {
             // At a UI scale the check boxes are drawn here, their marks at
             // the scale (Windows draws them at the monitor's size).
-            WM_NOTIFY if l != 0 => {
-                // SAFETY: what `App::strip_message` hands on is a message
-                // the main window was delivered: WM_NOTIFY's lParam is an
-                // NMHDR (read alone first, for its code).
-                let hdr = unsafe { &*(l as *const NMHDR) };
-                if hdr.code != NM_CUSTOMDRAW {
-                    return None;
-                }
-                // SAFETY: as above; an NM_CUSTOMDRAW's is an NMCUSTOMDRAW.
-                let cd = unsafe { &*(l as *const NMCUSTOMDRAW) };
+            WM_NOTIFY => {
+                // An NM_CUSTOMDRAW only.
+                let cd = m.notify()?.get::<NMCUSTOMDRAW>()?;
                 let button = cd.hdr.hwndFrom;
                 if !crate::dialog::ui_scaled(button) {
                     return None;
@@ -719,7 +708,7 @@ impl Strip for FindBar {
                     fg: bar.fg,
                     dim: pal.dim,
                 };
-                crate::dialog::paint_check(button, cd, kind, ink);
+                crate::dialog::paint_check(button, &cd, kind, ink);
                 Some(CDRF_SKIPDEFAULT as LRESULT)
             }
             WM_COMMAND => {

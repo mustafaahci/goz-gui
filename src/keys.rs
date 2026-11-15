@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL,
 };
 
-use crate::win::ext::b8::AccelTable;
+use crate::win::queue::AccelTable;
 use crate::{keymap, menu, searchtools};
 
 pub const NONE: u8 = 0;

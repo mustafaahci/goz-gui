@@ -30,7 +30,6 @@ use crate::history_dialogs::{self, Host, Mode};
 use crate::history_file::{self, FILE_NAME, HistoryFile, Written};
 use crate::settings::Settings;
 use crate::store::location;
-use crate::wide::window_text;
 use crate::win::{self, parcel, sys};
 use crate::{clipboard, dropdown};
 
@@ -233,7 +232,7 @@ impl App {
             dropdown::close(self);
             return;
         }
-        let text = window_text(self.edit);
+        let text = win::text(self.edit);
         let list = self.search_history.borrow().suggestions(&text, SUGGESTIONS);
         dropdown::suggest(self, list);
     }

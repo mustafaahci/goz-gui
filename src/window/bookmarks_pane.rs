@@ -59,9 +59,7 @@ use crate::paint::fill;
 use crate::pane::PaneContent;
 use crate::sidebars::{self, Shown};
 use crate::treeview::{self, Images, NONE, New, Source};
-use crate::wide::window_text;
 use crate::win::class::{self, Create};
-use crate::win::ext::b2;
 use crate::win::{self, Msg, edit, subclass, sys, tv};
 use crate::{searchbox, theme};
 
@@ -192,7 +190,7 @@ impl BookmarksPane {
     }
 
     fn filter(&self) -> String {
-        window_text(self.edit.get())
+        win::text(self.edit.get())
     }
 
     /// The entry of a tree item.
@@ -533,7 +531,7 @@ impl BookmarksPane {
             treeview::drop_highlight(tree, NONE);
         }
         // The menu made above.
-        b2::destroy_menu(popup);
+        win::menu::destroy(popup);
         // The menu's loop may have filled the tree again (another goz-gui
         // changed the bookmarks, read as the pane took the keyboard): the
         // item and its row are what they stand for now, or nothing if it

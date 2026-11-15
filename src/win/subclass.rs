@@ -17,10 +17,12 @@ use super::msg::{Msg, Via};
 /// A subclass's name. Declare one per kind of subclass, as a `static`:
 /// its address is the subclass's id.
 pub struct Key {
+    /// What the subclass is, for a reader (and a debugger).
     pub name: &'static str,
 }
 
 impl Key {
+    /// A key named `name`.
     pub const fn new(name: &'static str) -> Key {
         Key { name }
     }

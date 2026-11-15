@@ -308,6 +308,54 @@ pub fn set_item_text(dlg: HWND, id: u16, text: &str) {
     super::set_text(item(dlg, id), text);
 }
 
+/// Windows' own message box (MessageBoxW) over `owner`, modal; its answer
+/// (IDOK, IDCANCEL...), 0 if it could not be shown.
+pub fn message_box(
+    owner: HWND,
+    text: &str,
+    title: &str,
+    style: windows_sys::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
+) -> i32 {
+    let text = super::wz(text);
+    let title = super::wz(title);
+    // SAFETY: NUL-terminated strings that outlive the modal call.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            owner,
+            text.as_ptr(),
+            title.as_ptr(),
+            style,
+        )
+    }
+}
+
+/// Windows' colour picker (ChooseColorW), modal over `owner`, starting at
+/// `initial` with CC_RGBINIT; its 16 custom colours are `custom`'s, kept
+/// there. The colour chosen, `None` if the user cancelled. `flags` are
+/// CC_* without a hook or a template (those are ignored).
+pub fn choose_color(
+    owner: HWND,
+    initial: u32,
+    custom: &mut [u32; 16],
+    flags: windows_sys::Win32::UI::Controls::Dialogs::CHOOSECOLOR_FLAGS,
+) -> Option<u32> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        CC_ENABLEHOOK, CC_ENABLETEMPLATE, CC_ENABLETEMPLATEHANDLE, CHOOSECOLORW, ChooseColorW,
+    };
+    let mut cc = CHOOSECOLORW {
+        lStructSize: size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: owner,
+        rgbResult: initial,
+        lpCustColors: custom.as_mut_ptr(),
+        Flags: flags & !(CC_ENABLEHOOK | CC_ENABLETEMPLATE | CC_ENABLETEMPLATEHANDLE),
+        ..Default::default()
+    };
+    // SAFETY: a complete struct with its size; the custom colours are 16
+    // COLORREFs, read and written during the modal call; no hook, no
+    // template (their flags are masked off, their fields null).
+    (unsafe { ChooseColorW(&mut cc) } != 0).then_some(cc.rgbResult)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

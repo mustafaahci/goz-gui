@@ -16,9 +16,8 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{FILETIME, HWND};
 
 use super::Entry;
-use crate::wide::wz;
 use crate::win;
-use crate::win::ext::b6::{self, Find};
+use crate::win::file::{Find, Search};
 
 const DIRECTORY: u32 = 0x10;
 const REPARSE_POINT: u32 = 0x400;
@@ -277,8 +276,8 @@ pub fn item(path: &str) -> Option<Entry> {
     if !is_absolute(&p) {
         return None;
     }
-    let z = wz(&p);
-    let data = b6::file_attribute_data(&z)?;
+    let z = win::wz(&p);
+    let data = win::file::attribute_data(&z)?;
     let dir = data.dwFileAttributes & DIRECTORY != 0;
     Some(Entry {
         path: p,
@@ -294,9 +293,9 @@ pub fn item(path: &str) -> Option<Entry> {
 /// Lists `folder`'s items, handing each to `each` with its attributes;
 /// false when it could not be listed.
 fn list(folder: &str, mut each: impl FnMut(Entry, u32)) -> bool {
-    let pattern = wz(&join(folder, "*"));
+    let pattern = win::wz(&join(folder, "*"));
     // The find handle is closed before returning.
-    let Some((mut find, mut data)) = Find::first(&pattern, true) else {
+    let Ok((mut find, mut data)) = Find::first(&pattern, Search::Names, true) else {
         return false;
     };
     loop {

@@ -8,7 +8,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::App;
 use crate::filter::Filter;
-use crate::win::{self, ext::b1};
+use crate::win;
 use crate::{menu, zoom};
 
 /// Everything's `filters_wide`: the filter bar's width at 100 %.
@@ -58,7 +58,7 @@ impl App {
         self.invalidate_filter_bar();
         let cmd = crate::popup::track(popup, self.hwnd, pt, "filter bar", &|_| None);
         // The menu this function made.
-        b1::destroy_menu(popup);
+        win::menu::destroy(popup);
         self.filter_open.set(false);
         self.invalidate_filter_bar();
         if let Some(filter) = u16::try_from(cmd).ok().and_then(Filter::from_menu_id) {
@@ -137,7 +137,7 @@ impl App {
             cy: rc.bottom - rc.top,
             flags: SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER,
         };
-        b1::send_window_pos_changed(self.list, &wp);
+        win::send_window_pos_changed(self.list, &wp);
         win::invalidate(self.list, None, true);
         win::invalidate(self.header, None, true);
     }

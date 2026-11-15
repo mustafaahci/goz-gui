@@ -28,6 +28,7 @@ use windows_sys::Win32::UI::Controls::{
     HIMAGELIST, HTREEITEM, TVE_EXPAND, TVGN_CARET, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE,
     TVITEMEXW,
 };
+use windows_sys::Win32::UI::Shell::{SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     IDYES, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, WM_APP,
 };
@@ -36,7 +37,6 @@ use crate::bookmarks::ops::Op;
 use crate::bookmarks::tree::{Item, TOP, Tree};
 use crate::bookmarks::{Bookmarks, FolderPath, Settings, within};
 use crate::msgbox;
-use crate::win::ext::b5;
 use crate::win::{self, dlg, tv};
 
 /// Posted to an open Find or Organize dialog when the bookmarks changed
@@ -102,7 +102,11 @@ struct Icons {
 }
 
 fn icons() -> Icons {
-    let lookup = |name: &str, attributes: u32| b5::shell_icon_index(name, attributes, true);
+    let lookup = |name: &str, attributes: u32| {
+        // An attribute-only lookup by name (no file is read).
+        let name: Vec<u16> = name.encode_utf16().collect();
+        win::icon::sys_icon(&name, attributes, SHGFI_USEFILEATTRIBUTES | SHGFI_SMALLICON)
+    };
     let (list, folder) = lookup("folder", FILE_ATTRIBUTE_DIRECTORY);
     let (_, bookmark) = lookup("bookmark", FILE_ATTRIBUTE_NORMAL);
     Icons {

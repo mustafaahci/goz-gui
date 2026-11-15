@@ -22,7 +22,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{CW_USEDEFAULT, WS_EX_TOPMOST, 
 use crate::paint;
 use crate::theme;
 use crate::win::class::{self, Create};
-use crate::win::ext::b1;
 use crate::win::{self, lv, sys, tip};
 use crate::window::App;
 
@@ -211,7 +210,7 @@ pub fn timer(app: &App) {
     tip::set_max_width(tip, (work.right - work.left).max(1));
     let (x, y) = clamp(&window, &work);
     let info = tool(app);
-    b1::tip_update_text_wide(tip, &info, &ct.text);
+    tip::update_text(tip, &info, tip::Text::Units(&ct.text));
     tip::track_position(tip, x, y);
     tip::track_activate(tip, true, &info);
     app.cell_tip.shown.set(true);

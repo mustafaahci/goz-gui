@@ -22,7 +22,6 @@ use crate::store::file::{self, Loaded};
 use crate::store::ini::Ini;
 use crate::store::location::{self, SETTINGS_FILE};
 use crate::store::{IniWrites, writer::Writer};
-use crate::wide::window_text;
 use crate::win::{self, parcel};
 use crate::{places, syntax};
 
@@ -189,7 +188,7 @@ impl App {
         // if it is open (or closed since).
         self.take_editor_kept();
         let (window, maximized) = self.placement_now();
-        let text = window_text(self.edit);
+        let text = win::text(self.edit);
         let o = self.opts.get();
         let mut s = self.prefs.borrow().base.clone();
         if window.is_some() {

@@ -6,6 +6,7 @@ use windows_sys::Win32::UI::Controls::{
     TCM_GETITEMRECT, TCM_INSERTITEMW, TCM_SETCURSEL, TCM_SETITEMW,
 };
 
+/// The class these messages are for.
 pub const CLASS: &str = "SysTabControl32";
 
 /// # Safety
@@ -15,26 +16,31 @@ unsafe fn send(t: HWND, msg: u32, w: usize, l: isize) -> isize {
     unsafe { super::send_raw(super::of_class(t, CLASS), msg, w, l) }
 }
 
+/// How many tabs there are.
 pub fn count(t: HWND) -> usize {
     // SAFETY: no parameters.
     usize::try_from(unsafe { send(t, TCM_GETITEMCOUNT, 0, 0) }).unwrap_or(0)
 }
 
+/// The selected tab (-1 for none).
 pub fn cur_sel(t: HWND) -> i32 {
     // SAFETY: no parameters.
     unsafe { send(t, TCM_GETCURSEL, 0, 0) as i32 }
 }
 
+/// Selects tab `i`; the one selected before (-1 for none).
 pub fn set_cur_sel(t: HWND, i: i32) -> i32 {
     // SAFETY: an integer.
     unsafe { send(t, TCM_SETCURSEL, i as isize as usize, 0) as i32 }
 }
 
+/// Deletes every tab.
 pub fn delete_all(t: HWND) {
     // SAFETY: no parameters.
     unsafe { send(t, TCM_DELETEALLITEMS, 0, 0) };
 }
 
+/// Tab `i`'s rectangle, in the control's client coordinates.
 pub fn item_rect(t: HWND, i: i32) -> Option<RECT> {
     let mut rc = RECT::default();
     // SAFETY: TCM_GETITEMRECT's lParam is a RECT out.

@@ -36,8 +36,8 @@ use windows_sys::Win32::UI::Controls::{
 
 use crate::thumbs::Bitmap;
 use crate::win::com::Apartment;
-use crate::win::ext::b9::gdi::{Canvas, create_bitmap};
-use crate::win::ext::b9::imagelist::draw_indirect;
+use crate::win::dib::Canvas;
+use crate::win::imagelist::draw_indirect;
 use crate::win::sync::Event;
 use crate::win::{self, gdi, imagelist};
 
@@ -370,7 +370,7 @@ fn load_thread(shared: &Shared) {
     // ends with the process's, as the icon thread's does): drawing an icon
     // there is what makes the list load it.
     let dc = gdi::MemDc::compatible(core::ptr::null_mut());
-    let bitmap = gdi::Owned::new(create_bitmap(1, 1, 1, 32));
+    let bitmap = gdi::Owned::new(gdi::create_bitmap(1, 1, 1, 32));
     let _selected = gdi::Selected::new(dc.hdc(), bitmap.get());
     let mut last_told = Instant::now();
     loop {

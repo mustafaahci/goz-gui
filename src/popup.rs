@@ -19,8 +19,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::store::location;
-use crate::win::ext::b9::gdi::get_pixel;
-use crate::win::ext::b9::menu::{self as wmenu, By};
+use crate::win::gdi::get_pixel;
+use crate::win::menu::{self as wmenu, By};
 use crate::win::{self, gdi};
 
 /// Shows `menu` at `pt` (screen) for `owner` until an item is chosen or

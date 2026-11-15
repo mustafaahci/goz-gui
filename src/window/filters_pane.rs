@@ -43,7 +43,6 @@ use crate::paint::fill;
 use crate::pane::{PaneContent, PaneEvent};
 use crate::theme::{self, Ink};
 use crate::win::class::{self, Create};
-use crate::win::ext::b2;
 use crate::win::gdi::{self, Selected};
 use crate::win::{self, Msg, lv};
 use crate::{menu, searchtools};
@@ -293,7 +292,7 @@ impl FiltersPane {
         );
         let id = app.track_with_shell(popup, pt, "filters menu", None);
         // The menu made above.
-        b2::destroy_menu(popup);
+        win::menu::destroy(popup);
         if id > 0 {
             app.command(id as u16);
         }
@@ -462,7 +461,7 @@ impl PaneContent for FiltersPane {
                 if di.CtlType != ODT_LISTVIEW || di.hwndItem != self.list.get() {
                     return None;
                 }
-                let hot = b2::lv_hot_item(self.list.get()) as isize == di.itemID as isize;
+                let hot = win::lv::hot_item(self.list.get()) as isize == di.itemID as isize;
                 self.paint_row(app, di.hDC, di.itemID as usize, hot);
                 Some(1)
             }

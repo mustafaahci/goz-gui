@@ -51,7 +51,6 @@ pub mod undo_dialog;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use windows::Win32::UI::Shell::{IFileOperationProgressSink, IShellItem};
 use windows::core::HRESULT;
 use windows_sys::Win32::Foundation::{FILETIME, HWND};
 use windows_sys::Win32::Globalization::CSTR_EQUAL;
@@ -63,7 +62,8 @@ use windows_sys::Win32::UI::Shell::COPYENGINE_S_USER_IGNORED;
 
 use crate::fileops::{Outcome, parent};
 use crate::shell::{self, FileOp};
-use crate::win::ext::b6::{self, FileHandle, FileOperation, ItemOp};
+use crate::win;
+use crate::win::shell::{FileOperation, ItemOp, ProgressSink, ShellItem};
 
 pub use times::{Set, Times};
 pub use undo::{Action, Record};
@@ -199,15 +199,15 @@ pub enum Kind {
 }
 
 /// Records what an operation does to each item, as it is done: the
-/// progress sink is `win`'s ([`b6::progress_sink`]), and this keeps its log.
+/// progress sink is `win`'s ([`ProgressSink`]), and this keeps its log.
 pub struct Sink;
 
 impl Sink {
     /// A sink, and the log it writes to.
-    pub fn make() -> (IFileOperationProgressSink, Rc<RefCell<Vec<Change>>>) {
+    pub fn make() -> (ProgressSink, Rc<RefCell<Vec<Change>>>) {
         let log = Rc::new(RefCell::new(Vec::new()));
         let theirs = Rc::clone(&log);
-        let sink = b6::progress_sink(move |op, from, to, hr| {
+        let sink = ProgressSink::new(move |op, from, to, hr| {
             let kind = match op {
                 ItemOp::Rename => Kind::Rename,
                 ItemOp::Move => Kind::Move,
@@ -223,8 +223,8 @@ impl Sink {
     fn note(
         log: &RefCell<Vec<Change>>,
         kind: Kind,
-        from: Option<&IShellItem>,
-        to: Option<&IShellItem>,
+        from: Option<&ShellItem>,
+        to: Option<&ShellItem>,
         hr: HRESULT,
     ) {
         let Some(from) = from.and_then(path_of) else {
@@ -245,13 +245,13 @@ impl Sink {
 }
 
 /// The file system path of a shell item.
-fn path_of(item: &IShellItem) -> Option<Vec<u16>> {
-    b6::shell_item_path(item)
+fn path_of(item: &ShellItem) -> Option<Vec<u16>> {
+    item.file_system_path()
 }
 
 /// The shell item at `path`; `None` when it is gone.
-fn item(path: &[u16]) -> Option<IShellItem> {
-    b6::shell_item(path)
+fn item(path: &[u16]) -> Option<ShellItem> {
+    ShellItem::from_parsing_name(path)
 }
 
 /// `path` with its 8.3 short names expanded, the form the shell reports
@@ -264,7 +264,7 @@ pub(crate) fn long_path(path: &[u16]) -> Option<Vec<u16>> {
     }
     let mut buf = vec![0u16; 512];
     loop {
-        let n = b6::long_path_name(path, &mut buf) as usize;
+        let n = win::file::long_path_name(path, &mut buf) as usize;
         if n == 0 {
             return None;
         }
@@ -285,7 +285,7 @@ pub fn same_path(a: &[u16], b: &[u16]) -> bool {
         p
     }
     let (a, b) = (trim(a), trim(b));
-    b6::compare_ordinal(a, b, true) == CSTR_EQUAL
+    win::locale::compare_ordinal(a, b, true) == CSTR_EQUAL
 }
 
 /// What a move of several items into one folder runs (wave 5): each item
@@ -386,7 +386,7 @@ fn path_key(path: &[u16]) -> Vec<u16> {
     let mut key = vec![0u16; p.len()];
     // `p` is read and `key` written, each for its own length, which is the
     // same.
-    let written = b6::upper_invariant(p, &mut key);
+    let written = win::locale::upper_invariant(p, &mut key);
     if written as usize != p.len() {
         key = p.iter().map(|&c| ascii_upper(c)).collect();
     }
@@ -427,7 +427,7 @@ pub fn join(folder: &[u16], name: &[u16]) -> Vec<u16> {
 
 /// The attributes of `path`; `None` when there is nothing there.
 pub fn attributes(path: &[u16]) -> Option<u32> {
-    b6::file_attributes(path)
+    win::file::attributes(path)
 }
 
 fn exists(path: &[u16]) -> bool {
@@ -816,8 +816,8 @@ fn shell_steps(
     if queued == 0 {
         return Ok(true);
     }
-    let performed = op.perform_operations();
-    let aborted = op.any_operations_aborted().unwrap_or(false);
+    let performed = op.perform();
+    let aborted = op.any_aborted().unwrap_or(false);
     let log = log.borrow();
     for &i in mine {
         if results[i] != StepResult::NotRun {
@@ -891,12 +891,12 @@ fn drop_recycle_record(recycled: &[u16]) {
     let at = record.len() - name.len() + 1;
     record[at] = u16::from(b'I');
     // A missing file is reported and ignored.
-    b6::delete_file(&record);
+    win::file::delete(&record);
 }
 
 /// Opens `path` (a file or a folder) to read and set its times.
-fn open_for_times(path: &[u16]) -> Result<FileHandle, String> {
-    FileHandle::open(
+fn open_for_times(path: &[u16]) -> Result<win::file::Handle, String> {
+    win::file::Handle::open(
         path,
         FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -917,7 +917,7 @@ fn error_text(e: std::io::Error) -> String {
         .unwrap_or_else(|| e.to_string())
 }
 
-fn read_times(h: &FileHandle) -> Option<Times> {
+fn read_times(h: &win::file::Handle) -> Option<Times> {
     let t = h.times()?;
     let v = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
     Some(Times {
@@ -1011,7 +1011,7 @@ fn make_shortcut(target: &[u16], link: Option<&[u16]>, desktop: Option<&[u16]>) 
     };
     let work = parent(target).filter(|_| !is_dir(target));
     // COM is initialised on this thread.
-    let saved = b6::save_shortcut(target, work, &path);
+    let saved = win::shell::save_shortcut(target, work, &path);
     match saved {
         Ok(()) => StepResult::Done {
             to: path,

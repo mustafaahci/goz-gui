@@ -1,12 +1,6 @@
-//! Wrappers added while the crate moves onto this module, one file per
-//! batch of the move, folded into the modules above once it is done.
+//! Wrappers added while batch 7 (the shell's context menus, the preview
+//! pane, thumbnails, accessibility) moves onto this module, folded into
+//! the modules above once it is done.
 
-pub mod b1;
-pub mod b2;
-pub mod b3;
-pub mod b4;
-pub mod b5;
-pub mod b6;
+/// Batch 7's wrappers.
 pub mod b7;
-pub mod b8;
-pub mod b9;

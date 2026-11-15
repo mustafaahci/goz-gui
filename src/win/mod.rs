@@ -39,25 +39,39 @@
 
 pub mod button;
 pub mod class;
+pub mod clipboard;
 pub mod com;
 pub mod combo;
+pub mod datetime;
+pub mod dib;
 pub mod dlg;
 pub mod dropfiles;
 pub mod edit;
+pub mod file;
 pub mod gdi;
 pub mod header;
 pub mod hook;
 pub mod hotkey;
+pub mod icon;
 pub mod imagelist;
 pub mod listbox;
+pub mod locale;
 pub mod lv;
+pub mod menu;
+pub mod menubar;
 pub mod msg;
 pub mod parcel;
+pub mod process;
 pub mod queue;
+pub mod reg;
+pub mod resource;
+pub mod scroll;
+pub mod shell;
 pub mod subclass;
 pub mod sync;
 pub mod sys;
 pub mod tab;
+pub mod time;
 pub mod tip;
 pub mod trackbar;
 pub mod tv;
@@ -71,6 +85,8 @@ mod trampolines_tests;
 
 pub use msg::{Msg, Notify, View};
 pub use wnd::*;
+
+use std::borrow::Cow;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, SendMessageW};
@@ -150,17 +166,47 @@ pub fn wz_units(s: &[u16]) -> Vec<u16> {
     v
 }
 
+/// `units` NUL-terminated, for a call that wants a C string: as they are
+/// when they end with a NUL, else a copy with one.
+pub(crate) fn nul_ended(units: &[u16]) -> Cow<'_, [u16]> {
+    if units.last() == Some(&0) {
+        Cow::Borrowed(units)
+    } else {
+        Cow::Owned(wz_units(units))
+    }
+}
+
+/// A slice's length as the `i32` count a call takes, cut to fit (the call
+/// then reads or writes less of the slice, never more).
+pub(crate) fn len_i32(len: usize) -> i32 {
+    i32::try_from(len).unwrap_or(i32::MAX)
+}
+
+/// A slice's length as the `u32` count a call takes, cut to fit.
+pub(crate) fn len_u32(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
+/// `units` as the bytes they are in memory (native order), for a byte
+/// search over UTF-16 text.
+pub fn units_as_bytes(units: &[u16]) -> &[u8] {
+    // SAFETY: u16 has no padding and u8's alignment is 1; the bytes are
+    // the slice's own, borrowed for as long as it is.
+    unsafe { core::slice::from_raw_parts(units.as_ptr().cast::<u8>(), size_of_val(units)) }
+}
+
 /// The UTF-16 units before the first NUL of `buf` (all of it without one).
 pub fn until_nul(buf: &[u16]) -> &[u16] {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     &buf[..end]
 }
 
-/// The low and high words of a message parameter.
+/// The low word of a message parameter.
 pub fn loword(v: usize) -> u16 {
     (v & 0xffff) as u16
 }
 
+/// The high word of a message parameter.
 pub fn hiword(v: usize) -> u16 {
     ((v >> 16) & 0xffff) as u16
 }
@@ -184,6 +230,14 @@ mod tests {
         assert_eq!(loword(make_wparam(3, 7)), 3);
         assert_eq!(hiword(make_wparam(3, 7)), 7);
         assert_eq!(make_lparam(0xffff, 0xffff), -1);
+    }
+
+    #[test]
+    fn units_are_their_bytes() {
+        assert_eq!(units_as_bytes(&[0x0102, 0x0304]), [2, 1, 4, 3]);
+        assert!(units_as_bytes(&[]).is_empty());
+        assert_eq!(&*nul_ended(&[104, 0]), &[104, 0]);
+        assert_eq!(&*nul_ended(&[104]), &[104, 0]);
     }
 
     #[test]

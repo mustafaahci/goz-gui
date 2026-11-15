@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use windows_sys::Win32::Foundation::{HWND, LRESULT};
 use windows_sys::Win32::UI::WindowsAndMessaging::HCBT_CREATEWND;
 
-use crate::win::ext::b8;
+use crate::win;
 use crate::win::hook::{self, Event, Hook, Kind};
 
 /// One point of the timeline.
@@ -63,8 +63,8 @@ fn tracing() -> bool {
 
 /// Adds a point stamped now. Whatever it holds was read before.
 fn push(kind: char, hwnd: usize, msg: u32, w: usize, class: String) {
-    let at = b8::precise_time();
-    let cycles = b8::thread_cycles();
+    let at = win::time::precise_time();
+    let cycles = win::process::thread_cycles();
     let entry = Entry {
         at,
         cycles,

@@ -9,7 +9,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{HMENU, MFS_GRAYED};
 
 use crate::columns::{self, COL_NAME, COLS};
 use crate::filter::Filter;
-use crate::win::ext::b9::menu::{self as wmenu, By, NewItem};
+use crate::win::menu::{self as wmenu, By, NewItem};
 
 // File, and the row context menu.
 pub const OPEN: u16 = 1000;

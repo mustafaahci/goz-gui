@@ -29,7 +29,7 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, HELPINFO};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, MINMAXINFO, MSG, NCCALCSIZE_PARAMS, STYLESTRUCT, WINDOWPOS,
     WM_APP, WM_COPYDATA, WM_CREATE, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES, WM_GETDLGCODE,
-    WM_GETMINMAXINFO, WM_HELP, WM_MEASUREITEM, WM_NCCALCSIZE, WM_NCCREATE, WM_NOTIFY,
+    WM_GETMINMAXINFO, WM_HELP, WM_MEASUREITEM, WM_NCCALCSIZE, WM_NCCREATE, WM_NOTIFY, WM_PAINT,
     WM_SETTINGCHANGE, WM_STYLECHANGED, WM_STYLECHANGING, WM_USER, WM_WINDOWPOSCHANGED,
     WM_WINDOWPOSCHANGING,
 };
@@ -60,9 +60,13 @@ pub(crate) enum Via {
 /// in [`super::class`], [`super::dlg`] and [`super::subclass`]; only those
 /// hand out what their `lParam` points at.
 pub struct Msg {
+    /// The window it is for.
     pub hwnd: HWND,
+    /// Which message it is (WM_*).
     pub id: u32,
+    /// Its wParam.
     pub w: WPARAM,
+    /// Its lParam (read as a pointer only through the accessors).
     pub l: LPARAM,
     via: Via,
     /// Whether a [`View`] of the `lParam` is out: one at a time, so a view
@@ -128,6 +132,21 @@ impl Msg {
             Via::Subclass => unsafe { DefSubclassProc(self.hwnd, self.id, self.w, self.l) },
             Via::Dialog | Via::Made => 0,
         }
+    }
+
+    /// From a subclass's handling of a WM_PAINT: the next procedure in the
+    /// window's chain (in the end the window's own) paints into `hdc`
+    /// instead of the window, as the common controls do with a WM_PAINT
+    /// that carries a DC. 0 for any other message, and for one not
+    /// delivered to a subclass.
+    pub fn paint_next_into(&self, hdc: windows_sys::Win32::Graphics::Gdi::HDC) -> LRESULT {
+        if self.id != WM_PAINT || self.via != Via::Subclass {
+            return 0;
+        }
+        // SAFETY: WM_PAINT with a DC handle, which GDI checks, and no
+        // lParam: no pointers. From within the subclass procedure the
+        // system called, for the window it was called for.
+        unsafe { DefSubclassProc(self.hwnd, WM_PAINT, hdc as usize, 0) }
     }
 
     /// Sends the message on to `to`, as it came, such as a notification
@@ -410,10 +429,12 @@ impl<T> Drop for View<'_, T> {
 /// came in by [`Notify::get`].
 pub struct Notify<'a> {
     msg: &'a Msg,
+    /// The notification's header, copied.
     pub hdr: NMHDR,
 }
 
 impl<'a> Notify<'a> {
+    /// The notification's code (LVN_*, NM_*…).
     pub fn code(&self) -> u32 {
         self.hdr.code
     }

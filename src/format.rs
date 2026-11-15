@@ -9,12 +9,12 @@ use windows_sys::Win32::Globalization::{
 };
 
 use crate::ui_options::SizeFormat;
-use crate::win::ext::b8;
+use crate::win;
 
 /// One of the user's locale strings, such as a separator, or `default`.
 fn locale_text(kind: u32, default: &str) -> String {
     let mut buf = [0u16; 8];
-    let n = b8::user_locale_info(kind, &mut buf);
+    let n = win::locale::user_locale_info(kind, &mut buf);
     if n > 1 {
         String::from_utf16_lossy(&buf[..n as usize - 1])
     } else {
@@ -138,17 +138,18 @@ pub fn date(ft: i64, out: &mut Vec<u16>) {
         dwHighDateTime: (ft >> 32) as u32,
     };
     // In the user's locale (and its default formats).
-    let Some(local) = b8::file_time_to_system_time(&ft).and_then(|utc| b8::to_local_time(&utc))
+    let Some(local) =
+        win::time::file_time_to_system_time(&ft).and_then(|utc| win::time::utc_to_local(&utc))
     else {
         return;
     };
     let mut buf = [0u16; 64];
-    let n = b8::date_format(DATE_SHORTDATE, &local, &mut buf);
+    let n = win::locale::date_format(DATE_SHORTDATE, &local, &mut buf);
     if n > 1 {
         out.extend_from_slice(&buf[..n as usize - 1]);
         out.push(u16::from(b' '));
     }
-    let n = b8::time_format(TIME_NOSECONDS, &local, &mut buf);
+    let n = win::locale::time_format(TIME_NOSECONDS, &local, &mut buf);
     if n > 1 {
         out.extend_from_slice(&buf[..n as usize - 1]);
     }
@@ -214,7 +215,7 @@ mod tests {
 
     /// Explorer's own formatter, in the same user locale.
     fn explorer(n: u64) -> String {
-        b8::format_byte_size(n as i64)
+        win::locale::format_byte_size(n as i64)
     }
 
     #[test]

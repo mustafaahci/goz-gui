@@ -9,7 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_APP;
 
 use super::App;
@@ -84,15 +84,15 @@ pub(super) fn sort_feature(id: usize) -> Option<&'static str> {
 
 impl App {
     /// Wave 9's WM_APP messages.
-    pub(super) fn w9_message(&self, msg: u32, w: WPARAM, l: LPARAM) {
-        match msg {
+    pub(super) fn w9_message(&self, m: &Msg) {
+        match m.id {
             WM_PROPS => self.props_answered(),
             WM_CONTENT => self.content_news(),
-            super::w9b::WM_WATCH => self.watch_news(w),
+            super::w9b::WM_WATCH => self.watch_news(m.w),
             super::w9b::WM_REFETCH => self.refetch(),
             WM_INDEX_SET => {
                 // The text the Indexes page's thread posted.
-                if let Some(text) = parcel::take::<String>(&Msg::new(self.hwnd, msg, w, l)) {
+                if let Some(text) = parcel::take::<String>(m) {
                     self.show_note(text);
                 }
             }

@@ -20,9 +20,9 @@ use windows_sys::Win32::UI::Shell::{SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SI
 use crate::client::Row;
 use crate::filetype;
 use crate::typeinfo::TypeInfo;
-use crate::wide::{nul, wz};
+use crate::win;
 use crate::win::com::Apartment;
-use crate::win::ext::b9::icon;
+use crate::win::icon;
 use crate::win::parcel;
 use crate::win::sync::Event;
 
@@ -88,7 +88,7 @@ impl Icons {
     pub fn new(hwnd: HWND, msg: u32, types_msg: u32, ask_msg: u32) -> Icons {
         // An attribute-only lookup.
         let (list, folder) = icon::sys_icon(
-            &wz("folder"),
+            &win::wz("folder"),
             FILE_ATTRIBUTE_DIRECTORY,
             SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
         );
@@ -150,7 +150,7 @@ impl Icons {
                 if q.items.len() >= MAX_QUEUED {
                     dropped = Some(q.items.remove(0).0);
                 }
-                q.items.push((index, nul(&row.path)));
+                q.items.push((index, win::wz_units(&row.path)));
                 row.icon.set(PENDING);
                 if let Some(work) = &self.shared.work {
                     work.set();

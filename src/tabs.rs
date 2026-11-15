@@ -1056,7 +1056,7 @@ mod tests {
 
     /// How `CommandLineToArgvW` splits `line`, as the new process will.
     fn argv(line: &str) -> Vec<String> {
-        crate::win::ext::b8::command_line_to_argv(line)
+        crate::win::shell::command_line_to_argv(line)
     }
 
     #[test]

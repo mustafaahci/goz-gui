@@ -3,6 +3,7 @@
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Controls::{HKM_GETHOTKEY, HKM_SETHOTKEY, HKM_SETRULES};
 
+/// The class these messages are for.
 pub const CLASS: &str = "msctls_hotkey32";
 
 fn send_int(h: HWND, msg: u32, w: usize, l: isize) -> isize {
@@ -16,6 +17,7 @@ pub fn get(h: HWND) -> u16 {
     send_int(h, HKM_GETHOTKEY, 0, 0) as u16
 }
 
+/// Shows key `key` (the virtual key in the low byte, HOTKEYF_* above).
 pub fn set(h: HWND, key: u16) {
     send_int(h, HKM_SETHOTKEY, usize::from(key), 0);
 }

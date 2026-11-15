@@ -27,7 +27,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::WM_APP;
 
 use super::App;
 use crate::pane::PaneEvent;
-use crate::win::{self, ext::b1};
+use crate::win;
 
 /// Posted to the main window: the next slice of rows to set.
 pub(super) const WM_SELECTING: u32 = WM_APP + 370;
@@ -191,7 +191,7 @@ impl App {
             // The user's keys and clicks first, if some are waiting (a
             // posted message would come before them): the timer comes
             // after them.
-            if b1::input_waiting() {
+            if win::queue::input_waiting() {
                 win::set_timer(self.hwnd, TIMER_SELECTING, 1);
             } else {
                 win::post_app(self.hwnd, WM_SELECTING, 0, 0);

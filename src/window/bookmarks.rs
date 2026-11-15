@@ -32,7 +32,6 @@ use crate::menu::{self, Mark};
 use crate::settings;
 use crate::store::location;
 use crate::theme::ThemeMode;
-use crate::wide::window_text;
 use crate::win::{self, parcel, sys};
 
 /// The name a new bookmark of an empty search is offered, Everything's.
@@ -190,7 +189,7 @@ impl App {
             return;
         }
         self.refresh_bookmarks();
-        let text = window_text(self.edit);
+        let text = win::text(self.edit);
         let name = if text.is_empty() { NEW_BOOKMARK } else { &text };
         let mut row = Bookmark::new(&[], name, &text, &self.remembered());
         if !self.bookmarks.remember.search {
@@ -270,7 +269,7 @@ impl App {
         let s = c.settings;
         let text = match &c.search {
             Some(search) => one_line(search),
-            None => window_text(self.edit),
+            None => win::text(self.edit),
         };
         self.navigate(
             &text,

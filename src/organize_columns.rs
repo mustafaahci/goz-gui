@@ -17,7 +17,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::columns::{COL_NAME, COLS, Layout};
 use crate::dialog::{Class, LIST_BOX, Look, Template, apply_theme, center_on_owner, common};
-use crate::win::ext::b4 as ext;
 use crate::win::{self, Msg, dlg, listbox};
 
 const LIST: u16 = 1000;
@@ -216,7 +215,7 @@ impl Organize {
         };
         let cmd = crate::popup::track(menu, dlg, pt, "organize columns add", &|_| None);
         // The menu made above.
-        ext::destroy_menu(menu);
+        win::menu::destroy(menu);
         let Some(id) = u16::try_from(cmd).ok().and_then(crate::menu::column_of) else {
             return;
         };

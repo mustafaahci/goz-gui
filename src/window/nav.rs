@@ -16,7 +16,6 @@ use goz_core::types::{SortDir, SortSpec};
 use super::{App, Options};
 use crate::bookmarks::{one_line, sort_name};
 use crate::session::Search;
-use crate::wide::window_text;
 use crate::win::{self, edit};
 use crate::{dropdown, menu, searchbox};
 
@@ -65,7 +64,7 @@ impl App {
     /// The search on screen.
     pub(super) fn nav_state(&self) -> NavState {
         NavState {
-            text: window_text(self.edit),
+            text: win::text(self.edit),
             opts: self.opts.get(),
             folder: self.folder_selection(),
         }
@@ -81,7 +80,7 @@ impl App {
             return;
         }
         if !self.recorded.replace(true) {
-            self.record_in_history(&window_text(self.edit));
+            self.record_in_history(&win::text(self.edit));
         }
         self.commit_nav();
         self.settle_search();
@@ -162,7 +161,7 @@ impl App {
     /// match case, match path, the filter and the sort unchanged.
     pub(super) fn go_home(&self) {
         let home = self.prefs.borrow().base.home();
-        let text = home.search.unwrap_or_else(|| window_text(self.edit));
+        let text = home.search.unwrap_or_else(|| win::text(self.edit));
         let o = self.opts.get();
         let h = home.options;
         self.navigate(
@@ -222,7 +221,7 @@ impl App {
     /// as a bookmark's are: the box shows one line.
     pub(super) fn set_search_text(&self, text: &str) {
         let text = one_line(text);
-        if window_text(self.edit) == text {
+        if win::text(self.edit) == text {
             self.start_search(false);
         } else {
             // The change searches through EN_CHANGE.

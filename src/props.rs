@@ -189,7 +189,7 @@ fn filetime(ft: FILETIME) -> i64 {
 /// The attributes and dates of the file at `path` (no NUL), read with the
 /// process's own token; `None` when it cannot be (gone, no access).
 pub fn read_disk(path: &[u16]) -> Option<Disk> {
-    let data = crate::win::ext::b8::file_attribute_data(path)?;
+    let data = crate::win::file::attribute_data(path)?;
     Some(Disk {
         attrib: data.dwFileAttributes,
         ctime: filetime(data.ftCreationTime),

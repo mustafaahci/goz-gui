@@ -212,7 +212,7 @@ pub fn start(hwnd: HWND, msg: u32, job: Job) -> Running {
         .spawn(move || {
             // The Type column asks the shell for type names, which wants COM
             // on the thread (this new thread's, for its life).
-            crate::win::ext::b8::sta_with_ole1dde();
+            crate::win::com::sta_with_ole1dde();
             let ended = run(&job, &t_stop, &t_done, &t_total, hwnd, msg);
             // Dropped if not posted (the window is gone).
             crate::win::parcel::post(hwnd as HWND, msg, ENDED, ended);

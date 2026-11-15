@@ -63,8 +63,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_F5, VK_RETURN, VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, HMENU, HWND_MESSAGE, MB_ICONWARNING, MF_BYCOMMAND, MSG, SM_CXSMICON, SW_HIDE,
-    WM_APP, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NOTIFY, WM_SETFOCUS,
+    CW_USEDEFAULT, HMENU, HWND_MESSAGE, MB_ICONWARNING, MSG, SM_CXSMICON, SW_HIDE, WM_APP,
+    WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NOTIFY, WM_SETFOCUS,
     WM_SYSKEYDOWN, WM_TIMER, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -81,7 +81,6 @@ use crate::store::location;
 use crate::theme;
 use crate::treeview::{self, Images, NONE, New, Source};
 use crate::win::class::{self, Create};
-use crate::win::ext::b2;
 use crate::win::gdi::{self, Owned, Selected, WindowDc};
 use crate::win::tip::Text;
 use crate::win::{self, Msg, parcel, subclass, sys, tv};
@@ -1041,7 +1040,7 @@ impl FoldersPane {
         }
         // The menu made here; the shell's handlers are done with it once
         // its command ran.
-        b2::destroy_menu(popup);
+        win::menu::destroy(popup);
     }
 
     /// One of the folder menu's own items, for node `n` (`item`) at `path`.
@@ -1258,7 +1257,7 @@ fn park(tree: HWND, items: Vec<HTREEITEM>, ending: bool) {
     // Hides this thread's tree and makes it a message-only window of this
     // thread, no longer a child of the pane.
     win::show(tree, SW_HIDE);
-    b2::set_parent(tree, HWND_MESSAGE);
+    win::set_parent(tree, HWND_MESSAGE);
     if ending {
         return;
     }
@@ -1356,9 +1355,10 @@ fn shell_part(
     ) {
         return None;
     }
-    let default = b2::menu_default_item(popup, false, 0);
-    if cm.owns(default, u32::from(menu::SHELL_LAST)) {
-        b2::delete_menu(popup, default, MF_BYCOMMAND);
+    if let Some(default) = win::menu::default_item(popup, false, 0)
+        && cm.owns(default, u32::from(menu::SHELL_LAST))
+    {
+        win::menu::delete(popup, win::menu::By::Command(default));
     }
     Some(Rc::new(cm))
 }

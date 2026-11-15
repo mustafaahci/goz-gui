@@ -7,10 +7,10 @@
 
 use windows_sys::Win32::Foundation::{HANDLE, HWND, LRESULT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, HACCEL, IsDialogMessageW, MSG,
-    MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, MsgWaitForMultipleObjectsEx, PEEK_MESSAGE_REMOVE_TYPE,
-    PeekMessageW, PostQuitMessage, PostThreadMessageW, QUEUE_STATUS_FLAGS, TranslateAcceleratorW,
-    TranslateMessage,
+    ACCEL, CreateAcceleratorTableW, DestroyAcceleratorTable, DispatchMessageW, GetInputState,
+    GetMessageW, HACCEL, IsDialogMessageW, MSG, MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS,
+    MsgWaitForMultipleObjectsEx, PEEK_MESSAGE_REMOVE_TYPE, PeekMessageW, PostQuitMessage,
+    PostThreadMessageW, QUEUE_STATUS_FLAGS, TranslateAcceleratorW, TranslateMessage,
 };
 
 use super::sync::Event;
@@ -25,13 +25,27 @@ impl Queued {
     }
 }
 
+/// What [`get`] took from the queue.
+pub enum Got {
+    /// A message, to translate and dispatch.
+    Message(Queued),
+    /// WM_QUIT: the message loop is to end, with the code
+    /// [`post_quit`] gave (its wParam).
+    Quit(i32),
+    /// The queue failed (`filter` is no window, say).
+    Failed,
+}
+
 /// Waits for and takes the next message (of `filter`'s windows; all for
-/// null); `None` at WM_QUIT (or if the queue failed).
-pub fn get(filter: HWND) -> Option<Queued> {
+/// null).
+pub fn get(filter: HWND) -> Got {
     let mut msg = MSG::default();
     // SAFETY: an out-struct.
-    let got = unsafe { GetMessageW(&mut msg, filter, 0, 0) };
-    (got > 0).then_some(Queued(msg))
+    match unsafe { GetMessageW(&mut msg, filter, 0, 0) } {
+        0 => Got::Quit(msg.wParam as i32),
+        -1 => Got::Failed,
+        _ => Got::Message(Queued(msg)),
+    }
 }
 
 /// The next message in `min..=max` (0, 0: any) of `filter`'s windows, taken
@@ -78,6 +92,47 @@ pub fn translate_accelerator(hwnd: HWND, table: HACCEL, q: &Queued) -> bool {
     // SAFETY: a message the queue gave; the table is a handle the system
     // checks.
     unsafe { TranslateAcceleratorW(hwnd, table, &q.0) != 0 }
+}
+
+/// Whether mouse or keyboard input waits in this thread's queue.
+pub fn input_waiting() -> bool {
+    // SAFETY: no pointers.
+    unsafe { GetInputState() != 0 }
+}
+
+/// An accelerator table (CreateAcceleratorTableW), destroyed when this
+/// drops.
+pub struct AccelTable(HACCEL);
+
+impl AccelTable {
+    /// A table of `entries` (Windows copies them); `None` for an empty one,
+    /// which cannot be made, or when Windows would not make it.
+    pub fn new(entries: &[ACCEL]) -> Option<AccelTable> {
+        // SAFETY: the entries and their count.
+        let h = unsafe { CreateAcceleratorTableW(entries.as_ptr(), super::len_i32(entries.len())) };
+        (!h.is_null()).then_some(AccelTable(h))
+    }
+
+    /// The table's handle, for [`translate_accelerator`] (it stays this
+    /// table's).
+    pub fn handle(&self) -> HACCEL {
+        self.0
+    }
+
+    /// The table, no longer destroyed by this: whoever takes it destroys
+    /// it.
+    pub fn into_raw(self) -> HACCEL {
+        let h = self.0;
+        core::mem::forget(self);
+        h
+    }
+}
+
+impl Drop for AccelTable {
+    fn drop(&mut self) {
+        // SAFETY: the table this owns, destroyed once.
+        unsafe { DestroyAcceleratorTable(self.0) };
+    }
 }
 
 /// Ends this thread's message loop with `code` (posts WM_QUIT).

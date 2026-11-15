@@ -102,7 +102,7 @@ impl Runs {
 pub(super) fn give_back_memory() {
     // Windows decommits what the process's heaps hold free (any thread
     // may; each heap is locked meanwhile).
-    win::ext::b3::heap_optimize_resources();
+    win::process::optimize_heaps();
 }
 
 /// Posts `value` to the window with `msg`, as a parcel (`win::parcel`);

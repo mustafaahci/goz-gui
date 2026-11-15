@@ -117,10 +117,10 @@ impl App {
     }
 
     /// F3's WM_APP messages.
-    pub(super) fn window_message(&self, msg: u32, w: usize, l: isize) -> Option<isize> {
-        match msg {
+    pub(super) fn window_message(&self, m: &Msg) -> Option<isize> {
+        match m.id {
             WM_EXIT_WINDOW => {
-                if w != 0 {
+                if m.w != 0 {
                     // Another window imports or resets the settings: what
                     // this one holds is not written over them.
                     self.writer.close();
@@ -131,7 +131,7 @@ impl App {
             }
             WM_NEW_WINDOW_FAILED => {
                 // The text the store thread posted.
-                if let Some(text) = parcel::take::<String>(&Msg::new(self.hwnd, msg, w, l)) {
+                if let Some(text) = parcel::take::<String>(m) {
                     self.show_note(text);
                 }
                 Some(0)
@@ -167,6 +167,6 @@ fn spawn(exe: &Path, args: &[String], show: u16, front: bool) -> Result<(), Stri
     // The program by its exact name; the command line's first argument
     // (which goz-gui does not read) may be a lossy copy.
     let line = tabs::command_line(&exe.to_string_lossy(), args);
-    win::ext::b3::create_process(exe, &line, show, CREATE_DEFAULT_ERROR_MODE, front)
+    win::process::create(exe, &line, show, CREATE_DEFAULT_ERROR_MODE, front)
         .map_err(|e| e.to_string())
 }

@@ -20,7 +20,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::colorfilter::ColorFilter;
 use crate::colors::{format_color, parse_color};
 use crate::dialog::{Class, LIST_BOX, Look, Template, apply_theme, center_on_owner, common};
-use crate::win::ext::b4 as ext;
 use crate::win::{self, Msg, button, dlg, listbox};
 
 const STATIC: u16 = 0xffff;
@@ -80,7 +79,7 @@ pub fn pick_color(owner: HWND, initial: Option<u32>, custom: &mut [u32; 16]) -> 
         return parse_color(&v);
     }
     let flags = CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR;
-    ext::choose_color(owner, initial.unwrap_or(0), custom, flags).map(|c| c & 0x00ff_ffff)
+    win::dlg::choose_color(owner, initial.unwrap_or(0), custom, flags).map(|c| c & 0x00ff_ffff)
 }
 
 /// Edits `rules`; the new rules at OK, `None` at Cancel.

@@ -2,9 +2,8 @@
 //! dates its Custom boxes take (Everything's: `YYYY-MM-DDThh:mm:ss`, the
 //! earliest value for what is left out, in local time).
 
+use crate::win;
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
-
-use crate::win::ext::b6;
 
 /// A file's times, as FILETIMEs (UTC).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -143,8 +142,8 @@ impl Local {
             wMilliseconds: self.millis,
         };
         // In the current time zone.
-        let utc = b6::local_to_utc(&local)?;
-        let ft = b6::system_time_to_file_time(&utc)?;
+        let utc = win::time::local_to_utc(&local)?;
+        let ft = win::time::system_time_to_file_time(&utc)?;
         Some((u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime))
     }
 
@@ -155,8 +154,8 @@ impl Local {
             dwHighDateTime: (ft >> 32) as u32,
         };
         // In the current time zone.
-        let utc = b6::file_time_to_system_time(&ft)?;
-        let local = b6::utc_to_local(&utc)?;
+        let utc = win::time::file_time_to_system_time(&ft)?;
+        let local = win::time::utc_to_local(&utc)?;
         Some(Local {
             year: local.wYear,
             month: local.wMonth,

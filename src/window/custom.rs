@@ -10,11 +10,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{LRESULT, RECT};
 use windows_sys::Win32::Graphics::Gdi::HFONT;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    HMENU, MENUITEMINFOW, MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID, MIIM_STRING, MIIM_SUBMENU, WM_APP,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{HMENU, WM_APP};
 
 use super::{App, Fonts};
 use crate::a11y::Server;
@@ -23,7 +21,8 @@ use crate::colors::{Colors, FontSpec};
 use crate::custom::DoubleCtrl;
 use crate::keymap::{self, Bindings};
 use crate::theme::Palette;
-use crate::win::{self, ext::b3};
+use crate::win::menu::By;
+use crate::win::{self, Msg};
 
 /// Posted by the double-Ctrl hook (`crate::dblctrl`): Ctrl was pressed
 /// twice.
@@ -355,8 +354,8 @@ impl App {
         }
     }
 
-    pub(super) fn custom_message(&self, msg: u32, _w: WPARAM, _l: LPARAM) -> Option<LRESULT> {
-        match msg {
+    pub(super) fn custom_message(&self, m: &Msg) -> Option<LRESULT> {
+        match m.id {
             WM_DOUBLE_CTRL => {
                 self.double_ctrl();
                 Some(0)
@@ -389,19 +388,15 @@ type Originals = HashMap<(usize, u16), (String, Option<String>)>;
 /// `None` for a command whose keys are the defaults, whose item gets back
 /// what it said before it was first rewritten (kept in `originals`).
 fn relabel(menu: HMENU, key: &dyn Fn(u16) -> Option<Option<String>>, originals: &mut Originals) {
-    let n = b3::menu_item_count(menu);
+    let n = win::menu::count(menu);
     for i in 0..n.max(0) as u32 {
-        let mask = MIIM_FTYPE | MIIM_ID | MIIM_STRING | MIIM_SUBMENU;
-        let Some((mii, Some(text))) = b3::menu_item_info(menu, i, true, mask, 256) else {
+        let Some(item) = win::menu::item_info(menu, By::Position(i)) else {
             continue;
         };
-        if mii.fType & MFT_SEPARATOR != 0
-            || !mii.hSubMenu.is_null()
-            || mii.wID > u32::from(u16::MAX)
-        {
+        if item.is_separator() || !item.submenu.is_null() || item.id > u32::from(u16::MAX) {
             continue;
         }
-        let cmd = mii.wID as u16;
+        let (cmd, text) = (item.id as u16, item.text);
         let (label, tail) = match text.split_once('\t') {
             Some((label, tail)) => (label, Some(tail)),
             None => (text.as_str(), None),
@@ -430,17 +425,17 @@ fn relabel(menu: HMENU, key: &dyn Fn(u16) -> Option<Option<String>>, originals: 
         if wanted == text {
             continue;
         }
-        b3::set_menu_item_info(menu, i, true, MENUITEMINFOW::default(), Some(&wanted));
+        win::menu::set_text(menu, By::Position(i), &wanted);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MF_BYCOMMAND, MF_STRING};
+    use crate::win::menu::NewItem;
 
     fn text(menu: HMENU, cmd: u16) -> String {
-        b3::menu_string(menu, u32::from(cmd), MF_BYCOMMAND)
+        win::menu::text(menu, By::Command(u32::from(cmd)))
     }
 
     /// Keys back to the defaults put back the shortcut text a menu built
@@ -448,10 +443,10 @@ mod tests {
     #[test]
     fn menus_get_their_shortcut_text_back_with_the_default_keys() {
         // A menu of this thread's, destroyed at the end.
-        let menu = b3::create_popup_menu();
+        let menu = win::menu::create_popup();
         assert!(!menu.is_null());
         for (cmd, label) in [(1u16, "Zoom &In\tCtrl+="), (2, "&Status Bar")] {
-            b3::append_menu(menu, MF_STRING, usize::from(cmd), label);
+            win::menu::append(menu, &NewItem::command(u32::from(cmd), label));
         }
         let mut originals = Originals::new();
         let f7 = |cmd: u16| (cmd == 1).then(|| Some("F7".to_owned()));
@@ -479,6 +474,6 @@ mod tests {
         assert_eq!(text(menu, 2), "&Status Bar\tCtrl+B");
         relabel(menu, &defaults, &mut originals);
         assert_eq!(text(menu, 2), "&Status Bar");
-        b3::destroy_menu(menu);
+        win::menu::destroy(menu);
     }
 }

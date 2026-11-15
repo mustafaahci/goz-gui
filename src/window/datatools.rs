@@ -30,7 +30,6 @@ use std::sync::Arc;
 
 use goz_core::types::SortDir;
 
-use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     HMENU, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
 };
@@ -45,7 +44,8 @@ use crate::filelist::{FileList, Notify};
 use crate::menu::{self, Item};
 use crate::msgbox;
 use crate::store::location;
-use crate::win::{self, ext::b3::ProcessWait};
+use crate::win::process::Process;
+use crate::win::{self, Msg};
 
 /// A file list finished reading: wParam 1 when every row was read, 0 when
 /// reading stopped on an error; lParam the list's id (the shown tab's list
@@ -96,7 +96,7 @@ pub(super) fn before_window(l: &crate::cmdline::Launch) -> Option<i32> {
 fn wait_for_process(pid: u32, ms: u32) {
     // Opened for waiting only, closed after; a process gone already gives
     // nothing to wait for.
-    if let Some(process) = ProcessWait::open(pid) {
+    if let Some(process) = Process::open(pid) {
         process.wait(ms);
     }
 }
@@ -691,16 +691,16 @@ impl App {
     }
 
     /// A data tool's WM_APP message.
-    pub(super) fn data_tools_message(&self, msg: u32, _w: WPARAM, l: LPARAM) {
-        if msg == WM_FILELIST {
+    pub(super) fn data_tools_message(&self, m: &Msg) {
+        if m.id == WM_FILELIST {
             // Only the shown list's end shows now (W5R-5); a held list's is
             // said when its tab shows.
-            match self.data_tools.read_ended(l as u64) {
+            match self.data_tools.read_ended(m.l as u64) {
                 Reader::Shown => self.file_list_read(),
                 Reader::Temp => self.temp_list_read(),
                 Reader::Held | Reader::Gone => {}
             }
-        } else if msg == WM_OTHERS_ENDED {
+        } else if m.id == WM_OTHERS_ENDED {
             let replace = self.data_tools.replacing.take();
             if let Some(replace) = replace {
                 self.replace_settings(replace);
@@ -1006,10 +1006,7 @@ impl App {
         let pids = self.exit_other_windows_unsaved();
         // Opened now, so a process id used again later is not waited for;
         // each for waiting only, and a process gone already gives nothing.
-        let handles: Vec<ProcessWait> = pids
-            .iter()
-            .filter_map(|&pid| ProcessWait::open(pid))
-            .collect();
+        let handles: Vec<Process> = pids.iter().filter_map(|&pid| Process::open(pid)).collect();
         if handles.is_empty() {
             self.replace_settings(replace);
             return;

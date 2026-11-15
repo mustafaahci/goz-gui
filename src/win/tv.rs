@@ -11,6 +11,7 @@ use windows_sys::Win32::UI::Controls::{
     TVM_SETLINECOLOR, TVM_SETTEXTCOLOR, TVM_SORTCHILDREN,
 };
 
+/// The class these messages are for.
 pub const CLASS: &str = "SysTreeView32";
 
 /// # Safety
@@ -46,38 +47,47 @@ pub fn expand(tv: HWND, item: HTREEITEM, code: u32) -> bool {
     send_int(tv, TVM_EXPAND, code as usize, item) != 0
 }
 
+/// Expands and scrolls the tree so `item` shows.
 pub fn ensure_visible(tv: HWND, item: HTREEITEM) {
     send_int(tv, TVM_ENSUREVISIBLE, 0, item);
 }
 
+/// Deletes `item` and its children ([`ROOT`]: every item).
 pub fn delete_item(tv: HWND, item: HTREEITEM) -> bool {
     send_int(tv, TVM_DELETEITEM, 0, item) != 0
 }
 
+/// How many items the tree has.
 pub fn count(tv: HWND) -> usize {
     usize::try_from(send_int(tv, TVM_GETCOUNT, 0, 0)).unwrap_or(0)
 }
 
+/// The TVIS_* state bits of `item` that `mask` asks for.
 pub fn item_state(tv: HWND, item: HTREEITEM, mask: u32) -> u32 {
     send_int(tv, TVM_GETITEMSTATE, item as usize, mask as isize) as u32
 }
 
+/// The items' height, in pixels.
 pub fn item_height(tv: HWND) -> i32 {
     send_int(tv, TVM_GETITEMHEIGHT, 0, 0) as i32
 }
 
+/// Sets the items' height, in pixels (-1: the default).
 pub fn set_item_height(tv: HWND, height: i32) {
     send_int(tv, TVM_SETITEMHEIGHT, height as isize as usize, 0);
 }
 
+/// The items' text colour.
 pub fn set_text_color(tv: HWND, c: COLORREF) {
     send_int(tv, TVM_SETTEXTCOLOR, 0, c as isize);
 }
 
+/// The tree's background colour.
 pub fn set_bk_color(tv: HWND, c: COLORREF) {
     send_int(tv, TVM_SETBKCOLOR, 0, c as isize);
 }
 
+/// The colour of the lines between the items.
 pub fn set_line_color(tv: HWND, c: COLORREF) {
     send_int(tv, TVM_SETLINECOLOR, 0, c as isize);
 }
@@ -92,10 +102,12 @@ pub fn set_image_list(tv: HWND, which: u32, il: HIMAGELIST) -> HIMAGELIST {
     send_int(tv, TVM_SETIMAGELIST, which as usize, il)
 }
 
+/// The tree's tooltip control.
 pub fn tooltips(tv: HWND) -> HWND {
     send_int(tv, TVM_GETTOOLTIPS, 0, 0) as HWND
 }
 
+/// The edit box of a label being edited (null: none).
 pub fn edit_control(tv: HWND) -> HWND {
     send_int(tv, TVM_GETEDITCONTROL, 0, 0) as HWND
 }
@@ -253,6 +265,47 @@ pub fn insert(
     // SAFETY: TVM_INSERTITEMW's lParam is a TVINSERTSTRUCTW whose text is
     // set above (or the callback marker), read during the call.
     unsafe { send(tv, TVM_INSERTITEMW, 0, (&raw const ins) as isize) }
+}
+
+/// [`insert`] with UTF-16 text (a file name need not be valid Unicode, and
+/// is read up to a NUL, if it has one): `item` (its TVIF_* fields,
+/// TVIF_TEXT added) under `parent` after `after`, with `text`. The new
+/// item; 0 if not.
+pub fn insert_units(
+    tv: HWND,
+    parent: HTREEITEM,
+    after: HTREEITEM,
+    item: TVITEMW,
+    text: &[u16],
+) -> HTREEITEM {
+    let z = super::wz_units(super::until_nul(text));
+    let mut it = item;
+    it.mask |= TVIF_TEXT;
+    it.pszText = z.as_ptr().cast_mut();
+    it.cchTextMax = 0;
+    let mut ins = TVINSERTSTRUCTW {
+        hParent: parent,
+        hInsertAfter: after,
+        ..Default::default()
+    };
+    ins.Anonymous.item = it;
+    // SAFETY: TVM_INSERTITEMW's lParam is a TVINSERTSTRUCTW whose only
+    // pointer is the text set above, read during the call.
+    unsafe { send(tv, TVM_INSERTITEMW, 0, (&raw const ins) as isize) }
+}
+
+/// Sets tree item `item`'s text from UTF-16 (up to a NUL, if it has one).
+pub fn set_text_units(tv: HWND, item: HTREEITEM, text: &[u16]) -> bool {
+    let z = super::wz_units(super::until_nul(text));
+    let it = TVITEMW {
+        mask: TVIF_TEXT,
+        hItem: item,
+        pszText: z.as_ptr().cast_mut(),
+        ..Default::default()
+    };
+    // SAFETY: TVM_SETITEMW's lParam is a TVITEMW whose only pointer is the
+    // text set above, read during the call.
+    unsafe { send(tv, TVM_SETITEMW, 0, (&raw const it) as isize) != 0 }
 }
 
 /// LPSTR_TEXTCALLBACKW for [`insert`]: the item's text is asked for with

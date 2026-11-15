@@ -40,7 +40,7 @@ use crate::dialog::{
 use crate::filter::Filter;
 use crate::places::{self, Which};
 use crate::theme::Palette;
-use crate::win::ext::b5::{self, WindowTheme};
+use crate::win::uxtheme::Theme;
 use crate::win::{self, Msg, combo, dlg, edit, gdi, subclass, sys};
 
 const STATIC: u16 = 0xffff;
@@ -373,7 +373,7 @@ impl Edit {
         let dark = self.look.get().dark;
         // The list's parts, and where it is (a list that is not there has
         // no parts).
-        let Some(info) = b5::combo_box_info(model) else {
+        let Some(info) = win::combo::info(model) else {
             return;
         };
         let at = win::window_rect(model);
@@ -381,7 +381,7 @@ impl Edit {
         // Its visual style (closed when it drops), and the dialog's font on
         // the DC of its WM_PAINT, put back when `_font` drops (before the
         // style closes).
-        let theme = WindowTheme::open(model, "Combobox");
+        let theme = Theme::open_for_window(model, "Combobox");
         let _font = gdi::Selected::new(hdc, win::font(dlg));
         gdi::set_bk_mode(hdc, TRANSPARENT as i32);
         let anchors = |id: u16| ANCHORS.iter().find(|a| a.0 == id).map_or(0, |a| a.2);

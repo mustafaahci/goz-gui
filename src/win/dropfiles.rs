@@ -81,9 +81,18 @@ pub(crate) fn paths(h: usize) -> Option<Vec<Vec<u16>>> {
     if !in_flight(h) {
         return None;
     }
-    let drop = h as HDROP;
-    // SAFETY: a drop being delivered (above), not yet finished; index
-    // 0xFFFFFFFF with no buffer asks for the count.
+    // SAFETY: a drop being delivered (above), not yet finished.
+    Some(unsafe { read_paths(h as HDROP) })
+}
+
+/// The paths of the drop `drop` (a WM_DROPFILES's, or the clipboard's
+/// CF_HDROP), copied out.
+///
+/// # Safety
+/// `drop` is a valid HDROP, not freed, for as long as the call runs.
+pub(crate) unsafe fn read_paths(drop: HDROP) -> Vec<Vec<u16>> {
+    // SAFETY: as the caller promises; index 0xFFFFFFFF with no buffer asks
+    // for the count.
     let count = unsafe { DragQueryFileW(drop, u32::MAX, core::ptr::null_mut(), 0) };
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
@@ -96,7 +105,7 @@ pub(crate) fn paths(h: usize) -> Option<Vec<Vec<u16>>> {
         buf.truncate(got.min(len));
         out.push(buf);
     }
-    Some(out)
+    out
 }
 
 /// Where the drop `h` landed (client coordinates), and whether in the client

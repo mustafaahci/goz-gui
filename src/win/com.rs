@@ -36,6 +36,16 @@ impl Apartment {
     }
 }
 
+/// Initializes COM on this thread as a single-threaded apartment with OLE
+/// 1.0's DDE left on (COINIT_APARTMENTTHREADED alone), for the rest of the
+/// thread's life: it is never uninitialized, so nothing made in it can
+/// outlive it. False if the thread has an apartment of another kind.
+pub fn sta_with_ole1dde() -> bool {
+    // SAFETY: no pointers (the reserved one is null); never balanced, which
+    // only keeps COM loaded on the thread.
+    unsafe { CoInitializeEx(core::ptr::null(), COINIT_APARTMENTTHREADED as u32) >= 0 }
+}
+
 fn init(flags: u32) -> Option<Apartment> {
     // SAFETY: no pointers (the reserved one is null).
     let hr = unsafe { CoInitializeEx(core::ptr::null(), flags) };

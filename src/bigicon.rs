@@ -26,12 +26,11 @@ use windows_sys::Win32::UI::Shell::SIID_APPLICATION;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DI_NORMAL, HICON};
 
 use crate::thumbs::{Bitmap, Picture};
-use crate::win::ext::b9::gdi::Canvas;
-use crate::win::ext::b9::icon::{self, Icon};
-use crate::win::ext::b9::path;
-use crate::win::ext::b9::resource::DataFile;
-use crate::win::ext::b9::shell::ShellItem;
-use crate::win::gdi;
+use crate::win::dib::Canvas;
+use crate::win::icon::{self, Icon};
+use crate::win::resource::DataFile;
+use crate::win::shell::ShellItem;
+use crate::win::{self, gdi};
 
 /// `RT_GROUP_ICON`: an icon's directory of images in a program.
 const RT_GROUP_ICON: u16 = 14;
@@ -137,7 +136,7 @@ fn file_url_path(text: &[u16]) -> Option<Vec<u16>> {
     if !is_file_url(text) {
         return None;
     }
-    path::from_url(text)
+    win::file::path_from_url(text)
 }
 
 /// `text` with its environment variables (`%SystemRoot%`) expanded, as
@@ -148,7 +147,7 @@ fn expanded(text: &[u16]) -> Vec<u16> {
     }
     // Up to 1023 units expanded (1024 with the NUL); a longer expansion
     // leaves the text as it is.
-    match path::expand_environment(text) {
+    match win::sys::expand_environment(text) {
         Some(out) if out.len() < 1024 => out,
         _ => text.to_vec(),
     }

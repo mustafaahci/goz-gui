@@ -15,7 +15,7 @@ use windows_sys::Win32::UI::Shell::{
     FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST,
 };
 
-use crate::win::ext::b9::shell::FileDialog;
+use crate::win::shell::FileDialog;
 
 /// The check box's id among the dialog's added controls.
 const CHECK_ID: u32 = 1;

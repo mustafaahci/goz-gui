@@ -21,12 +21,17 @@ type Handler = Rc<dyn Fn(&Msg) -> LRESULT>;
 /// A window class to register: its procedure is the trampoline, which
 /// hands each message to the handler its window was made with ([`create`]).
 pub struct Class<'a> {
+    /// The class's name.
     pub name: &'a str,
     /// CS_* flags (CS_DBLCLKS, CS_HREDRAW…).
     pub style: u32,
+    /// The cursor over its windows (null: each sets its own).
     pub cursor: HCURSOR,
+    /// Its windows' large icon.
     pub icon: HICON,
+    /// Its windows' small icon.
     pub icon_small: HICON,
+    /// The brush its windows' background is erased with (null: none).
     pub background: HBRUSH,
 }
 
@@ -67,6 +72,20 @@ impl<'a> Class<'a> {
     }
 }
 
+/// Whether this module has registered a window class `name`
+/// (GetClassInfoExW).
+pub fn is_registered(name: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClassInfoExW;
+    let z = super::wz(name);
+    let mut wc = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a NUL-terminated name read during the call; an out-struct
+    // with its size (what it is given back is not kept).
+    unsafe { GetClassInfoExW(module(), z.as_ptr(), &mut wc) != 0 }
+}
+
 /// This module's handle.
 pub fn module() -> windows_sys::Win32::Foundation::HINSTANCE {
     // SAFETY: null asks for the module of the process's exe.
@@ -75,13 +94,17 @@ pub fn module() -> windows_sys::Win32::Foundation::HINSTANCE {
 
 /// Where a window is made, and as what.
 pub struct Create<'a> {
+    /// WS_EX_* styles.
     pub ex_style: u32,
     /// A class registered with [`Class::register`].
     pub class: &'a str,
+    /// The window's text.
     pub title: &'a str,
+    /// WS_* styles.
     pub style: u32,
     /// x, y, width, height (CW_USEDEFAULT where the system is to choose).
     pub rect: (i32, i32, i32, i32),
+    /// The parent (or owner) window; HWND_MESSAGE for a message-only one.
     pub parent: HWND,
     /// The menu of a top-level window, or a child's control id
     /// ([`id_menu`]).

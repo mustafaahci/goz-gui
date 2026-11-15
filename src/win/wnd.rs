@@ -3,13 +3,22 @@
 //! these read `win::set_focus(edit)`.
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, InvalidateRect, MapWindowPoints, REDRAW_WINDOW_FLAGS, RedrawWindow,
     ScreenToClient, UpdateWindow,
 };
+use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
+use windows_sys::Win32::UI::HiDpi::AdjustWindowRectExForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetActiveWindow, GetCapture, GetFocus, IsWindowEnabled, ReleaseCapture,
     SetActiveWindow, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, RegisterWindowMessageW,
+    SMTO_ABORTIFHUNG, SendMessageTimeoutW, SetParent, WINDOWPOS, WM_COPYDATA, WM_SETCURSOR,
+    WM_WINDOWPOSCHANGED,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DestroyWindow, GA_ROOT, GET_WINDOW_CMD, GWL_EXSTYLE, GWL_STYLE, GWLP_ID,
@@ -178,6 +187,40 @@ pub fn move_to(hwnd: HWND, rc: &RECT, repaint: bool) {
     };
 }
 
+/// A window and where it goes: x, y, width, height.
+pub type WindowMove = (HWND, (i32, i32, i32, i32));
+
+/// Moves each window of `moves` to its place together
+/// (BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos), with SWP_*
+/// `flags`, so they repaint once. False when the system could not (out of
+/// resources): then none, or not all, moved.
+pub fn defer_pos(moves: &[WindowMove], flags: SET_WINDOW_POS_FLAGS) -> bool {
+    let n = super::len_i32(moves.len());
+    // SAFETY: the structure the system makes for the moves stays in here:
+    // each DeferWindowPos hands back the one to go on with (null when it
+    // failed, and then the structure is gone and not used again), and the
+    // last is ended once. The windows are handles the system checks.
+    unsafe {
+        let mut hdwp = BeginDeferWindowPos(n);
+        for &(hwnd, (x, y, cx, cy)) in moves {
+            if hdwp.is_null() {
+                break;
+            }
+            hdwp = DeferWindowPos(hdwp, hwnd, core::ptr::null_mut(), x, y, cx, cy, flags);
+        }
+        !hdwp.is_null() && EndDeferWindowPos(hdwp) != 0
+    }
+}
+
+/// The window rectangle whose client area is `rc`, for these styles at
+/// `dpi` (AdjustWindowRectExForDpi).
+pub fn adjust_rect_for_dpi(rc: RECT, style: u32, menu: bool, ex_style: u32, dpi: u32) -> RECT {
+    let mut r = rc;
+    // SAFETY: an in-out struct.
+    unsafe { AdjustWindowRectExForDpi(&mut r, style, menu.into(), ex_style, dpi) };
+    r
+}
+
 /// MoveWindow by position and size.
 pub fn move_window(hwnd: HWND, x: i32, y: i32, cx: i32, cy: i32, repaint: bool) {
     // SAFETY: no pointers.
@@ -190,26 +233,31 @@ pub fn show(hwnd: HWND, cmd: SHOW_WINDOW_CMD) -> bool {
     unsafe { ShowWindow(hwnd, cmd) != 0 }
 }
 
+/// Whether `hwnd` is a window that is there.
 pub fn is_window(hwnd: HWND) -> bool {
     // SAFETY: no pointers.
     !hwnd.is_null() && unsafe { IsWindow(hwnd) != 0 }
 }
 
+/// Whether the window and its ancestors have WS_VISIBLE.
 pub fn is_visible(hwnd: HWND) -> bool {
     // SAFETY: no pointers.
     unsafe { IsWindowVisible(hwnd) != 0 }
 }
 
+/// Whether the window takes input.
 pub fn is_enabled(hwnd: HWND) -> bool {
     // SAFETY: no pointers.
     unsafe { IsWindowEnabled(hwnd) != 0 }
 }
 
+/// Whether the window is minimized.
 pub fn is_iconic(hwnd: HWND) -> bool {
     // SAFETY: no pointers.
     unsafe { IsIconic(hwnd) != 0 }
 }
 
+/// Whether the window is maximized.
 pub fn is_zoomed(hwnd: HWND) -> bool {
     // SAFETY: no pointers.
     unsafe { IsZoomed(hwnd) != 0 }
@@ -246,6 +294,14 @@ pub fn focus() -> HWND {
     unsafe { GetFocus() }
 }
 
+/// Makes `parent` the window's parent (HWND_MESSAGE: a message-only
+/// window); the parent before, null if it failed.
+pub fn set_parent(hwnd: HWND, parent: HWND) -> HWND {
+    // SAFETY: no pointers; both handles are checked by the system.
+    unsafe { SetParent(hwnd, parent) }
+}
+
+/// The window's parent (or owner, for a top-level window); null for none.
 pub fn parent(hwnd: HWND) -> HWND {
     // SAFETY: no pointers.
     unsafe { GetParent(hwnd) }
@@ -299,6 +355,7 @@ pub fn from_point(pt: POINT) -> HWND {
     unsafe { WindowFromPoint(pt) }
 }
 
+/// The window the user works in now.
 pub fn foreground() -> HWND {
     // SAFETY: no pointers.
     unsafe { GetForegroundWindow() }
@@ -310,6 +367,7 @@ pub fn set_foreground(hwnd: HWND) -> bool {
     unsafe { SetForegroundWindow(hwnd) != 0 }
 }
 
+/// Puts the window on top of its siblings.
 pub fn bring_to_top(hwnd: HWND) {
     // SAFETY: no pointers.
     unsafe { BringWindowToTop(hwnd) };
@@ -321,6 +379,7 @@ pub fn active() -> HWND {
     unsafe { GetActiveWindow() }
 }
 
+/// Activates a top-level window of this thread; the one active before.
 pub fn set_active(hwnd: HWND) -> HWND {
     // SAFETY: no pointers.
     unsafe { SetActiveWindow(hwnd) }
@@ -340,11 +399,13 @@ pub fn set_capture(hwnd: HWND) -> HWND {
     unsafe { SetCapture(hwnd) }
 }
 
+/// The window of this thread that has the mouse captured (null: none).
 pub fn capture() -> HWND {
     // SAFETY: no pointers.
     unsafe { GetCapture() }
 }
 
+/// Lets the mouse go (the capture).
 pub fn release_capture() {
     // SAFETY: no pointers.
     unsafe { ReleaseCapture() };
@@ -380,6 +441,7 @@ pub fn set_style(hwnd: HWND, style: u32) -> u32 {
     unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize) as u32 }
 }
 
+/// The window's WS_EX_* styles.
 pub fn ex_style(hwnd: HWND) -> u32 {
     // SAFETY: no pointers.
     unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 }
@@ -407,6 +469,7 @@ pub fn placement(hwnd: HWND) -> Option<WINDOWPLACEMENT> {
     (unsafe { GetWindowPlacement(hwnd, &mut wp) } != 0).then_some(wp)
 }
 
+/// Puts the window where `wp` says (its size is set here).
 pub fn set_placement(hwnd: HWND, wp: &WINDOWPLACEMENT) -> bool {
     let mut wp = *wp;
     wp.length = size_of::<WINDOWPLACEMENT>() as u32;
@@ -421,6 +484,7 @@ pub fn set_timer(hwnd: HWND, id: usize, ms: u32) -> bool {
     unsafe { SetTimer(hwnd, id, ms, None) != 0 }
 }
 
+/// Stops the window's timer `id`.
 pub fn kill_timer(hwnd: HWND, id: usize) {
     // SAFETY: no pointers.
     unsafe { KillTimer(hwnd, id) };
@@ -438,6 +502,101 @@ pub fn font(hwnd: HWND) -> windows_sys::Win32::Graphics::Gdi::HFONT {
 pub fn set_font(hwnd: HWND, font: windows_sys::Win32::Graphics::Gdi::HFONT, redraw: bool) {
     // SAFETY: WM_SETFONT's parameters are a handle and a flag.
     unsafe { super::send_raw(hwnd, WM_SETFONT, font as usize, isize::from(redraw)) };
+}
+
+/// DwmSetWindowAttribute of a 4-byte value (a BOOL, a COLORREF, an enum):
+/// DWMWA_USE_IMMERSIVE_DARK_MODE (20) and the like. False if DWM refused
+/// it (a window that is not there, an attribute that takes another size).
+pub fn set_dwm_attribute(hwnd: HWND, attribute: u32, value: i32) -> bool {
+    // SAFETY: DWM reads `cbAttribute` bytes from the pointer, here the 4 of
+    // `value`, during the call; no window attribute's value is a pointer.
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            attribute,
+            (&raw const value).cast(),
+            size_of::<i32>() as u32,
+        ) >= 0
+    }
+}
+
+/// Registers hotkey `id` of `hwnd` (WM_HOTKEY): MOD_* `mods` and key `vk`;
+/// false if another program has it.
+pub fn register_hotkey(hwnd: HWND, id: i32, mods: u32, vk: u32) -> bool {
+    // SAFETY: no pointers.
+    unsafe { RegisterHotKey(hwnd, id, mods, vk) != 0 }
+}
+
+/// Unregisters hotkey `id` of `hwnd` (one not registered is fine).
+pub fn unregister_hotkey(hwnd: HWND, id: i32) {
+    // SAFETY: no pointers.
+    unsafe { UnregisterHotKey(hwnd, id) };
+}
+
+/// Sends WM_WINDOWPOSCHANGED to `hwnd` with a copy of `wp`, as if it had
+/// moved there (an owner-drawn list then measures its items again).
+pub fn send_window_pos_changed(hwnd: HWND, wp: &WINDOWPOS) -> LRESULT {
+    let mut pos = *wp;
+    // SAFETY: WM_WINDOWPOSCHANGED (below WM_USER, the same for every
+    // window) takes a WINDOWPOS of handles and integers: a copy, alive for
+    // the call.
+    unsafe { super::send_raw(hwnd, WM_WINDOWPOSCHANGED, 0, (&raw mut pos) as LPARAM) }
+}
+
+/// Sends WM_SETCURSOR to `hwnd` as a mouse message `mouse` over hit-test
+/// area `hit` of window `over` would; whether the cursor was set.
+pub fn send_set_cursor(hwnd: HWND, over: HWND, hit: u16, mouse: u16) -> LRESULT {
+    // SAFETY: WM_SETCURSOR (below WM_USER, the same for every window) takes
+    // a window handle and two words, no pointer.
+    unsafe {
+        super::send_raw(
+            hwnd,
+            WM_SETCURSOR,
+            over as usize,
+            super::make_lparam(hit, mouse),
+        )
+    }
+}
+
+/// Sends `to` a WM_COPYDATA from `from` with `data` (its dwData) and a copy
+/// of `bytes`, giving up after `timeout_ms` or at once if `to` hangs
+/// (SMTO_ABORTIFHUNG): its answer, `None` if it gave none.
+pub fn send_copy_data(
+    to: HWND,
+    from: HWND,
+    data: usize,
+    bytes: &[u8],
+    timeout_ms: u32,
+) -> Option<usize> {
+    let cds = COPYDATASTRUCT {
+        dwData: data,
+        cbData: super::len_u32(bytes.len()),
+        lpData: bytes.as_ptr() as *mut core::ffi::c_void,
+    };
+    let mut answer = 0usize;
+    // SAFETY: WM_COPYDATA's lParam is a COPYDATASTRUCT, here of `bytes`
+    // (no more than its length); both outlive the call, and the system
+    // copies them for a receiver on another thread before it returns.
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            to,
+            WM_COPYDATA,
+            from as usize,
+            (&raw const cds) as LPARAM,
+            SMTO_ABORTIFHUNG,
+            timeout_ms,
+            &mut answer,
+        )
+    } != 0;
+    ok.then_some(answer)
+}
+
+/// The message registered as `name` (RegisterWindowMessageW), the same in
+/// every process; 0 if it could not be.
+pub fn register_message(name: &str) -> u32 {
+    let name = super::wz(name);
+    // SAFETY: a NUL-terminated name.
+    unsafe { RegisterWindowMessageW(name.as_ptr()) }
 }
 
 /// Turns the window's drawing on or off (WM_SETREDRAW).

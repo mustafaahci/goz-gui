@@ -21,7 +21,6 @@ use crate::colors::{Item, State};
 use crate::paint::fill;
 use crate::theme::{self, Palette};
 use crate::win::class::{Create, create_plain};
-use crate::win::ext::b4 as ext;
 use crate::win::{self, gdi, tip};
 use crate::window::App;
 
@@ -539,7 +538,7 @@ fn draw(hdc: HDC, cx: i32, cy: i32, strokes: &[Stroke], fg: u32, bg: u32) {
             // The glyph's centre is the middle of pixel (cx, cy).
             let c = coverage(strokes, dx as f32 - 0.5, dy as f32 - 0.5);
             if c > 0.0 {
-                ext::set_pixel(hdc, cx + dx, cy + dy, blend(bg, fg, c));
+                win::gdi::set_pixel(hdc, cx + dx, cy + dy, blend(bg, fg, c));
             }
         }
     }

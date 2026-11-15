@@ -67,8 +67,6 @@ pub const MSG_FIRST: u32 = WM_APP + 340;
 pub const WM_FOUND: u32 = MSG_FIRST;
 /// A save ended.
 pub const WM_SAVED: u32 = MSG_FIRST + 1;
-/// Files were dropped on the editor: a parcel of their paths.
-pub const WM_DROPPED: u32 = MSG_FIRST + 2;
 const MSG_END: u32 = MSG_FIRST + 10;
 
 /// W6 (`WM_APP + 360..370`): the main window's, as the editor closes
@@ -85,7 +83,7 @@ pub const W6_MSG_END: u32 = WM_APP + 370;
 
 // Past the main window's ranges (G2's end at WM_APP + 320); the editor's
 // window has no timers.
-const _: () = assert!(MSG_FIRST >= WM_APP + 320 && WM_DROPPED < MSG_END);
+const _: () = assert!(MSG_FIRST >= WM_APP + 320 && WM_SAVED < MSG_END);
 const _: () = assert!(MSG_END <= WM_EDITOR_CLOSED && WM_EDITOR_LOOK < W6_MSG_END);
 
 const BACKSLASH: char = '\\';
@@ -532,7 +530,7 @@ impl Export {
 /// `text` in the system's ANSI code page; a character it has not got is
 /// its default character (`?`).
 fn ansi(text: &str) -> Vec<u8> {
-    use crate::win::ext::b6::wide_to_multi_byte;
+    use crate::win::locale::wide_to_multi_byte;
     use windows_sys::Win32::Globalization::CP_ACP;
     let wide: Vec<u16> = text.encode_utf16().collect();
     if wide.is_empty() {

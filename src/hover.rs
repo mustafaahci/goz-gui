@@ -11,7 +11,6 @@ use windows_sys::Win32::UI::Controls::{
 };
 
 use crate::celltip;
-use crate::win::ext::b1;
 use crate::win::{self, lv};
 use crate::window::App;
 
@@ -35,7 +34,7 @@ pub fn left(app: &App) {
 /// pressed, which may have scrolled it).
 pub fn scrolled(app: &App) {
     // The cursor position, mapped into the list.
-    let over = b1::cursor_pos()
+    let over = win::sys::cursor_pos()
         .filter(|&pt| win::from_point(pt) == app.list)
         .map(|pt| win::screen_to_client(app.list, pt));
     let row = over.and_then(|pt| row_at(app, pt));

@@ -4,7 +4,7 @@
 //! `allow_multiple_windows_from_tray`, `allow_multiple_windows`), goz-gui's
 //! place for `minimize_to_tray`, and Everything's `double_ctrl_action`.
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::TBS_AUTOTICKS;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -19,8 +19,7 @@ use crate::options::{
 };
 use crate::settings::Background;
 use crate::ui_options::UiOptions;
-use crate::win::ext::b4 as ext;
-use crate::win::trackbar;
+use crate::win::{self, Msg, trackbar};
 use crate::window::App;
 
 /// Everything's control ids (Minimize to tray and Double Ctrl are
@@ -119,7 +118,7 @@ impl Page for Ui {
     fn fill(&self, app: &App, page: HWND) {
         show(page, &app.background(), &app.ui());
         let c = app.custom_settings();
-        ext::trackbar_set_range16(
+        win::trackbar::set_range16(
             item(page, SCALE_SLIDER),
             (SCALE_MIN / STEP) as u16,
             (SCALE_MAX / STEP) as u16,
@@ -139,8 +138,8 @@ impl Page for Ui {
     }
 
     /// The slider moved: the box follows (and that is the change).
-    fn message(&self, _app: &App, page: HWND, msg: u32, _w: WPARAM, l: LPARAM) -> Option<isize> {
-        if msg == WM_HSCROLL && l as HWND == item(page, SCALE_SLIDER) {
+    fn message(&self, _app: &App, page: HWND, m: &Msg) -> Option<isize> {
+        if m.id == WM_HSCROLL && m.l as HWND == item(page, SCALE_SLIDER) {
             let pos = trackbar::pos(item(page, SCALE_SLIDER)).max(0) as u32;
             set_text(page, SCALE, &(pos * STEP).to_string());
             return Some(0);

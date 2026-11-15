@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::Shell::{
 
 use crate::client::Row;
 use crate::highlight::fold;
-use crate::win::ext::b8;
+use crate::win;
 
 /// The text after the name's last dot: empty for a folder, and for a name
 /// with no dot or ending in one.
@@ -107,9 +107,10 @@ pub fn look_up(ext: Option<&[u16]>, icon: bool) -> (Option<i32>, Vec<u16>) {
         flags |= SHGFI_SYSICONINDEX | SHGFI_SMALLICON;
     }
     // An attribute-only lookup by name (nothing is read from disk).
-    let Some(info) = b8::file_info_by_name(&probe, attrs, flags) else {
+    let (found, info) = win::shell::file_info(&probe, attrs, flags);
+    if found == 0 {
         return (None, Vec::new());
-    };
+    }
     let len = info
         .szTypeName
         .iter()

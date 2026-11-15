@@ -16,7 +16,7 @@
 
 use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::Graphics::Gdi::{RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE};
-use windows_sys::Win32::UI::WindowsAndMessaging::{HMENU, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED};
+use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 
 use super::{App, slots};
 use crate::dock::PaneId;
@@ -24,8 +24,7 @@ use crate::menu::{self, Item};
 use crate::session::{Search, Session, View};
 use crate::strip::StripSlot;
 use crate::tabs::{self, Others, TabList, TabSettings};
-use crate::wide::window_text;
-use crate::win::{self, ext::b3, lv};
+use crate::win::{self, lv};
 
 /// The timer that lets the list paint again if a tab's rows are slow to
 /// come (gozd busy or gone).
@@ -58,7 +57,7 @@ impl App {
     /// Each tab's title, left to right: the shown one's as its search box
     /// has it now.
     pub(super) fn tab_titles(&self) -> Vec<String> {
-        let live = window_text(self.edit);
+        let live = win::text(self.edit);
         let t = self.tabs.borrow();
         t.tabs()
             .iter()
@@ -146,7 +145,7 @@ impl App {
     /// match options, filter and sort as they are), its view and columns.
     fn home_view(&self) -> View {
         let home = self.prefs.borrow().base.home();
-        let text = home.search.unwrap_or_else(|| window_text(self.edit));
+        let text = home.search.unwrap_or_else(|| win::text(self.edit));
         let o = self.opts.get();
         let h = home.options;
         View {
@@ -459,9 +458,8 @@ impl App {
         ]
         .into_iter()
         .find(|&cmd| {
-            // All bits set when the menu has no such item.
-            let state = b3::menu_state(history, u32::from(cmd), MF_BYCOMMAND);
-            state != u32::MAX
+            // Whether the menu has such an item.
+            win::menu::state(history, win::menu::By::Command(u32::from(cmd))).is_some()
         });
         match after {
             Some(menu::RESTORE_SESSION) => {
@@ -516,11 +514,7 @@ impl App {
         let m = menu::submenu(&items);
         let grey = |cmd: u16, on: bool| {
             // An item of the menu made above, by command.
-            b3::enable_menu_item(
-                m,
-                u32::from(cmd),
-                MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED },
-            );
+            win::menu::enable(m, win::menu::By::Command(u32::from(cmd)), on);
         };
         grey(tabs::CLOSE_TABS_LEFT, target > 0);
         grey(tabs::CLOSE_TABS_RIGHT, target + 1 < n);
@@ -624,6 +618,6 @@ fn popup_menu(owner: HWND, m: HMENU, pt: POINT, what: &str) -> u16 {
     // for its own menus); nothing is borrowed while it is up.
     let cmd = crate::popup::track(m, owner, pt, what, &|_| None);
     // The menu made by the caller, no longer shown.
-    b3::destroy_menu(m);
+    win::menu::destroy(m);
     u16::try_from(cmd).unwrap_or(0)
 }

@@ -18,13 +18,11 @@ use windows_sys::Win32::UI::Controls::{
     LVS_EX_HEADERDRAGDROP, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
     NM_CUSTOMDRAW, NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_CONTROL, VK_DOWN, VK_NEXT, VK_PRIOR, VK_UP,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, CBN_SELCHANGE, CBS_DROPDOWNLIST, EN_CHANGE, ES_AUTOHSCROLL, IDCANCEL, IDOK,
-    SM_CXVSCROLL, WM_APP, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN,
-    WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
+    SM_CXVSCROLL, WM_APP, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_NOTIFY,
+    WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::ui::{enable, item, set_state, units};
@@ -35,7 +33,7 @@ use crate::dialog::{
 };
 use crate::fileops::parent;
 use crate::places::{self, Which};
-use crate::win::{self, Msg, View, combo, dlg, header, lv, subclass, sys};
+use crate::win::{self, Msg, View, combo, dlg, header, lv, sys};
 
 const TITLE: &str = "Undo History";
 
@@ -238,22 +236,6 @@ fn fit_columns(list: HWND) {
     }
 }
 
-/// The search box's subclass: Up, Down, Page Up and Page Down move in the
-/// list while the keyboard stays in the box (the history dialogs' filter
-/// box does the same).
-static SEARCH_BOX: subclass::Key = subclass::Key::new("undo history search box");
-
-/// Subclasses `search` so its Up, Down, Page Up and Page Down go to `list`.
-fn keys_to_list(search: HWND, list: HWND) {
-    subclass::set(search, &SEARCH_BOX, move |m| {
-        if m.id == WM_KEYDOWN && matches!(m.w as u16, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT) {
-            win::send_plain(list, WM_KEYDOWN, m.w, m.l);
-            return 0;
-        }
-        m.def()
-    });
-}
-
 impl Dlg<'_> {
     fn list(dlg: HWND) -> HWND {
         item(dlg, ID_LIST)
@@ -277,7 +259,7 @@ impl Dlg<'_> {
         win::set_redraw(actions, true);
         // The search box's keys that move in the list (the subclass goes
         // with the box).
-        keys_to_list(item(dlg, ID_SEARCH), list);
+        crate::history_dialogs::filter_keys(item(dlg, ID_SEARCH), list);
         apply_theme(dlg, self.look.get().dark);
         center_on_owner(dlg);
         let wr = win::window_rect(dlg);

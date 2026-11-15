@@ -19,8 +19,7 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Controls::LVNI_FOCUSED;
 use windows_sys::Win32::UI::Shell::FOLDERID_Desktop;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    HMENU, IDYES, MB_ICONQUESTION, MB_OK, MB_YESNO, MENUITEMINFOW, MFS_ENABLED, MFS_GRAYED,
-    MIIM_STATE,
+    HMENU, IDYES, MB_ICONQUESTION, MB_OK, MB_YESNO, MFS_ENABLED, MFS_GRAYED,
 };
 
 use super::App;
@@ -39,7 +38,8 @@ use crate::history::filetime_now;
 use crate::menu::{self, Item as MenuItem};
 use crate::msgbox;
 use crate::store::location;
-use crate::win::{self, ext::b3, lv, sys};
+use crate::win::menu::By;
+use crate::win::{self, lv, sys};
 
 /// The name a new folder gets, numbered by Windows when taken (Everything's
 /// "New folder", "New folder (2)").
@@ -95,13 +95,9 @@ impl Tools {
 
 /// Sets the text of `menu`'s item `id`, and whether it can be chosen.
 fn set_item(menu: HMENU, id: u16, text: &str, enabled: bool) {
-    let mii = MENUITEMINFOW {
-        fMask: MIIM_STATE,
-        fState: if enabled { MFS_ENABLED } else { MFS_GRAYED },
-        ..Default::default()
-    };
+    let state = if enabled { MFS_ENABLED } else { MFS_GRAYED };
     // By command; Windows copies the text.
-    b3::set_menu_item_info(menu, u32::from(id), false, mii, Some(text));
+    win::menu::set_item(menu, By::Command(u32::from(id)), Some(text), Some(state));
 }
 
 fn beep() {
@@ -134,7 +130,7 @@ fn desktop() -> Option<Vec<u16>> {
     if let Some(dir) = location::desktop_dir() {
         return Some(dir.as_os_str().to_string_lossy().encode_utf16().collect());
     }
-    b3::known_folder_path(&FOLDERID_Desktop)
+    win::shell::known_folder(&FOLDERID_Desktop)
 }
 
 /// What the status bar says of the steps that did not go: how many of
@@ -656,7 +652,7 @@ impl App {
     fn await_new_folder(&self, path: Vec<u16>) {
         *self.file_tools.new_folder.borrow_mut() = Some(NewFolder {
             path,
-            search: crate::wide::window_text(self.edit),
+            search: crate::win::text(self.edit),
             left: NEW_FOLDER_TRIES,
         });
         win::set_timer(self.hwnd, TIMER_NEW_FOLDER, NEW_FOLDER_EVERY_MS);
@@ -671,7 +667,7 @@ impl App {
         let Some(mut nf) = self.file_tools.new_folder.borrow_mut().take() else {
             return;
         };
-        if crate::wide::window_text(self.edit) != nf.search {
+        if crate::win::text(self.edit) != nf.search {
             return;
         }
         if self.model.borrow().find(&nf.path).is_some() {
