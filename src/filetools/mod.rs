@@ -16,8 +16,6 @@
 //! and is skipped (with the reason) otherwise. Nothing is ever written
 //! over, even with the questions turned off.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 /// The file tools' commands, from `menu::F5_FIRST` (3400..=3499).
 pub mod cmd {
     use crate::menu::F5_FIRST;
@@ -53,31 +51,19 @@ pub mod undo_dialog;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use windows::Win32::Foundation::HWND as WHWND;
-use windows::Win32::System::Com::{
-    CLSCTX_ALL, CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile,
-};
-use windows::Win32::UI::Shell::{
-    FILEOPERATION_FLAGS, FileOperation, IFileOperation, IFileOperationProgressSink,
-    IFileOperationProgressSink_Impl, IShellItem, IShellLinkW, SHCreateItemFromParsingName,
-    SIGDN_FILESYSPATH, ShellLink,
-};
-use windows::core::{HRESULT, Interface, PCWSTR, implement};
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HWND, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Globalization::{
-    CSTR_EQUAL, CompareStringOrdinal, LCMAP_UPPERCASE, LCMapStringEx, LOCALE_NAME_INVARIANT,
-};
+use windows::Win32::UI::Shell::{IFileOperationProgressSink, IShellItem};
+use windows::core::HRESULT;
+use windows_sys::Win32::Foundation::{FILETIME, HWND};
+use windows_sys::Win32::Globalization::CSTR_EQUAL;
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, DeleteFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_WRITE_ATTRIBUTES, GetFileAttributesW, GetFileTime, GetLongPathNameW,
-    INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, SetFileTime,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
 };
 use windows_sys::Win32::UI::Shell::COPYENGINE_S_USER_IGNORED;
 
 use crate::fileops::{Outcome, parent};
 use crate::shell::{self, FileOp};
-use crate::wide::nul;
+use crate::win::ext::b6::{self, FileHandle, FileOperation, ItemOp};
 
 pub use times::{Set, Times};
 pub use undo::{Action, Record};
@@ -212,24 +198,35 @@ pub enum Kind {
     New,
 }
 
-/// Records what an operation does to each item, as it is done.
-#[implement(IFileOperationProgressSink)]
-pub struct Sink {
-    log: Rc<RefCell<Vec<Change>>>,
-}
+/// Records what an operation does to each item, as it is done: the
+/// progress sink is `win`'s ([`b6::progress_sink`]), and this keeps its log.
+pub struct Sink;
 
 impl Sink {
     /// A sink, and the log it writes to.
     pub fn make() -> (IFileOperationProgressSink, Rc<RefCell<Vec<Change>>>) {
         let log = Rc::new(RefCell::new(Vec::new()));
-        let sink: IFileOperationProgressSink = Sink {
-            log: Rc::clone(&log),
-        }
-        .into();
+        let theirs = Rc::clone(&log);
+        let sink = b6::progress_sink(move |op, from, to, hr| {
+            let kind = match op {
+                ItemOp::Rename => Kind::Rename,
+                ItemOp::Move => Kind::Move,
+                ItemOp::Copy => Kind::Copy,
+                ItemOp::Delete => Kind::Delete,
+                ItemOp::New => Kind::New,
+            };
+            Sink::note(&theirs, kind, from, to, hr);
+        });
         (sink, log)
     }
 
-    fn note(&self, kind: Kind, from: Option<&IShellItem>, to: Option<&IShellItem>, hr: HRESULT) {
+    fn note(
+        log: &RefCell<Vec<Change>>,
+        kind: Kind,
+        from: Option<&IShellItem>,
+        to: Option<&IShellItem>,
+        hr: HRESULT,
+    ) {
         let Some(from) = from.and_then(path_of) else {
             return;
         };
@@ -238,7 +235,7 @@ impl Sink {
         } else {
             None
         };
-        self.log.borrow_mut().push(Change {
+        log.borrow_mut().push(Change {
             kind,
             from,
             to,
@@ -247,119 +244,14 @@ impl Sink {
     }
 }
 
-type R = windows::core::Result<()>;
-type ItemRef<'a> = windows::core::Ref<'a, IShellItem>;
-
-#[allow(non_snake_case, reason = "the interface's method names")]
-impl IFileOperationProgressSink_Impl for Sink_Impl {
-    fn StartOperations(&self) -> R {
-        Ok(())
-    }
-    fn FinishOperations(&self, _hr: HRESULT) -> R {
-        Ok(())
-    }
-    fn PreRenameItem(&self, _f: u32, _item: ItemRef<'_>, _name: &PCWSTR) -> R {
-        Ok(())
-    }
-    fn PostRenameItem(
-        &self,
-        _f: u32,
-        item: ItemRef<'_>,
-        _name: &PCWSTR,
-        hr: HRESULT,
-        new: ItemRef<'_>,
-    ) -> R {
-        self.note(Kind::Rename, item.as_ref(), new.as_ref(), hr);
-        Ok(())
-    }
-    fn PreMoveItem(&self, _f: u32, _item: ItemRef<'_>, _to: ItemRef<'_>, _name: &PCWSTR) -> R {
-        Ok(())
-    }
-    fn PostMoveItem(
-        &self,
-        _f: u32,
-        item: ItemRef<'_>,
-        _to: ItemRef<'_>,
-        _name: &PCWSTR,
-        hr: HRESULT,
-        new: ItemRef<'_>,
-    ) -> R {
-        self.note(Kind::Move, item.as_ref(), new.as_ref(), hr);
-        Ok(())
-    }
-    fn PreCopyItem(&self, _f: u32, _item: ItemRef<'_>, _to: ItemRef<'_>, _name: &PCWSTR) -> R {
-        Ok(())
-    }
-    fn PostCopyItem(
-        &self,
-        _f: u32,
-        item: ItemRef<'_>,
-        _to: ItemRef<'_>,
-        _name: &PCWSTR,
-        hr: HRESULT,
-        new: ItemRef<'_>,
-    ) -> R {
-        self.note(Kind::Copy, item.as_ref(), new.as_ref(), hr);
-        Ok(())
-    }
-    fn PreDeleteItem(&self, _f: u32, _item: ItemRef<'_>) -> R {
-        Ok(())
-    }
-    fn PostDeleteItem(&self, _f: u32, item: ItemRef<'_>, hr: HRESULT, new: ItemRef<'_>) -> R {
-        self.note(Kind::Delete, item.as_ref(), new.as_ref(), hr);
-        Ok(())
-    }
-    fn PreNewItem(&self, _f: u32, _folder: ItemRef<'_>, _name: &PCWSTR) -> R {
-        Ok(())
-    }
-    fn PostNewItem(
-        &self,
-        _f: u32,
-        folder: ItemRef<'_>,
-        _name: &PCWSTR,
-        _template: &PCWSTR,
-        _attrs: u32,
-        hr: HRESULT,
-        new: ItemRef<'_>,
-    ) -> R {
-        self.note(Kind::New, folder.as_ref(), new.as_ref(), hr);
-        Ok(())
-    }
-    fn UpdateProgress(&self, _total: u32, _done: u32) -> R {
-        Ok(())
-    }
-    fn ResetTimer(&self) -> R {
-        Ok(())
-    }
-    fn PauseTimer(&self) -> R {
-        Ok(())
-    }
-    fn ResumeTimer(&self) -> R {
-        Ok(())
-    }
-}
-
 /// The file system path of a shell item.
 fn path_of(item: &IShellItem) -> Option<Vec<u16>> {
-    // SAFETY: the item is a live COM object of this thread; the name it
-    // gives is a NUL-terminated string from the COM allocator, read and
-    // then freed.
-    unsafe {
-        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-        if name.is_null() {
-            return None;
-        }
-        let path = name.as_wide().to_vec();
-        CoTaskMemFree(Some(name.0.cast()));
-        Some(path)
-    }
+    b6::shell_item_path(item)
 }
 
 /// The shell item at `path`; `None` when it is gone.
 fn item(path: &[u16]) -> Option<IShellItem> {
-    let path = nul(path);
-    // SAFETY: a NUL-terminated path that outlives the call.
-    unsafe { SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None).ok() }
+    b6::shell_item(path)
 }
 
 /// `path` with its 8.3 short names expanded, the form the shell reports
@@ -370,12 +262,9 @@ pub(crate) fn long_path(path: &[u16]) -> Option<Vec<u16>> {
     if !path.contains(&u16::from(b'~')) {
         return None;
     }
-    let path = nul(path);
     let mut buf = vec![0u16; 512];
     loop {
-        // SAFETY: a NUL-terminated path and a buffer of the length given.
-        let n =
-            unsafe { GetLongPathNameW(path.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        let n = b6::long_path_name(path, &mut buf) as usize;
         if n == 0 {
             return None;
         }
@@ -396,11 +285,7 @@ pub fn same_path(a: &[u16], b: &[u16]) -> bool {
         p
     }
     let (a, b) = (trim(a), trim(b));
-    // SAFETY: two buffers, each read for its own length.
-    unsafe {
-        CompareStringOrdinal(a.as_ptr(), a.len() as i32, b.as_ptr(), b.len() as i32, 1)
-            == CSTR_EQUAL
-    }
+    b6::compare_ordinal(a, b, true) == CSTR_EQUAL
 }
 
 /// What a move of several items into one folder runs (wave 5): each item
@@ -499,21 +384,9 @@ fn path_key(path: &[u16]) -> Vec<u16> {
         p = rest;
     }
     let mut key = vec![0u16; p.len()];
-    // SAFETY: `p` is read and `key` written, each for its own length,
-    // which is the same.
-    let written = unsafe {
-        LCMapStringEx(
-            LOCALE_NAME_INVARIANT,
-            LCMAP_UPPERCASE,
-            p.as_ptr(),
-            p.len() as i32,
-            key.as_mut_ptr(),
-            key.len() as i32,
-            core::ptr::null(),
-            core::ptr::null(),
-            0,
-        )
-    };
+    // `p` is read and `key` written, each for its own length, which is the
+    // same.
+    let written = b6::upper_invariant(p, &mut key);
     if written as usize != p.len() {
         key = p.iter().map(|&c| ascii_upper(c)).collect();
     }
@@ -554,10 +427,7 @@ pub fn join(folder: &[u16], name: &[u16]) -> Vec<u16> {
 
 /// The attributes of `path`; `None` when there is nothing there.
 pub fn attributes(path: &[u16]) -> Option<u32> {
-    let z = nul(path);
-    // SAFETY: a NUL-terminated path.
-    let a = unsafe { GetFileAttributesW(z.as_ptr()) };
-    (a != INVALID_FILE_ATTRIBUTES).then_some(a)
+    b6::file_attributes(path)
 }
 
 fn exists(path: &[u16]) -> bool {
@@ -894,143 +764,119 @@ fn shell_steps(
         Group::Duplicate => FileOp::Duplicate,
         _ => FileOp::Transfer,
     };
-    // SAFETY: COM is initialised on this thread (an STA); every item and
-    // string lives across the calls that take it, and the operation is
-    // released when this ends.
-    unsafe {
-        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
-        if !owner.is_null() {
-            op.SetOwnerWindow(WHWND(owner))?;
-        }
-        op.SetOperationFlags(FILEOPERATION_FLAGS(shell::fileop_flags(kind, silent)))?;
-        let (sink, log) = Sink::make();
-        let cookie = op.Advise(&sink)?;
-        let mut queued = 0;
-        // Names kept alive until the operation has run.
-        let mut names: Vec<Vec<u16>> = Vec::new();
-        // Each source's long form, read while it still exists: the
-        // operation reports its items that way.
-        let mut long: Vec<Option<Vec<u16>>> = vec![None; steps.len()];
-        for &i in mine {
-            let step = &steps[i];
-            long[i] = long_path(step.source());
-            let Some(source) = item(step.source()) else {
-                results[i] = StepResult::Failed(hr_text(0x8007_0002_u32 as i32));
-                continue;
-            };
-            let name_ptr = |names: &mut Vec<Vec<u16>>, name: Option<&[u16]>| match name {
-                Some(n) => {
-                    names.push(nul(n));
-                    PCWSTR(names.last().map_or(core::ptr::null(), |n| n.as_ptr()))
-                }
-                None => PCWSTR::null(),
-            };
-            let none = None::<&IFileOperationProgressSink>;
-            let queued_one = match step {
-                Step::Rename { name, .. } => {
-                    let n = name_ptr(&mut names, Some(name));
-                    op.RenameItem(&source, n, none)
-                }
-                Step::Move { folder, name, .. } | Step::Copy { folder, name, .. } => {
-                    let Some(to) = item(folder) else {
-                        results[i] = StepResult::Failed(hr_text(0x8007_0003_u32 as i32));
-                        continue;
-                    };
-                    let n = name_ptr(&mut names, name.as_deref());
-                    if matches!(step, Step::Move { .. }) {
-                        op.MoveItem(&source, &to, n, none)
-                    } else {
-                        op.CopyItem(&source, &to, n, none)
-                    }
-                }
-                Step::Restore { path, .. } => {
-                    let Some(to) = parent(path).and_then(item) else {
-                        results[i] = StepResult::Failed(hr_text(0x8007_0003_u32 as i32));
-                        continue;
-                    };
-                    let n = name_ptr(&mut names, Some(name_of(path)));
-                    op.MoveItem(&source, &to, n, none)
-                }
-                Step::Recycle { .. } => op.DeleteItem(&source, none),
-                Step::NewFolder { name, .. } => {
-                    let n = name_ptr(&mut names, Some(name));
-                    op.NewItem(&source, FILE_ATTRIBUTE_DIRECTORY, n, PCWSTR::null(), none)
-                }
-                Step::Times { .. } | Step::Shortcut { .. } => continue,
-            };
-            match queued_one {
-                Ok(()) => queued += 1,
-                Err(e) => results[i] = StepResult::Failed(hr_text(e.code().0)),
-            }
-        }
-        if queued == 0 {
-            return Ok(true);
-        }
-        let performed = op.PerformOperations();
-        let aborted = op
-            .GetAnyOperationsAborted()
-            .map(|b| b.as_bool())
-            .unwrap_or(false);
-        let log = log.borrow();
-        for &i in mine {
-            if results[i] != StepResult::NotRun {
-                continue;
-            }
-            let step = &steps[i];
-            let want = match step {
-                Step::Rename { .. } => Kind::Rename,
-                Step::Move { .. } | Step::Restore { .. } => Kind::Move,
-                Step::Copy { .. } => Kind::Copy,
-                Step::Recycle { .. } => Kind::Delete,
-                Step::NewFolder { .. } => Kind::New,
-                _ => continue,
-            };
-            // The operation reports the items inside a folder too: only
-            // the one given counts.
-            let seen = log.iter().find(|c| {
-                c.kind == want
-                    && (same_path(&c.from, step.source())
-                        || long[i].as_deref().is_some_and(|l| same_path(&c.from, l)))
-            });
-            let done = |to: Vec<u16>| StepResult::Done {
-                to,
-                before: None,
-                after: None,
-            };
-            results[i] = match seen {
-                // Sent to the Recycle Bin: done once it is gone from its
-                // place (a question answered "skip" leaves it), wherever
-                // the bin keeps it.
-                // "Skip" in Explorer's question: nothing was done to it,
-                // whatever item the operation names.
-                Some(c) if c.hr == COPYENGINE_S_USER_IGNORED => StepResult::NotRun,
-                Some(c) if c.hr >= 0 && want == Kind::Delete => {
-                    if exists(step.source()) {
-                        StepResult::NotRun
-                    } else {
-                        done(c.to.clone().unwrap_or_default())
-                    }
-                }
-                Some(c) if c.hr >= 0 => match &c.to {
-                    Some(to) => {
-                        if let Step::Restore { recycled, .. } = step {
-                            drop_recycle_record(recycled);
-                        }
-                        done(to.clone())
-                    }
-                    // Skipped by the user in a question.
-                    None => StepResult::NotRun,
-                },
-                Some(c) if CANCELLED.contains(&c.hr) => StepResult::NotRun,
-                Some(c) => StepResult::Failed(hr_text(c.hr)),
-                None => StepResult::NotRun,
-            };
-        }
-        drop(log);
-        let _ = op.Unadvise(cookie);
-        performed?;
-        Ok(!aborted)
+    // COM is initialised on this thread (an STA); the operation keeps the
+    // names it is given, and is released when this ends.
+    let op = FileOperation::new()?;
+    if !owner.is_null() {
+        op.set_owner_window(owner)?;
     }
+    op.set_operation_flags(shell::fileop_flags(kind, silent))?;
+    let (sink, log) = Sink::make();
+    let cookie = op.advise(&sink)?;
+    let mut queued = 0;
+    // Each source's long form, read while it still exists: the
+    // operation reports its items that way.
+    let mut long: Vec<Option<Vec<u16>>> = vec![None; steps.len()];
+    for &i in mine {
+        let step = &steps[i];
+        long[i] = long_path(step.source());
+        let Some(source) = item(step.source()) else {
+            results[i] = StepResult::Failed(hr_text(0x8007_0002_u32 as i32));
+            continue;
+        };
+        let queued_one = match step {
+            Step::Rename { name, .. } => op.rename_item(&source, name),
+            Step::Move { folder, name, .. } | Step::Copy { folder, name, .. } => {
+                let Some(to) = item(folder) else {
+                    results[i] = StepResult::Failed(hr_text(0x8007_0003_u32 as i32));
+                    continue;
+                };
+                if matches!(step, Step::Move { .. }) {
+                    op.move_item(&source, &to, name.as_deref())
+                } else {
+                    op.copy_item(&source, &to, name.as_deref())
+                }
+            }
+            Step::Restore { path, .. } => {
+                let Some(to) = parent(path).and_then(item) else {
+                    results[i] = StepResult::Failed(hr_text(0x8007_0003_u32 as i32));
+                    continue;
+                };
+                op.move_item(&source, &to, Some(name_of(path)))
+            }
+            Step::Recycle { .. } => op.delete_item(&source),
+            Step::NewFolder { name, .. } => op.new_item(&source, FILE_ATTRIBUTE_DIRECTORY, name),
+            Step::Times { .. } | Step::Shortcut { .. } => continue,
+        };
+        match queued_one {
+            Ok(()) => queued += 1,
+            Err(e) => results[i] = StepResult::Failed(hr_text(e.code().0)),
+        }
+    }
+    if queued == 0 {
+        return Ok(true);
+    }
+    let performed = op.perform_operations();
+    let aborted = op.any_operations_aborted().unwrap_or(false);
+    let log = log.borrow();
+    for &i in mine {
+        if results[i] != StepResult::NotRun {
+            continue;
+        }
+        let step = &steps[i];
+        let want = match step {
+            Step::Rename { .. } => Kind::Rename,
+            Step::Move { .. } | Step::Restore { .. } => Kind::Move,
+            Step::Copy { .. } => Kind::Copy,
+            Step::Recycle { .. } => Kind::Delete,
+            Step::NewFolder { .. } => Kind::New,
+            _ => continue,
+        };
+        // The operation reports the items inside a folder too: only
+        // the one given counts.
+        let seen = log.iter().find(|c| {
+            c.kind == want
+                && (same_path(&c.from, step.source())
+                    || long[i].as_deref().is_some_and(|l| same_path(&c.from, l)))
+        });
+        let done = |to: Vec<u16>| StepResult::Done {
+            to,
+            before: None,
+            after: None,
+        };
+        results[i] = match seen {
+            // Sent to the Recycle Bin: done once it is gone from its
+            // place (a question answered "skip" leaves it), wherever
+            // the bin keeps it.
+            // "Skip" in Explorer's question: nothing was done to it,
+            // whatever item the operation names.
+            Some(c) if c.hr == COPYENGINE_S_USER_IGNORED => StepResult::NotRun,
+            Some(c) if c.hr >= 0 && want == Kind::Delete => {
+                if exists(step.source()) {
+                    StepResult::NotRun
+                } else {
+                    done(c.to.clone().unwrap_or_default())
+                }
+            }
+            Some(c) if c.hr >= 0 => match &c.to {
+                Some(to) => {
+                    if let Step::Restore { recycled, .. } = step {
+                        drop_recycle_record(recycled);
+                    }
+                    done(to.clone())
+                }
+                // Skipped by the user in a question.
+                None => StepResult::NotRun,
+            },
+            Some(c) if CANCELLED.contains(&c.hr) => StepResult::NotRun,
+            Some(c) => StepResult::Failed(hr_text(c.hr)),
+            None => StepResult::NotRun,
+        };
+    }
+    drop(log);
+    let _ = op.unadvise(cookie);
+    performed?;
+    Ok(!aborted)
 }
 
 /// After a `$R` item came back out of the Recycle Bin, its `$I` record
@@ -1044,54 +890,37 @@ fn drop_recycle_record(recycled: &[u16]) {
     let mut record = recycled.to_vec();
     let at = record.len() - name.len() + 1;
     record[at] = u16::from(b'I');
-    let z = nul(&record);
-    // SAFETY: a NUL-terminated path; a missing file is reported and ignored.
-    unsafe { DeleteFileW(z.as_ptr()) };
+    // A missing file is reported and ignored.
+    b6::delete_file(&record);
 }
 
 /// Opens `path` (a file or a folder) to read and set its times.
-fn open_for_times(path: &[u16]) -> Result<Handle, String> {
-    let z = nul(path);
-    // SAFETY: a NUL-terminated path; the handle is closed by `Handle`.
-    let h = unsafe {
-        CreateFileW(
-            z.as_ptr(),
-            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            core::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            core::ptr::null_mut(),
-        )
-    };
-    if h == INVALID_HANDLE_VALUE {
-        return Err(last_error());
-    }
-    Ok(Handle(h))
-}
-
-struct Handle(windows_sys::Win32::Foundation::HANDLE);
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        // SAFETY: the handle `open_for_times` opened, closed once.
-        unsafe { CloseHandle(self.0) };
-    }
+fn open_for_times(path: &[u16]) -> Result<FileHandle, String> {
+    FileHandle::open(
+        path,
+        FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+    )
+    .map_err(error_text)
 }
 
 fn last_error() -> String {
-    let e = std::io::Error::last_os_error();
+    error_text(std::io::Error::last_os_error())
+}
+
+/// What an error from the system says.
+fn error_text(e: std::io::Error) -> String {
     e.raw_os_error()
         .map(|code| hr_text((code as u32 | 0x8007_0000) as i32))
         .unwrap_or_else(|| e.to_string())
 }
 
-fn read_times(h: &Handle) -> Option<Times> {
-    let mut t = [FILETIME::default(); 3];
-    // SAFETY: an open handle and three out-structs.
-    let ok = unsafe { GetFileTime(h.0, &mut t[0], &mut t[1], &mut t[2]) } != 0;
+fn read_times(h: &FileHandle) -> Option<Times> {
+    let t = h.times()?;
     let v = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
-    ok.then(|| Times {
+    Some(Times {
         created: v(t[0]),
         accessed: v(t[1]),
         modified: v(t[2]),
@@ -1115,10 +944,8 @@ fn set_times(path: &[u16], set: &[Set; 3]) -> StepResult {
         })
     };
     let (c, a, m) = (ft(want.0), ft(want.1), ft(want.2));
-    let ptr = |f: &Option<FILETIME>| f.as_ref().map_or(core::ptr::null(), |f| f as *const _);
-    // SAFETY: an open handle; each time is a FILETIME that lives across
-    // the call, or null for "leave it".
-    let ok = unsafe { SetFileTime(h.0, ptr(&c), ptr(&a), ptr(&m)) } != 0;
+    // Each time `None` is "leave it".
+    let ok = h.set_times(c.as_ref(), a.as_ref(), m.as_ref());
     if !ok {
         return StepResult::Failed(last_error());
     }
@@ -1182,23 +1009,9 @@ fn make_shortcut(target: &[u16], link: Option<&[u16]>, desktop: Option<&[u16]>) 
             }
         }
     };
-    let target_z = nul(target);
-    let path_z = nul(&path);
-    let work = parent(target).filter(|_| !is_dir(target)).map(nul);
-    // SAFETY: COM is initialised on this thread; every string is
-    // NUL-terminated and outlives the call that takes it.
-    let saved = unsafe {
-        (|| -> windows::core::Result<()> {
-            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
-            link.SetPath(PCWSTR(target_z.as_ptr()))?;
-            if let Some(w) = &work {
-                link.SetWorkingDirectory(PCWSTR(w.as_ptr()))?;
-            }
-            link.cast::<IPersistFile>()?
-                .Save(PCWSTR(path_z.as_ptr()), true)?;
-            Ok(())
-        })()
-    };
+    let work = parent(target).filter(|_| !is_dir(target));
+    // COM is initialised on this thread.
+    let saved = b6::save_shortcut(target, work, &path);
     match saved {
         Ok(()) => StepResult::Done {
             to: path,
@@ -1213,9 +1026,8 @@ fn make_shortcut(target: &[u16], link: Option<&[u16]>, desktop: Option<&[u16]>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::win::com::Apartment;
     use std::path::{Path, PathBuf};
-    use windows::Win32::System::Com::COINIT_APARTMENTTHREADED as WSTA;
-    use windows::Win32::System::Com::CoInitializeEx as WCoInitializeEx;
 
     fn w(p: &Path) -> Vec<u16> {
         p.as_os_str().to_string_lossy().encode_utf16().collect()
@@ -1249,8 +1061,10 @@ mod tests {
     /// where its item went, and a checked step never writes over anything.
     #[test]
     fn steps_say_where_their_items_went() {
-        // SAFETY: COM for this test thread, which ends with the test.
-        let _ = unsafe { WCoInitializeEx(None, WSTA) };
+        // COM for this test thread, which ends with the test.
+        if let Some(com) = Apartment::sta() {
+            com.keep();
+        }
         let dir = scratch("steps");
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::create_dir_all(&a).unwrap();
@@ -1357,8 +1171,10 @@ mod tests {
     /// move Undo may take back: that would take what was there along.
     #[test]
     fn what_lands_on_an_item_already_there_is_not_undone() {
-        // SAFETY: COM for this test thread, which ends with the test.
-        let _ = unsafe { WCoInitializeEx(None, WSTA) };
+        // COM for this test thread, which ends with the test.
+        if let Some(com) = Apartment::sta() {
+            com.keep();
+        }
         let dir = scratch("landed");
         let (src, dest) = (dir.join("src"), dir.join("dest"));
         std::fs::create_dir_all(src.join("X")).unwrap();
@@ -1411,8 +1227,10 @@ mod tests {
     /// name, numbered when taken.
     #[test]
     fn times_and_shortcuts() {
-        // SAFETY: COM for this test thread, which ends with the test.
-        let _ = unsafe { WCoInitializeEx(None, WSTA) };
+        // COM for this test thread, which ends with the test.
+        if let Some(com) = Apartment::sta() {
+            com.keep();
+        }
         let dir = scratch("times");
         let file = dir.join("f.txt");
         std::fs::write(&file, "x").unwrap();
@@ -1555,8 +1373,10 @@ mod tests {
     /// name) runs once that one is done, so every item is done each time.
     #[test]
     fn a_renamed_folder_and_an_item_moved_out_undo_and_redo() {
-        // SAFETY: COM for this test thread, which ends with the test.
-        let _ = unsafe { WCoInitializeEx(None, WSTA) };
+        // COM for this test thread, which ends with the test.
+        if let Some(com) = Apartment::sta() {
+            com.keep();
+        }
         let dir = scratch("redo-renamed");
         let f = dir.join("F");
         std::fs::create_dir_all(&f).unwrap();

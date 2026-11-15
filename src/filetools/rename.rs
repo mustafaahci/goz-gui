@@ -27,12 +27,12 @@
 //! name). Each new name is trimmed of white-space at its ends
 //! (Everything's `rename_trim=1`).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use windows_sys::Win32::Globalization::{NormalizationD, NormalizeString};
+use windows_sys::Win32::Globalization::NormalizationD;
+
+use crate::win::ext::b6;
 
 /// The renamer's switches, Everything's `rename_match_case`,
 /// `rename_match_diacritics`, `rename_regex`, `rename_ignore_extension`.
@@ -121,16 +121,7 @@ pub(crate) fn base_letter(c: char) -> char {
     let mut unit = [0u16; 2];
     let src = c.encode_utf16(&mut unit);
     let mut out = [0u16; 8];
-    // SAFETY: the source and its length; the buffer and its length.
-    let n = unsafe {
-        NormalizeString(
-            NormalizationD,
-            src.as_ptr(),
-            src.len() as i32,
-            out.as_mut_ptr(),
-            out.len() as i32,
-        )
-    };
+    let n = b6::normalize(NormalizationD, src, &mut out);
     let base = usize::try_from(n)
         .ok()
         .filter(|&n| n > 0 && n <= out.len())
