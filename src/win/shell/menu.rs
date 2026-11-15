@@ -18,6 +18,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::win::len_u32;
 use crate::win::msg::Msg;
 
+/// CMIC_MASK_HASLINKNAME and CMIC_MASK_HASTITLE (SEE_MASK_*'s values): the
+/// title fields hold a string. Never passed, as those fields are null.
+const HAS_TITLE: u32 = 0x1_0000 | 0x2_0000;
+
 /// The Explorer context menu of some items (IContextMenu, and the versions
 /// that draw their own items), from [`super::Folder::context_menu`].
 pub struct ShellMenu {
@@ -73,9 +77,9 @@ impl ShellMenu {
 
     /// Runs the item `offset` ids after the first for `owner`, as chosen at
     /// `pt` (screen), with CMIC_MASK_* `mask` (InvokeCommand with a
-    /// CMINVOKECOMMANDINFOEX). False if the handler failed, or `offset` is
-    /// not one an item can have (it travels as a resource id, under
-    /// 0x10000).
+    /// CMINVOKECOMMANDINFOEX; the flags that say a title is given are taken
+    /// off, as none is). False if the handler failed, or `offset` is not
+    /// one an item can have (it travels as a resource id, under 0x10000).
     pub fn invoke(&self, owner: HWND, offset: u32, pt: POINT, mask: u32) -> bool {
         // MAKEINTRESOURCE: the offset travels as the pointer's address,
         // which only below 0x10000 is read as an id, not a string.
@@ -85,7 +89,7 @@ impl ShellMenu {
         let verb = offset as usize;
         let info = CMINVOKECOMMANDINFOEX {
             cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-            fMask: mask,
+            fMask: mask & !HAS_TITLE,
             hwnd: WHWND(owner),
             lpVerb: PCSTR(core::ptr::without_provenance(verb)),
             lpVerbW: PCWSTR(core::ptr::without_provenance(verb)),
@@ -96,7 +100,8 @@ impl ShellMenu {
         // SAFETY: the EX structure (its cbSize says so), which outlives the
         // call: its verbs are resource ids (checked above), and its other
         // pointers (parameters, directory, title) null, which every mask
-        // allows. The handler may dispatch messages meanwhile.
+        // left allows (none says a title is there). The handler may
+        // dispatch messages meanwhile.
         unsafe {
             self.menu
                 .InvokeCommand((&raw const info).cast::<CMINVOKECOMMANDINFO>())
