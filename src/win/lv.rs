@@ -24,6 +24,7 @@ use windows_sys::Win32::UI::Controls::{
     LVM_SUBITEMHITTEST,
 };
 
+use super::WndProc;
 use super::imagelist::{ImageList, SystemList};
 
 /// The class these messages are for.
@@ -43,6 +44,19 @@ unsafe fn send(lv: HWND, msg: u32, w: usize, l: isize) -> isize {
 fn send_int(lv: HWND, msg: u32, w: usize, l: isize) -> isize {
     // SAFETY: the callers' messages take integers.
     unsafe { send(lv, msg, w, l) }
+}
+
+/// Sends `msg`, whose parameters are integers or an image list's handle,
+/// to the list view class's own procedure `proc` for `lv` (from
+/// [`super::system_class_proc`]): the answer is the list view's own, with
+/// no subclass of the window in between to give another.
+fn class_send(lv: HWND, proc: WndProc, msg: u32, w: usize, l: isize) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::CallWindowProcW;
+    // SAFETY: the callers' messages (LVM_GETIMAGELIST, LVM_SETIMAGELIST)
+    // take a kind and a list's handle (one the list view may keep, see
+    // `give`) or none; called on the class's own procedure, for a list view
+    // of this thread whose class's it is.
+    unsafe { CallWindowProcW(Some(proc), lv, msg, w, l) }
 }
 
 /// How many items the list has.
@@ -177,7 +191,9 @@ pub fn hot_item(lv: HWND) -> i32 {
 }
 
 /// Draws image `i` of the list's image list `which` (LVSIL_*) on `hdc` at
-/// `x, y`; false if the list has none (or the image did not draw).
+/// `x, y`; false if the list has none (or the image did not draw), or `lv`
+/// is not a list view of this thread. The list is asked of the list view
+/// class's own procedure, past any subclass of the window.
 pub fn draw_image(
     lv: HWND,
     which: u32,
@@ -186,14 +202,18 @@ pub fn draw_image(
     at: (i32, i32),
     style: IMAGE_LIST_DRAW_STYLE,
 ) -> bool {
-    let il = send_int(lv, LVM_GETIMAGELIST, which as usize, 0);
+    let Some(proc) = super::system_class_proc(lv, CLASS) else {
+        return false;
+    };
+    let il = class_send(lv, proc, LVM_GETIMAGELIST, which as usize, 0);
     if il == 0 {
         return false;
     }
-    // SAFETY: the list's own image list, which it keeps alive while it
-    // shows it: one it was given here (`set_image_list`: one it destroys
-    // only with itself, or a system list) or by the system. Nothing here
-    // can change it during the call (drawing sends the list no message).
+    // SAFETY: the image list the list view itself shows, as its class's own
+    // procedure answered, which it keeps alive while it shows it: one it
+    // was given here (`set_image_list`: one it destroys only with itself,
+    // or a system list) or by the system. Nothing here can change it
+    // during the call (drawing sends the list no message).
     unsafe { ImageList_Draw(il, i, hdc, at.0, at.1, style) != 0 }
 }
 
@@ -272,30 +292,38 @@ fn release_system(il: HIMAGELIST) {
     });
 }
 
-/// Sends LVM_SETIMAGELIST of `il` to `lv`, notes `given` for it, and lets
-/// go of the list it gives back if it was one given here.
+/// Sends LVM_SETIMAGELIST of `il` to `lv`'s class's own procedure, notes
+/// `given` for it, and lets go of the list it gives back if it was one
+/// given here. Past any subclass of the window: the list view takes `il`,
+/// and what it gives back is the list it showed, which no subclass can
+/// answer for (a list it still shows, destroyed as given back).
 fn give(lv: HWND, which: u32, il: HIMAGELIST, given: Option<Given>) -> bool {
-    if !super::class_is(lv, CLASS) || !super::is_this_thread(lv) {
+    let Some(proc) = super::system_class_proc(lv, CLASS) else {
         return false;
-    }
+    };
     // Its entries go with it: its own lists are then its to destroy.
-    if !super::subclass::has(lv, &GIVEN_KEY)
-        && !super::subclass::set(lv, &GIVEN_KEY, |m| {
+    if !super::subclass::has(lv, &GIVEN_KEY) {
+        // Entries under its handle without the subclass are of a window that
+        // went without its end being seen (a subclass in front swallowed
+        // it): what they name went with that window.
+        let key = lv as usize;
+        GIVEN.with_borrow_mut(|g| g.retain(|&(h, _), _| h != key));
+        if !super::subclass::set(lv, &GIVEN_KEY, |m| {
             if m.id == windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY {
                 let key = m.hwnd as usize;
                 GIVEN.with_borrow_mut(|g| g.retain(|&(h, _), _| h != key));
             }
             m.def()
-        })
-    {
-        return false;
+        }) {
+            return false;
+        }
     }
     let key = (lv as usize, which);
     let before = GIVEN.with_borrow_mut(|g| match given {
         Some(given) => g.insert(key, given),
         None => g.remove(&key),
     });
-    let old = send_int(lv, LVM_SETIMAGELIST, which as usize, il);
+    let old = class_send(lv, proc, LVM_SETIMAGELIST, which as usize, il);
     match before {
         // SAFETY: the list given up whole here before, which the list view
         // no longer shows (it gave it back): goz-gui's again.

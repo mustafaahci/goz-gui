@@ -380,14 +380,14 @@ pub fn set_extended_style(tv: HWND, mask: u32, style: u32) {
 /// Gives the tree `tv` (one of this thread) image list `which` (TVSIL_*):
 /// `list` (`None`: none). A tree never destroys its lists, so this keeps
 /// `list` alive (a clone of it) for as long as the tree shows it: until
-/// it is given another, or is destroyed. False if `tv` is not a tree of
-/// this thread.
+/// it is given another, or is destroyed. Sent to the tree's class's own
+/// procedure, so no subclass keeps the tree from taking it. False if `tv`
+/// is not a tree of this thread.
 pub fn set_image_list(tv: HWND, which: u32, list: Option<&ImageList>) -> bool {
-    if !track(tv) {
+    let il = list.map_or(0, imagelist::raw_of);
+    if !track(tv) || !give_list(tv, which, il) {
         return false;
     }
-    let il = list.map_or(0, imagelist::raw_of);
-    send_int(tv, TVM_SETIMAGELIST, which as usize, il);
     // The list it showed before, if it was one given here, is let go
     // after the tree no longer shows it.
     let before = keep_list(tv, which, list.cloned());
@@ -399,17 +399,35 @@ pub fn set_image_list(tv: HWND, which: u32, list: Option<&ImageList>) -> bool {
 /// list `which` (TVSIL_*): the list lives as long as the process. False if
 /// `tv` is not a tree of this thread.
 pub fn set_system_image_list(tv: HWND, which: u32, list: SystemList) -> bool {
-    if !track(tv) {
+    if !track(tv) || !give_list(tv, which, imagelist::raw_of(&list)) {
         return false;
     }
-    send_int(
-        tv,
-        TVM_SETIMAGELIST,
-        which as usize,
-        imagelist::raw_of(&list),
-    );
     let before = keep_list(tv, which, None);
     drop(before);
+    true
+}
+
+/// TVM_SETIMAGELIST of `il` as list `which` to `tv`'s class's own
+/// procedure, called directly: the tree shows `il` after, whatever a
+/// subclass of it would answer. False if `tv` is not a tree view of this
+/// thread whose class's procedure is the system's.
+fn give_list(tv: HWND, which: u32, il: isize) -> bool {
+    let Some(proc) = super::system_class_proc(tv, CLASS) else {
+        return false;
+    };
+    // SAFETY: TVM_SETIMAGELIST takes a kind and a list's handle (alive
+    // while the tree shows it: kept by the caller, or a system list) or
+    // none; called on the tree's class's own procedure, for a tree of this
+    // thread whose class's it is.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::CallWindowProcW(
+            Some(proc),
+            tv,
+            TVM_SETIMAGELIST,
+            which as usize,
+            il,
+        )
+    };
     true
 }
 

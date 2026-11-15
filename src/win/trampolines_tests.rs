@@ -847,3 +847,70 @@ fn a_notification_is_read_by_its_header_as_delivered() {
     super::destroy(parent);
     super::destroy(list_parent);
 }
+
+static ANSWERS: subclass::Key = subclass::Key::new("test image list answers");
+
+#[test]
+fn a_control_s_image_lists_are_judged_by_its_own_answers() {
+    use super::imagelist::{self, ImageList};
+    use super::{gdi, lv, tv};
+    use windows_sys::Win32::UI::Controls::{
+        ILC_COLOR32, ILD_NORMAL, LVM_GETIMAGELIST, LVM_SETIMAGELIST, LVSIL_NORMAL,
+        TVM_GETIMAGELIST, TVM_SETIMAGELIST, TVSIL_NORMAL,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::CallWindowProcW;
+    let list = || {
+        let il = ImageList::create(16, 16, ILC_COLOR32, 1, 1).expect("an image list");
+        assert!(il.set_image_count(1));
+        il
+    };
+    // The list a control shows, asked of its class's own procedure.
+    let shown = |hwnd: HWND, class: &str, msg: u32| {
+        let proc = super::system_class_proc(hwnd, class).expect("a control of the system's");
+        // SAFETY: LVM_GETIMAGELIST and TVM_GETIMAGELIST take a kind and
+        // answer a handle; to the control's class's own procedure.
+        unsafe { CallWindowProcW(Some(proc), hwnd, msg, 0, 0) }
+    };
+    // A list view given A, then a subclass that answers every
+    // LVM_SETIMAGELIST with A (taking nothing) and LVM_GETIMAGELIST with
+    // none.
+    let (view, parent) = hidden_control(lv::CLASS, 0);
+    let a = list();
+    let raw_a = imagelist::raw_of(&a);
+    assert!(lv::set_image_list(view, LVSIL_NORMAL, Some(a)));
+    assert!(subclass::set(view, &ANSWERS, move |m| match m.id {
+        LVM_SETIMAGELIST => raw_a,
+        LVM_GETIMAGELIST => 0,
+        _ => m.def(),
+    }));
+    let b = list();
+    let raw_b = imagelist::raw_of(&b);
+    assert!(lv::set_image_list(view, LVSIL_NORMAL, Some(b)));
+    // The view took B (and gave A back, destroyed): what it shows is B, no
+    // list goz-gui let go of.
+    assert_eq!(shown(view, lv::CLASS, LVM_GETIMAGELIST), raw_b);
+    // Its own list is drawn from, whatever the subclass says it has.
+    let dc = gdi::MemDc::compatible(core::ptr::null_mut());
+    assert!(lv::draw_image(
+        view,
+        LVSIL_NORMAL,
+        0,
+        dc.hdc(),
+        (0, 0),
+        ILD_NORMAL
+    ));
+    super::destroy(parent);
+    // A tree shows a list that only goz-gui keeps alive; then a subclass
+    // takes no TVM_SETIMAGELIST.
+    let (tree, parent) = hidden_control(tv::CLASS, 0);
+    let mine = list();
+    assert!(tv::set_image_list(tree, TVSIL_NORMAL, Some(&mine)));
+    drop(mine);
+    assert!(subclass::set(tree, &ANSWERS, |m| {
+        if m.id == TVM_SETIMAGELIST { 0 } else { m.def() }
+    }));
+    assert!(tv::set_image_list(tree, TVSIL_NORMAL, None));
+    // The list let go of is no longer shown: the tree took the change.
+    assert_eq!(shown(tree, tv::CLASS, TVM_GETIMAGELIST), 0);
+    super::destroy(parent);
+}
