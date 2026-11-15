@@ -8,30 +8,23 @@
 //! are looked up on a background thread of their own and the row is
 //! redrawn when the answer arrives.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
-use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
-};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForSingleObject,
-};
+use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::UI::Controls::HIMAGELIST;
-use windows_sys::Win32::UI::Shell::{
-    SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGSI_SYSICONINDEX,
-    SHGetFileInfoW, SHGetStockIconInfo, SHSTOCKICONINFO, SIID_DOCNOASSOC,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows_sys::Win32::UI::Shell::{SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SIID_DOCNOASSOC};
 
 use crate::client::Row;
 use crate::filetype;
 use crate::typeinfo::TypeInfo;
 use crate::wide::{nul, wz};
+use crate::win::com::Apartment;
+use crate::win::ext::b9::icon;
+use crate::win::parcel;
+use crate::win::sync::Event;
 
 /// Not looked at yet.
 pub const UNSET: i32 = -2;
@@ -70,7 +63,8 @@ struct Queue {
 
 struct Shared {
     queue: Mutex<Queue>,
-    work: usize,
+    /// Set while lookups wait (`None` if the system could not make one).
+    work: Option<Event>,
     hwnd: usize,
     msg: u32,
 }
@@ -87,37 +81,22 @@ pub struct Icons {
 }
 
 impl Icons {
-    /// Starts the icon thread; its answers arrive at `hwnd` as `msg`, with a
-    /// `Box<IconReply>` in `lParam`. The types' thread tells `hwnd` of its
-    /// answers as `types_msg`, and `ask_msg` is posted to send it what a
-    /// paint asked for (`TypeInfo::new`).
+    /// Starts the icon thread; its answers arrive at `hwnd` as `msg`, each
+    /// an [`IconReply`] parcel (`win::parcel::take`). The types' thread
+    /// tells `hwnd` of its answers as `types_msg`, and `ask_msg` is posted
+    /// to send it what a paint asked for (`TypeInfo::new`).
     pub fn new(hwnd: HWND, msg: u32, types_msg: u32, ask_msg: u32) -> Icons {
-        let mut info = info();
-        // SAFETY: an attribute-only lookup; `info` is a plain out-struct.
-        let list = unsafe {
-            SHGetFileInfoW(
-                wz("folder").as_ptr(),
-                FILE_ATTRIBUTE_DIRECTORY,
-                &mut info,
-                size_of::<SHFILEINFOW>() as u32,
-                SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
-            )
-        } as HIMAGELIST;
-        let folder = info.iIcon;
-        // SAFETY: SHSTOCKICONINFO is plain data, its size set as asked; the
-        // stock icon's index only (0.3 ms; the same lookup by the name
+        // An attribute-only lookup.
+        let (list, folder) = icon::sys_icon(
+            &wz("folder"),
+            FILE_ATTRIBUTE_DIRECTORY,
+            SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+        );
+        // The stock icon's index only (0.3 ms; the same lookup by the name
         // "file" took 2.5 to 3.4 ms).
-        let generic = unsafe {
-            let mut stock: SHSTOCKICONINFO = core::mem::zeroed();
-            stock.cbSize = size_of::<SHSTOCKICONINFO>() as u32;
-            if SHGetStockIconInfo(SIID_DOCNOASSOC, SHGSI_SYSICONINDEX, &mut stock) >= 0 {
-                stock.iSysImageIndex.max(0)
-            } else {
-                0
-            }
-        };
-        // SAFETY: an unnamed manual-reset event.
-        let work = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) } as usize;
+        let generic = icon::stock_index(SIID_DOCNOASSOC).map_or(0, |i| i.max(0));
+        // A manual-reset event.
+        let work = Event::new(true, false);
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 epoch: 0,
@@ -173,8 +152,9 @@ impl Icons {
                 }
                 q.items.push((index, nul(&row.path)));
                 row.icon.set(PENDING);
-                // SAFETY: a live event handle.
-                unsafe { SetEvent(self.shared.work as HANDLE) };
+                if let Some(work) = &self.shared.work {
+                    work.set();
+                }
             }
         }
         (generic, dropped)
@@ -226,64 +206,37 @@ fn extension(name: &[u16]) -> Vec<u16> {
     }
 }
 
-fn info() -> SHFILEINFOW {
-    // SAFETY: SHFILEINFOW is plain data; all-zero is a valid value.
-    unsafe { core::mem::zeroed() }
-}
-
 fn icon_thread(shared: &Shared) {
-    // SAFETY: the shell wants COM on a thread that asks it for icons.
-    unsafe {
-        CoInitializeEx(
-            core::ptr::null(),
-            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        )
-    };
+    // The shell wants COM on a thread that asks it for icons, for the
+    // thread's life.
+    let _com = Apartment::sta();
     loop {
         let next = {
             let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             match q.items.pop() {
                 Some((index, path)) => Some((q.epoch, index, path)),
                 None => {
-                    // SAFETY: a live event handle.
-                    unsafe { ResetEvent(shared.work as HANDLE) };
+                    if let Some(work) = &shared.work {
+                        work.reset();
+                    }
                     None
                 }
             }
         };
         let Some((epoch, index, path)) = next else {
-            // SAFETY: a live event handle.
-            unsafe { WaitForSingleObject(shared.work as HANDLE, INFINITE) };
+            if let Some(work) = &shared.work {
+                work.wait(INFINITE);
+            }
             continue;
         };
-        let mut info = info();
-        // SAFETY: `path` is NUL-terminated; `info` is a plain out-struct.
-        let ok = unsafe {
-            SHGetFileInfoW(
-                path.as_ptr(),
-                0,
-                &mut info,
-                size_of::<SHFILEINFOW>() as u32,
-                SHGFI_SYSICONINDEX | SHGFI_SMALLICON,
-            )
-        } != 0;
-        let reply = Box::into_raw(Box::new(IconReply {
+        let (list, icon) = icon::sys_icon(&path, 0, SHGFI_SMALLICON);
+        let ok = list != 0;
+        let reply = IconReply {
             epoch,
             index,
-            icon: if ok { info.iIcon } else { GENERIC },
-        }));
-        // SAFETY: the window owns the box once posted; reclaimed if not.
-        unsafe {
-            if PostMessageW(shared.hwnd as HWND, shared.msg, 0, reply as isize) == 0 {
-                drop(Box::from_raw(reply));
-            }
-        }
-    }
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // SAFETY: the event is owned by `Shared` and closed once.
-        unsafe { CloseHandle(self.work as HANDLE) };
+            icon: if ok { icon } else { GENERIC },
+        };
+        // The window takes the reply once posted; it is dropped if not.
+        parcel::post(shared.hwnd as HWND, shared.msg, 0, reply);
     }
 }
