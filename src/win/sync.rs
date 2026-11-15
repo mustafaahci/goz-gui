@@ -51,11 +51,6 @@ impl Event {
         unsafe { WaitForSingleObject(self.0, ms) == WAIT_OBJECT_0 }
     }
 
-    /// Whether the event is set now.
-    pub fn is_set(&self) -> bool {
-        self.wait(0)
-    }
-
     /// The handle, for the waits here (it stays this event's).
     pub(crate) fn handle(&self) -> HANDLE {
         self.0
@@ -87,9 +82,9 @@ mod tests {
     #[test]
     fn an_event_is_set_and_reset() {
         let e = Event::new(true, false).unwrap();
-        assert!(!e.is_set());
+        assert!(!e.wait(0));
         e.set();
-        assert!(e.is_set());
+        assert!(e.wait(0));
         assert_eq!(wait_any(&[&e], false, 0), Some(0));
         e.reset();
         assert!(!e.wait(0));

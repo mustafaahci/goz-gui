@@ -6,8 +6,8 @@
 use core::marker::PhantomData;
 
 use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
-    CoFreeUnusedLibrariesEx, CoInitializeEx, CoUninitialize,
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoFreeUnusedLibrariesEx, CoInitializeEx,
+    CoUninitialize,
 };
 use windows_sys::Win32::System::Ole::OleInitialize;
 
@@ -23,11 +23,6 @@ impl Apartment {
     /// other kind already.
     pub fn sta() -> Option<Apartment> {
         init((COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32)
-    }
-
-    /// A multithreaded apartment for this thread (a worker's).
-    pub fn mta() -> Option<Apartment> {
-        init(COINIT_MULTITHREADED as u32)
     }
 
     /// Keeps the apartment until the thread ends (the UI thread's, whose

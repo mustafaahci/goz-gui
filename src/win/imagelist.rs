@@ -1,13 +1,11 @@
 //! Image lists (comctl32 checks the handles it is given): owned ones,
 //! the shell's system image lists, and drawing their images.
 
-use windows_sys::Win32::Foundation::COLORREF;
 use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::UI::Controls::{
     HIMAGELIST, IMAGE_LIST_DRAW_STYLE, IMAGELIST_CREATION_FLAGS, IMAGELISTDRAWPARAMS,
     ImageList_Create, ImageList_Destroy, ImageList_Draw, ImageList_DrawIndirect, ImageList_GetIcon,
-    ImageList_GetIconSize, ImageList_GetImageCount, ImageList_ReplaceIcon, ImageList_SetBkColor,
-    ImageList_SetImageCount,
+    ImageList_GetIconSize, ImageList_ReplaceIcon, ImageList_SetImageCount,
 };
 use windows_sys::Win32::UI::Shell::SHGetImageList;
 use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
@@ -125,18 +123,6 @@ pub fn icon_size(il: HIMAGELIST) -> Option<(i32, i32)> {
     (unsafe { ImageList_GetIconSize(il, &mut cx, &mut cy) } != 0).then_some((cx, cy))
 }
 
-/// How many images the list has.
-pub fn count(il: HIMAGELIST) -> i32 {
-    // SAFETY: no pointers.
-    unsafe { ImageList_GetImageCount(il) }
-}
-
-/// The colour drawn behind the images (CLR_NONE: none); the one before.
-pub fn set_bk_color(il: HIMAGELIST, c: COLORREF) -> COLORREF {
-    // SAFETY: no pointers.
-    unsafe { ImageList_SetBkColor(il, c) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,7 +131,6 @@ mod tests {
     fn an_image_list_is_made_and_grown() {
         let il = ImageList::create(16, 16, 0x20 | 0x1, 4, 4).expect("an image list");
         assert!(il.set_image_count(3));
-        assert_eq!(count(il.handle()), 3);
         assert!(icon(il.handle(), 7, 0).is_null());
         let raw = il.into_raw();
         assert!(destroy(raw));

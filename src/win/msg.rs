@@ -9,28 +9,20 @@ use core::ptr::NonNull;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, DTN_DATETIMECHANGE, HDN_BEGINDRAG, HDN_BEGINTRACKW, HDN_DIVIDERDBLCLICKW,
-    HDN_DROPDOWN, HDN_ENDDRAG, HDN_ENDTRACKW, HDN_ITEMCHANGEDW, HDN_ITEMCHANGINGW, HDN_ITEMCLICKW,
-    HDN_ITEMDBLCLICKW, HDN_TRACKW, LVN_BEGINDRAG, LVN_BEGINLABELEDITW, LVN_BEGINRDRAG,
-    LVN_COLUMNCLICK, LVN_DELETEALLITEMS, LVN_DELETEITEM, LVN_ENDLABELEDITW, LVN_GETDISPINFOW,
-    LVN_GETEMPTYMARKUP, LVN_GETINFOTIPW, LVN_HOTTRACK, LVN_INSERTITEM, LVN_ITEMACTIVATE,
-    LVN_ITEMCHANGED, LVN_ITEMCHANGING, LVN_KEYDOWN, LVN_MARQUEEBEGIN, LVN_ODCACHEHINT,
-    LVN_ODFINDITEMW, LVN_ODSTATECHANGED, LVN_SETDISPINFOW, MEASUREITEMSTRUCT, NM_CLICK,
-    NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, NM_RDBLCLK, NMCUSTOMDRAW, NMDATETIMECHANGE, NMHDR,
-    NMHEADERW, NMITEMACTIVATE, NMLISTVIEW, NMLVCACHEHINT, NMLVCUSTOMDRAW, NMLVDISPINFOW,
-    NMLVEMPTYMARKUP, NMLVFINDITEMW, NMLVGETINFOTIPW, NMLVKEYDOWN, NMLVODSTATECHANGE, NMTREEVIEWW,
-    NMTTDISPINFOW, NMTVCUSTOMDRAW, NMTVDISPINFOW, NMTVGETINFOTIPW, NMTVKEYDOWN, NMUPDOWN,
-    TTN_GETDISPINFOW, TVN_BEGINDRAGW, TVN_BEGINLABELEDITW, TVN_BEGINRDRAGW, TVN_DELETEITEMW,
-    TVN_ENDLABELEDITW, TVN_GETDISPINFOW, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW, TVN_ITEMEXPANDINGW,
-    TVN_KEYDOWN, TVN_SELCHANGEDW, TVN_SELCHANGINGW, TVN_SETDISPINFOW, TVN_SINGLEEXPAND,
-    UDN_DELTAPOS,
+    DRAWITEMSTRUCT, LVN_BEGINDRAG, LVN_BEGINLABELEDITW, LVN_BEGINRDRAG, LVN_COLUMNCLICK,
+    LVN_DELETEALLITEMS, LVN_DELETEITEM, LVN_ENDLABELEDITW, LVN_GETDISPINFOW, LVN_HOTTRACK,
+    LVN_INSERTITEM, LVN_ITEMACTIVATE, LVN_ITEMCHANGED, LVN_ITEMCHANGING, LVN_KEYDOWN,
+    LVN_MARQUEEBEGIN, LVN_ODCACHEHINT, LVN_ODSTATECHANGED, LVN_SETDISPINFOW, MEASUREITEMSTRUCT,
+    NM_CLICK, NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, NM_RDBLCLK, NMCUSTOMDRAW, NMHDR, NMITEMACTIVATE,
+    NMLISTVIEW, NMLVCACHEHINT, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN, NMLVODSTATECHANGE,
+    NMTREEVIEWW, NMTTDISPINFOW, NMTVCUSTOMDRAW, NMTVGETINFOTIPW, NMTVKEYDOWN, TTN_GETDISPINFOW,
+    TVN_BEGINDRAGW, TVN_BEGINRDRAGW, TVN_DELETEITEMW, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW,
+    TVN_ITEMEXPANDINGW, TVN_KEYDOWN, TVN_SELCHANGEDW, TVN_SELCHANGINGW, TVN_SINGLEEXPAND,
 };
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, HELPINFO};
+use windows_sys::Win32::UI::Shell::DefSubclassProc;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, DefWindowProcW, MINMAXINFO, MSG, NCCALCSIZE_PARAMS, STYLESTRUCT, WINDOWPOS,
-    WM_APP, WM_COPYDATA, WM_CREATE, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES, WM_GETDLGCODE,
-    WM_GETMINMAXINFO, WM_HELP, WM_MEASUREITEM, WM_NCCALCSIZE, WM_NCCREATE, WM_NOTIFY, WM_PAINT,
-    WM_SETTINGCHANGE, WM_STYLECHANGED, WM_STYLECHANGING, WM_USER, WM_WINDOWPOSCHANGED,
+    DefWindowProcW, MINMAXINFO, WINDOWPOS, WM_COPYDATA, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES,
+    WM_GETMINMAXINFO, WM_MEASUREITEM, WM_NOTIFY, WM_PAINT, WM_SETTINGCHANGE, WM_WINDOWPOSCHANGED,
     WM_WINDOWPOSCHANGING,
 };
 
@@ -106,12 +98,6 @@ impl Msg {
         }
     }
 
-    /// Whether the system delivered this message (it was not made by
-    /// [`Msg::new`]).
-    pub fn is_delivered(&self) -> bool {
-        self.via != Via::Made
-    }
-
     /// The default processing of the message: the window class's for a
     /// window procedure, the next procedure's for a subclass; 0 for a dialog
     /// procedure (whose answer of 0 lets the dialog manager handle it) and
@@ -147,31 +133,6 @@ impl Msg {
         // lParam: no pointers. From within the subclass procedure the
         // system called, for the window it was called for.
         unsafe { DefSubclassProc(self.hwnd, WM_PAINT, hdc as usize, 0) }
-    }
-
-    /// Sends the message on to `to`, as it came, such as a notification
-    /// passed up to a parent. A delivered system message (below `WM_USER`,
-    /// which means the same to every window) or one of goz-gui's own
-    /// (`WM_APP` and up) is passed on; 0 for any other, and for a system
-    /// message goz-gui made (its parameters could be pointers no one vouches
-    /// for).
-    ///
-    /// # Panics
-    /// If a [`View`] of the message's `lParam` is still out.
-    pub fn forward(&self, to: HWND) -> LRESULT {
-        assert!(!self.lent.get(), "a view of the message is still out");
-        let own = (WM_APP..APP_END).contains(&self.id);
-        // A drop is finished by goz-gui's procedures once they are done
-        // with it (`super::dropfiles`): no other window gets it to free.
-        let system = self.id < WM_USER && self.via != Via::Made && self.id != WM_DROPFILES;
-        if !own && !system {
-            return 0;
-        }
-        // SAFETY: a message that means the same to `to` as to the window it
-        // came to, with the parameters the system delivered (alive for the
-        // call, which is synchronous), or one of goz-gui's own, whose
-        // parameters are never pointers.
-        unsafe { super::send_raw(to, self.id, self.w, self.l) }
     }
 
     /// The point a mouse message carries (signed, in client coordinates or
@@ -247,43 +208,6 @@ impl Msg {
         unsafe { self.view_lparam() }
     }
 
-    /// `WM_NCCREATE`'s or `WM_CREATE`'s CREATESTRUCTW.
-    pub fn create_struct(&self) -> Option<View<'_, CREATESTRUCTW>> {
-        if self.id != WM_NCCREATE && self.id != WM_CREATE {
-            return None;
-        }
-        // SAFETY: both messages' lParam is a CREATESTRUCTW.
-        unsafe { self.view_lparam() }
-    }
-
-    /// `WM_NCCALCSIZE`'s NCCALCSIZE_PARAMS, when wParam is TRUE.
-    pub fn nc_calc_size(&self) -> Option<View<'_, NCCALCSIZE_PARAMS>> {
-        if self.id != WM_NCCALCSIZE || self.w == 0 {
-            return None;
-        }
-        // SAFETY: with wParam TRUE, WM_NCCALCSIZE's lParam is an
-        // NCCALCSIZE_PARAMS.
-        unsafe { self.view_lparam() }
-    }
-
-    /// `WM_NCCALCSIZE`'s RECT, when wParam is FALSE.
-    pub fn nc_calc_rect(&self) -> Option<View<'_, RECT>> {
-        if self.id != WM_NCCALCSIZE || self.w != 0 {
-            return None;
-        }
-        // SAFETY: with wParam FALSE, WM_NCCALCSIZE's lParam is a RECT.
-        unsafe { self.view_lparam() }
-    }
-
-    /// `WM_STYLECHANGING`'s or `WM_STYLECHANGED`'s STYLESTRUCT.
-    pub fn style_struct(&self) -> Option<View<'_, STYLESTRUCT>> {
-        if self.id != WM_STYLECHANGING && self.id != WM_STYLECHANGED {
-            return None;
-        }
-        // SAFETY: both messages' lParam is a STYLESTRUCT.
-        unsafe { self.view_lparam() }
-    }
-
     /// `WM_DPICHANGED`'s suggested window rectangle.
     pub fn dpi_rect(&self) -> Option<RECT> {
         if self.id != WM_DPICHANGED {
@@ -291,25 +215,6 @@ impl Msg {
         }
         // SAFETY: WM_DPICHANGED's lParam is a RECT; it is copied out.
         unsafe { self.view_lparam::<RECT>() }.map(|v| *v)
-    }
-
-    /// `WM_HELP`'s HELPINFO.
-    pub fn help_info(&self) -> Option<HELPINFO> {
-        if self.id != WM_HELP {
-            return None;
-        }
-        // SAFETY: WM_HELP's lParam is a HELPINFO; it is copied out.
-        unsafe { self.view_lparam::<HELPINFO>() }.map(|v| *v)
-    }
-
-    /// `WM_GETDLGCODE`'s message, when there is one (a key the dialog
-    /// manager asks about).
-    pub fn dlg_code_msg(&self) -> Option<MSG> {
-        if self.id != WM_GETDLGCODE {
-            return None;
-        }
-        // SAFETY: WM_GETDLGCODE's lParam is null or a MSG; it is copied out.
-        unsafe { self.view_lparam::<MSG>() }.map(|v| *v)
     }
 
     /// `WM_SETTINGCHANGE`'s setting name, when it has one (`"ImmersiveColorSet"`,
@@ -346,15 +251,6 @@ impl Msg {
             return None;
         }
         super::dropfiles::paths(self.w)
-    }
-
-    /// Where a `WM_DROPFILES`'s files were dropped (client coordinates),
-    /// and whether in the client area.
-    pub fn drop_point(&self) -> Option<(POINT, bool)> {
-        if self.id != WM_DROPFILES || self.via == Via::Made {
-            return None;
-        }
-        super::dropfiles::point(self.w)
     }
 
     /// `WM_COPYDATA`'s value and a copy of its data.
@@ -464,15 +360,6 @@ impl<'a> Notify<'a> {
         // `T`.
         unsafe { self.msg.view_lparam() }
     }
-
-    /// The notification's structure as a `T`, which the caller vouches for.
-    ///
-    /// # Safety
-    /// This notification's lParam points at a `T`.
-    pub(crate) unsafe fn get_unchecked<T>(&self) -> Option<View<'a, T>> {
-        // SAFETY: as the caller promises.
-        unsafe { self.msg.view_lparam() }
-    }
 }
 
 /// A structure a `WM_NOTIFY` notification comes with.
@@ -486,7 +373,6 @@ pub unsafe trait NotifyStruct {
 
 const LIST_VIEW: &str = "SysListView32";
 const TREE_VIEW: &str = "SysTreeView32";
-const HEADER: &str = "SysHeader32";
 const TOOLTIP: &str = "tooltips_class32";
 
 macro_rules! notify_struct {
@@ -556,9 +442,6 @@ notify_struct!(
 notify_struct!(NMLVKEYDOWN, LIST_VIEW, [LVN_KEYDOWN]);
 notify_struct!(NMLVODSTATECHANGE, LIST_VIEW, [LVN_ODSTATECHANGED]);
 notify_struct!(NMLVCACHEHINT, LIST_VIEW, [LVN_ODCACHEHINT]);
-notify_struct!(NMLVFINDITEMW, LIST_VIEW, [LVN_ODFINDITEMW]);
-notify_struct!(NMLVGETINFOTIPW, LIST_VIEW, [LVN_GETINFOTIPW]);
-notify_struct!(NMLVEMPTYMARKUP, LIST_VIEW, [LVN_GETEMPTYMARKUP]);
 notify_struct!(
     NMTREEVIEWW,
     TREE_VIEW,
@@ -573,38 +456,9 @@ notify_struct!(
         TVN_SINGLEEXPAND,
     ]
 );
-notify_struct!(
-    NMTVDISPINFOW,
-    TREE_VIEW,
-    [
-        TVN_GETDISPINFOW,
-        TVN_SETDISPINFOW,
-        TVN_BEGINLABELEDITW,
-        TVN_ENDLABELEDITW
-    ]
-);
 notify_struct!(NMTVKEYDOWN, TREE_VIEW, [TVN_KEYDOWN]);
 notify_struct!(NMTVGETINFOTIPW, TREE_VIEW, [TVN_GETINFOTIPW]);
 notify_struct!(NMTTDISPINFOW, TOOLTIP, [TTN_GETDISPINFOW]);
-notify_struct!(
-    NMHEADERW,
-    HEADER,
-    [
-        HDN_ITEMCHANGINGW,
-        HDN_ITEMCHANGEDW,
-        HDN_ITEMCLICKW,
-        HDN_ITEMDBLCLICKW,
-        HDN_DIVIDERDBLCLICKW,
-        HDN_BEGINTRACKW,
-        HDN_ENDTRACKW,
-        HDN_TRACKW,
-        HDN_BEGINDRAG,
-        HDN_ENDDRAG,
-        HDN_DROPDOWN,
-    ]
-);
-notify_struct!(NMDATETIMECHANGE, "SysDateTimePick32", [DTN_DATETIMECHANGE]);
-notify_struct!(NMUPDOWN, "msctls_updown32", [UDN_DELTAPOS]);
 
 /// Copies `text` into a notification's text buffer of `cap` units (a
 /// display-info or info-tip structure's), cut to fit, NUL-terminated.
@@ -644,32 +498,6 @@ impl View<'_, NMLVDISPINFOW> {
     }
 }
 
-impl View<'_, NMTVDISPINFOW> {
-    /// Puts `text` in the tree's buffer for the item's text (TVIF_TEXT).
-    pub fn set_text(&mut self, text: &[u16]) {
-        let item = self.item;
-        // SAFETY: TVN_GETDISPINFOW's pszText is the tree's buffer of
-        // cchTextMax units.
-        unsafe { write_text(item.pszText, item.cchTextMax, text) };
-    }
-
-    /// The text of TVN_ENDLABELEDITW (`None` when editing was cancelled).
-    pub fn text(&self) -> Option<Vec<u16>> {
-        // SAFETY: a tree's pszText, when not null, is NUL-terminated.
-        unsafe { read_nul(self.item.pszText) }
-    }
-}
-
-impl View<'_, NMLVGETINFOTIPW> {
-    /// Puts `text` in the list's buffer for the item's tip.
-    pub fn set_text(&mut self, text: &[u16]) {
-        let (buf, cap) = (self.pszText, self.cchTextMax);
-        // SAFETY: LVN_GETINFOTIPW's pszText is the list's buffer of
-        // cchTextMax units.
-        unsafe { write_text(buf, cap, text) };
-    }
-}
-
 impl View<'_, NMTVGETINFOTIPW> {
     /// Puts `text` in the tree's buffer for the item's tip.
     pub fn set_text(&mut self, text: &[u16]) {
@@ -677,37 +505,6 @@ impl View<'_, NMTVGETINFOTIPW> {
         // SAFETY: TVN_GETINFOTIPW's pszText is the tree's buffer of
         // cchTextMax units.
         unsafe { write_text(buf, cap, text) };
-    }
-}
-
-impl View<'_, NMLVEMPTYMARKUP> {
-    /// Puts `text` in the list's markup buffer (L_MAX_URL_LENGTH units).
-    pub fn set_text(&mut self, text: &[u16]) {
-        let cap = self.szMarkup.len() as i32;
-        let buf = self.szMarkup.as_mut_ptr();
-        // SAFETY: the structure's own array of `cap` units.
-        unsafe { write_text(buf, cap, text) };
-    }
-}
-
-impl View<'_, NMTTDISPINFOW> {
-    /// Puts `text` in the tooltip's own buffer (80 units, cut to fit) and
-    /// points the tip at it.
-    pub fn set_text(&mut self, text: &[u16]) {
-        let cap = self.szText.len() as i32;
-        let buf = self.szText.as_mut_ptr();
-        // SAFETY: the structure's own array of `cap` units.
-        unsafe { write_text(buf, cap, text) };
-        self.lpszText = self.szText.as_mut_ptr();
-    }
-}
-
-impl View<'_, NMLVFINDITEMW> {
-    /// The text LVN_ODFINDITEMW looks for, when it looks for one
-    /// (LVFI_STRING or LVFI_PARTIAL).
-    pub fn text(&self) -> Option<Vec<u16>> {
-        // SAFETY: the find info's psz, when not null, is NUL-terminated.
-        unsafe { read_nul(self.lvfi.psz) }
     }
 }
 
@@ -752,25 +549,25 @@ mod tests {
 
     #[test]
     fn one_view_at_a_time() {
-        let mut rect = RECT::default();
-        // SAFETY: a RECT, as WM_NCCALCSIZE with wParam FALSE has, alive for
-        // the test.
+        let mut item = MEASUREITEMSTRUCT::default();
+        // SAFETY: a MEASUREITEMSTRUCT, as WM_MEASUREITEM has, alive for the
+        // test.
         let m = unsafe {
             Msg::delivered(
                 core::ptr::null_mut(),
-                WM_NCCALCSIZE,
+                WM_MEASUREITEM,
                 0,
-                (&raw mut rect) as LPARAM,
+                (&raw mut item) as LPARAM,
                 Via::Dialog,
             )
         };
-        let mut v = m.nc_calc_rect().unwrap();
-        v.right = 5;
+        let mut v = m.measure_item().unwrap();
+        v.itemHeight = 5;
         let again =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.nc_calc_rect().is_some()));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.measure_item().is_some()));
         assert!(again.is_err());
         drop(v);
-        assert_eq!(m.nc_calc_rect().unwrap().right, 5);
+        assert_eq!(m.measure_item().unwrap().itemHeight, 5);
     }
 
     #[test]

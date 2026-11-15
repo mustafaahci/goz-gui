@@ -9,7 +9,7 @@ use windows_sys::Win32::Globalization::{
     GetLocaleInfoEx, GetTimeFormatEx, IsDBCSLeadByteEx, LCMAP_UPPERCASE, LCMapStringEx,
     LOCALE_NAME_INVARIANT, MultiByteToWideChar, NORM_FORM, NormalizeString, WideCharToMultiByte,
 };
-use windows_sys::Win32::UI::Shell::{StrCmpLogicalW, StrFormatByteSizeW};
+use windows_sys::Win32::UI::Shell::StrCmpLogicalW;
 
 use super::{len_i32, until_nul, wz_units};
 
@@ -199,7 +199,11 @@ pub fn time_format(flags: u32, st: &SYSTEMTIME, buf: &mut [u16]) -> i32 {
 }
 
 /// `n` bytes as Explorer writes a size (StrFormatByteSizeW).
+/// Only the tests use it, as the oracle goz-gui's own size format is
+/// checked against.
+#[cfg(test)]
 pub fn format_byte_size(n: i64) -> String {
+    use windows_sys::Win32::UI::Shell::StrFormatByteSizeW;
     let mut buf = [0u16; 64];
     // SAFETY: the buffer and its length.
     unsafe { StrFormatByteSizeW(n, buf.as_mut_ptr(), buf.len() as u32) };

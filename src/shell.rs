@@ -576,12 +576,23 @@ mod tests {
         std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())
     }
 
-    /// The files of a data object's CF_HDROP.
+    /// The files of a data object's CF_HDROP: a DROPFILES block (where
+    /// the list starts, then whether it is UTF-16, at byte 16), then the
+    /// names, each ended by a NUL, the list by an empty one.
     fn hdrop_files(data: &DataObject) -> Vec<String> {
-        data.files()
-            .expect("CF_HDROP")
+        let block = data.get(15).expect("CF_HDROP");
+        let field = |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().unwrap());
+        assert_ne!(field(16), 0, "the shell's names are UTF-16");
+        let units: Vec<u16> = block[field(0) as usize..]
+            .as_chunks::<2>()
+            .0
             .iter()
-            .map(|f| String::from_utf16_lossy(f))
+            .map(|&c| u16::from_le_bytes(c))
+            .collect();
+        units
+            .split(|&c| c == 0)
+            .take_while(|name| !name.is_empty())
+            .map(String::from_utf16_lossy)
             .collect()
     }
 
@@ -806,14 +817,6 @@ mod tests {
         menu::destroy(popup);
     }
 
-    /// The names of the formats a data object offers.
-    fn format_names(data: &DataObject) -> Vec<String> {
-        data.formats()
-            .into_iter()
-            .map(|cf| clipboard::format_name(u32::from(cf)).unwrap_or_else(|| format!("#{cf}")))
-            .collect()
-    }
-
     /// How many items a data object's Shell IDList Array holds (a CIDA,
     /// whose count comes first).
     fn cida_count(data: &DataObject) -> u32 {
@@ -848,11 +851,6 @@ mod tests {
             let data = items
                 .data_object(core::ptr::null_mut())
                 .expect("data object");
-            let names = format_names(&data);
-            assert!(
-                names.iter().any(|n| n == "Shell IDList Array") && names.iter().any(|n| n == "#15"),
-                "{names:?}"
-            );
             assert_eq!(cida_count(&data) as usize, picked.len());
             let want: Vec<String> = picked.iter().map(|p| String::from_utf16_lossy(p)).collect();
             assert_eq!(hdrop_files(&data), want);

@@ -4,11 +4,10 @@
 use windows_sys::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
 use windows_sys::Win32::UI::Controls::{
     HIMAGELIST, HTREEITEM, TVHITTESTINFO, TVI_LAST, TVI_ROOT, TVIF_TEXT, TVINSERTSTRUCTW,
-    TVITEMEXW, TVITEMW, TVM_DELETEITEM, TVM_EDITLABELW, TVM_ENSUREVISIBLE, TVM_EXPAND,
-    TVM_GETCOUNT, TVM_GETEDITCONTROL, TVM_GETITEMHEIGHT, TVM_GETITEMRECT, TVM_GETITEMSTATE,
+    TVITEMEXW, TVITEMW, TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMRECT,
     TVM_GETITEMW, TVM_GETNEXTITEM, TVM_GETTOOLTIPS, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM,
     TVM_SETBKCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETIMAGELIST, TVM_SETITEMHEIGHT, TVM_SETITEMW,
-    TVM_SETLINECOLOR, TVM_SETTEXTCOLOR, TVM_SORTCHILDREN,
+    TVM_SETLINECOLOR, TVM_SETTEXTCOLOR,
 };
 
 /// The class these messages are for.
@@ -57,21 +56,6 @@ pub fn delete_item(tv: HWND, item: HTREEITEM) -> bool {
     send_int(tv, TVM_DELETEITEM, 0, item) != 0
 }
 
-/// How many items the tree has.
-pub fn count(tv: HWND) -> usize {
-    usize::try_from(send_int(tv, TVM_GETCOUNT, 0, 0)).unwrap_or(0)
-}
-
-/// The TVIS_* state bits of `item` that `mask` asks for.
-pub fn item_state(tv: HWND, item: HTREEITEM, mask: u32) -> u32 {
-    send_int(tv, TVM_GETITEMSTATE, item as usize, mask as isize) as u32
-}
-
-/// The items' height, in pixels.
-pub fn item_height(tv: HWND) -> i32 {
-    send_int(tv, TVM_GETITEMHEIGHT, 0, 0) as i32
-}
-
 /// Sets the items' height, in pixels (-1: the default).
 pub fn set_item_height(tv: HWND, height: i32) {
     send_int(tv, TVM_SETITEMHEIGHT, height as isize as usize, 0);
@@ -105,21 +89,6 @@ pub fn set_image_list(tv: HWND, which: u32, il: HIMAGELIST) -> HIMAGELIST {
 /// The tree's tooltip control.
 pub fn tooltips(tv: HWND) -> HWND {
     send_int(tv, TVM_GETTOOLTIPS, 0, 0) as HWND
-}
-
-/// The edit box of a label being edited (null: none).
-pub fn edit_control(tv: HWND) -> HWND {
-    send_int(tv, TVM_GETEDITCONTROL, 0, 0) as HWND
-}
-
-/// Starts editing `item`'s label; the edit box.
-pub fn edit_label(tv: HWND, item: HTREEITEM) -> HWND {
-    send_int(tv, TVM_EDITLABELW, 0, item) as HWND
-}
-
-/// Sorts `item`'s children by their text.
-pub fn sort_children(tv: HWND, item: HTREEITEM, recurse: bool) {
-    send_int(tv, TVM_SORTCHILDREN, usize::from(recurse), item);
 }
 
 /// The item's rectangle (only its text's, when `text_only`).
@@ -195,18 +164,6 @@ pub fn item_param(tv: HWND, item: HTREEITEM) -> Option<isize> {
         ..Default::default()
     };
     get_item(tv, it, 0).map(|(it, _)| it.lParam)
-}
-
-/// The item's text, up to `max` units.
-pub fn item_text(tv: HWND, item: HTREEITEM, max: usize) -> String {
-    let it = TVITEMW {
-        mask: TVIF_TEXT,
-        hItem: item,
-        ..Default::default()
-    };
-    get_item(tv, it, max)
-        .and_then(|(_, t)| t)
-        .unwrap_or_default()
 }
 
 /// Sets the fields `item.mask` names of `item.hItem`, with `text` as its
@@ -306,10 +263,4 @@ pub fn set_text_units(tv: HWND, item: HTREEITEM, text: &[u16]) -> bool {
     // SAFETY: TVM_SETITEMW's lParam is a TVITEMW whose only pointer is the
     // text set above, read during the call.
     unsafe { send(tv, TVM_SETITEMW, 0, (&raw const it) as isize) != 0 }
-}
-
-/// LPSTR_TEXTCALLBACKW for [`insert`]: the item's text is asked for with
-/// TVN_GETDISPINFO.
-pub fn text_callback() -> windows_sys::core::PWSTR {
-    core::ptr::without_provenance_mut(usize::MAX)
 }

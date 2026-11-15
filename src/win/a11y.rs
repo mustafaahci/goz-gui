@@ -19,9 +19,6 @@ use windows::Win32::UI::Accessibility::{
 };
 use windows::core::{BSTR, GUID, Interface, PCWSTR, implement};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-use windows_sys::Win32::UI::WindowsAndMessaging::WM_GETOBJECT;
-
-use super::msg::Msg;
 
 const OBJID_CLIENT: i32 = -4;
 const NAVDIR_NEXT: i32 = 5;
@@ -443,11 +440,6 @@ impl AccessibleObject {
         // wParam is WM_GETOBJECT's flags, an integer.
         let r: WLRESULT = unsafe { LresultFromObject(&IAccessible::IID, WWPARAM(w), &self.object) };
         r.0
-    }
-
-    /// The answer to `m` if it is WM_GETOBJECT for the client area.
-    pub fn answer(&self, m: &Msg) -> Option<isize> {
-        (m.id == WM_GETOBJECT && wants_client(m.l)).then(|| self.answer_w(m.w))
     }
 }
 

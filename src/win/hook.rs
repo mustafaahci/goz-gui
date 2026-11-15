@@ -63,43 +63,22 @@ impl Kind {
 /// An event a hook sees, copied out of what the system passed.
 #[derive(Clone, Copy)]
 pub enum Event {
-    /// HCBT_CREATEWND: window `hwnd` is being made, with these styles,
-    /// under `parent`.
-    Create {
-        hwnd: HWND,
-        style: u32,
-        ex_style: u32,
-        parent: HWND,
-    },
-    /// HCBT_ACTIVATE: window `hwnd` is about to be activated.
-    Activate { hwnd: HWND, by_mouse: bool },
-    /// Any other CBT event: its code and parameters (as numbers).
-    Cbt { code: i32, w: WPARAM, l: LPARAM },
+    /// HCBT_CREATEWND: window `hwnd` is being made, with style `style`.
+    Create { hwnd: HWND, style: u32 },
+    /// HCBT_ACTIVATE: a window is about to be activated, by the mouse or
+    /// not.
+    Activate { by_mouse: bool },
+    /// Any other CBT event: its code and wParam (as a number).
+    Cbt { code: i32, w: WPARAM },
     /// A message taken from the queue (`removed`), or peeked at.
     Got { msg: MSG, removed: bool },
-    /// A message sent to a window of this thread, before its procedure.
-    Sent {
-        hwnd: HWND,
-        message: u32,
-        w: WPARAM,
-        l: LPARAM,
-    },
-    /// The same, after, with the procedure's answer.
-    Returned {
-        hwnd: HWND,
-        message: u32,
-        w: WPARAM,
-        l: LPARAM,
-        answer: LRESULT,
-    },
+    /// A message sent to a window of this thread, before its procedure
+    /// (its wParam as a number).
+    Sent { hwnd: HWND, message: u32, w: WPARAM },
+    /// The same, after its procedure.
+    Returned { hwnd: HWND, message: u32, w: WPARAM },
     /// A key (WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP).
-    Key {
-        message: u32,
-        vk: u32,
-        scan: u32,
-        flags: u32,
-        time: u32,
-    },
+    Key { message: u32, vk: u32, time: u32 },
 }
 
 /// What handles a hook's events: `Some` answers the event (and the next
@@ -208,18 +187,15 @@ unsafe extern "system" fn cbt_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         Event::Create {
             hwnd: w as HWND,
             style: cs.style as u32,
-            ex_style: cs.dwExStyle,
-            parent: cs.hwndParent,
         }
     } else if code == HCBT_ACTIVATE as i32 && l != 0 {
         // SAFETY: HCBT_ACTIVATE's lParam is a CBTACTIVATESTRUCT; copied out.
         let a = unsafe { *(l as *const CBTACTIVATESTRUCT) };
         Event::Activate {
-            hwnd: w as HWND,
             by_mouse: a.fMouse != 0,
         }
     } else {
-        Event::Cbt { code, w, l }
+        Event::Cbt { code, w }
     };
     dispatch(Kind::Cbt, &event).unwrap_or_else(|| next(code, w, l))
 }
@@ -247,7 +223,6 @@ unsafe extern "system" fn call_wnd_proc(code: i32, w: WPARAM, l: LPARAM) -> LRES
             hwnd: c.hwnd,
             message: c.message,
             w: c.wParam,
-            l: c.lParam,
         };
         if let Some(answer) = dispatch(Kind::CallWndProc, &event) {
             return answer;
@@ -264,8 +239,6 @@ unsafe extern "system" fn call_wnd_proc_ret(code: i32, w: WPARAM, l: LPARAM) -> 
             hwnd: c.hwnd,
             message: c.message,
             w: c.wParam,
-            l: c.lParam,
-            answer: c.lResult,
         };
         if let Some(answer) = dispatch(Kind::CallWndProcRet, &event) {
             return answer;
@@ -281,8 +254,6 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, w: WPARAM, l: LPARAM) -> L
         let event = Event::Key {
             message: w as u32,
             vk: k.vkCode,
-            scan: k.scanCode,
-            flags: k.flags,
             time: k.time,
         };
         if let Some(answer) = dispatch(Kind::KeyboardLl, &event) {

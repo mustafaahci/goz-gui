@@ -6,13 +6,13 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM}
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, InvalidateRect, MapWindowPoints, REDRAW_WINDOW_FLAGS, RedrawWindow,
-    ScreenToClient, UpdateWindow,
+    ScreenToClient,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::HiDpi::AdjustWindowRectExForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetActiveWindow, GetCapture, GetFocus, IsWindowEnabled, ReleaseCapture,
-    SetActiveWindow, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -21,13 +21,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_WINDOWPOSCHANGED,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, DestroyWindow, GA_ROOT, GET_WINDOW_CMD, GWL_EXSTYLE, GWL_STYLE, GWLP_ID,
-    GetAncestor, GetClientRect, GetDlgCtrlID, GetForegroundWindow, GetParent, GetWindow,
-    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer,
-    MoveWindow, PostMessageW, SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow,
-    WINDOWPLACEMENT, WM_APP, WM_CLOSE, WM_GETFONT, WM_SETFONT, WM_SETREDRAW, WindowFromPoint,
+    DestroyWindow, GET_WINDOW_CMD, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetDlgCtrlID,
+    GetForegroundWindow, GetParent, GetWindow, GetWindowLongPtrW, GetWindowPlacement,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsChild,
+    IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer, MoveWindow, PostMessageW,
+    SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow, WINDOWPLACEMENT, WM_APP,
+    WM_CLOSE, WM_GETFONT, WM_SETFONT, WM_SETREDRAW, WindowFromPoint,
 };
 
 use super::msg::APP_END;
@@ -132,14 +132,6 @@ pub fn map_rect(from: HWND, to: HWND, rc: RECT) -> RECT {
     }
 }
 
-/// `pt`, in `from`'s client coordinates (the screen's for null), in `to`'s.
-pub fn map_point(from: HWND, to: HWND, pt: POINT) -> POINT {
-    let mut p = pt;
-    // SAFETY: one point, the count passed.
-    unsafe { MapWindowPoints(from, to, &mut p, 1) };
-    p
-}
-
 /// Marks `rc` of the window (all of it for `None`) to be painted.
 pub fn invalidate(hwnd: HWND, rc: Option<&RECT>, erase: bool) {
     let rc = rc.map_or(core::ptr::null(), |r| r as *const RECT);
@@ -152,12 +144,6 @@ pub fn redraw(hwnd: HWND, rc: Option<&RECT>, flags: REDRAW_WINDOW_FLAGS) {
     let rc = rc.map_or(core::ptr::null(), |r| r as *const RECT);
     // SAFETY: a rectangle or null, read during the call.
     unsafe { RedrawWindow(hwnd, rc, core::ptr::null_mut(), flags) };
-}
-
-/// Paints what is waiting to be painted, now.
-pub fn update(hwnd: HWND) {
-    // SAFETY: no pointers.
-    unsafe { UpdateWindow(hwnd) };
 }
 
 /// SetWindowPos; false if it failed.
@@ -307,12 +293,6 @@ pub fn parent(hwnd: HWND) -> HWND {
     unsafe { GetParent(hwnd) }
 }
 
-/// The top-level window `hwnd` is in (GA_ROOT).
-pub fn root(hwnd: HWND) -> HWND {
-    // SAFETY: no pointers.
-    unsafe { GetAncestor(hwnd, GA_ROOT) }
-}
-
 /// GetWindow: a window related to `hwnd` (GW_CHILD, GW_HWNDNEXT, GW_OWNER…).
 pub fn related(hwnd: HWND, cmd: GET_WINDOW_CMD) -> HWND {
     // SAFETY: no pointers.
@@ -367,22 +347,10 @@ pub fn set_foreground(hwnd: HWND) -> bool {
     unsafe { SetForegroundWindow(hwnd) != 0 }
 }
 
-/// Puts the window on top of its siblings.
-pub fn bring_to_top(hwnd: HWND) {
-    // SAFETY: no pointers.
-    unsafe { BringWindowToTop(hwnd) };
-}
-
 /// This thread's active window.
 pub fn active() -> HWND {
     // SAFETY: no pointers.
     unsafe { GetActiveWindow() }
-}
-
-/// Activates a top-level window of this thread; the one active before.
-pub fn set_active(hwnd: HWND) -> HWND {
-    // SAFETY: no pointers.
-    unsafe { SetActiveWindow(hwnd) }
 }
 
 /// The process the window belongs to (0 if it is not there).
@@ -445,18 +413,6 @@ pub fn set_style(hwnd: HWND, style: u32) -> u32 {
 pub fn ex_style(hwnd: HWND) -> u32 {
     // SAFETY: no pointers.
     unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 }
-}
-
-/// Sets the window's extended style; the old one.
-pub fn set_ex_style(hwnd: HWND, style: u32) -> u32 {
-    // SAFETY: a style is a set of flags, no pointer.
-    unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize) as u32 }
-}
-
-/// Sets a child window's control id (GWLP_ID).
-pub fn set_ctrl_id(hwnd: HWND, id: i32) {
-    // SAFETY: an id, no pointer.
-    unsafe { SetWindowLongPtrW(hwnd, GWLP_ID, id as isize) };
 }
 
 /// The window's placement (normal position, state).
@@ -609,12 +565,6 @@ pub fn set_redraw(hwnd: HWND, on: bool) {
 pub fn post_close(hwnd: HWND) -> bool {
     // SAFETY: WM_CLOSE has no parameters.
     unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 }
-}
-
-/// Sends WM_CLOSE now.
-pub fn close(hwnd: HWND) -> LRESULT {
-    // SAFETY: WM_CLOSE has no parameters.
-    unsafe { super::send_raw(hwnd, WM_CLOSE, 0, 0) }
 }
 
 /// Whether `msg` is one of goz-gui's private messages, which carry no

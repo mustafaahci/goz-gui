@@ -7,12 +7,11 @@ use windows_sys::Win32::Graphics::Gdi::{
     AlphaBlend, BITMAP, BLENDFUNCTION, BeginPaint, BitBlt, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontIndirectW, CreatePen, CreateSolidBrush, DRAW_TEXT_FORMAT,
     DT_MODIFYSTRING, DeleteDC, DeleteObject, DrawFocusRect, DrawTextW, ETO_OPTIONS, EndPaint,
-    ExcludeClipRect, ExtTextOutW, FillRect, FrameRect, GET_STOCK_OBJECT_FLAGS, GdiFlush, GetDC,
-    GetDeviceCaps, GetObjectW, GetStockObject, GetSysColor, GetSysColorBrush,
-    GetTextExtentPoint32W, GetTextMetricsW, GetWindowDC, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
-    HPEN, IntersectClipRect, LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PEN_STYLE, PatBlt, ROP_CODE,
-    Rectangle, ReleaseDC, RestoreDC, SYS_COLOR_INDEX, SaveDC, SelectObject, SetBkColor, SetBkMode,
-    SetDCBrushColor, SetTextColor, SetViewportOrgEx, StretchBlt, TEXTMETRICW,
+    ExtTextOutW, FillRect, GET_STOCK_OBJECT_FLAGS, GetDC, GetObjectW, GetStockObject, GetSysColor,
+    GetSysColorBrush, GetTextExtentPoint32W, GetTextMetricsW, GetWindowDC, HBITMAP, HBRUSH, HDC,
+    HFONT, HGDIOBJ, HPEN, LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PEN_STYLE, ROP_CODE, ReleaseDC,
+    SYS_COLOR_INDEX, SelectObject, SetBkColor, SetBkMode, SetDCBrushColor, SetTextColor,
+    SetViewportOrgEx, StretchBlt, TEXTMETRICW,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     CreateBitmap, EnumFontFamiliesExW, GetPixel, GetTextColor, GetTextExtentExPointW, RoundRect,
@@ -43,11 +42,6 @@ impl Paint {
     /// The area to paint.
     pub fn area(&self) -> RECT {
         self.ps.rcPaint
-    }
-
-    /// Whether the background is to be erased.
-    pub fn erase(&self) -> bool {
-        self.ps.fErase != 0
     }
 }
 
@@ -126,13 +120,6 @@ impl Owned {
     /// The object, to draw with (it stays this one's).
     pub fn get(&self) -> HGDIOBJ {
         self.0
-    }
-
-    /// Gives the object up without deleting it.
-    pub fn into_raw(self) -> HGDIOBJ {
-        let obj = self.0;
-        core::mem::forget(self);
-        obj
     }
 }
 
@@ -443,37 +430,10 @@ pub fn fill_rect(hdc: HDC, rc: &RECT, brush: HBRUSH) {
     unsafe { FillRect(hdc, rc, brush) };
 }
 
-/// Draws a one-pixel frame round `rc` with `brush`.
-pub fn frame_rect(hdc: HDC, rc: &RECT, brush: HBRUSH) {
-    // SAFETY: an in-struct.
-    unsafe { FrameRect(hdc, rc, brush) };
-}
-
 /// Draws (or, again, takes away) the dotted focus rectangle.
 pub fn draw_focus_rect(hdc: HDC, rc: &RECT) {
     // SAFETY: an in-struct.
     unsafe { DrawFocusRect(hdc, rc) };
-}
-
-/// A rectangle outlined in the DC's pen and filled with its brush.
-pub fn rectangle(hdc: HDC, rc: &RECT) {
-    // SAFETY: no pointers.
-    unsafe { Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom) };
-}
-
-/// Paints `rc` with the DC's brush as `rop` says (PATCOPY…).
-pub fn pat_blt(hdc: HDC, rc: &RECT, rop: ROP_CODE) {
-    // SAFETY: no pointers.
-    unsafe {
-        PatBlt(
-            hdc,
-            rc.left,
-            rc.top,
-            rc.right - rc.left,
-            rc.bottom - rc.top,
-            rop,
-        )
-    };
 }
 
 /// BitBlt of `cx` × `cy` from `src` at `sx, sy` to `dst` at `x, y`.
@@ -532,36 +492,6 @@ pub fn line_to(hdc: HDC, x: i32, y: i32) {
     unsafe { LineTo(hdc, x, y) };
 }
 
-/// Clips drawing to `rc` (and what was clipped to before).
-pub fn intersect_clip(hdc: HDC, rc: &RECT) {
-    // SAFETY: no pointers.
-    unsafe { IntersectClipRect(hdc, rc.left, rc.top, rc.right, rc.bottom) };
-}
-
-/// Clips `rc` out of what is drawn.
-pub fn exclude_clip(hdc: HDC, rc: &RECT) {
-    // SAFETY: no pointers.
-    unsafe { ExcludeClipRect(hdc, rc.left, rc.top, rc.right, rc.bottom) };
-}
-
-/// Saves the DC's state; what [`restore_dc`] takes.
-pub fn save_dc(hdc: HDC) -> i32 {
-    // SAFETY: no pointers.
-    unsafe { SaveDC(hdc) }
-}
-
-/// Puts back the state [`save_dc`] saved.
-pub fn restore_dc(hdc: HDC, saved: i32) {
-    // SAFETY: no pointers.
-    unsafe { RestoreDC(hdc, saved) };
-}
-
-/// A device capability of the DC (LOGPIXELSY…).
-pub fn device_caps(hdc: HDC, index: i32) -> i32 {
-    // SAFETY: no pointers.
-    unsafe { GetDeviceCaps(hdc, index) }
-}
-
 /// A font as `lf` describes it, to delete (null if it could not be made).
 pub fn create_font(lf: &LOGFONTW) -> HFONT {
     // SAFETY: an in-struct (the face name is read within its array).
@@ -607,12 +537,6 @@ pub fn set_stretch_blt_mode(hdc: HDC, mode: STRETCH_BLT_MODE) -> i32 {
 pub fn set_brush_org(hdc: HDC, x: i32, y: i32) {
     // SAFETY: no out-point asked for.
     unsafe { SetBrushOrgEx(hdc, x, y, core::ptr::null_mut()) };
-}
-
-/// Waits for this thread's GDI calls to finish.
-pub fn flush() {
-    // SAFETY: no pointers.
-    unsafe { GdiFlush() };
 }
 
 /// DrawIconEx of `icon` at `x, y`, `cx` × `cy`.

@@ -435,7 +435,7 @@ mod tests {
     use crate::win::menu::NewItem;
 
     fn text(menu: HMENU, cmd: u16) -> String {
-        win::menu::text(menu, By::Command(u32::from(cmd)))
+        String::from_utf16_lossy(&win::menu::text_units(menu, By::Command(u32::from(cmd))))
     }
 
     /// Keys back to the defaults put back the shortcut text a menu built

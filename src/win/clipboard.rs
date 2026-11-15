@@ -6,9 +6,8 @@ use core::marker::PhantomData;
 
 use windows_sys::Win32::Foundation::{GlobalFree, HWND};
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardFormatNameW,
-    GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
-    RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
@@ -143,14 +142,6 @@ pub fn register_format(name: &str) -> u32 {
     let name = wz(name);
     // SAFETY: a NUL-terminated name.
     unsafe { RegisterClipboardFormatW(name.as_ptr()) }
-}
-
-/// A registered clipboard format's name; `None` for a standard format.
-pub fn format_name(format: u32) -> Option<String> {
-    let mut buf = [0u16; 128];
-    // SAFETY: the buffer and its length in units.
-    let n = unsafe { GetClipboardFormatNameW(format, buf.as_mut_ptr(), buf.len() as i32) };
-    (n > 0).then(|| String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())]))
 }
 
 #[cfg(test)]

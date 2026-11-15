@@ -332,11 +332,6 @@ pub fn item_info(menu: HMENU, by: By) -> Option<ItemInfo> {
     })
 }
 
-/// An item's text (empty for none, or no such item).
-pub fn text(menu: HMENU, by: By) -> String {
-    String::from_utf16_lossy(&text_units(menu, by))
-}
-
 /// An item's text as UTF-16, without a NUL (empty for none, or no such
 /// item).
 pub fn text_units(menu: HMENU, by: By) -> Vec<u16> {
@@ -489,6 +484,11 @@ pub fn bar_info(hwnd: HWND, object: OBJECT_IDENTIFIER, item: i32) -> Option<MENU
 mod tests {
     use super::*;
     use windows_sys::Win32::UI::WindowsAndMessaging::{MFS_CHECKED, MFS_GRAYED};
+
+    /// An item's text, as a string.
+    fn text(menu: HMENU, by: By) -> String {
+        String::from_utf16_lossy(&text_units(menu, by))
+    }
 
     #[test]
     fn items_go_in_and_come_back() {

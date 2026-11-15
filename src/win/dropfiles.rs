@@ -14,8 +14,8 @@
 
 use std::cell::RefCell;
 
-use windows_sys::Win32::Foundation::{POINT, WPARAM};
-use windows_sys::Win32::UI::Shell::{DragFinish, DragQueryFileW, DragQueryPoint, HDROP};
+use windows_sys::Win32::Foundation::WPARAM;
+use windows_sys::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_DROPFILES;
 
 thread_local! {
@@ -106,18 +106,6 @@ pub(crate) unsafe fn read_paths(drop: HDROP) -> Vec<Vec<u16>> {
         out.push(buf);
     }
     out
-}
-
-/// Where the drop `h` landed (client coordinates), and whether in the client
-/// area; `None` if it is not being delivered on this thread.
-pub(crate) fn point(h: usize) -> Option<(POINT, bool)> {
-    if !in_flight(h) {
-        return None;
-    }
-    let mut pt = POINT::default();
-    // SAFETY: a drop being delivered, not yet finished; an out-struct.
-    let client = unsafe { DragQueryPoint(h as HDROP, &mut pt) } != 0;
-    Some((pt, client))
 }
 
 /// Whether `hwnd` takes files dropped on it (WM_DROPFILES).

@@ -8,7 +8,7 @@
 use windows_sys::Win32::Foundation::{HANDLE, HWND, LRESULT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, CopyAcceleratorTableW, CreateAcceleratorTableW, DestroyAcceleratorTable,
-    DispatchMessageW, GetInputState, GetMessageW, HACCEL, IsDialogMessageW, MSG,
+    DispatchMessageW, GetInputState, GetMessageW, HACCEL, MSG,
     MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, MsgWaitForMultipleObjectsEx, PEEK_MESSAGE_REMOVE_TYPE,
     PeekMessageW, PostQuitMessage, PostThreadMessageW, QUEUE_STATUS_FLAGS, TranslateAcceleratorW,
     TranslateMessage,
@@ -80,13 +80,6 @@ pub fn dispatch(q: &Queued) -> LRESULT {
     unsafe { DispatchMessageW(&q.0) }
 }
 
-/// Lets dialog `dlg` handle the message if it is its keyboard's (Tab,
-/// Enter, Esc, access keys); whether it did.
-pub fn is_dialog_message(dlg: HWND, q: &Queued) -> bool {
-    // SAFETY: a message the queue gave.
-    unsafe { IsDialogMessageW(dlg, &q.0) != 0 }
-}
-
 /// Runs the accelerator table `table` for window `hwnd` on the message;
 /// whether it was one of its keys.
 pub fn translate_accelerator(hwnd: HWND, table: HACCEL, q: &Queued) -> bool {
@@ -129,14 +122,6 @@ impl AccelTable {
     /// table's).
     pub fn handle(&self) -> HACCEL {
         self.0
-    }
-
-    /// The table, no longer destroyed by this: whoever takes it destroys
-    /// it.
-    pub fn into_raw(self) -> HACCEL {
-        let h = self.0;
-        core::mem::forget(self);
-        h
     }
 }
 

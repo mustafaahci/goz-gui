@@ -285,8 +285,6 @@ fn a_drop_is_read_while_it_is_delivered_and_finished_once_after() {
             // Still in flight: the window's call has returned, this one has
             // not.
             assert!(m.dropped_files().is_some());
-            // Not passed on to other windows.
-            assert_eq!(m.forward(m.hwnd), 0);
             return r;
         }
         m.def()

@@ -1,7 +1,7 @@
 //! Hotkey-control messages (msctls_hotkey32), sent only to one.
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::Controls::{HKM_GETHOTKEY, HKM_SETHOTKEY, HKM_SETRULES};
+use windows_sys::Win32::UI::Controls::{HKM_GETHOTKEY, HKM_SETHOTKEY};
 
 /// The class these messages are for.
 pub const CLASS: &str = "msctls_hotkey32";
@@ -20,10 +20,4 @@ pub fn get(h: HWND) -> u16 {
 /// Shows key `key` (the virtual key in the low byte, HOTKEYF_* above).
 pub fn set(h: HWND, key: u16) {
     send_int(h, HKM_SETHOTKEY, usize::from(key), 0);
-}
-
-/// The combinations the box refuses (HKCOMB_*), and the modifiers it uses
-/// instead.
-pub fn set_rules(h: HWND, invalid: u16, instead: u16) {
-    send_int(h, HKM_SETRULES, usize::from(invalid), instead as isize);
 }

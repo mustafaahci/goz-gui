@@ -197,13 +197,11 @@ impl Folder {
             )
         }
         .is_ok();
-        // SAFETY: on success the list ParseDisplayName allocated for the
-        // caller.
-        if ok {
-            unsafe { Pidl::own(id.cast()) }
-        } else {
-            None
+        if !ok {
+            return None;
         }
+        // SAFETY: the list ParseDisplayName allocated for the caller.
+        unsafe { Pidl::own(id.cast()) }
     }
 
     /// The Explorer context menu of the items `ids` name, owned by `owner`

@@ -6,8 +6,7 @@ use core::mem::ManuallyDrop;
 
 use windows::Win32::Foundation::{HGLOBAL, HWND as WHWND};
 use windows::Win32::System::Com::{
-    CoTaskMemFree, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, STGMEDIUM_0,
-    TYMED_HGLOBAL,
+    DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::Ole::{DROPEFFECT, IDropSource, OleGetClipboard, ReleaseStgMedium};
 use windows::Win32::UI::Shell::SHDoDragDrop;
@@ -16,13 +15,12 @@ use windows_sys::Win32::Foundation::{GlobalFree, HWND};
 use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
-use windows_sys::Win32::System::Ole::{CF_HDROP, OleFlushClipboard};
+use windows_sys::Win32::System::Ole::OleFlushClipboard;
 use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows_sys::Win32::UI::Shell::{ILFindChild, SHCreateDataObject, SHMultiFileProperties};
 
 use super::Pidl;
 use crate::win::len_u32;
-use crate::win::locale::ansi_to_wide;
 
 /// A data object (IDataObject), released when this drops. It belongs to
 /// the thread (the apartment) that got it: it is not `Send`.
@@ -133,37 +131,6 @@ impl DataObject {
         }
     }
 
-    /// The files its CF_HDROP names, in order; `None` if it has none.
-    pub fn files(&self) -> Option<Vec<Vec<u16>>> {
-        drop_files(&self.get(CF_HDROP)?)
-    }
-
-    /// The clipboard formats it offers to be read (EnumFormatEtc,
-    /// DATADIR_GET), in its order.
-    pub fn formats(&self) -> Vec<u16> {
-        let mut out = Vec::new();
-        // SAFETY: a call on a data object of this thread.
-        let Ok(formats) = (unsafe { self.0.EnumFormatEtc(DATADIR_GET.0 as u32) }) else {
-            return out;
-        };
-        loop {
-            let mut one = [FORMATETC::default()];
-            let mut got = 0u32;
-            // SAFETY: one FORMATETC into a local array of one, and the
-            // count.
-            if unsafe { formats.Next(&mut one, Some(&mut got)) }.is_err() || got == 0 {
-                break;
-            }
-            out.push(one[0].cfFormat);
-            if !one[0].ptd.is_null() {
-                // SAFETY: a target device the enumerator allocated for its
-                // caller, who frees it (CoTaskMemFree) and does not keep it.
-                unsafe { CoTaskMemFree(Some(one[0].ptd.cast())) };
-            }
-        }
-        out
-    }
-
     /// Drags it out of `owner` with the shell's drag image and cursors
     /// (SHDoDragDrop with its own drop source, which follows either mouse
     /// button), allowing the DROPEFFECT_* in `allowed`. Returns once it is
@@ -221,88 +188,5 @@ unsafe fn copy_global(mem: HGLOBAL) -> Option<Vec<u8>> {
         let out = core::slice::from_raw_parts(p, size).to_vec();
         GlobalUnlock(mem.0);
         Some(out)
-    }
-}
-
-/// The paths a DROPFILES block lists, read within the block: its header
-/// (`pFiles`, `pt`, `fNC`, `fWide`), then NUL-separated names that end
-/// with an empty one, UTF-16 when `fWide`, else in the ANSI code page.
-fn drop_files(block: &[u8]) -> Option<Vec<Vec<u16>>> {
-    let field = |at: usize| -> Option<u32> {
-        let b = block.get(at..at + 4)?;
-        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    };
-    let (start, wide) = (field(0)? as usize, field(16)? != 0);
-    let list = block.get(start..)?;
-    let mut out = Vec::new();
-    if wide {
-        let units: Vec<u16> = list
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&c| u16::from_le_bytes(c))
-            .collect();
-        for name in units.split(|&c| c == 0) {
-            if name.is_empty() {
-                break;
-            }
-            out.push(name.to_vec());
-        }
-    } else {
-        for name in list.split(|&c| c == 0) {
-            if name.is_empty() {
-                break;
-            }
-            out.push(ansi_to_wide(name));
-        }
-    }
-    Some(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A DROPFILES block of `names`, wide or not.
-    fn dropfiles(names: &[&str], wide: bool) -> Vec<u8> {
-        let mut out = Vec::new();
-        for v in [20u32, 0, 0, 0, u32::from(wide)] {
-            out.extend(v.to_le_bytes());
-        }
-        for name in names {
-            if wide {
-                out.extend(
-                    name.encode_utf16()
-                        .chain(Some(0))
-                        .flat_map(u16::to_le_bytes),
-                );
-            } else {
-                out.extend(name.bytes().chain(Some(0)));
-            }
-        }
-        out.extend(if wide {
-            [0u8, 0].as_slice()
-        } else {
-            [0u8].as_slice()
-        });
-        out
-    }
-
-    #[test]
-    fn a_drop_lists_its_files_within_the_block() {
-        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
-        let names = [r"C:\a.txt", r"C:\dir\b c.png"];
-        for wide in [true, false] {
-            let got = drop_files(&dropfiles(&names, wide)).expect("a list");
-            assert_eq!(got, vec![w(names[0]), w(names[1])], "wide {wide}");
-        }
-        // Cut short, or pointing past the block: no more than is there.
-        let mut short = dropfiles(&names, true);
-        short.truncate(26);
-        assert_eq!(drop_files(&short), Some(vec![w(r"C:\")]));
-        assert_eq!(drop_files(&[0u8; 12]), None);
-        let mut past = dropfiles(&names, true);
-        past[0] = 200;
-        assert_eq!(drop_files(&past), None);
     }
 }

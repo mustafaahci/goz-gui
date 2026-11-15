@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use windows_sys::Win32::Foundation::{HWND, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, WPARAM};
 
 use super::msg::Msg;
 
@@ -61,16 +61,6 @@ pub fn post<T: Send + 'static>(hwnd: HWND, msg: u32, w: WPARAM, value: T) -> boo
     }
     drop(remove(t));
     false
-}
-
-/// Sends goz-gui's private message `msg` to `hwnd` with `value`, and waits
-/// for the answer; the value is dropped then if the handler did not take it.
-pub fn send<T: Send + 'static>(hwnd: HWND, msg: u32, w: WPARAM, value: T) -> LRESULT {
-    let t = ticket();
-    put(t, hwnd, Box::new(value));
-    let answer = super::send_app(hwnd, msg, w, t);
-    drop(remove(t));
-    answer
 }
 
 /// Takes the `T` that came with `m` (sent with [`post`] or [`send`]);

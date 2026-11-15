@@ -3,10 +3,8 @@
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::UI::Controls::{
-    EM_CANUNDO, EM_CHARFROMPOS, EM_EMPTYUNDOBUFFER, EM_GETFIRSTVISIBLELINE, EM_GETLINECOUNT,
-    EM_GETMARGINS, EM_GETRECT, EM_GETSEL, EM_LINEINDEX, EM_LINESCROLL, EM_POSFROMCHAR,
-    EM_REPLACESEL, EM_SCROLLCARET, EM_SETCUEBANNER, EM_SETLIMITTEXT, EM_SETMARGINS, EM_SETREADONLY,
-    EM_SETRECTNP, EM_SETSEL, EM_SETTABSTOPS, EM_UNDO,
+    EM_CANUNDO, EM_CHARFROMPOS, EM_GETMARGINS, EM_GETSEL, EM_REPLACESEL, EM_SETCUEBANNER,
+    EM_SETLIMITTEXT, EM_SETMARGINS, EM_SETRECTNP, EM_SETSEL, EM_SETTABSTOPS, EM_UNDO,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -93,44 +91,9 @@ pub fn can_undo(e: HWND) -> bool {
     send_int(e, EM_CANUNDO, 0, 0) != 0
 }
 
-/// Forgets the change [`undo`] would undo.
-pub fn empty_undo(e: HWND) {
-    send_int(e, EM_EMPTYUNDOBUFFER, 0, 0);
-}
-
 /// The most UTF-16 units the box takes.
 pub fn set_limit(e: HWND, units: usize) {
     send_int(e, EM_SETLIMITTEXT, units, 0);
-}
-
-/// Makes the box read-only, or not.
-pub fn set_read_only(e: HWND, on: bool) {
-    send_int(e, EM_SETREADONLY, usize::from(on), 0);
-}
-
-/// Scrolls the caret into view.
-pub fn scroll_caret(e: HWND) {
-    send_int(e, EM_SCROLLCARET, 0, 0);
-}
-
-/// How many lines a multiline box has.
-pub fn line_count(e: HWND) -> i32 {
-    send_int(e, EM_GETLINECOUNT, 0, 0) as i32
-}
-
-/// The first line shown (a single-line box: the first character shown).
-pub fn first_visible_line(e: HWND) -> i32 {
-    send_int(e, EM_GETFIRSTVISIBLELINE, 0, 0) as i32
-}
-
-/// The character index where line `line` starts (-1: the caret's line).
-pub fn line_index(e: HWND, line: i32) -> i32 {
-    send_int(e, EM_LINEINDEX, line as isize as usize, 0) as i32
-}
-
-/// Scrolls by `cols` characters and `lines` lines.
-pub fn line_scroll(e: HWND, cols: i32, lines: i32) {
-    send_int(e, EM_LINESCROLL, cols as isize as usize, lines as isize);
 }
 
 /// EM_CHARFROMPOS: (character index, line) nearest `pt` (client
@@ -143,16 +106,6 @@ pub fn char_from_pos(e: HWND, pt: POINT) -> (u16, u16) {
         super::make_lparam(pt.x as u16, pt.y as u16),
     ) as usize;
     (super::loword(v), super::hiword(v))
-}
-
-/// EM_POSFROMCHAR: the client point of character `i` ((-1, -1) past the
-/// end).
-pub fn pos_from_char(e: HWND, i: usize) -> POINT {
-    let v = send_int(e, EM_POSFROMCHAR, i, 0) as usize;
-    POINT {
-        x: super::loword(v) as i16 as i32,
-        y: super::hiword(v) as i16 as i32,
-    }
 }
 
 /// The margins: (left, right).
@@ -169,14 +122,6 @@ pub fn set_margins(e: HWND, which: u32, left: u16, right: u16) {
         which as usize,
         super::make_lparam(left, right),
     );
-}
-
-/// The formatting rectangle.
-pub fn rect(e: HWND) -> RECT {
-    let mut rc = RECT::default();
-    // SAFETY: EM_GETRECT's lParam is a RECT out.
-    unsafe { super::send_raw(e, EM_GETRECT, 0, (&raw mut rc) as isize) };
-    rc
 }
 
 /// Sets the formatting rectangle without redrawing (EM_SETRECTNP).

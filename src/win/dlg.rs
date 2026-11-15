@@ -12,8 +12,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MapDialogRect, SetWindowLongPtrW, WM_INITDIALOG, WM_NCDESTROY, WM_NEXTDLGCTL,
 };
 
-use windows_sys::Win32::UI::Controls::{CheckDlgButton, DLG_BUTTON_CHECK_STATE};
-
 use super::msg::{Msg, Via};
 
 /// A control's window class in a [`Template`].
@@ -272,18 +270,6 @@ pub fn set_def_id(dlg: HWND, id: u16) {
 pub fn focus_ctl(dlg: HWND, to: HWND) {
     // SAFETY: WM_NEXTDLGCTL's parameters: a handle and a flag.
     unsafe { super::send_raw(dlg, WM_NEXTDLGCTL, to as WPARAM, 1) };
-}
-
-/// Moves the keyboard to the dialog's next (or previous) tab stop.
-pub fn next_ctl(dlg: HWND, previous: bool) {
-    // SAFETY: WM_NEXTDLGCTL's parameters: a flag and a flag.
-    unsafe { super::send_raw(dlg, WM_NEXTDLGCTL, usize::from(previous), 0) };
-}
-
-/// Checks or clears check box or radio button `id` (BST_*).
-pub fn check(dlg: HWND, id: u16, state: DLG_BUTTON_CHECK_STATE) {
-    // SAFETY: no pointers.
-    unsafe { CheckDlgButton(dlg, i32::from(id), state) };
 }
 
 /// Whether check box or radio button `id` is checked (BST_CHECKED).

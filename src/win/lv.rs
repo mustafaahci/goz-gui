@@ -7,17 +7,16 @@
 use windows_sys::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
 use windows_sys::Win32::UI::Controls::{
     HIMAGELIST, LVCF_TEXT, LVCOLUMNW, LVHITTESTINFO, LVIF_COLFMT, LVIF_COLUMNS, LVIF_TEXT, LVITEMW,
-    LVM_ARRANGE, LVM_CANCELEDITLABEL, LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_DELETEITEM,
-    LVM_EDITLABELW, LVM_ENSUREVISIBLE, LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNW, LVM_GETCOLUMNWIDTH,
-    LVM_GETCOUNTPERPAGE, LVM_GETEDITCONTROL, LVM_GETEXTENDEDLISTVIEWSTYLE, LVM_GETHEADER,
-    LVM_GETHOTITEM, LVM_GETIMAGELIST, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSPACING,
-    LVM_GETITEMSTATE, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_GETSELECTIONMARK,
-    LVM_GETSTRINGWIDTHW, LVM_GETSUBITEMRECT, LVM_GETTOOLTIPS, LVM_GETTOPINDEX, LVM_GETVIEW,
-    LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETBKCOLOR,
-    LVM_SETCOLUMNORDERARRAY, LVM_SETCOLUMNW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETICONSPACING, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
-    LVM_SETITEMW, LVM_SETSELECTIONMARK, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVM_SETVIEW,
-    LVM_SUBITEMHITTEST, LVM_UPDATE,
+    LVM_ARRANGE, LVM_CANCELEDITLABEL, LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_EDITLABELW,
+    LVM_ENSUREVISIBLE, LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNW, LVM_GETCOLUMNWIDTH,
+    LVM_GETCOUNTPERPAGE, LVM_GETEDITCONTROL, LVM_GETHEADER, LVM_GETHOTITEM, LVM_GETIMAGELIST,
+    LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSPACING, LVM_GETITEMSTATE, LVM_GETITEMW,
+    LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_GETSELECTIONMARK, LVM_GETSTRINGWIDTHW,
+    LVM_GETSUBITEMRECT, LVM_GETTOPINDEX, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETBKCOLOR, LVM_SETCOLUMNORDERARRAY, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETICONSPACING, LVM_SETIMAGELIST, LVM_SETITEMCOUNT,
+    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SETSELECTIONMARK, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
+    LVM_SUBITEMHITTEST,
 };
 
 /// The class these messages are for.
@@ -90,11 +89,6 @@ pub fn count_per_page(lv: HWND) -> i32 {
     send_int(lv, LVM_GETCOUNTPERPAGE, 0, 0) as i32
 }
 
-/// The LVS_EX_* extended styles.
-pub fn extended_style(lv: HWND) -> u32 {
-    send_int(lv, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as u32
-}
-
 /// Sets the LVS_EX_* styles in `mask` to `style`.
 pub fn set_extended_style(lv: HWND, mask: u32, style: u32) {
     send_int(
@@ -108,11 +102,6 @@ pub fn set_extended_style(lv: HWND, mask: u32, style: u32) {
 /// The list's header control.
 pub fn header(lv: HWND) -> HWND {
     send_int(lv, LVM_GETHEADER, 0, 0) as HWND
-}
-
-/// The list's tooltip control.
-pub fn tooltips(lv: HWND) -> HWND {
-    send_int(lv, LVM_GETTOOLTIPS, 0, 0) as HWND
 }
 
 /// The edit box of a label being edited (null: none).
@@ -135,11 +124,6 @@ pub fn redraw_items(lv: HWND, first: i32, last: i32) {
     send_int(lv, LVM_REDRAWITEMS, first as isize as usize, last as isize);
 }
 
-/// Arranges (with LVS_AUTOARRANGE) and redraws `item`.
-pub fn update(lv: HWND, item: i32) {
-    send_int(lv, LVM_UPDATE, item as isize as usize, 0);
-}
-
 /// Scrolls by `dx` pixels and `dy` (pixels; in report view, rounded to
 /// rows).
 pub fn scroll(lv: HWND, dx: i32, dy: i32) {
@@ -159,16 +143,6 @@ pub fn set_text_bk_color(lv: HWND, c: COLORREF) {
 /// The list's background colour.
 pub fn set_bk_color(lv: HWND, c: COLORREF) {
     send_int(lv, LVM_SETBKCOLOR, 0, c as isize);
-}
-
-/// The list's LV_VIEW_* view.
-pub fn view(lv: HWND) -> u32 {
-    send_int(lv, LVM_GETVIEW, 0, 0) as u32
-}
-
-/// Sets the list's LV_VIEW_* view.
-pub fn set_view(lv: HWND, view: u32) {
-    send_int(lv, LVM_SETVIEW, view as usize, 0);
 }
 
 /// LVM_ARRANGE with LVA_* `how`.
@@ -203,11 +177,6 @@ pub fn image_list(lv: HWND, which: u32) -> HIMAGELIST {
 /// Sets image list `which` (LVSIL_*); the one before.
 pub fn set_image_list(lv: HWND, which: u32, il: HIMAGELIST) -> HIMAGELIST {
     send_int(lv, LVM_SETIMAGELIST, which as usize, il)
-}
-
-/// Deletes `item`; false if it could not.
-pub fn delete_item(lv: HWND, item: i32) -> bool {
-    send_int(lv, LVM_DELETEITEM, item as isize as usize, 0) != 0
 }
 
 /// Deletes every item; false if it could not.
@@ -390,16 +359,6 @@ pub fn item_text(lv: HWND, item: i32, sub: i32, max: usize) -> String {
         .unwrap_or_default()
 }
 
-/// Sets the fields `item` names (LVIF_*), with `text` as the item's text
-/// when given (LVIF_TEXT then). False if the list refused.
-pub fn set_item(lv: HWND, item: LVITEMW, text: Option<&str>) -> bool {
-    with_item(item, text, |it| {
-        // SAFETY: LVM_SETITEMW's lParam is an LVITEMW whose pointers are set
-        // by `with_item`.
-        unsafe { send(lv, LVM_SETITEMW, 0, (&raw const *it) as isize) != 0 }
-    })
-}
-
 /// Inserts `item` (at `item.iItem`), with `text`; its index, -1 if not.
 pub fn insert_item(lv: HWND, item: LVITEMW, text: Option<&str>) -> i32 {
     with_item(item, text, |it| {
@@ -480,21 +439,6 @@ pub fn insert_column(lv: HWND, at: i32, col: LVCOLUMNW, text: Option<&str>) -> i
                 at as isize as usize,
                 (&raw const *c) as isize,
             ) as i32
-        }
-    })
-}
-
-/// Sets the fields `col` names of column `at`, titled `text` when given.
-pub fn set_column(lv: HWND, at: i32, col: LVCOLUMNW, text: Option<&str>) -> bool {
-    with_column(col, text, |c| {
-        // SAFETY: as in `insert_column`.
-        unsafe {
-            send(
-                lv,
-                LVM_SETCOLUMNW,
-                at as isize as usize,
-                (&raw const *c) as isize,
-            ) != 0
         }
     })
 }

@@ -15,10 +15,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY;
 use super::msg::{Msg, Via};
 
 /// A subclass's name. Declare one per kind of subclass, as a `static`:
-/// its address is the subclass's id.
+/// its address is the subclass's id. The name also gives the key a size,
+/// and so each `static` an address of its own (zero-sized ones may share
+/// one).
 pub struct Key {
     /// What the subclass is, for a reader (and a debugger).
-    pub name: &'static str,
+    name: &'static str,
+}
+
+impl core::fmt::Debug for Key {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "subclass::Key({:?})", self.name)
+    }
 }
 
 impl Key {

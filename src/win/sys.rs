@@ -9,17 +9,16 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW, MessageBeep,
 };
-use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::HiDpi::{
-    GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi,
+    GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetDoubleClickTime, GetKeyState,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetMessagePos, GetMessageTime, GetSystemMetrics, HCURSOR, LoadCursorW,
-    MESSAGEBOX_STYLE, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_METRICS_INDEX, SetCursor,
+    GetCursorPos, GetMessageTime, GetSystemMetrics, HCURSOR, LoadCursorW, MESSAGEBOX_STYLE,
+    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_METRICS_INDEX, SetCursor,
 };
 
 use windows_sys::Win32::Foundation::HWND;
@@ -28,12 +27,6 @@ use windows_sys::Win32::Foundation::HWND;
 pub fn key_down(vk: u16) -> bool {
     // SAFETY: no pointers.
     unsafe { GetKeyState(i32::from(vk)) < 0 }
-}
-
-/// Whether toggle key `vk` (Caps Lock…) is on.
-pub fn key_toggled(vk: u16) -> bool {
-    // SAFETY: no pointers.
-    unsafe { GetKeyState(i32::from(vk)) & 1 != 0 }
 }
 
 /// Whether key `vk` is down now, whatever the messages say.
@@ -85,16 +78,6 @@ pub fn caret_pos() -> POINT {
     p
 }
 
-/// Where the pointer was at the current message.
-pub fn message_pos() -> POINT {
-    // SAFETY: no pointers.
-    let v = unsafe { GetMessagePos() } as usize;
-    POINT {
-        x: super::loword(v) as i16 as i32,
-        y: super::hiword(v) as i16 as i32,
-    }
-}
-
 /// When the message this thread took last was posted (GetMessageTime), in
 /// ms since the system started (it wraps).
 pub fn message_time() -> u32 {
@@ -141,22 +124,10 @@ pub fn dpi_for_window(hwnd: HWND) -> u32 {
     }
 }
 
-/// The system's DPI (96 at 100 %).
-pub fn system_dpi() -> u32 {
-    // SAFETY: no pointers.
-    unsafe { GetDpiForSystem() }
-}
-
 /// The most time between the clicks of a double-click, in ms.
 pub fn double_click_ms() -> u32 {
     // SAFETY: no pointers.
     unsafe { GetDoubleClickTime() }
-}
-
-/// The ms since the system started.
-pub fn tick_ms() -> u64 {
-    // SAFETY: no pointers.
-    unsafe { GetTickCount64() }
 }
 
 /// This thread's last error (GetLastError).

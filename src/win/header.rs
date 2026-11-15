@@ -4,8 +4,7 @@
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::UI::Controls::{
     HDHITTESTINFO, HDI_FILTER, HDI_TEXT, HDITEMW, HDLAYOUT, HDM_GETITEMCOUNT, HDM_GETITEMRECT,
-    HDM_GETITEMW, HDM_GETORDERARRAY, HDM_HITTEST, HDM_LAYOUT, HDM_ORDERTOINDEX, HDM_SETIMAGELIST,
-    HDM_SETITEMW, HIMAGELIST,
+    HDM_GETITEMW, HDM_HITTEST, HDM_LAYOUT, HDM_SETITEMW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::WINDOWPOS;
 
@@ -25,20 +24,6 @@ pub fn item_count(h: HWND) -> usize {
     usize::try_from(unsafe { send(h, HDM_GETITEMCOUNT, 0, 0) }).unwrap_or(0)
 }
 
-/// The index of the item shown at position `order`.
-pub fn order_to_index(h: HWND, order: i32) -> i32 {
-    // SAFETY: an integer.
-    unsafe { send(h, HDM_ORDERTOINDEX, order as isize as usize, 0) as i32 }
-}
-
-/// The items' display order.
-pub fn order(h: HWND) -> Vec<i32> {
-    let mut v = vec![0i32; item_count(h)];
-    // SAFETY: HDM_GETORDERARRAY's lParam is an array of wParam ints.
-    let ok = unsafe { send(h, HDM_GETORDERARRAY, v.len(), v.as_mut_ptr() as isize) } != 0;
-    if ok { v } else { Vec::new() }
-}
-
 /// Item `i`'s rectangle, in the header's client coordinates.
 pub fn item_rect(h: HWND, i: i32) -> Option<RECT> {
     let mut rc = RECT::default();
@@ -54,17 +39,6 @@ pub fn item_rect(h: HWND, i: i32) -> Option<RECT> {
     ok.then_some(rc)
 }
 
-/// HDM_HITTEST at `pt` (client coordinates).
-pub fn hit_test(h: HWND, pt: POINT) -> HDHITTESTINFO {
-    let mut ht = HDHITTESTINFO {
-        pt,
-        ..Default::default()
-    };
-    // SAFETY: HDM_HITTEST's lParam is an HDHITTESTINFO, in and out.
-    unsafe { send(h, HDM_HITTEST, 0, (&raw mut ht) as isize) };
-    ht
-}
-
 /// HDM_HITTEST's answer at `pt` (client coordinates): the item there, -1
 /// for none. ([`hit_test`] gives the filled structure, whose item a header
 /// may set even where it answers -1.)
@@ -75,20 +49,6 @@ pub fn item_at(h: HWND, pt: POINT) -> i32 {
     };
     // SAFETY: HDM_HITTEST's lParam is an HDHITTESTINFO, in and out.
     unsafe { send(h, HDM_HITTEST, 0, (&raw mut ht) as isize) as i32 }
-}
-
-/// HDM_LAYOUT: where the header goes in `rc`, and what of `rc` is left.
-pub fn layout(h: HWND, rc: RECT) -> (WINDOWPOS, RECT) {
-    let mut rest = rc;
-    let mut pos = WINDOWPOS::default();
-    let lay = HDLAYOUT {
-        prc: &mut rest,
-        pwpos: &mut pos,
-    };
-    // SAFETY: HDM_LAYOUT's lParam is an HDLAYOUT of a RECT in-out and a
-    // WINDOWPOS out, all alive for the call.
-    unsafe { send(h, HDM_LAYOUT, 0, (&raw const lay) as isize) };
-    (pos, rest)
 }
 
 /// HDM_LAYOUT as a header's procedure (or its subclass) gets it: `f`
@@ -167,12 +127,6 @@ pub fn set_item(h: HWND, i: i32, item: HDITEMW, text: Option<&str>) -> bool {
             (&raw const it) as isize,
         ) != 0
     }
-}
-
-/// The image list the items' images come from; the one before.
-pub fn set_image_list(h: HWND, il: HIMAGELIST) -> HIMAGELIST {
-    // SAFETY: a handle.
-    unsafe { send(h, HDM_SETIMAGELIST, 0, il) }
 }
 
 #[cfg(test)]

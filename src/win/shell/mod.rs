@@ -18,9 +18,9 @@ mod menu;
 mod pidl;
 
 pub use data::{DataObject, flush_clipboard};
-pub use dialog::{Customize, FileDialog};
+pub use dialog::FileDialog;
 pub use fileop::{FileOperation, ItemOp, ProgressSink};
-pub use link::{JumpList, ObjectArray, ObjectCollection, PropertyStore, ShellLink, save_shortcut};
+pub use link::{JumpList, ObjectCollection, PropertyStore, ShellLink, save_shortcut};
 pub use menu::ShellMenu;
 pub use pidl::{Folder, Pidl, open_folder_and_select};
 
@@ -34,9 +34,9 @@ use windows::Win32::UI::Shell::{
     SetCurrentProcessExplicitAppUserModelID,
 };
 use windows::core::{PCWSTR, PWSTR, Result};
-use windows_sys::Win32::Foundation::{HWND, LocalFree};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Shell::{
-    ASSOCF_NONE, ASSOCSTR_SHELLEXTENSION, AssocQueryStringW, CommandLineToArgvW, SEE_MASK_NOASYNC,
+    ASSOCF_NONE, ASSOCSTR_SHELLEXTENSION, AssocQueryStringW, SEE_MASK_NOASYNC,
     SEE_MASK_NOCLOSEPROCESS, SHARD_PATHW, SHAddToRecentDocs, SHELLEXECUTEINFOW, SHELLFLAGSTATE,
     SHELLSTATEA, SHFILEINFOW, SHGFI_FLAGS, SHGFI_PIDL, SHGetFileInfoW, SHGetSetSettings,
     SHGetSettings, SHOP_FILEPATH, SHObjectProperties, SSF_MASK, ShellExecuteExW,
@@ -285,7 +285,12 @@ pub fn state(mask: SSF_MASK) -> SHELLSTATEA {
 }
 
 /// How CommandLineToArgvW splits `line` (as a new process's arguments).
+/// Only the tests use it, as the oracle for the command lines goz-gui
+/// builds for a new process.
+#[cfg(test)]
 pub fn command_line_to_argv(line: &str) -> Vec<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
     let w = wz(line);
     let mut n = 0;
     // SAFETY: a NUL-terminated line; the array is read for its `n`

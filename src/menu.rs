@@ -883,7 +883,7 @@ mod tests {
                 if is_separator(menu, i) {
                     return "-".to_owned();
                 }
-                wmenu::text(menu, By::Position(i))
+                String::from_utf16_lossy(&wmenu::text_units(menu, By::Position(i)))
             })
             .collect()
     }

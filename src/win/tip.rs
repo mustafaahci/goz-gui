@@ -1,12 +1,10 @@
 //! Tooltip messages (tooltips_class32), each sent only to a tooltip. A
 //! tool's text goes in as a [`Text`], never as a pointer.
 
-use windows_sys::Win32::Foundation::{COLORREF, HWND, RECT};
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Controls::{
-    TTM_ACTIVATE, TTM_ADDTOOLW, TTM_ADJUSTRECT, TTM_DELTOOLW, TTM_GETDELAYTIME, TTM_NEWTOOLRECTW,
-    TTM_POP, TTM_POPUP, TTM_SETDELAYTIME, TTM_SETMARGIN, TTM_SETMAXTIPWIDTH, TTM_SETTIPBKCOLOR,
-    TTM_SETTIPTEXTCOLOR, TTM_SETWINDOWTHEME, TTM_TRACKACTIVATE, TTM_TRACKPOSITION,
-    TTM_UPDATETIPTEXTW, TTTOOLINFOW,
+    TTM_ADDTOOLW, TTM_ADJUSTRECT, TTM_GETDELAYTIME, TTM_NEWTOOLRECTW, TTM_SETMAXTIPWIDTH,
+    TTM_TRACKACTIVATE, TTM_TRACKPOSITION, TTM_UPDATETIPTEXTW, TTTOOLINFOW,
 };
 
 /// The class these messages are for.
@@ -61,11 +59,6 @@ pub fn add_tool(tip: HWND, ti: &TTTOOLINFOW, text: Text) -> bool {
     with_tool(tip, TTM_ADDTOOLW, 0, ti, text) != 0
 }
 
-/// Removes the tool `ti` names (its hwnd and uId).
-pub fn del_tool(tip: HWND, ti: &TTTOOLINFOW) {
-    with_tool(tip, TTM_DELTOOLW, 0, ti, Text::None);
-}
-
 /// Sets the text of the tool `ti` names.
 pub fn update_text(tip: HWND, ti: &TTTOOLINFOW, text: Text) {
     with_tool(tip, TTM_UPDATETIPTEXTW, 0, ti, text);
@@ -100,12 +93,6 @@ pub fn delay_time(tip: HWND, which: u32) -> i32 {
     unsafe { send(tip, TTM_GETDELAYTIME, which as usize, 0) as i32 }
 }
 
-/// Sets delay TTDT_* `which`, in ms (-1: the default).
-pub fn set_delay_time(tip: HWND, which: u32, ms: i32) {
-    // SAFETY: integers.
-    unsafe { send(tip, TTM_SETDELAYTIME, which as usize, ms as isize) };
-}
-
 /// TTM_ADJUSTRECT: the window rectangle for a text rectangle `rc` (or the
 /// text rectangle for a window rectangle, when not `larger`).
 pub fn adjust_rect(tip: HWND, larger: bool, rc: RECT) -> RECT {
@@ -120,45 +107,4 @@ pub fn adjust_rect(tip: HWND, larger: bool, rc: RECT) -> RECT {
         )
     };
     r
-}
-
-/// The room round a tip's text, in pixels.
-pub fn set_margin(tip: HWND, rc: RECT) {
-    // SAFETY: TTM_SETMARGIN's lParam is a RECT, read.
-    unsafe { send(tip, TTM_SETMARGIN, 0, (&raw const rc) as isize) };
-}
-
-/// Turns the tips on or off.
-pub fn activate(tip: HWND, on: bool) {
-    // SAFETY: a flag.
-    unsafe { send(tip, TTM_ACTIVATE, usize::from(on), 0) };
-}
-
-/// Hides the tip shown.
-pub fn pop(tip: HWND) {
-    // SAFETY: no parameters.
-    unsafe { send(tip, TTM_POP, 0, 0) };
-}
-
-/// Shows the tip of the tool under the mouse now.
-pub fn popup(tip: HWND) {
-    // SAFETY: no parameters.
-    unsafe { send(tip, TTM_POPUP, 0, 0) };
-}
-
-/// The tips' text and background colours.
-pub fn set_colors(tip: HWND, text: COLORREF, back: COLORREF) {
-    // SAFETY: colours.
-    unsafe {
-        send(tip, TTM_SETTIPTEXTCOLOR, text as usize, 0);
-        send(tip, TTM_SETTIPBKCOLOR, back as usize, 0);
-    }
-}
-
-/// TTM_SETWINDOWTHEME: the visual style the tip draws with
-/// ("DarkMode_Explorer").
-pub fn set_window_theme(tip: HWND, theme: &str) {
-    let z = super::wz(theme);
-    // SAFETY: a NUL-terminated string read during the call.
-    unsafe { send(tip, TTM_SETWINDOWTHEME, 0, z.as_ptr() as isize) };
 }

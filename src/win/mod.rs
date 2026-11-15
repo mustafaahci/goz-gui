@@ -34,8 +34,6 @@
 
 #![allow(unsafe_code)]
 #![warn(clippy::undocumented_unsafe_blocks)]
-// Until the whole crate is on this module, some of it is not used yet.
-#![allow(dead_code, unused_imports)]
 
 pub mod a11y;
 pub mod button;
@@ -217,19 +215,14 @@ pub fn make_lparam(lo: u16, hi: u16) -> LPARAM {
     (u32::from(lo) | (u32::from(hi) << 16)) as i32 as LPARAM
 }
 
-/// `lo` and `hi` as one `WPARAM`, as MAKEWPARAM makes it.
-pub fn make_wparam(lo: u16, hi: u16) -> WPARAM {
-    (u32::from(lo) | (u32::from(hi) << 16)) as WPARAM
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn words_go_in_and_come_out() {
-        assert_eq!(loword(make_wparam(3, 7)), 3);
-        assert_eq!(hiword(make_wparam(3, 7)), 7);
+        assert_eq!(loword(make_lparam(3, 7) as usize), 3);
+        assert_eq!(hiword(make_lparam(3, 7) as usize), 7);
         assert_eq!(make_lparam(0xffff, 0xffff), -1);
     }
 
