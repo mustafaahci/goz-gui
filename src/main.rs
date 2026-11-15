@@ -78,7 +78,6 @@ mod tray;
 mod typeahead;
 mod typeinfo;
 mod view;
-mod wide;
 mod win;
 mod window;
 mod zoom;
