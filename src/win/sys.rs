@@ -6,7 +6,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_FROM_FLAGS, MONITORINFO, MonitorFromPoint, MonitorFromRect,
     MonitorFromWindow,
 };
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW, MessageBeep,
+};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::HiDpi::{
@@ -16,8 +18,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetDoubleClickTime, GetKeyState,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetMessagePos, GetSystemMetrics, HCURSOR, LoadCursorW, MESSAGEBOX_STYLE,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_METRICS_INDEX, SetCursor,
+    GetCursorPos, GetMessagePos, GetMessageTime, GetSystemMetrics, HCURSOR, LoadCursorW,
+    MESSAGEBOX_STYLE, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_METRICS_INDEX, SetCursor,
 };
 
 use windows_sys::Win32::Foundation::HWND;
@@ -93,6 +95,13 @@ pub fn message_pos() -> POINT {
     }
 }
 
+/// When the message this thread took last was posted (GetMessageTime), in
+/// ms since the system started (it wraps).
+pub fn message_time() -> u32 {
+    // SAFETY: no pointers.
+    unsafe { GetMessageTime() as u32 }
+}
+
 /// One of the system's cursors (IDC_ARROW…); null for anything else.
 pub fn system_cursor(id: windows_sys::core::PCWSTR) -> HCURSOR {
     // A system cursor's id travels as the pointer's address
@@ -154,6 +163,25 @@ pub fn tick_ms() -> u64 {
 pub fn last_error() -> u32 {
     // SAFETY: no pointers.
     unsafe { GetLastError() }
+}
+
+/// The system's text for error `code` (FormatMessageW from the system, no
+/// inserts) as it gives it, at most 511 units; empty when it has none.
+pub fn error_message(code: u32) -> String {
+    let mut buf = [0u16; 512];
+    // SAFETY: the buffer and its length in units; no inserts are read.
+    let n = unsafe {
+        FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            core::ptr::null(),
+            code,
+            0,
+            buf.as_mut_ptr(),
+            super::len_u32(buf.len()),
+            core::ptr::null(),
+        )
+    };
+    String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())])
 }
 
 /// This process's id.

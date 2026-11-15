@@ -7,10 +7,11 @@
 
 use windows_sys::Win32::Foundation::{HANDLE, HWND, LRESULT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ACCEL, CreateAcceleratorTableW, DestroyAcceleratorTable, DispatchMessageW, GetInputState,
-    GetMessageW, HACCEL, IsDialogMessageW, MSG, MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS,
-    MsgWaitForMultipleObjectsEx, PEEK_MESSAGE_REMOVE_TYPE, PeekMessageW, PostQuitMessage,
-    PostThreadMessageW, QUEUE_STATUS_FLAGS, TranslateAcceleratorW, TranslateMessage,
+    ACCEL, CopyAcceleratorTableW, CreateAcceleratorTableW, DestroyAcceleratorTable,
+    DispatchMessageW, GetInputState, GetMessageW, HACCEL, IsDialogMessageW, MSG,
+    MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, MsgWaitForMultipleObjectsEx, PEEK_MESSAGE_REMOVE_TYPE,
+    PeekMessageW, PostQuitMessage, PostThreadMessageW, QUEUE_STATUS_FLAGS, TranslateAcceleratorW,
+    TranslateMessage,
 };
 
 use super::sync::Event;
@@ -111,6 +112,17 @@ impl AccelTable {
         // SAFETY: the entries and their count.
         let h = unsafe { CreateAcceleratorTableW(entries.as_ptr(), super::len_i32(entries.len())) };
         (!h.is_null()).then_some(AccelTable(h))
+    }
+
+    /// A copy of its entries.
+    pub fn entries(&self) -> Vec<ACCEL> {
+        // SAFETY: no buffer: asks for the count.
+        let n = unsafe { CopyAcceleratorTableW(self.0, core::ptr::null_mut(), 0) }.max(0);
+        let mut entries = vec![ACCEL::default(); n as usize];
+        // SAFETY: a buffer of `n` entries, the count passed.
+        let got = unsafe { CopyAcceleratorTableW(self.0, entries.as_mut_ptr(), n) }.max(0);
+        entries.truncate(got as usize);
+        entries
     }
 
     /// The table's handle, for [`translate_accelerator`] (it stays this

@@ -6,9 +6,10 @@
 use core::marker::PhantomData;
 
 use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoInitializeEx,
-    CoUninitialize,
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
+    CoFreeUnusedLibrariesEx, CoInitializeEx, CoUninitialize,
 };
+use windows_sys::Win32::System::Ole::OleInitialize;
 
 /// This thread's COM apartment, uninitialized when it drops. Not `Send`: it
 /// belongs to the thread that made it.
@@ -34,6 +35,26 @@ impl Apartment {
     pub fn keep(self) {
         core::mem::forget(self);
     }
+
+    /// Ends the apartment, first unloading the in-process COM servers it
+    /// loaded that say they can go (CoFreeUnusedLibrariesEx, each asked by
+    /// its DllCanUnloadNow) at once, rather than ten minutes after they
+    /// last served. For a thread whose objects are all released: a server
+    /// that still has one says so, and stays.
+    pub fn end_unloading_unused(self) {
+        // SAFETY: no pointers. A library is unloaded only once its
+        // DllCanUnloadNow says nothing of it is in use, and the trust model
+        // (`win`'s documentation) takes that answer as true.
+        unsafe { CoFreeUnusedLibrariesEx(0, 0) };
+        drop(self);
+    }
+}
+
+/// Initialises OLE on this thread (OleInitialize, an STA's, never
+/// uninitialized: it stays for the thread's life); whether it is.
+pub fn ole_initialize() -> bool {
+    // SAFETY: the reserved pointer is null.
+    unsafe { OleInitialize(core::ptr::null()) >= 0 }
 }
 
 /// Initializes COM on this thread as a single-threaded apartment with OLE

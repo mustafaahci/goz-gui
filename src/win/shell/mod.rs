@@ -1,7 +1,8 @@
-//! The shell: its items and item ID lists, the common item dialogs, file
-//! operations and their progress, shortcuts, property stores and the
-//! taskbar's jump list, known folders, ShellExecute, and a few shell calls
-//! that take or give memory of its own.
+//! The shell: its items, item ID lists and folders, the Explorer context
+//! menu, data objects and dragging them, item images, the common item
+//! dialogs, file operations and their progress, shortcuts, property stores
+//! and the taskbar's jump list, known folders, associations, ShellExecute,
+//! and a few shell calls that take or give memory of its own.
 //!
 //! Each COM object is owned by a wrapper that releases it when it drops,
 //! and reached only through the wrapper's methods, which build every
@@ -9,32 +10,36 @@
 //! allocates. They are made on a thread with COM (`win::com::Apartment`;
 //! making one fails without), and stay on it: no wrapper is `Send`.
 
+mod data;
 mod dialog;
 mod fileop;
 mod link;
+mod menu;
+mod pidl;
 
+pub use data::{DataObject, flush_clipboard};
 pub use dialog::{Customize, FileDialog};
 pub use fileop::{FileOperation, ItemOp, ProgressSink};
 pub use link::{JumpList, ObjectArray, ObjectCollection, PropertyStore, ShellLink, save_shortcut};
+pub use menu::ShellMenu;
+pub use pidl::{Folder, Pidl, open_folder_and_select};
 
-use core::ptr::NonNull;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 
+use windows::Win32::Foundation::SIZE;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    BHID_SFUIObject, IExtractIconW, IShellItem, IShellItemArray, SHCreateItemFromParsingName,
-    SIGDN, SIGDN_FILESYSPATH, SetCurrentProcessExplicitAppUserModelID,
+    BHID_SFUIObject, IExtractIconW, IShellItem, IShellItemArray, IShellItemImageFactory,
+    SHCreateItemFromParsingName, SIGDN, SIGDN_FILESYSPATH, SIIGBF,
+    SetCurrentProcessExplicitAppUserModelID,
 };
 use windows::core::{PCWSTR, PWSTR, Result};
 use windows_sys::Win32::Foundation::{HWND, LocalFree};
-use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows_sys::Win32::UI::Shell::{
-    CommandLineToArgvW, ILClone, ILCreateFromPathW, ILFindChild, ILFindLastID, ILFree, ILIsEqual,
-    ILIsParent, ILRemoveLastID, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHARD_PATHW,
-    SHAddToRecentDocs, SHCreateDataObject, SHELLEXECUTEINFOW, SHELLFLAGSTATE, SHELLSTATEA,
-    SHFILEINFOW, SHGFI_FLAGS, SHGFI_PIDL, SHGetFileInfoW, SHGetSetSettings, SHGetSettings,
-    SHMultiFileProperties, SHOP_FILEPATH, SHObjectProperties, SHOpenFolderAndSelectItems, SSF_MASK,
-    ShellExecuteExW,
+    ASSOCF_NONE, ASSOCSTR_SHELLEXTENSION, AssocQueryStringW, CommandLineToArgvW, SEE_MASK_NOASYNC,
+    SEE_MASK_NOCLOSEPROCESS, SHARD_PATHW, SHAddToRecentDocs, SHELLEXECUTEINFOW, SHELLFLAGSTATE,
+    SHELLSTATEA, SHFILEINFOW, SHGFI_FLAGS, SHGFI_PIDL, SHGetFileInfoW, SHGetSetSettings,
+    SHGetSettings, SHOP_FILEPATH, SHObjectProperties, SSF_MASK, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::Shell::{
     NIF_MESSAGE, NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW, Shell_NotifyIconW,
@@ -42,6 +47,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{SHOW_WINDOW_CMD, WM_APP};
 use windows_sys::core::GUID;
 
+use super::gdi;
 use super::icon::Icon;
 use super::msg::APP_END;
 use super::process::Process;
@@ -100,7 +106,7 @@ pub fn notify_associations_changed() {
 }
 
 /// A shell item: a file or folder as the shell sees it.
-pub struct ShellItem(IShellItem);
+pub struct ShellItem(pub(in crate::win) IShellItem);
 
 impl ShellItem {
     /// The item at `path` (a path, or another name the shell parses);
@@ -137,6 +143,30 @@ impl ShellItem {
         }
         .ok()
         .map(ExtractIcon)
+    }
+}
+
+/// The shell's image maker for an item (IShellItemImageFactory).
+pub struct ImageFactory(IShellItemImageFactory);
+
+impl ImageFactory {
+    /// The one of the item at `path` (SHCreateItemFromParsingName); `None`
+    /// when there is no such item.
+    pub fn of_path(path: &[u16]) -> Option<ImageFactory> {
+        let path = nul_ended(path);
+        // SAFETY: a NUL-terminated path read during the call; no bind
+        // context.
+        unsafe { SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None) }
+            .ok()
+            .map(ImageFactory)
+    }
+
+    /// Its image, at most `side` pixels square, as SIIGBF_* `flags` ask
+    /// (GetImage): a bitmap now the caller's.
+    pub fn image(&self, side: i32, flags: SIIGBF) -> Result<gdi::Owned> {
+        // SAFETY: no pointers in; the bitmap comes back the caller's.
+        let made = unsafe { self.0.GetImage(SIZE { cx: side, cy: side }, flags) }?;
+        Ok(gdi::Owned::new(made.0))
     }
 }
 
@@ -216,6 +246,28 @@ pub fn file_info(path: &[u16], attributes: u32, flags: SHGFI_FLAGS) -> (usize, S
     (answer, info)
 }
 
+/// The shell extension registered for `assoc` (an extension with its dot)
+/// as interface `iid` (`{…}`), through its type and perceived type
+/// (AssocQueryStringW, ASSOCSTR_SHELLEXTENSION): its class id as text, up
+/// to 63 units; `None` when there is none.
+pub fn assoc_shell_extension(assoc: &[u16], iid: &str) -> Option<Vec<u16>> {
+    let (assoc, iid) = (nul_ended(assoc), wz(iid));
+    let mut buf = [0u16; 64];
+    let mut len = len_u32(buf.len());
+    // SAFETY: NUL-terminated strings; the buffer with its length in units.
+    let hr = unsafe {
+        AssocQueryStringW(
+            ASSOCF_NONE,
+            ASSOCSTR_SHELLEXTENSION,
+            assoc.as_ptr(),
+            iid.as_ptr(),
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    (hr == 0).then(|| until_nul(&buf).to_vec())
+}
+
 /// The shell's settings `mask` asks for (SHGetSettings, SSF_*).
 pub fn settings(mask: SSF_MASK) -> SHELLFLAGSTATE {
     let mut s = SHELLFLAGSTATE::default();
@@ -269,136 +321,6 @@ pub fn object_properties(hwnd: HWND, path: &[u16]) -> bool {
     let path = nul_ended(path);
     // SAFETY: a NUL-terminated path; no page named.
     unsafe { SHObjectProperties(hwnd, SHOP_FILEPATH as u32, path.as_ptr(), core::ptr::null()) != 0 }
-}
-
-/// An item ID list the shell made (an absolute PIDL), freed when this
-/// drops.
-pub struct Pidl(NonNull<ITEMIDLIST>);
-
-impl Pidl {
-    /// The item at `path` (ILCreateFromPathW, which may read the disk);
-    /// `None` if there is none.
-    pub fn from_path(path: &[u16]) -> Option<Pidl> {
-        let path = nul_ended(path);
-        // SAFETY: a NUL-terminated path; the list made is this one's.
-        NonNull::new(unsafe { ILCreateFromPathW(path.as_ptr()) }).map(Pidl)
-    }
-
-    fn ptr(&self) -> *const ITEMIDLIST {
-        self.0.as_ptr()
-    }
-
-    /// A copy (ILClone); `None` if there was no memory for it.
-    pub fn try_clone(&self) -> Option<Pidl> {
-        // SAFETY: a valid list; the copy is the new one's.
-        NonNull::new(unsafe { ILClone(self.ptr()) }).map(Pidl)
-    }
-
-    /// Takes its last ID off, making it its parent's; false at the
-    /// desktop's (empty) list, which has none.
-    pub fn remove_last_id(&mut self) -> bool {
-        // SAFETY: a valid list of this one's, shortened in place.
-        unsafe { ILRemoveLastID(self.0.as_ptr()) != 0 }
-    }
-
-    /// Whether it holds `child` (`immediate`: directly).
-    pub fn is_parent_of(&self, child: &Pidl, immediate: bool) -> bool {
-        // SAFETY: two valid lists, read during the call.
-        unsafe { ILIsParent(self.ptr(), child.ptr(), immediate.into()) != 0 }
-    }
-
-    /// Whether it is the same item as `other`.
-    pub fn is_equal(&self, other: &Pidl) -> bool {
-        // SAFETY: two valid lists, read during the call.
-        unsafe { ILIsEqual(self.ptr(), other.ptr()) != 0 }
-    }
-}
-
-impl Drop for Pidl {
-    fn drop(&mut self) {
-        // SAFETY: the list this owns, freed once.
-        unsafe { ILFree(self.ptr()) };
-    }
-}
-
-/// Opens `folder` in Explorer with `items` (items in it) selected, by
-/// their last IDs; with none, opens `folder`'s own folder with `folder`
-/// selected (SHOpenFolderAndSelectItems).
-pub fn open_folder_and_select(folder: &Pidl, items: &[&Pidl]) -> bool {
-    // SAFETY: each item's last ID points into that item's list, which
-    // outlives the call.
-    let children: Vec<*const ITEMIDLIST> = items
-        .iter()
-        .map(|p| unsafe { ILFindLastID(p.ptr()) }.cast_const())
-        .collect();
-    let array = if children.is_empty() {
-        core::ptr::null()
-    } else {
-        children.as_ptr()
-    };
-    // SAFETY: a valid list and `children.len()` relative IDs, all alive for
-    // the call.
-    unsafe { SHOpenFolderAndSelectItems(folder.ptr(), len_u32(children.len()), array, 0) >= 0 }
-}
-
-/// IDataObject's interface id.
-const IID_IDATA_OBJECT: GUID = GUID::from_u128(0x0000010e_0000_0000_c000_000000000046);
-
-/// A data object the shell made of items (IDataObject), released when this
-/// drops. It belongs to this thread's apartment (it is not `Send`).
-pub struct DataObject(NonNull<core::ffi::c_void>);
-
-impl DataObject {
-    /// A data object of `items`, each held by `folder`, as children of it
-    /// (SHCreateDataObject, which copies what it keeps); `None` if one of
-    /// them is not under `folder`, or the shell made none.
-    pub fn of_children(folder: &Pidl, items: &[&Pidl]) -> Option<DataObject> {
-        let mut children: Vec<*const ITEMIDLIST> = Vec::with_capacity(items.len());
-        for item in items {
-            // SAFETY: two valid lists; the child points into `item`'s,
-            // which outlives its use below.
-            let child = unsafe { ILFindChild(folder.ptr(), item.ptr()) };
-            if child.is_null() {
-                return None;
-            }
-            children.push(child.cast_const());
-        }
-        let mut data = core::ptr::null_mut();
-        // SAFETY: a valid folder and `children.len()` children of it, alive
-        // for the call; no inner object; the interface id and an out-pointer
-        // for an IDataObject, whose reference is this one's.
-        let hr = unsafe {
-            SHCreateDataObject(
-                folder.ptr(),
-                len_u32(children.len()),
-                children.as_ptr(),
-                core::ptr::null_mut(),
-                &IID_IDATA_OBJECT,
-                &mut data,
-            )
-        };
-        if hr < 0 {
-            return None;
-        }
-        NonNull::new(data).map(DataObject)
-    }
-
-    /// Shows the shell's Properties for its items (SHMultiFileProperties):
-    /// one sheet for them all, which takes its own reference.
-    pub fn show_properties(&self) -> bool {
-        // SAFETY: a live IDataObject this holds a reference to.
-        unsafe { SHMultiFileProperties(self.0.as_ptr(), 0) >= 0 }
-    }
-}
-
-impl Drop for DataObject {
-    fn drop(&mut self) {
-        // SAFETY: the reference this holds, given up once (IUnknown's
-        // Release, by the interface's drop).
-        drop(unsafe {
-            <windows_core::IUnknown as windows_core::Interface>::from_raw(self.0.as_ptr())
-        });
-    }
 }
 
 /// What [`execute`] runs, and how.
@@ -504,10 +426,16 @@ mod tests {
             Some(r"c:\windows")
         );
         let a = Pidl::from_path(&wz(r"C:\Windows")).unwrap();
-        let mut b = Pidl::from_path(&wz(r"C:\Windows\System32")).unwrap();
+        let b = Pidl::from_path(&wz(r"C:\Windows\System32")).unwrap();
         assert!(a.is_parent_of(&b, true));
-        assert!(b.remove_last_id());
-        assert!(a.is_equal(&b) && a.try_clone().is_some_and(|c| c.is_equal(&a)));
+        assert!(b.parent().is_some_and(|p| p.is_equal(&a)));
+        assert!(a.try_clone().is_some_and(|c| c.is_equal(&a)));
+        assert!(!a.is_empty() && a.join(&a).is_some());
+        assert_eq!(
+            b.path()
+                .map(|p| String::from_utf16_lossy(&p).to_lowercase()),
+            Some(r"c:\windows\system32".into())
+        );
     }
 
     #[test]

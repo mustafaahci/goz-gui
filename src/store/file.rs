@@ -155,7 +155,7 @@ fn retrying<T>(
 fn refuses_for_good(path: &[u16]) -> bool {
     // A missing file has none.
     win::file::attributes(path)
-        .is_some_and(|a| a & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY) != 0)
+        .is_ok_and(|a| a & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY) != 0)
 }
 
 /// Renames `from` over `to` in one step, through to the disk; tried again

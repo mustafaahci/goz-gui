@@ -37,6 +37,7 @@
 // Until the whole crate is on this module, some of it is not used yet.
 #![allow(dead_code, unused_imports)]
 
+pub mod a11y;
 pub mod button;
 pub mod class;
 pub mod clipboard;
@@ -61,6 +62,7 @@ pub mod menu;
 pub mod menubar;
 pub mod msg;
 pub mod parcel;
+pub mod preview;
 pub mod process;
 pub mod queue;
 pub mod reg;
@@ -76,9 +78,8 @@ pub mod tip;
 pub mod trackbar;
 pub mod tv;
 pub mod uxtheme;
+pub mod wic;
 pub mod wnd;
-
-pub mod ext;
 
 #[cfg(test)]
 mod trampolines_tests;

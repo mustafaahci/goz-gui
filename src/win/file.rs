@@ -19,13 +19,18 @@ use windows_sys::Win32::UI::Shell::PathCreateFromUrlW;
 
 use super::{len_u32, nul_ended};
 
-/// The attributes of the file at `path` (GetFileAttributesW); `None` when
-/// there is nothing there or they cannot be read.
-pub fn attributes(path: &[u16]) -> Option<u32> {
+/// The attributes of the file or folder at `path` (GetFileAttributesW,
+/// FILE_ATTRIBUTE_*); the system's error code when there is nothing there
+/// or they cannot be read.
+pub fn attributes(path: &[u16]) -> Result<u32, u32> {
     let path = nul_ended(path);
     // SAFETY: a NUL-terminated path, read during the call.
     let a = unsafe { GetFileAttributesW(path.as_ptr()) };
-    (a != INVALID_FILE_ATTRIBUTES).then_some(a)
+    if a == INVALID_FILE_ATTRIBUTES {
+        Err(super::sys::last_error())
+    } else {
+        Ok(a)
+    }
 }
 
 /// Sets the attributes of the file at `path`; false if it could not.
@@ -316,7 +321,7 @@ mod tests {
         assert!(attribute_data(&file).is_some_and(|d| d.dwFileAttributes & 1 != 0));
         assert!(set_attributes(&file, attrs));
         assert!(delete(&file));
-        assert!(attributes(&file).is_none());
+        assert!(attributes(&file).is_err());
         let _ = std::fs::remove_dir_all(&base);
         let mut missing = pattern.clone();
         missing.truncate(missing.len() - 1);

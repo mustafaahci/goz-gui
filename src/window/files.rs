@@ -172,7 +172,7 @@ fn all_gone(paths: &[Vec<u16>]) -> bool {
 
 /// The file system's attributes of `path`; `None` when it is gone.
 fn attributes(path: &[u16]) -> Option<u32> {
-    win::file::attributes(path)
+    win::file::attributes(path).ok()
 }
 
 fn is_dir(path: &[u16]) -> bool {

@@ -31,7 +31,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLORONCOLOR,
     DEFAULT_CHARSET, DT_CALCRECT, DT_CENTER, DT_EDITCONTROL, DT_END_ELLIPSIS, DT_NOPREFIX,
@@ -55,7 +55,6 @@ use crate::paint::fill;
 use crate::pane::{PaneContent, PaneEvent, PaneSpec};
 use crate::theme::Ink;
 use crate::win::class::{self, Class, Create};
-use crate::win::ext::b7;
 use crate::win::gdi::{self, MemDc, Selected};
 use crate::win::{self, Msg, edit, lv, sys};
 use crate::window::App;
@@ -196,7 +195,7 @@ fn retire_host(host: HWND) {
         worker::note("host destroyed");
         return;
     }
-    b7::set_parent(host, HWND_MESSAGE);
+    win::set_parent(host, HWND_MESSAGE);
     GRAVEYARD.with(|g| g.borrow_mut().push(host as usize));
     worker::note("host parked");
 }
@@ -952,8 +951,8 @@ fn scale(hdc: HDC, image: &Decoded, w: i32, h: i32, bg: u32, smooth: bool) -> Op
         drop(pixels);
         old
     };
-    b7::set_stretch_blt_mode(dst.hdc(), if smooth { HALFTONE } else { COLORONCOLOR });
-    b7::set_brush_org(dst.hdc(), 0, 0);
+    gdi::set_stretch_blt_mode(dst.hdc(), if smooth { HALFTONE } else { COLORONCOLOR });
+    gdi::set_brush_org(dst.hdc(), 0, 0);
     gdi::stretch_blt(
         dst.hdc(),
         (0, 0, w, h),
@@ -1147,8 +1146,9 @@ impl PaneContent for PreviewPane {
         false
     }
 
-    fn message(&self, app: &App, pane: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
-        match msg {
+    fn handle(&self, app: &App, pane: HWND, m: &Msg) -> Option<LRESULT> {
+        let (w, l) = (m.w, m.l);
+        match m.id {
             WM_TIMER => {
                 match w {
                     T_FOCUS => {
@@ -1199,7 +1199,7 @@ impl PaneContent for PreviewPane {
                 // The message's time and the system's double-click
                 // settings.
                 let (now, limit, dx, dy) = (
-                    b7::message_time(),
+                    sys::message_time(),
                     sys::double_click_ms(),
                     sys::metric(SM_CXDOUBLECLK) / 2,
                     sys::metric(SM_CYDOUBLECLK) / 2,

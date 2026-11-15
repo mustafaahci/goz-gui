@@ -11,14 +11,12 @@
 //! handler showing UI, a menu loop), so callers hold no `RefCell` borrow
 //! across them.
 //!
-//! The `windows` crate brings the interfaces; the rest of goz-gui stays on
-//! `windows-sys`, whose handles are the same pointers.
+//! The shell's objects are `crate::win::shell`'s wrappers.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use windows::Win32::System::Com::IDataObject;
 use windows::Win32::System::Ole::{
     DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
 };
@@ -26,14 +24,13 @@ use windows::Win32::UI::Shell::{
     CMF_CANRENAME, CMF_EXTENDEDVERBS, CMF_ITEMMENU, CMF_NORMAL, CMIC_MASK_CONTROL_DOWN,
     CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
     FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_RENAMEONCOLLISION, FOF_SILENT, FOFX_ADDUNDORECORD,
-    FOFX_RECYCLEONDELETE, IContextMenu, IShellFolder,
+    FOFX_RECYCLEONDELETE,
 };
-use windows::core::Interface;
 use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 
-use crate::win::Msg;
-use crate::win::ext::b7::{self, Pidl, ShellMenu};
+use crate::win::shell::{DataObject, Folder, Pidl, ShellLink, ShellMenu};
+use crate::win::{Msg, clipboard, com};
 
 thread_local! {
     /// OLE is initialised on this thread.
@@ -47,7 +44,7 @@ thread_local! {
 pub fn ole_ready() -> bool {
     if !OLE.get() {
         // On the UI thread, which is already an STA (as OLE wants).
-        OLE.set(b7::ole_initialize());
+        OLE.set(com::ole_initialize());
     }
     OLE.get()
 }
@@ -59,7 +56,7 @@ pub fn ole_done() {
     if OLE.get() {
         // OLE is initialised on this thread; with no data object of this
         // thread on the clipboard it does nothing.
-        b7::ole_flush_clipboard();
+        crate::win::shell::flush_clipboard();
     }
 }
 
@@ -88,7 +85,7 @@ fn split_parent(path: &[u16]) -> Option<(Vec<u16>, &[u16])> {
 /// A folder some items are in: its absolute ID list and the shell's folder.
 struct Dir {
     id: Pidl,
-    folder: IShellFolder,
+    folder: Folder,
 }
 
 /// The folders some items are in, each looked up once by path. A folder is
@@ -98,14 +95,14 @@ struct Dir {
 /// from the desktop for every item instead, which took about 1 ms an item in
 /// a folder some 12 levels deep (3 s for 3,000 rows); this takes some 40 µs.
 struct Dirs {
-    desktop: IShellFolder,
+    desktop: Folder,
     known: HashMap<Vec<u16>, Option<Rc<Dir>>>,
 }
 
 impl Dirs {
     fn new() -> Option<Dirs> {
         // COM is initialised on this thread (the UI thread's STA).
-        let desktop = b7::desktop_folder()?;
+        let desktop = Folder::desktop()?;
         Some(Dirs {
             desktop,
             known: HashMap::new(),
@@ -129,15 +126,15 @@ impl Dirs {
             let folder = if id.is_empty() {
                 self.desktop.clone()
             } else {
-                b7::bind_folder(&self.desktop, &id)?
+                self.desktop.bind(&id)?
             };
             return Some(Dir { id, folder });
         };
         let parent = self.get(&parent)?;
-        let child = parse_name(&parent.folder, name)?;
+        let child = parent.folder.parse(name)?;
         // The parent's absolute ID list and the child's relative to it; the
         // combined one is a copy owned by the new value.
-        let folder = b7::bind_folder(&parent.folder, &child)?;
+        let folder = parent.folder.bind(&child)?;
         let id = parent.id.join(&child)?;
         Some(Dir { id, folder })
     }
@@ -145,13 +142,7 @@ impl Dirs {
 
 /// The ID list of `path`, parsed whole from the desktop.
 fn id_of_path(path: &[u16]) -> Option<Pidl> {
-    Pidl::of_path(path)
-}
-
-/// The ID list, relative to `folder`, of the item `name` in it; `None` when
-/// it is not there (gone since the search).
-fn parse_name(folder: &IShellFolder, name: &[u16]) -> Option<Pidl> {
-    b7::parse_name(folder, name)
+    Pidl::from_path(path)
 }
 
 /// Some results as the shell knows them: the folder that holds them and
@@ -160,7 +151,7 @@ fn parse_name(folder: &IShellFolder, name: &[u16]) -> Option<Pidl> {
 /// item's absolute ID list (Everything's `single_parent_context_menu=0`),
 /// so the menu and the data object cover them all.
 pub struct Items {
-    folder: IShellFolder,
+    folder: Folder,
     /// Each item's ID list (relative to `folder` when one folder holds them
     /// all, else absolute).
     pidls: Vec<Pidl>,
@@ -192,7 +183,7 @@ impl Items {
                 let found = match split_parent(p) {
                     Some((parent, name)) => {
                         let dir = dirs.get(&parent)?;
-                        let child = parse_name(&dir.folder, name)?;
+                        let child = dir.folder.parse(name)?;
                         Found::In(dir, child)
                     }
                     None => Found::Whole(id_of_path(p)?),
@@ -245,9 +236,9 @@ impl Items {
         let parent = first.parent()?;
         let one_parent = pidls.iter().skip(1).all(|p| parent.is_parent_of(p, true));
         let folder = if one_parent {
-            b7::bind_to_parent(first)?
+            Folder::parent_of(first)?
         } else {
-            b7::desktop_folder()?
+            Folder::desktop()?
         };
         Some(Items {
             folder,
@@ -274,23 +265,17 @@ impl Items {
         self.one_parent
     }
 
-    /// One of the folder's UI objects for the items (a context menu, a
-    /// data object), owned by `owner`.
-    fn ui_object<T: Interface>(&self, owner: HWND) -> Option<T> {
-        b7::ui_object(&self.folder, owner, &self.pidls, self.last)
-    }
-
     /// The items' data object, as Explorer puts on the clipboard or drags:
     /// CF_HDROP, the Shell IDList Array, file names and the rest.
-    pub fn data_object(&self, owner: HWND) -> Option<IDataObject> {
-        self.ui_object(owner)
+    pub fn data_object(&self, owner: HWND) -> Option<DataObject> {
+        self.folder.data_object(owner, &self.pidls, self.last)
     }
 
     /// The items' Explorer context menu.
     pub fn context_menu(&self, owner: HWND) -> Option<ContextMenu> {
-        let menu: IContextMenu = self.ui_object(owner)?;
+        let menu = self.folder.context_menu(owner, &self.pidls, self.last)?;
         Some(ContextMenu {
-            menu: ShellMenu::new(menu),
+            menu,
             first: Cell::new(0),
         })
     }
@@ -370,17 +355,17 @@ pub fn fileop_flags(op: FileOp, silent: bool) -> u32 {
 /// allowing a copy, a move or a link. Returns once it is dropped or
 /// cancelled, with the effect the target reported (0: none, or a move the
 /// target made itself: see [`performed_effect`]).
-pub fn drag(owner: HWND, data: &IDataObject) -> u32 {
+pub fn drag(owner: HWND, data: &DataObject) -> u32 {
     let allowed = DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0;
     // A data object of this thread; the drag's loop pumps messages and the
     // caller holds no borrow across it.
-    b7::do_drag_drop(owner, data, allowed)
+    data.drag(owner, allowed)
 }
 
 /// The DROPEFFECT a drop target wrote back into `data` once it was done
 /// ("Performed DropEffect", or the "Logical Performed DropEffect" of an
 /// optimized move, which SHDoDragDrop reports as no effect); 0 if none.
-pub fn performed_effect(data: &IDataObject) -> u32 {
+pub fn performed_effect(data: &DataObject) -> u32 {
     ["Performed DropEffect", "Logical Performed DropEffect"]
         .iter()
         .filter_map(|name| get_effect(data, name))
@@ -401,27 +386,27 @@ pub fn source_deletes(effect: u32, performed: Option<u32>) -> bool {
 }
 
 /// The "Performed DropEffect" a drop target wrote back into `data`.
-pub fn performed(data: &IDataObject) -> Option<u32> {
+pub fn performed(data: &DataObject) -> Option<u32> {
     get_effect(data, "Performed DropEffect")
 }
 
 /// The registered clipboard format `name`.
 fn format(name: &str) -> u16 {
-    b7::register_clipboard_format(name) as u16
+    clipboard::register_format(name) as u16
 }
 
 /// A DROPEFFECT `data` holds as format `name`.
-fn get_effect(data: &IDataObject, name: &str) -> Option<u32> {
+fn get_effect(data: &DataObject, name: &str) -> Option<u32> {
     // The medium the object hands out is copied out, then released.
-    let bytes = b7::data_get(data, format(name))?;
+    let bytes = data.get(format(name))?;
     Some(u32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?))
 }
 
 /// Gives `data` the DROPEFFECT `effect` as format `name`; false if it
 /// would not take it.
-fn set_effect(data: &IDataObject, name: &str, effect: u32) -> bool {
+fn set_effect(data: &DataObject, name: &str, effect: u32) -> bool {
     // A block of 4 bytes, which the object owns once it takes it.
-    b7::data_set(data, format(name), &effect.to_ne_bytes())
+    data.set(format(name), &effect.to_ne_bytes())
 }
 
 /// What a paste that moved the files of a cut writes back into its data
@@ -450,7 +435,7 @@ const MOVED: [(&str, u32); 3] = [
 /// still the clipboard's, and only once none of the files is left
 /// (`crate::window`): never to whatever the user copied or cut since.
 pub struct Cut {
-    data: IDataObject,
+    data: DataObject,
     /// The clipboard's sequence number when its files were read.
     sequence: u32,
 }
@@ -466,7 +451,7 @@ impl Cut {
             return None;
         }
         // OLE is initialised on this thread.
-        let data = b7::ole_get_clipboard()?;
+        let data = DataObject::clipboard()?;
         (clipboard_sequence() == sequence).then_some(Cut { data, sequence })
     }
 
@@ -494,7 +479,7 @@ impl Cut {
 /// The clipboard's sequence number, which changes with whatever is put on
 /// it.
 fn clipboard_sequence() -> u32 {
-    b7::clipboard_sequence()
+    clipboard::sequence()
 }
 
 /// What the shortcut at `path` (a `.lnk`) points to, as a path; `None`
@@ -505,10 +490,8 @@ pub fn link_target(path: &[u16]) -> Option<Vec<u16>> {
     }
     // COM is initialised on this thread (OLE); the ID list is the link's
     // copy, freed here.
-    let link = b7::ShellLink::new()?;
-    if !link.load(path) {
-        return None;
-    }
+    let link = ShellLink::new().ok()?;
+    link.load(path).ok()?;
     link.id_list()?.path()
 }
 
@@ -582,6 +565,7 @@ impl ContextMenu {
 mod tests {
     use super::*;
     use crate::win::com::Apartment;
+    use crate::win::menu;
     use windows_sys::Win32::UI::WindowsAndMessaging::WM_INITMENUPOPUP;
 
     fn w(s: &str) -> Vec<u16> {
@@ -593,8 +577,8 @@ mod tests {
     }
 
     /// The files of a data object's CF_HDROP.
-    fn hdrop_files(data: &IDataObject) -> Vec<String> {
-        b7::data_files(data)
+    fn hdrop_files(data: &DataObject) -> Vec<String> {
+        data.files()
             .expect("CF_HDROP")
             .iter()
             .map(|f| String::from_utf16_lossy(f))
@@ -657,9 +641,9 @@ mod tests {
         assert!(one.one_parent());
         let menu = one.context_menu(core::ptr::null_mut()).expect("menu");
         // A popup menu of this thread, destroyed below.
-        let popup = b7::create_popup_menu();
+        let popup = menu::create_popup();
         assert!(menu.fill(popup, 0, 0x7000, 0x7fff, query_flags(false, false)));
-        b7::destroy_menu(popup);
+        menu::destroy(popup);
     }
 
     #[test]
@@ -770,9 +754,9 @@ mod tests {
 
         let menu = items.context_menu(core::ptr::null_mut()).expect("menu");
         // A popup menu of this thread, destroyed below.
-        let popup = b7::create_popup_menu();
+        let popup = menu::create_popup();
         assert!(menu.fill(popup, 0, 0x7000, 0x7fff, query_flags(false, false)));
-        let n = b7::menu_item_count(popup);
+        let n = menu::count(popup);
         assert!(n > 3, "the shell added {n} items");
         let verbs: Vec<String> = (0x7000..0x7100).filter_map(|id| menu.verb(id)).collect();
         for verb in ["copy", "properties"] {
@@ -789,11 +773,12 @@ mod tests {
         for pos in 0..n {
             // Reads and fills submenus of the menu made above, as the menu
             // loop would when each opens.
-            let sub = b7::sub_menu(popup, pos);
+            let sub = menu::item_info(popup, menu::By::Position(pos as u32))
+                .map_or(core::ptr::null_mut(), |i| i.submenu);
             if sub.is_null() {
                 continue;
             }
-            let before = b7::menu_item_count(sub);
+            let before = menu::count(sub);
             let opened = Msg::new(
                 core::ptr::null_mut(),
                 WM_INITMENUPOPUP,
@@ -801,7 +786,7 @@ mod tests {
                 pos as isize,
             );
             menu.message(&opened);
-            let after = b7::menu_item_count(sub);
+            let after = menu::count(sub);
             if after > before {
                 grew.push((pos, before, after));
             }
@@ -818,21 +803,23 @@ mod tests {
             );
         }
         // The menu made above.
-        b7::destroy_menu(popup);
+        menu::destroy(popup);
     }
 
     /// The names of the formats a data object offers.
-    fn format_names(data: &IDataObject) -> Vec<String> {
-        b7::data_formats(data)
+    fn format_names(data: &DataObject) -> Vec<String> {
+        data.formats()
             .into_iter()
-            .map(|cf| b7::clipboard_format_name(u32::from(cf)).unwrap_or_else(|| format!("#{cf}")))
+            .map(|cf| clipboard::format_name(u32::from(cf)).unwrap_or_else(|| format!("#{cf}")))
             .collect()
     }
 
     /// How many items a data object's Shell IDList Array holds (a CIDA,
     /// whose count comes first).
-    fn cida_count(data: &IDataObject) -> u32 {
-        let cida = b7::data_get(data, format("Shell IDList Array")).expect("Shell IDList Array");
+    fn cida_count(data: &DataObject) -> u32 {
+        let cida = data
+            .get(format("Shell IDList Array"))
+            .expect("Shell IDList Array");
         u32::from_ne_bytes(cida[..4].try_into().expect("a CIDA"))
     }
 
@@ -889,9 +876,7 @@ mod tests {
         let lnk = dir.join("to target.lnk");
         let (t, l) = (w(&target.to_string_lossy()), w(&lnk.to_string_lossy()));
         // COM is ready (OLE).
-        let link = b7::ShellLink::new().expect("link");
-        assert!(link.set_path(&t), "set path");
-        assert!(link.save(&l), "save");
+        crate::win::shell::save_shortcut(&t, None, &l).expect("saved");
         let got = link_target(&l).map(|p| String::from_utf16_lossy(&p));
         assert_eq!(got.as_deref(), Some(&*target.to_string_lossy()));
         assert_eq!(

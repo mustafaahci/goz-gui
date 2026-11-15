@@ -3,7 +3,7 @@
 use windows::Win32::Foundation::{HWND as WHWND, PROPERTYKEY};
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemAlloc, IPersistFile,
+    CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemAlloc, IPersistFile, STGM_READ,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::Common::{IObjectArray, IObjectCollection};
@@ -15,6 +15,7 @@ use windows::Win32::UI::Shell::{
 use windows::core::{Interface, PCWSTR, PWSTR, Result};
 use windows_sys::Win32::Foundation::HWND;
 
+use super::Pidl;
 use crate::win::{nul_ended, until_nul, wz};
 
 /// A string PROPVARIANT (VT_LPWSTR) holding a copy of `text`, for
@@ -84,6 +85,24 @@ impl ShellLink {
         // SAFETY: the shortcut this holds; a NUL-terminated string read
         // during the call.
         unsafe { self.0.SetPath(PCWSTR(path.as_ptr())) }
+    }
+
+    /// Reads the shortcut file at `path` (IPersistFile::Load, read only).
+    pub fn load(&self, path: &[u16]) -> Result<()> {
+        let file = self.0.cast::<IPersistFile>()?;
+        let path = nul_ended(path);
+        // SAFETY: the shortcut's interface; a NUL-terminated path read
+        // during the call.
+        unsafe { file.Load(PCWSTR(path.as_ptr()), STGM_READ) }
+    }
+
+    /// What it points to, as an absolute ID list (GetIDList); `None` when
+    /// it has none.
+    pub fn id_list(&self) -> Option<Pidl> {
+        // SAFETY: the shortcut this holds.
+        let list = unsafe { self.0.GetIDList() }.ok()?;
+        // SAFETY: the list GetIDList allocated for the caller (or null).
+        unsafe { Pidl::own(list.cast()) }
     }
 
     /// The command line it passes.

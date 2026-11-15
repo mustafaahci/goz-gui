@@ -30,13 +30,14 @@ use windows::Win32::UI::Shell::{SIIGBF_ICONONLY, SIIGBF_THUMBNAILONLY};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::HBITMAP;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
-use windows_sys::Win32::System::Registry::HKEY_CLASSES_ROOT;
 use windows_sys::Win32::System::Threading::INFINITE;
 
 use crate::win::com::Apartment;
-use crate::win::ext::b7::{self, ImageFactory};
+use crate::win::dib::{self, Section};
+use crate::win::reg::{self, Hive};
+use crate::win::shell::{self, ImageFactory};
 use crate::win::sync::Event;
-use crate::win::{gdi, parcel};
+use crate::win::{file, gdi, parcel};
 
 /// The shell extension interfaces of a thumbnail handler: `IThumbnailProvider`
 /// and the older `IExtractImage`.
@@ -58,22 +59,21 @@ const MAX_QUEUED: usize = 512;
 /// A 32-bit top-down DIB with premultiplied alpha, ready for `AlphaBlend`;
 /// deleted when dropped.
 pub struct Bitmap {
-    handle: usize,
+    section: Section,
     pub width: i32,
     pub height: i32,
 }
 
 impl Bitmap {
     pub fn handle(&self) -> HBITMAP {
-        self.handle as HBITMAP
+        self.section.handle()
     }
 
     /// A new `width` by `height` bitmap, all zero; `None` if it could not
     /// be made.
     fn new(width: i32, height: i32) -> Option<Bitmap> {
-        let made = b7::create_dib32(width, height);
-        (!made.is_null()).then_some(Bitmap {
-            handle: made as usize,
+        Section::new(width, height).map(|section| Bitmap {
+            section,
             width,
             height,
         })
@@ -91,25 +91,17 @@ impl Bitmap {
         let out = Bitmap::new(width, height)?;
         // A new DIB section is all zero, as this is.
         let mut pixels = vec![[0u8; 4]; width as usize * height as usize];
-        (fill(&mut pixels) && b7::dib_write(out.handle(), &pixels)).then_some(out)
+        (fill(&mut pixels) && out.section.set_pixels(&pixels)).then_some(out)
     }
 
     /// A copy of its pixels (top-down, premultiplied BGRA).
     #[cfg_attr(not(test), expect(dead_code, reason = "the tests read pixels back"))]
     pub fn pixels(&self) -> Option<Vec<[u8; 4]>> {
-        b7::dib_pixels(self.handle()).map(|(_, _, px)| px)
+        self.section.pixels()
     }
 
     fn cost(&self) -> usize {
         (self.width.max(0) as usize * self.height.max(0) as usize * 4).max(MIN_COST)
-    }
-}
-
-impl Drop for Bitmap {
-    fn drop(&mut self) {
-        // The bitmap is owned here and selected into no DC once its owner
-        // lets go of it (drawing borrows it).
-        gdi::delete_object(self.handle());
     }
 }
 
@@ -265,7 +257,7 @@ fn source_for(ext: &[u16], handled: impl FnOnce() -> bool) -> Source {
 fn has_thumbnail_handler(ext: &[u16]) -> bool {
     let mut dotted = vec![u16::from(b'.')];
     dotted.extend_from_slice(ext);
-    let assoc = |iid: &str| b7::assoc_shell_extension(&dotted, iid).is_some();
+    let assoc = |iid: &str| shell::assoc_shell_extension(&dotted, iid).is_some();
     if assoc(THUMBNAIL_PROVIDER) || assoc(EXTRACT_IMAGE) {
         return true;
     }
@@ -286,12 +278,13 @@ fn has_thumbnail_handler(ext: &[u16]) -> bool {
 /// The `PerceivedType` of extension key `dotted` (".png") under
 /// HKEY_CLASSES_ROOT.
 fn perceived_type(dotted: &[u16]) -> Option<Vec<u16>> {
-    b7::reg_string(HKEY_CLASSES_ROOT, dotted, "PerceivedType", 64).filter(|t| !t.is_empty())
+    reg::get_string_units(Hive::ClassesRoot, dotted, Some("PerceivedType"))
+        .filter(|t| !t.is_empty())
 }
 
 /// Whether key `path` exists under HKEY_CLASSES_ROOT.
 fn key_exists(path: &[u16]) -> bool {
-    b7::reg_key_exists(HKEY_CLASSES_ROOT, path)
+    reg::key_exists(Hive::ClassesRoot, path)
 }
 
 /// `path`'s extension, lower case, without its dot; empty with none.
@@ -519,7 +512,7 @@ fn thumb_thread(shared: &Shared) {
 /// `None` for the view to draw its type's icon. `sources` keeps what each
 /// extension's thumbnails are made from.
 fn make(path: &[u16], side: i32, sources: &mut HashMap<Vec<u16>, Source>) -> Option<Picture> {
-    let is_dir = b7::file_attributes(path).is_ok_and(|a| a & FILE_ATTRIBUTE_DIRECTORY != 0);
+    let is_dir = file::attributes(path).is_ok_and(|a| a & FILE_ATTRIBUTE_DIRECTORY != 0);
     let source = if is_dir {
         // A folder's picture shows what it holds.
         Source::Shell
@@ -572,9 +565,9 @@ pub fn premultiplied(src: HBITMAP) -> Option<Bitmap> {
     }
     let out = Bitmap::new(w, h)?;
     // Its pixels through the screen's DC, made right, then into the DIB.
-    let mut pixels = b7::bitmap_pixels(src, w, h)?;
+    let mut pixels = dib::bitmap_pixels(src, w, h)?;
     fix_alpha(&mut pixels);
-    b7::dib_write(out.handle(), &pixels).then_some(out)
+    out.section.set_pixels(&pixels).then_some(out)
 }
 
 /// Makes BGRA pixels premultiplied: all-zero alpha is opaque; a colour
@@ -756,9 +749,7 @@ mod tests {
         let link = |name: &str, to: &std::path::Path| {
             let lnk = w(&dir.join(name).to_string_lossy());
             // COM is ready (OLE).
-            let link = b7::ShellLink::new().expect("link");
-            assert!(link.set_path(&w(&to.to_string_lossy())), "set path");
-            assert!(link.save(&lnk), "save");
+            shell::save_shortcut(&w(&to.to_string_lossy()), None, &lnk).expect("saved");
             lnk
         };
         let to_picture = link("to picture.lnk", &picture);

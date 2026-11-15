@@ -5,7 +5,7 @@
 
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 use windows_sys::Win32::Globalization::{
-    COMPARESTRING_RESULT, CPINFO, CompareStringOrdinal, GetCPInfo, GetDateFormatEx,
+    COMPARESTRING_RESULT, CP_ACP, CPINFO, CompareStringOrdinal, GetCPInfo, GetDateFormatEx,
     GetLocaleInfoEx, GetTimeFormatEx, IsDBCSLeadByteEx, LCMAP_UPPERCASE, LCMapStringEx,
     LOCALE_NAME_INVARIANT, MultiByteToWideChar, NORM_FORM, NormalizeString, WideCharToMultiByte,
 };
@@ -122,6 +122,15 @@ pub fn multi_byte_to_wide(cp: u32, flags: u32, src: &[u8], out: &mut [u16]) -> u
         )
     };
     usize::try_from(n).unwrap_or(0)
+}
+
+/// `bytes` in the system's ANSI code page (MultiByteToWideChar, CP_ACP).
+pub fn ansi_to_wide(bytes: &[u8]) -> Vec<u16> {
+    // A code page character is never more UTF-16 units than bytes.
+    let mut out = vec![0u16; bytes.len()];
+    let n = multi_byte_to_wide(CP_ACP, 0, bytes, &mut out);
+    out.truncate(n);
+    out
 }
 
 /// What code page `cp` is (GetCPInfo); `None` if it is not one.

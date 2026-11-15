@@ -427,7 +427,7 @@ pub fn join(folder: &[u16], name: &[u16]) -> Vec<u16> {
 
 /// The attributes of `path`; `None` when there is nothing there.
 pub fn attributes(path: &[u16]) -> Option<u32> {
-    win::file::attributes(path)
+    win::file::attributes(path).ok()
 }
 
 fn exists(path: &[u16]) -> bool {

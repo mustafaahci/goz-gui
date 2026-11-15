@@ -22,16 +22,13 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{E_NOINTERFACE, REGDB_E_CLASSNOTREG};
 use windows::Win32::System::Com::{CLSCTX_ACTIVATE_32_BIT_SERVER, CLSCTX_LOCAL_SERVER};
-use windows::Win32::UI::Shell::{
-    IPreviewHandlerFrame, SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT, SIIGBF_THUMBNAILONLY,
-};
+use windows::Win32::UI::Shell::{SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT, SIIGBF_THUMBNAILONLY};
 use windows::core::GUID;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::LOGFONTW;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
 };
-use windows_sys::Win32::System::Registry::HKEY_CURRENT_USER;
 use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT, VK_TAB};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -45,10 +42,12 @@ use super::stream::FileStream;
 use super::text;
 use crate::thumbs::{Picture, premultiplied};
 use crate::win::com::Apartment;
-use crate::win::ext::b7::{self, ImageFactory, PreviewHandler};
-use crate::win::queue::{self, Woke};
+use crate::win::preview::{Frame as HandlerFrame, Handler as PreviewHandler};
+use crate::win::queue::{self, AccelTable, Woke};
+use crate::win::reg::{self, Hive};
+use crate::win::shell::{self, ImageFactory};
 use crate::win::sync::Event;
-use crate::win::sys;
+use crate::win::{file, locale, sys};
 
 /// What the pane asks to see.
 pub struct Request {
@@ -334,8 +333,8 @@ fn handlers_allowed(settings: &PreviewSettings) -> bool {
         Handlers::Always => true,
         Handlers::Never => false,
         Handlers::System => {
-            let data = b7::reg_dword(
-                HKEY_CURRENT_USER,
+            let data = reg::get_dword(
+                Hive::CurrentUser,
                 r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
                 "ShowPreviewHandlers",
             );
@@ -369,7 +368,7 @@ pub fn parse_guid(text: &str) -> Option<GUID> {
 
 /// The preview handler registered for extension `ext` (with its dot).
 fn handler_for(ext: &[u16]) -> Option<GUID> {
-    let text = b7::assoc_shell_extension(ext, PREVIEW_HANDLER)?;
+    let text = shell::assoc_shell_extension(ext, PREVIEW_HANDLER)?;
     parse_guid(&String::from_utf16_lossy(&text))
 }
 
@@ -417,7 +416,7 @@ fn log(what: &str, took: Duration, path: &[u16]) {
 
 /// The system's text for error `code`.
 fn error_text(code: u32) -> String {
-    let text = b7::error_message(code);
+    let text = sys::error_message(code);
     let text = text.trim();
     if text.is_empty() {
         format!("Error {code}.")
@@ -445,7 +444,7 @@ fn read_text(path: &[u16]) -> Option<Vec<u16>> {
 
 /// `bytes` in the system's ANSI code page.
 fn ansi(bytes: &[u8]) -> Vec<u16> {
-    b7::ansi_to_wide(bytes)
+    locale::ansi_to_wide(bytes)
 }
 
 /// A shell image of `path` `side` pixels square, premultiplied.
@@ -505,7 +504,7 @@ struct State<'a> {
     shared: &'a Shared,
     wic: Option<Wic>,
     handler: Option<Loaded>,
-    frame: Option<IPreviewHandlerFrame>,
+    frame: Option<HandlerFrame>,
     /// The content's size now.
     size: (i32, i32),
     /// The request shown last, for phases outside a request.
@@ -565,7 +564,7 @@ impl State<'_> {
 
     fn make(&mut self, r: &Request) -> Shown {
         let settings = self.shared.settings;
-        let attrs = match b7::file_attributes(&r.path) {
+        let attrs = match file::attributes(&r.path) {
             Ok(attrs) => attrs,
             Err(code) => return Shown::Failed(error_text(code)),
         };
@@ -705,14 +704,14 @@ impl State<'_> {
     }
 
     /// The frame preview handlers pass keys to.
-    fn frame(&mut self) -> Option<IPreviewHandlerFrame> {
+    fn frame(&mut self) -> Option<HandlerFrame> {
         if self.frame.is_none() {
             let frame = Rc::new(Frame {
                 main: self.shared.main,
                 keys: RefCell::new(Keys::new(crate::keymap::generation(), Accel::new())),
             });
             let context = Rc::clone(&frame);
-            self.frame = Some(b7::preview_frame(
+            self.frame = Some(HandlerFrame::new(
                 move || context.context(),
                 move |msg| frame.translate(msg),
             ));
@@ -824,7 +823,8 @@ fn initialize(handler: &PreviewHandler, path: &[u16]) -> windows::core::Result<I
 /// The keys a preview handler passes on to its frame: the window's
 /// shortcuts, and Tab and Shift+Tab leaving the handler.
 struct Accel {
-    handle: HACCEL,
+    /// The table of `entries`; `None` if Windows would not make it.
+    table: Option<AccelTable>,
     entries: Vec<ACCEL>,
 }
 
@@ -836,10 +836,11 @@ pub const TAB_BACK_OUT: u16 = crate::menu::F1_FIRST + 1;
 
 impl Accel {
     fn new() -> Accel {
-        let window = crate::keys::accelerators();
         // A copy of the window's table; the temporary table is destroyed.
-        let mut entries = b7::accel_entries(window);
-        b7::destroy_accel(window);
+        let mut entries = crate::keys::accelerators()
+            .as_ref()
+            .map(AccelTable::entries)
+            .unwrap_or_default();
         entries.push(ACCEL {
             fVirt: FVIRTKEY,
             key: VK_TAB,
@@ -851,8 +852,8 @@ impl Accel {
             cmd: TAB_BACK_OUT,
         });
         // Windows copies the entries.
-        let handle = b7::create_accel(&entries);
-        Accel { handle, entries }
+        let table = AccelTable::new(&entries);
+        Accel { table, entries }
     }
 }
 
@@ -888,15 +889,6 @@ impl Keys {
     }
 }
 
-impl Drop for Accel {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            // The table made in `new`, destroyed once.
-            b7::destroy_accel(self.handle);
-        }
-    }
-}
-
 /// The command `entries` give key `vk` with the modifiers held (`ctrl`,
 /// `shift`, `alt`), if any.
 pub fn command_for(entries: &[ACCEL], vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<u16> {
@@ -909,8 +901,8 @@ pub fn command_for(entries: &[ACCEL], vk: u16, ctrl: bool, shift: bool, alt: boo
         .map(|e| e.cmd)
 }
 
-/// goz-gui's side of a preview handler (the frame `win::ext::b7` makes
-/// of it): the keys the handler does not use come back here, and the
+/// goz-gui's side of a preview handler (the frame `win::preview::Frame`
+/// makes of it): the keys the handler does not use come back here, and the
 /// window's shortcuts among them go to the main window, so F6, Shift+Esc,
 /// Alt+P... work while the handler has the keyboard.
 struct Frame {
@@ -931,7 +923,11 @@ impl Frame {
     fn context(&self) -> (HACCEL, u32) {
         let mut keys = self.keys.borrow_mut();
         let accel = keys.at(crate::keymap::generation(), Accel::new);
-        (accel.handle, accel.entries.len() as u32)
+        let table = accel
+            .table
+            .as_ref()
+            .map_or(core::ptr::null_mut(), AccelTable::handle);
+        (table, accel.entries.len() as u32)
     }
 
     /// TranslateAccelerator: whether `msg` was one of the window's keys,
@@ -1033,8 +1029,7 @@ fn run(shared: &Shared) {
         // Every COM object of the thread is released above; the libraries
         // none uses any more (WIC's codecs, the shell's image makers) go at
         // once rather than in ten minutes, then COM ends on this thread.
-        b7::co_free_unused_libraries();
-        drop(apartment);
+        apartment.end_unloading_unused();
     }
     if shared.abandoned.load(Ordering::SeqCst) {
         HUNG.fetch_sub(1, Ordering::SeqCst);
@@ -1108,7 +1103,7 @@ mod tests {
         );
         // The window's own table, with Tab out added.
         let accel = Accel::new();
-        assert!(!accel.handle.is_null());
+        assert!(accel.table.is_some());
         assert_eq!(
             command_for(&accel.entries, VK_TAB, false, false, false),
             Some(TAB_OUT)
@@ -1128,7 +1123,7 @@ mod tests {
     #[test]
     fn the_frames_keys_follow_the_keyboard_page() {
         let table = |cmd: u16| Accel {
-            handle: core::ptr::null_mut(),
+            table: None,
             entries: vec![ACCEL {
                 fVirt: FVIRTKEY,
                 key: 0x76, // F7

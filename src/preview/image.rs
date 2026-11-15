@@ -9,13 +9,12 @@ use std::collections::HashSet;
 
 use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY};
 use windows::Win32::Graphics::Imaging::{
-    GUID_ContainerFormatIco, GUID_ContainerFormatJpeg, GUID_ContainerFormatTiff, IWICBitmapDecoder,
-    IWICBitmapFrameDecode, IWICBitmapSource, IWICImagingFactory,
+    GUID_ContainerFormatIco, GUID_ContainerFormatJpeg, GUID_ContainerFormatTiff,
 };
-use windows::core::{GUID, Interface};
+use windows::core::GUID;
 
 use crate::thumbs::Bitmap;
-use crate::win::ext::b7;
+use crate::win::wic::{Decoder, Factory, Frame};
 
 /// `size` drawn in `bounds`: as it is when it fits (or bigger, filling the
 /// bounds, with `enlarge`), else shrunk to fit; the aspect is kept and no
@@ -78,7 +77,7 @@ pub struct Decoded {
 
 /// WIC on the preview's thread (COM is initialized there).
 pub struct Wic {
-    factory: IWICImagingFactory,
+    factory: Factory,
     /// The extensions WIC's decoders take (`.jpg`, lower case), listed
     /// the first time they are asked for.
     extensions: Option<HashSet<Vec<u16>>>,
@@ -87,7 +86,7 @@ pub struct Wic {
 impl Wic {
     pub fn new() -> Option<Wic> {
         // WIC's factory is an in-process server.
-        let factory = b7::wic_factory()?;
+        let factory = Factory::new()?;
         Some(Wic {
             factory,
             extensions: None,
@@ -105,7 +104,7 @@ impl Wic {
 
     fn list_extensions(&self) -> HashSet<Vec<u16>> {
         let mut out = HashSet::new();
-        for text in b7::wic_decoder_extensions(&self.factory) {
+        for text in self.factory.decoder_extensions() {
             for ext in String::from_utf16_lossy(&text).split(',') {
                 let ext = ext.trim().to_lowercase();
                 if ext.starts_with('.') && ext.len() > 1 {
@@ -119,10 +118,10 @@ impl Wic {
     /// Decodes `path` into a box `side` pixels square (never bigger than
     /// the file's own size), upright.
     pub fn decode(&self, path: &[u16], side: i32) -> windows::core::Result<Decoded> {
-        let decoder = b7::wic_decoder(&self.factory, path)?;
-        let container = b7::wic_container(&decoder)?;
+        let decoder = self.factory.decoder(path)?;
+        let container = decoder.container()?;
         let frame = best_frame(&decoder, container)?;
-        let (w, h) = b7::wic_size(&frame)?;
+        let (w, h) = frame.size()?;
         if w == 0 || h == 0 || w > i32::MAX as u32 || h > i32::MAX as u32 {
             return Err(E_FAIL.into());
         }
@@ -135,14 +134,15 @@ impl Wic {
         };
         let shown = fit(upright, (side, side), false);
         let (tw, th) = if swaps(o) { (shown.1, shown.0) } else { shown };
-        let source: IWICBitmapSource = if (tw, th) == stored {
-            frame.cast()?
+        let source = if (tw, th) == stored {
+            frame.source()?
         } else {
-            b7::wic_scaler(&self.factory, &frame, tw as u32, th as u32)?.cast()?
+            self.factory
+                .scaled(&frame.source()?, tw as u32, th as u32)?
         };
-        let converter = b7::wic_pbgra(&self.factory, &source)?;
+        let converter = self.factory.pbgra(&source)?;
         let (w, h) = (tw as usize, th as usize);
-        let copy = |pixels: &mut [[u8; 4]]| b7::wic_copy_pixels(&converter, tw as u32, pixels);
+        let copy = |pixels: &mut [[u8; 4]]| converter.copy_pixels(tw as u32, pixels);
         // Whether no pixel is see-through, seen as they go into the bitmap.
         let mut opaque = false;
         let bitmap = if o <= 1 || o > 8 {
@@ -173,20 +173,17 @@ impl Wic {
 }
 
 /// The frame to show: the first, or of an icon file the biggest.
-fn best_frame(
-    decoder: &IWICBitmapDecoder,
-    container: GUID,
-) -> windows::core::Result<IWICBitmapFrameDecode> {
+fn best_frame(decoder: &Decoder, container: GUID) -> windows::core::Result<Frame> {
     if container != GUID_ContainerFormatIco {
-        return b7::wic_frame(decoder, 0);
+        return decoder.frame(0);
     }
-    let mut best = b7::wic_frame(decoder, 0)?;
+    let mut best = decoder.frame(0)?;
     let mut area = 0u64;
-    for i in 0..b7::wic_frame_count(decoder)?.min(64) {
-        let Ok(frame) = b7::wic_frame(decoder, i) else {
+    for i in 0..decoder.frame_count()?.min(64) {
+        let Ok(frame) = decoder.frame(i) else {
             continue;
         };
-        if let Ok((w, h)) = b7::wic_size(&frame)
+        if let Ok((w, h)) = frame.size()
             && u64::from(w) * u64::from(h) > area
         {
             area = u64::from(w) * u64::from(h);
@@ -199,7 +196,7 @@ fn best_frame(
 /// The EXIF orientation of a JPEG's or TIFF's frame (1, upright, when it
 /// has none); other formats carry their turn in their own data, which
 /// their decoders apply.
-fn orientation(frame: &IWICBitmapFrameDecode, container: GUID) -> u16 {
+fn orientation(frame: &Frame, container: GUID) -> u16 {
     let query = if container == GUID_ContainerFormatJpeg {
         "/app1/ifd/{ushort=274}"
     } else if container == GUID_ContainerFormatTiff {
@@ -207,7 +204,7 @@ fn orientation(frame: &IWICBitmapFrameDecode, container: GUID) -> u16 {
     } else {
         return 1;
     };
-    let o = b7::wic_metadata_u16(frame, query).unwrap_or(1);
+    let o = frame.metadata_u16(query).unwrap_or(1);
     if (1..=8).contains(&o) { o } else { 1 }
 }
 

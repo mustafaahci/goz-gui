@@ -3,16 +3,18 @@
 
 use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
-    RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW,
-    RegDeleteKeyW, RegDeleteTreeW, RegGetValueW, RegSetValueExW,
+    HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE,
+    REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW,
+    RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
 };
 
-use crate::win::wz;
+use crate::win::{wz, wz_units};
 
 /// A root key of the registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hive {
+    /// HKEY_CLASSES_ROOT.
+    ClassesRoot,
     /// HKEY_CURRENT_USER.
     CurrentUser,
     /// HKEY_LOCAL_MACHINE.
@@ -22,6 +24,7 @@ pub enum Hive {
 impl Hive {
     fn key(self) -> HKEY {
         match self {
+            Hive::ClassesRoot => HKEY_CLASSES_ROOT,
             Hive::CurrentUser => HKEY_CURRENT_USER,
             Hive::LocalMachine => HKEY_LOCAL_MACHINE,
         }
@@ -59,7 +62,14 @@ pub fn get_dword(hive: Hive, key: &str, value: &str) -> Option<u32> {
 /// The REG_SZ value `value` of `key` under `hive` (`None`: the key's
 /// default value); `None` if there is none.
 pub fn get_string(hive: Hive, key: &str, value: Option<&str>) -> Option<String> {
-    let key = wz(key);
+    let key: Vec<u16> = key.encode_utf16().collect();
+    get_string_units(hive, &key, value).map(|s| String::from_utf16_lossy(&s))
+}
+
+/// [`get_string`] of a key named in UTF-16 (a name need not be valid
+/// Unicode), the value as it is, up to its NUL.
+pub fn get_string_units(hive: Hive, key: &[u16], value: Option<&str>) -> Option<Vec<u16>> {
+    let key = wz_units(key);
     let value = value.map(wz);
     let mut buf = vec![0u16; 2048];
     // Twice more at most, for a value that grows while it is read.
@@ -88,7 +98,7 @@ pub fn get_string(hive: Hive, key: &str, value: Option<&str>) -> Option<String> 
         // The size counts the NUL.
         let len = (size as usize / 2).saturating_sub(1).min(buf.len());
         buf.truncate(len);
-        return Some(String::from_utf16_lossy(&buf));
+        return Some(buf);
     }
     None
 }
@@ -129,6 +139,21 @@ pub fn set_string(hive: Hive, key: &str, value: Option<&str>, data: &str) -> boo
         RegCloseKey(h);
         rc == ERROR_SUCCESS
     }
+}
+
+/// Whether `key` (named in UTF-16) is there under `hive` and can be
+/// opened for reading.
+pub fn key_exists(hive: Hive, key: &[u16]) -> bool {
+    let key = wz_units(key);
+    let mut h: HKEY = core::ptr::null_mut();
+    // SAFETY: a NUL-terminated name and an out-handle, closed at once.
+    unsafe {
+        if RegOpenKeyExW(hive.key(), key.as_ptr(), 0, KEY_READ, &mut h) != ERROR_SUCCESS {
+            return false;
+        }
+        RegCloseKey(h);
+    }
+    true
 }
 
 /// Deletes value `value` of `key` under `hive`; false if it could not

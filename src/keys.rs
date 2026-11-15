@@ -162,16 +162,10 @@ pub const LIST_KEYS: &[(u8, u16, u16)] = &[
 /// it renames in the list.
 pub const SEARCH_BOX_KEYS: &[(u8, u16, u16)] = &[(NONE, VK_F2, searchtools::ADVANCED_SEARCH)];
 
-/// An accelerator table of the window's shortcuts in force; whoever takes
-/// it destroys it.
-pub fn accelerators() -> HACCEL {
-    made().map_or(core::ptr::null_mut(), AccelTable::into_raw)
-}
-
-/// The table of the window's shortcuts in force (Windows copies them). An
-/// empty table cannot be made: `None`, whose null handle
-/// TranslateAccelerator takes as "no shortcuts".
-fn made() -> Option<AccelTable> {
+/// A table of the window's shortcuts in force (Windows copies them),
+/// destroyed as it drops. An empty table cannot be made: `None`, whose null
+/// handle TranslateAccelerator takes as "no shortcuts".
+pub fn accelerators() -> Option<AccelTable> {
     let current = keymap::current();
     let table: Vec<ACCEL> = current
         .global
@@ -198,7 +192,7 @@ pub fn table() -> HACCEL {
     TABLE.with_borrow_mut(|(table, made_for)| {
         if *made_for != generation {
             // The new one is made before the old one is destroyed.
-            *table = made();
+            *table = accelerators();
             *made_for = generation;
         }
         table

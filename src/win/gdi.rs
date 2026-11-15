@@ -16,7 +16,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     CreateBitmap, EnumFontFamiliesExW, GetPixel, GetTextColor, GetTextExtentExPointW, RoundRect,
-    SetDCPenColor, SetPixelV,
+    STRETCH_BLT_MODE, SetBrushOrgEx, SetDCPenColor, SetPixelV, SetStretchBltMode,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{DI_FLAGS, DestroyIcon, DrawIconEx, HICON};
 
@@ -594,6 +594,19 @@ pub fn bitmap_info(bmp: HBITMAP) -> Option<BITMAP> {
     // SAFETY: an out-struct and its size.
     let n = unsafe { GetObjectW(bmp, size_of::<BITMAP>() as i32, (&raw mut bm).cast()) };
     (n != 0).then_some(bm)
+}
+
+/// How the DC stretches bitmaps (HALFTONE, COLORONCOLOR…); the mode
+/// before.
+pub fn set_stretch_blt_mode(hdc: HDC, mode: STRETCH_BLT_MODE) -> i32 {
+    // SAFETY: no pointers.
+    unsafe { SetStretchBltMode(hdc, mode) }
+}
+
+/// Moves the DC's brush origin (the one before is not asked for).
+pub fn set_brush_org(hdc: HDC, x: i32, y: i32) {
+    // SAFETY: no out-point asked for.
+    unsafe { SetBrushOrgEx(hdc, x, y, core::ptr::null_mut()) };
 }
 
 /// Waits for this thread's GDI calls to finish.

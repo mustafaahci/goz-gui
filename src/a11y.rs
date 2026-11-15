@@ -5,7 +5,7 @@
 //!
 //! A window that has such parts answers WM_GETOBJECT for its client area
 //! with an `IAccessible` of its own that wraps the system's standard one
-//! (`win::ext::b7::AccessibleObject`): the window itself and its child
+//! (`win::a11y::AccessibleObject`): the window itself and its child
 //! windows (the search box, the results list and its header, a pane's
 //! tree or list, which have accessibility of their own) are the standard
 //! object's, and the painted parts are added after them as simple
@@ -18,7 +18,8 @@
 
 use windows_sys::Win32::Foundation::RECT;
 
-use crate::win::ext::b7::{AccessibleObject, Element, Elements};
+pub use crate::win::a11y::wants_client;
+use crate::win::a11y::{AccessibleObject, Element, Elements};
 
 /// MSAA roles (oleacc.h).
 pub const ROLE_PANE: u32 = 16;
@@ -34,8 +35,6 @@ pub const STATE_SELECTED: u32 = 0x2;
 pub const STATE_READONLY: u32 = 0x40;
 pub const STATE_HOTTRACKED: u32 = 0x80;
 pub const STATE_SELECTABLE: u32 = 0x20_0000;
-
-const OBJID_CLIENT: i32 = -4;
 
 /// What doing a part's default action does; the window runs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,23 +171,12 @@ impl Server {
     }
 }
 
-/// Whether WM_GETOBJECT's `l` asks for the client area.
-pub fn wants_client(l: isize) -> bool {
-    l as i32 == OBJID_CLIENT
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::win::ext::b7;
 
     #[test]
-    fn child_ids_read_from_variants() {
-        assert_eq!(b7::child_id(&b7::variant_i4(3)), Some(3));
-        assert_eq!(
-            b7::child_id(&windows::Win32::System::Variant::VARIANT::default()),
-            Some(0)
-        );
+    fn a_part_starts_plain() {
         let p = Part::new("Clear", ROLE_PUSHBUTTON, RECT::default());
         assert_eq!(p.state, 0);
         assert!(wants_client(-4));
