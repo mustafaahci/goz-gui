@@ -17,52 +17,42 @@
 //! Delete and F2 delete or rename the folder. Each change is made at once
 //! and the window writes the file.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Controls::{
     HTREEITEM, I_IMAGENONE, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVIS_FOCUSED,
-    LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE,
-    LVM_SETSELECTIONMARK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW,
+    LVIS_SELECTED, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW,
     LVN_ODSTATECHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
     LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS, LVSIL_SMALL, NM_CUSTOMDRAW,
-    NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN, NMTVKEYDOWN,
-    TVM_SETEXTENDEDSTYLE, TVM_SETIMAGELIST, TVN_KEYDOWN, TVN_SELCHANGEDW, TVS_EX_DOUBLEBUFFER,
-    TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS, TVSIL_NORMAL,
+    NM_DBLCLK, NMITEMACTIVATE, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN, NMTVKEYDOWN,
+    TVN_KEYDOWN, TVN_SELCHANGEDW, TVS_EX_DOUBLEBUFFER, TVS_HASBUTTONS, TVS_HASLINES,
+    TVS_LINESATROOT, TVS_SHOWSELALWAYS, TVSIL_NORMAL,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, IsWindowEnabled, VK_BACK, VK_CONTROL, VK_DELETE, VK_F2,
-};
-use windows_sys::Win32::UI::Shell::SetWindowSubclass;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_BACK, VK_CONTROL, VK_DELETE, VK_F2};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DWLP_MSGRESULT, EN_CHANGE, ES_AUTOHSCROLL, EndDialog, GWLP_USERDATA, GetClientRect,
-    GetWindowRect, IDCANCEL, IDOK, MINMAXINFO, MapDialogRect, MoveWindow, SetWindowLongPtrW,
-    WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SIZE,
-    WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
+    EN_CHANGE, ES_AUTOHSCROLL, IDCANCEL, IDOK, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO,
+    WM_INITDIALOG, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
 };
 
 use super::pick::{folder_name, pick_folder};
 use super::{
     Host, Icons, WM_REFRESH, ask, edit, enable, fill_tree, folder_name_problem, icons, inform,
-    item, send, set_text, tree_select, tree_selected, unique_name, warn,
+    tree_select, tree_selected, unique_name, warn,
 };
 use crate::bookmarks::ops::{Id, Op, Target};
 use crate::bookmarks::tree::{Item, TOP, Tree};
 use crate::bookmarks::{Bookmark, Bookmarks, FolderPath, Kind, one_line, same_path, within};
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common, fill_last_column,
-    list_custom_draw, state,
+    Class, Look, Template, apply_theme, center_on_owner, common_msg, fill_last_column,
+    list_custom_draw,
 };
 use crate::filedlg::{self, Check};
-use crate::history_dialogs::filter_proc;
+use crate::history_dialogs::filter_keys;
 use crate::places::{self, Which};
 use crate::store;
-use crate::wide::{window_text, wz};
+use crate::win::{self, Msg, Notify, View, dlg, lv, sys, tv};
 
 const STATIC: u16 = 0xffff;
 const ID_TREE: u16 = 100;
@@ -279,61 +269,41 @@ pub fn organize(owner: HWND, host: &dyn Host, look: Look) {
         WS_EX_CLIENTEDGE,
         (7, 7, 80, cy - 14),
     );
-    t.run(owner, Some(organize_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| organize_proc(&state, m));
 }
 
 impl Organize<'_> {
     fn list_view(dlg: HWND) -> HWND {
-        item(dlg, ID_LIST)
+        dlg::item(dlg, ID_LIST)
     }
 
     fn tree_view(dlg: HWND) -> HWND {
-        item(dlg, ID_TREE)
+        dlg::item(dlg, ID_TREE)
     }
 
     fn init(&self, dlg: HWND) {
         let list = Organize::list_view(dlg);
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
-        send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
-        send(
-            list,
-            LVM_SETIMAGELIST,
-            LVSIL_SMALL as usize,
-            self.icons.list,
-        );
+        lv::set_extended_style(list, ex, ex);
+        lv::set_image_list(list, LVSIL_SMALL, self.icons.list);
         let dpi = crate::custom::window_dpi(dlg) as i32;
         for (i, (title, width)) in COLUMNS.into_iter().enumerate() {
-            let mut text = wz(title);
             let col = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH,
                 cx: width * dpi / 96,
-                pszText: text.as_mut_ptr(),
-                // SAFETY: the rest of LVCOLUMNW is plain data.
-                ..unsafe { core::mem::zeroed() }
+                ..Default::default()
             };
-            send(list, LVM_INSERTCOLUMNW, i, (&raw const col) as isize);
+            lv::insert_column(list, i as i32, col, Some(title));
         }
         let tree = Organize::tree_view(dlg);
-        send(
-            tree,
-            TVM_SETIMAGELIST,
-            TVSIL_NORMAL as usize,
-            self.icons.list,
-        );
-        send(
-            tree,
-            TVM_SETEXTENDEDSTYLE,
-            TVS_EX_DOUBLEBUFFER as usize,
-            TVS_EX_DOUBLEBUFFER as isize,
-        );
-        // SAFETY: subclasses this thread's filter box; the list outlives it
-        // (both go with the dialog), and the subclass removes itself.
-        unsafe { SetWindowSubclass(item(dlg, ID_FILTER), Some(filter_proc), 1, list as usize) };
+        tv::set_image_list(tree, TVSIL_NORMAL, self.icons.list);
+        tv::set_extended_style(tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
+        // The list outlives the box (both go with the dialog), and the
+        // subclass goes with the box.
+        filter_keys(dlg::item(dlg, ID_FILTER), list);
         apply_theme(dlg, self.look.get().dark);
         center_on_owner(dlg);
-        let mut wr = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetWindowRect(dlg, &mut wr) };
+        let wr = win::window_rect(dlg);
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
         places::restore(dlg, Which::BookmarkOrganize, list, self.min.get());
         self.layout(dlg);
@@ -345,22 +315,19 @@ impl Organize<'_> {
     /// search box and the list taking the room, the buttons at the right.
     fn layout(&self, dlg: HWND) {
         let px = |x: i32, y: i32| {
-            let mut r = RECT {
-                left: 0,
-                top: 0,
-                right: x,
-                bottom: y,
-            };
-            // SAFETY: converts within this thread's dialog.
-            unsafe { MapDialogRect(dlg, &mut r) };
+            let r = dlg::map_rect(
+                dlg,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: x,
+                    bottom: y,
+                },
+            );
             (r.right, r.bottom)
         };
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's dialog and its DPI.
-        let dpi = unsafe {
-            GetClientRect(dlg, &mut rc);
-            crate::custom::window_dpi(dlg) as i32
-        };
+        let rc = win::client_rect(dlg);
+        let dpi = crate::custom::window_dpi(dlg) as i32;
         let (w, h) = (rc.right, rc.bottom);
         let (m, my) = px(7, 7);
         let (bw, bh) = px(56, 14);
@@ -370,10 +337,9 @@ impl Organize<'_> {
         let (_, label_y) = px(0, 9);
         let (_, label_h) = px(0, 8);
         let place = |id: u16, x: i32, y: i32, cw: i32, ch: i32| {
-            let hwnd = item(dlg, id);
+            let hwnd = dlg::item(dlg, id);
             if !hwnd.is_null() {
-                // SAFETY: moves a control of this thread's dialog.
-                unsafe { MoveWindow(hwnd, x, y, cw.max(0), ch.max(0), 1) };
+                win::move_window(hwnd, x, y, cw.max(0), ch.max(0), true);
             }
         };
         let tree_w = TREE_WIDTH * dpi / 96;
@@ -387,7 +353,7 @@ impl Organize<'_> {
         place(ID_LIST, lx, top, lw, h - my - top);
         // The Search column takes what the Name column leaves (again in
         // `reshow`, once the rows are in).
-        fill_last_column(item(dlg, ID_LIST));
+        fill_last_column(dlg::item(dlg, ID_LIST));
         for (id, _, y) in BUTTONS {
             place(id, bx, px(0, y).1, bw, bh);
         }
@@ -434,7 +400,7 @@ impl Organize<'_> {
 
     /// Shows the folder (or the search) with `keep` selected.
     fn reshow(&self, dlg: HWND, keep: Keep) {
-        let filter = window_text(item(dlg, ID_FILTER));
+        let filter = dlg::item_text(dlg, ID_FILTER);
         let (items, select) = {
             let list = self.list.borrow();
             let tree = self.tree.borrow();
@@ -469,30 +435,23 @@ impl Organize<'_> {
         // The list's notifications come back into this dialog: no borrow
         // is held from here on.
         let list = Organize::list_view(dlg);
-        send(list, LVM_SETITEMCOUNT, n, 0);
+        lv::set_item_count(list, n, 0);
         // The rows may have brought the vertical scroll bar (or taken it
         // away): the Search column fills what the list has now.
         fill_last_column(list);
-        let set = |row: usize, on: u32, mask: u32| {
-            let it = LVITEMW {
-                state: on,
-                stateMask: mask,
-                // SAFETY: the rest of LVITEMW is plain data.
-                ..unsafe { core::mem::zeroed() }
-            };
-            send(list, LVM_SETITEMSTATE, row, (&raw const it) as isize);
+        let set = |row: i32, on: u32, mask: u32| {
+            lv::set_item_state(list, row, on, mask);
         };
-        set(usize::MAX, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        set(-1, 0, LVIS_SELECTED | LVIS_FOCUSED);
         for &row in &select {
-            set(row, LVIS_SELECTED, LVIS_SELECTED);
+            set(row as i32, LVIS_SELECTED, LVIS_SELECTED);
         }
         if let Some(&first) = select.first() {
-            set(first, LVIS_FOCUSED, LVIS_FOCUSED);
-            send(list, LVM_SETSELECTIONMARK, 0, first as isize);
-            send(list, LVM_ENSUREVISIBLE, first, 0);
+            set(first as i32, LVIS_FOCUSED, LVIS_FOCUSED);
+            lv::set_selection_mark(list, first as i32);
+            lv::ensure_visible(list, first as i32, false);
         }
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(list, core::ptr::null(), 1) };
+        win::invalidate(list, None, true);
         self.update_buttons(dlg);
     }
 
@@ -500,14 +459,14 @@ impl Organize<'_> {
     fn selected(&self, dlg: HWND) -> Vec<Item> {
         let list = Organize::list_view(dlg);
         let mut rows = Vec::new();
-        let mut at = usize::MAX;
+        let mut at = -1;
         loop {
-            let next = send(list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize);
+            let next = lv::next_item(list, at, LVNI_SELECTED);
             let Ok(row) = usize::try_from(next) else {
                 break;
             };
             rows.push(row);
-            at = row;
+            at = next;
         }
         let shown = self.shown.borrow();
         rows.into_iter()
@@ -566,10 +525,9 @@ impl Organize<'_> {
         );
         enable(dlg, ID_EXPORT, !self.list.borrow().is_empty());
         // A button greyed while it had the keyboard hands it to the list.
-        // SAFETY: reads this thread's focus and one of its windows.
-        let focus = unsafe { GetFocus() };
-        if !focus.is_null() && unsafe { IsWindowEnabled(focus) } == 0 {
-            send(dlg, WM_NEXTDLGCTL, Organize::list_view(dlg) as usize, 1);
+        let focus = win::focus();
+        if !focus.is_null() && !win::is_enabled(focus) {
+            dlg::focus_ctl(dlg, Organize::list_view(dlg));
         }
     }
 
@@ -589,8 +547,8 @@ impl Organize<'_> {
     /// Shows folder `node` (a search is cleared).
     fn open_folder(&self, dlg: HWND, node: usize) {
         *self.folder.borrow_mut() = self.tree.borrow().nodes[node].path.clone();
-        if !window_text(item(dlg, ID_FILTER)).is_empty() {
-            set_text(item(dlg, ID_FILTER), "");
+        if !dlg::item_text(dlg, ID_FILTER).is_empty() {
+            win::set_text(dlg::item(dlg, ID_FILTER), "");
         }
         let view = Organize::tree_view(dlg);
         self.filling.set(true);
@@ -600,8 +558,8 @@ impl Organize<'_> {
     }
 
     fn clear_search(&self, dlg: HWND) {
-        if !window_text(item(dlg, ID_FILTER)).is_empty() {
-            set_text(item(dlg, ID_FILTER), "");
+        if !dlg::item_text(dlg, ID_FILTER).is_empty() {
+            win::set_text(dlg::item(dlg, ID_FILTER), "");
         }
     }
 
@@ -700,13 +658,8 @@ impl Organize<'_> {
             let tree = self.tree.borrow();
             delete_question(&list, &tree, items)
         };
-        let first = usize::try_from(send(
-            Organize::list_view(dlg),
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_SELECTED as isize,
-        ))
-        .ok();
+        let first =
+            usize::try_from(lv::next_item(Organize::list_view(dlg), -1, LVNI_SELECTED)).ok();
         if !ask(dlg, title, &question) {
             return;
         }
@@ -891,15 +844,12 @@ impl Organize<'_> {
                     self.reshow(dlg, Keep::At(Some(0)));
                 }
             }
-            // SAFETY: ends this modal dialog.
-            CANCEL => unsafe {
-                EndDialog(dlg, 0);
-            },
+            CANCEL => dlg::end(dlg, 0),
             _ => {}
         }
     }
 
-    fn disp_info(&self, info: &mut NMLVDISPINFOW) {
+    fn disp_info(&self, info: &mut View<'_, NMLVDISPINFOW>) {
         let item = usize::try_from(info.item.iItem)
             .ok()
             .and_then(|row| self.shown.borrow().get(row).copied());
@@ -935,18 +885,12 @@ impl Organize<'_> {
             _ => String::new(),
         };
         let text: Vec<u16> = text.encode_utf16().collect();
-        let n = text.len().min(info.item.cchTextMax as usize - 1);
-        // SAFETY: the list gave a buffer of `cchTextMax` code units.
-        unsafe {
-            core::ptr::copy_nonoverlapping(text.as_ptr(), info.item.pszText, n);
-            *info.item.pszText.add(n) = 0;
-        }
+        info.set_text(&text);
     }
 
     /// A key pressed in the list.
     fn list_key(&self, dlg: HWND, vk: u16) {
-        // SAFETY: reads this thread's keyboard state.
-        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
+        let ctrl = sys::key_down(VK_CONTROL);
         match (vk, ctrl) {
             (VK_DELETE, false) => {
                 let selected = self.selected(dlg);
@@ -969,18 +913,7 @@ impl Organize<'_> {
                 }
             }
             (0x41, true) => {
-                let it = LVITEMW {
-                    state: LVIS_SELECTED,
-                    stateMask: LVIS_SELECTED,
-                    // SAFETY: the rest of LVITEMW is plain data.
-                    ..unsafe { core::mem::zeroed() }
-                };
-                send(
-                    Organize::list_view(dlg),
-                    LVM_SETITEMSTATE,
-                    usize::MAX,
-                    (&raw const it) as isize,
-                );
+                lv::set_item_state(Organize::list_view(dlg), -1, LVIS_SELECTED, LVIS_SELECTED);
             }
             _ => {}
         }
@@ -1000,68 +933,63 @@ impl Organize<'_> {
     }
 
     /// Answers a notification; `Some` is DWLP_MSGRESULT's value.
-    ///
-    /// # Safety
-    /// `l` is a WM_NOTIFY's lParam.
-    unsafe fn notify(&self, dlg: HWND, l: LPARAM) -> Option<isize> {
-        // SAFETY: as the caller promises; each code's struct is read as
-        // its control sends it.
-        unsafe {
-            let hdr = &*(l as *const NMHDR);
-            if hdr.idFrom == usize::from(ID_TREE) {
-                match hdr.code {
-                    TVN_SELCHANGEDW if !self.filling.get() => {
-                        if let Some(node) = tree_selected(hdr.hwndFrom) {
-                            *self.folder.borrow_mut() = self.tree.borrow().nodes[node].path.clone();
-                            self.clear_search(dlg);
-                            self.reshow(dlg, Keep::At(Some(0)));
-                        }
-                    }
-                    TVN_KEYDOWN => self.tree_key(dlg, (*(l as *const NMTVKEYDOWN)).wVKey),
-                    _ => {}
-                }
-                return None;
-            }
-            if hdr.idFrom != usize::from(ID_LIST) {
-                return None;
-            }
-            match hdr.code {
-                NM_CUSTOMDRAW => {
-                    let cd = &*(l as *const NMLVCUSTOMDRAW);
-                    return Some(list_custom_draw(hdr.hwndFrom, cd, self.look.get().dark));
-                }
-                LVN_GETDISPINFOW => self.disp_info(&mut *(l as *mut NMLVDISPINFOW)),
-                // No type-ahead: the search box is for finding.
-                LVN_ODFINDITEMW => return Some(-1),
-                LVN_ITEMCHANGED | LVN_ODSTATECHANGED => self.update_buttons(dlg),
-                NM_DBLCLK => {
-                    if (*(l as *const NMITEMACTIVATE)).iItem >= 0 {
-                        self.activate(dlg);
+    fn notify(&self, dlg: HWND, n: &Notify) -> Option<isize> {
+        if n.id() == usize::from(ID_TREE) {
+            match n.code() {
+                TVN_SELCHANGEDW if !self.filling.get() => {
+                    if let Some(node) = tree_selected(n.from()) {
+                        *self.folder.borrow_mut() = self.tree.borrow().nodes[node].path.clone();
+                        self.clear_search(dlg);
+                        self.reshow(dlg, Keep::At(Some(0)));
                     }
                 }
-                LVN_KEYDOWN => self.list_key(dlg, (*(l as *const NMLVKEYDOWN)).wVKey),
+                TVN_KEYDOWN => {
+                    if let Some(vk) = n.get::<NMTVKEYDOWN>().map(|k| k.wVKey) {
+                        self.tree_key(dlg, vk);
+                    }
+                }
                 _ => {}
             }
-            None
+            return None;
         }
+        if n.id() != usize::from(ID_LIST) {
+            return None;
+        }
+        match n.code() {
+            NM_CUSTOMDRAW => {
+                let cd = n.get::<NMLVCUSTOMDRAW>()?;
+                return Some(list_custom_draw(n.from(), &cd, self.look.get().dark));
+            }
+            LVN_GETDISPINFOW => {
+                if let Some(mut info) = n.get::<NMLVDISPINFOW>() {
+                    self.disp_info(&mut info);
+                }
+            }
+            // No type-ahead: the search box is for finding.
+            LVN_ODFINDITEMW => return Some(-1),
+            LVN_ITEMCHANGED | LVN_ODSTATECHANGED => self.update_buttons(dlg),
+            NM_DBLCLK => {
+                if n.get::<NMITEMACTIVATE>().is_some_and(|a| a.iItem >= 0) {
+                    self.activate(dlg);
+                }
+            }
+            LVN_KEYDOWN => {
+                if let Some(vk) = n.get::<NMLVKEYDOWN>().map(|k| k.wVKey) {
+                    self.list_key(dlg, vk);
+                }
+            }
+            _ => {}
+        }
+        None
     }
 }
 
-unsafe extern "system" fn organize_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Organize` that `organize` keeps alive until
-        // the dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Organize` from `organize`, or null
-    // before.
-    let Some(s) = (unsafe { state::<Organize<'_>>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn organize_proc(s: &Organize<'_>, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common_msg(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.init(dlg);
             // The dialog manager puts the keyboard in the search box; Up
@@ -1074,22 +1002,20 @@ unsafe extern "system" fn organize_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARA
         }
         WM_GETMINMAXINFO => {
             let (w, h) = s.min.get();
-            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
-            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = w;
-            mmi.ptMinTrackSize.y = h;
+            if let Some(mut mmi) = m.min_max_info() {
+                mmi.ptMinTrackSize.x = w;
+                mmi.ptMinTrackSize.y = h;
+            }
             1
         }
         WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR from a control.
-            if let Some(answer) = unsafe { s.notify(dlg, l) } {
-                // SAFETY: the answer of this dialog's WM_NOTIFY.
-                unsafe { SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, answer) };
+            if let Some(answer) = m.notify().and_then(|n| s.notify(dlg, &n)) {
+                dlg::set_result(dlg, answer);
             }
             1
         }
         WM_COMMAND => {
-            s.command(dlg, (w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            s.command(dlg, win::loword(m.w), u32::from(win::hiword(m.w)));
             1
         }
         WM_REFRESH => {
