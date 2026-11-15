@@ -470,9 +470,9 @@ pub fn spawn(job: Job, hwnd: HWND, msg: u32, alive: Alive) {
         .name("goz-folders".into())
         .spawn(move || {
             // No dialog for a drive without a disk on this thread; COM for
-            // the shell's icons and names, released below.
+            // the shell's icons and names, for the rest of the thread.
             win::process::set_thread_error_mode(SEM_FAILCRITICALERRORS);
-            let com = Apartment::sta();
+            let _com = Apartment::sta();
             let shown = Shown::now();
             let reply = match job {
                 Job::Roots { labels } => Reply::Roots(roots(labels, shown)),
@@ -486,8 +486,6 @@ pub fn spawn(job: Job, hwnd: HWND, msg: u32, alive: Alive) {
                     found: list(&path, shown),
                 },
             };
-            // Pairs the successful CoInitializeEx above.
-            drop(com);
             let open = alive.lock().unwrap_or_else(|e| e.into_inner());
             if !*open {
                 return;

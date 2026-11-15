@@ -315,8 +315,8 @@ fn run_elevated(exe: &Path, args: &str) -> Result<(), String> {
         return Err("a dry run: goz.exe was not run".into());
     }
     let file: Vec<u16> = exe.to_string_lossy().encode_utf16().collect();
-    // COM for this thread (the page's own), undone right after.
-    let com = Apartment::sta();
+    // COM for this thread (the page's own), for the rest of its life.
+    let _com = Apartment::sta();
     let ran = win::shell::execute(&Execute {
         owner: core::ptr::null_mut(),
         verb: Some("runas"),
@@ -326,7 +326,6 @@ fn run_elevated(exe: &Path, args: &str) -> Result<(), String> {
         show: SW_HIDE,
         process: true,
     });
-    drop(com);
     let process = match ran {
         Ok(process) => process,
         Err(err) => {

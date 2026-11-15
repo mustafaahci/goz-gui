@@ -257,8 +257,8 @@ fn run(start: Start, hwnd: Arc<AtomicUsize>) {
         export_selection,
         owner,
     } = start;
-    // This thread's own COM, given back as it ends.
-    let com = Apartment::sta();
+    // This thread's own COM, for the rest of its life.
+    let _com = Apartment::sta();
     // Message boxes on this thread take the window's look.
     dialog::set_app_look(look);
     // Opened by a command posted while goz-gui was not in front (a test),
@@ -314,7 +314,6 @@ fn run(start: Start, hwnd: Arc<AtomicUsize>) {
     if let Some(job) = state.job.take() {
         job.stop();
     }
-    drop(com);
 }
 
 /// What waits for a save to finish: the command the "Save changes?"

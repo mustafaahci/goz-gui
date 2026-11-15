@@ -203,9 +203,8 @@ fn spawn(owner: usize, message: u32) -> Option<Worker> {
 /// The thread: an STA with a message loop (the shell's windows run their
 /// own loops inside a job), running each job as it comes.
 fn thread(queue: &Queue, owner: usize, message: u32) {
-    // COM for the life of the thread, ended below; then a standard message
-    // loop.
-    let com = Apartment::sta();
+    // COM for the life of the thread; then a standard message loop.
+    let _com = Apartment::sta();
     // Makes the thread's message queue, so that a wake posted from now on
     // waits in it; jobs pushed before it are found below anyway.
     win::queue::ensure();
@@ -260,7 +259,6 @@ fn thread(queue: &Queue, owner: usize, message: u32) {
             break;
         }
     }
-    drop(com);
     give_back_memory();
 }
 

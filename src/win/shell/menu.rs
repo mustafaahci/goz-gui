@@ -32,6 +32,10 @@ pub struct ShellMenu {
 
 impl ShellMenu {
     pub(super) fn new(menu: IContextMenu) -> ShellMenu {
+        // The handlers it loads may answer DllCanUnloadNow wrongly (Work
+        // Folders' does, under a thread of its own): this thread's libraries
+        // are never unloaded early.
+        crate::win::com::refuse_unloading();
         ShellMenu {
             menu2: menu.cast().ok(),
             menu3: menu.cast().ok(),

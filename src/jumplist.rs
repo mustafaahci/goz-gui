@@ -230,10 +230,10 @@ pub fn update(searches: Vec<String>, marks: Vec<(String, Vec<String>)>, instance
 /// Builds and commits the list; the number of entries left out because
 /// the user removed them.
 fn commit(id: &str, items: &[(&'static str, String, String)]) -> windows::core::Result<usize> {
-    // This thread's own apartment, ended before it returns; every COM
-    // object is released as it drops, before the apartment.
-    let com = Apartment::sta().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
-    let r = (|| {
+    // This thread's own apartment, for the rest of its life; every COM
+    // object is released as it drops.
+    Apartment::sta().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+    (|| {
         let list = JumpList::new()?;
         list.set_app_id(id)?;
         let removed = list.begin_list()?;
@@ -273,9 +273,7 @@ fn commit(id: &str, items: &[(&'static str, String, String)]) -> windows::core::
         }
         list.commit_list()?;
         Ok(skipped)
-    })();
-    drop(com);
-    r
+    })()
 }
 
 /// The test hook's clean-up: a test instance's jump list goes as it ends.
@@ -285,13 +283,12 @@ pub fn delete_for_test() {
     }
     let Some(id) = APP_ID.get() else { return };
     // As in `commit`.
-    let Some(com) = Apartment::sta() else {
+    if Apartment::sta().is_none() {
         return;
-    };
+    }
     if let Ok(list) = JumpList::new() {
         let _ = list.delete_list(id);
     }
-    drop(com);
 }
 
 #[cfg(test)]

@@ -305,10 +305,9 @@ pub fn in_background(f: impl FnOnce() + Send + 'static) {
     let spawned = std::thread::Builder::new()
         .name("goz-shell".into())
         .spawn(move || {
-            // COM for this thread, which ends below.
-            let com = Apartment::sta();
+            // COM for this thread, for the rest of its life.
+            let _com = Apartment::sta();
             f();
-            drop(com);
             RUNNING.fetch_sub(1, Ordering::SeqCst);
         });
     // Without a thread there is nothing to run it on; the action is lost,

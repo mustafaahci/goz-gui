@@ -1028,7 +1028,7 @@ fn run(shared: &Shared) {
     if let Some(apartment) = apartment {
         // Every COM object of the thread is released above; the libraries
         // none uses any more (WIC's codecs, the shell's image makers) go at
-        // once rather than in ten minutes, then COM ends on this thread.
+        // once rather than in ten minutes. COM stays until the thread ends.
         apartment.end_unloading_unused();
     }
     if shared.abandoned.load(Ordering::SeqCst) {
