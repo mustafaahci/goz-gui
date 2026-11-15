@@ -19,25 +19,18 @@ use std::time::{Duration, Instant};
 
 use goz_core::proto::DaemonStatus;
 use goz_core::types::{SortDir, SortKey, SortSpec};
-use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DC_BRUSH, DeleteObject, GetDC, GetStockObject, GetTextMetricsW, HFONT,
-    InvalidateRect, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, ReleaseDC,
-    SelectObject, SetBkColor, SetDCBrushColor, SetTextColor, TEXTMETRICW,
+    DC_BRUSH, HFONT, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
 };
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::{
     APPCOMMAND_BROWSER_BACKWARD, APPCOMMAND_BROWSER_FORWARD, APPCOMMAND_BROWSER_HOME, MK_CONTROL,
 };
 use windows_sys::Win32::UI::Controls::*;
-use windows_sys::Win32::UI::HiDpi::{
-    GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi,
-};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT, VK_TAB,
+    VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT, VK_TAB,
 };
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, DragAcceptFiles, HDROP, SetWindowSubclass};
+use windows_sys::Win32::UI::Shell::HDROP;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::celltip::{self, CellTip};
@@ -62,7 +55,10 @@ use crate::theme::{Palette, ThemeMode};
 use crate::thumbs::{ThumbReply, Thumbs};
 use crate::typeahead::TypeAhead;
 use crate::view::View;
-use crate::wide::{is_wide, window_text, wz};
+use crate::wide::window_text;
+use crate::win::class::{self, Class, Create};
+use crate::win::ext::b1;
+use crate::win::{self, Msg, gdi, lv, parcel, queue, subclass, sys};
 use crate::{
     dialog, dropdown, format, header, hover, keys, menu, msgbox, paint, places, searchbox, shell,
     status, syntax, theme,
@@ -235,49 +231,37 @@ impl Fonts {
         zoom: u32,
         adjust: impl FnOnce(&mut windows_sys::Win32::Graphics::Gdi::LOGFONTW),
     ) -> Fonts {
-        // SAFETY: plain out-structs; the font handles are owned by `Fonts`.
-        unsafe {
-            let mut ncm: NONCLIENTMETRICSW = core::mem::zeroed();
-            ncm.cbSize = size_of::<NONCLIENTMETRICSW>() as u32;
-            SystemParametersInfoForDpi(
-                SPI_GETNONCLIENTMETRICS,
-                ncm.cbSize,
-                (&raw mut ncm).cast(),
-                0,
-                dpi,
-            );
-            let mut lf = ncm.lfMessageFont;
-            adjust(&mut lf);
-            if zoom != crate::zoom::DEFAULT {
-                lf.lfHeight = crate::zoom::scale(lf.lfHeight, 96, zoom);
-                lf.lfWidth = crate::zoom::scale(lf.lfWidth, 96, zoom);
-            }
-            let normal = CreateFontIndirectW(&lf);
-            lf.lfWeight = 700;
-            let bold = CreateFontIndirectW(&lf);
-            let dc = GetDC(core::ptr::null_mut());
-            let old = SelectObject(dc, normal);
-            let mut tm: TEXTMETRICW = core::mem::zeroed();
-            GetTextMetricsW(dc, &mut tm);
-            SelectObject(dc, old);
-            ReleaseDC(core::ptr::null_mut(), dc);
-            Fonts {
-                normal,
-                bold,
-                height: tm.tmHeight,
-            }
+        // The font handles are owned by `Fonts`.
+        let ncm = sys::non_client_metrics(dpi).unwrap_or_default();
+        let mut lf = ncm.lfMessageFont;
+        adjust(&mut lf);
+        if zoom != crate::zoom::DEFAULT {
+            lf.lfHeight = crate::zoom::scale(lf.lfHeight, 96, zoom);
+            lf.lfWidth = crate::zoom::scale(lf.lfWidth, 96, zoom);
+        }
+        let normal = gdi::create_font(&lf);
+        lf.lfWeight = 700;
+        let bold = gdi::create_font(&lf);
+        // The screen's DC, measured in and given back; the old font is put
+        // back first.
+        let dc = gdi::WindowDc::get(core::ptr::null_mut());
+        let old = gdi::Selected::new(dc.hdc(), normal);
+        let tm = gdi::text_metrics(dc.hdc());
+        drop(old);
+        drop(dc);
+        Fonts {
+            normal,
+            bold,
+            height: tm.tmHeight,
         }
     }
 }
 
 impl Drop for Fonts {
     fn drop(&mut self) {
-        // SAFETY: owned GDI objects, no longer selected anywhere once
-        // replaced.
-        unsafe {
-            DeleteObject(self.normal);
-            DeleteObject(self.bold);
-        }
+        // Owned GDI objects, no longer selected anywhere once replaced.
+        gdi::delete_object(self.normal);
+        gdi::delete_object(self.bold);
     }
 }
 
@@ -535,20 +519,9 @@ pub struct App {
 /// How the program that started goz-gui asked for its window to be shown
 /// (a shortcut's Run: Normal, Minimized, Maximized; a test's no-activate).
 fn startup_show() -> i32 {
-    use windows_sys::Win32::System::Threading::{
-        GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW,
-    };
-    // SAFETY: fills a plain out-struct.
-    let si = unsafe {
-        let mut si: STARTUPINFOW = core::mem::zeroed();
-        si.cb = size_of::<STARTUPINFOW>() as u32;
-        GetStartupInfoW(&mut si);
-        si
-    };
-    if si.dwFlags & STARTF_USESHOWWINDOW != 0 {
-        i32::from(si.wShowWindow)
-    } else {
-        SW_SHOWNORMAL
+    match b1::startup_show_window() {
+        Some(show) => i32::from(show),
+        None => SW_SHOWNORMAL,
     }
 }
 
@@ -741,213 +714,192 @@ See Help > Search Syntax and the README for goz-gui's switches."
     let start: Option<Rect> = settings
         .window
         .and_then(|w| placement::fit(&w, &placement::monitors()));
-    // SAFETY: the window class and windows are created and used on this
-    // thread only; `App` is leaked so every pointer to it stays valid until
-    // the process exits.
-    unsafe {
-        let hinst = GetModuleHandleW(core::ptr::null());
-        let class = wz("goz-gui");
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            // Double-clicks reach the status bar's indicators.
-            style: CS_DBLCLKS,
-            lpfnWndProc: Some(wndproc),
-            hInstance: hinst,
-            hCursor: LoadCursorW(core::ptr::null_mut(), IDC_ARROW),
-            hIcon: app_icon(GetSystemMetrics(SM_CXICON)),
-            hIconSm: app_icon(GetSystemMetrics(SM_CXSMICON)),
-            lpszClassName: class.as_ptr(),
-            ..core::mem::zeroed()
-        };
-        RegisterClassExW(&wc);
-        let menus = menu::menu_bar(prefs.base.history.run_enabled);
-        // Made where it opens, so it gets that monitor's DPI from the start
-        // and no DPI change rescales the size worked out for it.
-        let (x, y, w, h) = match start {
-            Some(r) => (r.x, r.y, r.w, r.h),
-            None => (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
-        };
-        let hwnd = CreateWindowExW(
-            0,
-            class.as_ptr(),
-            wz("goz").as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-            x,
-            y,
-            w,
-            h,
-            core::ptr::null_mut(),
-            menus.bar,
-            hinst,
-            core::ptr::null(),
-        );
-        if hwnd.is_null() {
-            return 1;
-        }
-        let app: &'static App = Box::leak(App::create(
-            hwnd,
-            hinst,
-            menus,
-            prefs,
-            &settings,
-            (searches, history),
-            (sessions, marks, runs),
+    // The window class and windows are made and used on this thread only;
+    // `App` is leaked, so the `&'static App` the window's handler and its
+    // subclasses find stays valid until the process exits.
+    Class {
+        name: "goz-gui",
+        // Double-clicks reach the status bar's indicators.
+        style: CS_DBLCLKS,
+        cursor: sys::system_cursor(IDC_ARROW),
+        icon: app_icon(sys::metric(SM_CXICON)),
+        icon_small: app_icon(sys::metric(SM_CXSMICON)),
+        background: core::ptr::null_mut(),
+    }
+    .register();
+    let menus = menu::menu_bar(prefs.base.history.run_enabled);
+    // Made where it opens, so it gets that monitor's DPI from the start
+    // and no DPI change rescales the size worked out for it.
+    let rect = match start {
+        Some(r) => (r.x, r.y, r.w, r.h),
+        None => (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
+    };
+    // Its messages go to the `App` once it is attached (`APP`, set
+    // right after), and to their default processing before.
+    let hwnd = class::create(
+        &Create {
+            ex_style: 0,
+            class: "goz-gui",
+            title: "goz",
+            style: WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            rect,
+            parent: core::ptr::null_mut(),
+            menu: menus.bar,
+        },
+        |m| match app_of(m.hwnd) {
+            Some(app) => app.handle(m),
+            None => m.def(),
+        },
+    );
+    if hwnd.is_null() {
+        return 1;
+    }
+    let app: &'static App = Box::leak(App::create(
+        hwnd,
+        menus,
+        prefs,
+        &settings,
+        (searches, history),
+        (sessions, marks, runs),
+    ));
+    APP.set(Some(app));
+    // W8: GOZ_GUI_TRACE's timeline of this thread (a test hook).
+    crate::trace::start();
+    // F3: which window of the instance this is (before the tray and
+    // hotkeys, which only the first has).
+    app.new_window.set(secondary);
+    *app.instance.borrow_mut() = launch.instance.clone();
+    *app.instance_key.borrow_mut() = key.clone();
+    app.init(start.is_none());
+    // A new window leaves the starts handed over, the tray icon and
+    // the hotkeys to the first goz-gui.
+    if !secondary {
+        crate::instance::listen(&key, hwnd, WM_LAUNCH);
+    }
+    app.listen_for_exit();
+    let taken = app.apply_background(prefs_background(app));
+    // -startup (signing in to Windows) starts in the background, with
+    // no window; not a new window, which has no tray icon to come back
+    // from.
+    // W6: -edit or -filelist-editor alone shows the editor, not the
+    // window.
+    let editor_only = launch.editor_only() && !secondary;
+    let asked = if (launch.startup || editor_only) && !secondary {
+        SW_HIDE
+    } else {
+        startup_show()
+    };
+    let (show, deferred, min_to_max) = first_show(asked, settings.maximized);
+    app.maximize_deferred.set(deferred);
+    if min_to_max {
+        let mut wp = win::placement(hwnd).unwrap_or_default();
+        wp.flags = WPF_RESTORETOMAXIMIZED;
+        wp.showCmd = show as u32;
+        win::set_placement(hwnd, &wp);
+    } else {
+        win::show(hwnd, show);
+    }
+    // W4 (G1): -filelist (or a bare .efu): the first search is the
+    // list's. W5: else the previous session's shown tab's list, if it
+    // searched one.
+    if let Some(list) = &launch.filelist {
+        app.set_file_list(list);
+    } else if let Some(list) = restored.as_ref().and_then(|s| s.view().file_list.clone()) {
+        app.start_with_file_list(&list);
+    }
+    // W6: the shown tab's file-list slots, before its first search.
+    if let Some(s) = &restored {
+        app.show_tab_slots(&s.view().slots);
+    }
+    app.start_search(false);
+    // W6: -edit and -filelist-editor open the File List Editor; alone
+    // (nothing else asked), goz-gui's window is not shown and ends
+    // with it.
+    if launch.edit.is_some() || launch.filelist_editor {
+        app.start_list_editor(launch.edit.as_deref(), editor_only);
+    }
+    if let Some(s) = &restored {
+        // Its tabs, the shown one's navigation entries, and its place
+        // in the results once they come.
+        app.start_tabs(s);
+    }
+    // The search the window starts with is the first navigation entry,
+    // as in Everything.
+    app.commit_nav();
+    app.session_timer();
+    // What could not be read, said once the window is up.
+    let notes: Vec<String> = [
+        app.prefs.borrow_mut().note.take(),
+        app.searches.note.borrow_mut().take(),
+        app.sessions.note.borrow_mut().take(),
+        app.bookmarks.note.borrow_mut().take(),
+        app.runs.note.borrow_mut().take(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !notes.is_empty() {
+        app.show_note(notes.join("; "));
+    }
+    if !taken.is_empty() {
+        app.show_note(format!(
+            "Another program already uses the {} hotkey",
+            taken.join(" and ")
         ));
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as *const App as isize);
-        APP.set(Some(app));
-        // W8: GOZ_GUI_TRACE's timeline of this thread (a test hook).
-        crate::trace::start();
-        // F3: which window of the instance this is (before the tray and
-        // hotkeys, which only the first has).
-        app.new_window.set(secondary);
-        *app.instance.borrow_mut() = launch.instance.clone();
-        *app.instance_key.borrow_mut() = key.clone();
-        app.init(start.is_none());
-        // A new window leaves the starts handed over, the tray icon and
-        // the hotkeys to the first goz-gui.
-        if !secondary {
-            crate::instance::listen(&key, hwnd, WM_LAUNCH);
-        }
-        app.listen_for_exit();
-        let taken = app.apply_background(prefs_background(app));
-        // -startup (signing in to Windows) starts in the background, with
-        // no window; not a new window, which has no tray icon to come back
-        // from.
-        // W6: -edit or -filelist-editor alone shows the editor, not the
-        // window.
-        let editor_only = launch.editor_only() && !secondary;
-        let asked = if (launch.startup || editor_only) && !secondary {
-            SW_HIDE
-        } else {
-            startup_show()
-        };
-        let (show, deferred, min_to_max) = first_show(asked, settings.maximized);
-        app.maximize_deferred.set(deferred);
-        if min_to_max {
-            let mut wp = WINDOWPLACEMENT {
-                length: size_of::<WINDOWPLACEMENT>() as u32,
-                ..core::mem::zeroed()
-            };
-            GetWindowPlacement(hwnd, &mut wp);
-            wp.flags = WPF_RESTORETOMAXIMIZED;
-            wp.showCmd = show as u32;
-            SetWindowPlacement(hwnd, &wp);
-        } else {
-            ShowWindow(hwnd, show);
-        }
-        // W4 (G1): -filelist (or a bare .efu): the first search is the
-        // list's. W5: else the previous session's shown tab's list, if it
-        // searched one.
-        if let Some(list) = &launch.filelist {
-            app.set_file_list(list);
-        } else if let Some(list) = restored.as_ref().and_then(|s| s.view().file_list.clone()) {
-            app.start_with_file_list(&list);
-        }
-        // W6: the shown tab's file-list slots, before its first search.
-        if let Some(s) = &restored {
-            app.show_tab_slots(&s.view().slots);
-        }
-        app.start_search(false);
-        // W6: -edit and -filelist-editor open the File List Editor; alone
-        // (nothing else asked), goz-gui's window is not shown and ends
-        // with it.
-        if launch.edit.is_some() || launch.filelist_editor {
-            app.start_list_editor(launch.edit.as_deref(), editor_only);
-        }
-        if let Some(s) = &restored {
-            // Its tabs, the shown one's navigation entries, and its place
-            // in the results once they come.
-            app.start_tabs(s);
-        }
-        // The search the window starts with is the first navigation entry,
-        // as in Everything.
-        app.commit_nav();
-        app.session_timer();
-        // What could not be read, said once the window is up.
-        let notes: Vec<String> = [
-            app.prefs.borrow_mut().note.take(),
-            app.searches.note.borrow_mut().take(),
-            app.sessions.note.borrow_mut().take(),
-            app.bookmarks.note.borrow_mut().take(),
-            app.runs.note.borrow_mut().take(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        if !notes.is_empty() {
-            app.show_note(notes.join("; "));
-        }
-        if !taken.is_empty() {
-            app.show_note(format!(
-                "Another program already uses the {} hotkey",
-                taken.join(" and ")
-            ));
-        }
-
-        let mut msg: MSG = core::mem::zeroed();
-        while GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0) > 0 {
-            dropdown::click_elsewhere(app, &msg);
-            // A pane or strip takes the keys its controls keep first.
-            if matches!(
-                msg.message,
-                WM_KEYDOWN | WM_SYSKEYDOWN | WM_CHAR | WM_SYSCHAR
-            ) && app.frame_key(&msg)
-            {
-                continue;
-            }
-            // Shortcuts are the main window's; another window of the thread
-            // (Help > Search Syntax) keeps its keys.
-            let ours = msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd) != 0;
-            // Esc stops an export first, wherever the keyboard is; W9: then
-            // a content search reading.
-            if ours
-                && msg.message == WM_KEYDOWN
-                && msg.wParam == usize::from(VK_ESCAPE)
-                && (app.cancel_export() || app.cancel_content())
-            {
-                continue;
-            }
-            if ours && TranslateAcceleratorW(hwnd, keys::table(), &msg) != 0 {
-                continue;
-            }
-            // Tab and Shift+Tab go round the tab stops: the search box, the
-            // panes that are tab stops, the results (a pane or strip may
-            // keep it among its own controls); so does Ctrl+Tab while no
-            // shortcut above takes it.
-            if msg.message == WM_KEYDOWN
-                && msg.wParam == usize::from(VK_TAB)
-                && !key_down(VK_MENU)
-                && app.tab_key(msg.hwnd, key_down(VK_SHIFT))
-            {
-                continue;
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        crate::trace::finish();
-        // W5: the File List Editor is asked to close (it asks about unsaved
-        // changes), and goz-gui ends once it has.
-        crate::listedit::ui::finish();
-        // A copy or move still running finishes first, and so do the
-        // opens handed to the shell (Close window on execute closes right
-        // after one).
-        app.fileops.finish();
-        crate::actions::wait_for_launches(Duration::from_secs(10));
-        shell::ole_done();
-        msg.wParam as i32
     }
-}
 
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // SAFETY: GWLP_USERDATA holds the leaked `App` once `run` set it, and
-    // null before.
-    unsafe {
-        let app = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const App;
-        if app.is_null() {
-            return DefWindowProcW(hwnd, msg, w, l);
+    while let Some(q) = queue::get(core::ptr::null_mut()) {
+        let msg = q.msg();
+        dropdown::click_elsewhere(app, &msg);
+        // A pane or strip takes the keys its controls keep first.
+        if matches!(
+            msg.message,
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_CHAR | WM_SYSCHAR
+        ) && app.frame_key(&msg)
+        {
+            continue;
         }
-        (*app).handle(msg, w, l)
+        // Shortcuts are the main window's; another window of the thread
+        // (Help > Search Syntax) keeps its keys.
+        let ours = msg.hwnd == hwnd || win::is_child(hwnd, msg.hwnd);
+        // Esc stops an export first, wherever the keyboard is; W9: then
+        // a content search reading.
+        if ours
+            && msg.message == WM_KEYDOWN
+            && msg.wParam == usize::from(VK_ESCAPE)
+            && (app.cancel_export() || app.cancel_content())
+        {
+            continue;
+        }
+        if ours && queue::translate_accelerator(hwnd, keys::table(), &q) {
+            continue;
+        }
+        // Tab and Shift+Tab go round the tab stops: the search box, the
+        // panes that are tab stops, the results (a pane or strip may
+        // keep it among its own controls); so does Ctrl+Tab while no
+        // shortcut above takes it.
+        if msg.message == WM_KEYDOWN
+            && msg.wParam == usize::from(VK_TAB)
+            && !key_down(VK_MENU)
+            && app.tab_key(msg.hwnd, key_down(VK_SHIFT))
+        {
+            continue;
+        }
+        queue::translate(&q);
+        queue::dispatch(&q);
     }
+    crate::trace::finish();
+    // W5: the File List Editor is asked to close (it asks about unsaved
+    // changes), and goz-gui ends once it has.
+    crate::listedit::ui::finish();
+    // A copy or move still running finishes first, and so do the
+    // opens handed to the shell (Close window on execute closes right
+    // after one).
+    app.fileops.finish();
+    crate::actions::wait_for_launches(Duration::from_secs(10));
+    shell::ole_done();
+    // WM_QUIT's code: the only one this thread posts is WM_DESTROY's 0.
+    0
 }
 
 thread_local! {
@@ -964,26 +916,25 @@ pub fn app_of(main: HWND) -> Option<&'static App> {
 /// goz-gui's icon, resource 1 (build.rs embeds it), at `size` pixels; null
 /// if the build has none.
 pub fn app_icon(size: i32) -> HICON {
-    // SAFETY: loads a resource of this module by its id; a missing one is
-    // reported as null, which callers accept.
-    unsafe {
-        LoadImageW(
-            GetModuleHandleW(core::ptr::null()),
-            // MAKEINTRESOURCE(1): the id travels as the pointer's address.
-            core::ptr::without_provenance(1),
-            IMAGE_ICON,
-            size,
-            size,
-            LR_DEFAULTCOLOR,
-        )
-    }
+    // A resource of this module by its id; a missing one is reported as
+    // null, which callers accept.
+    b1::module_icon(1, size)
 }
 
+/// Sends any message, for the window's modules not yet moved onto
+/// `crate::win`'s typed wrappers (the code here no longer calls it). It
+/// goes, and this file's `allow(unsafe_code)` with it, once none of them
+/// does.
 fn send(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
     // SAFETY: a message to a window of this thread; any pointer in `l` is
     // the caller's and lives across the synchronous call.
     unsafe { SendMessageW(hwnd, msg, w, l) }
 }
+
+// `wide::is_wide` had its one caller here (WM_SETTINGCHANGE, which reads
+// its setting with `Msg::setting_is` now). Named, not called, until it goes
+// from `wide.rs`, so the build stays free of warnings meanwhile.
+const _: unsafe fn(*const u16, &str) -> bool = crate::wide::is_wide;
 
 fn loword(v: usize) -> u16 {
     (v & 0xffff) as u16
@@ -994,8 +945,7 @@ fn hiword(v: usize) -> u16 {
 }
 
 fn key_down(vk: u16) -> bool {
-    // SAFETY: reads this thread's keyboard state.
-    unsafe { GetKeyState(i32::from(vk)) < 0 }
+    sys::key_down(vk)
 }
 
 /// The client point a mouse message carries.
@@ -1012,242 +962,224 @@ fn in_rect(rc: &RECT, pt: POINT) -> bool {
 
 impl App {
     /// The window's state, made from `s`, the settings it starts with.
-    unsafe fn create(
+    fn create(
         hwnd: HWND,
-        hinst: HINSTANCE,
         menus: menu::Bar,
         prefs: prefs::Prefs,
         s: &Settings,
         (searches, history): (searches::Searches, SearchHistory),
         (sessions, marks, runs): (session::Sessions, bookmarks::Marks, runs::Runs),
     ) -> Box<App> {
-        // SAFETY: creates the child controls of `hwnd` on its thread.
-        unsafe {
-            let edit = CreateWindowExW(
-                0,
-                wz("EDIT").as_ptr(),
-                core::ptr::null(),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                ID_EDIT as HMENU,
-                hinst,
-                core::ptr::null(),
-            );
-            let list = CreateWindowExW(
-                0,
-                WC_LISTVIEWW,
-                core::ptr::null(),
-                WS_CHILD
-                    | WS_VISIBLE
-                    | WS_TABSTOP
-                    | LVS_REPORT
-                    | LVS_OWNERDATA
-                    | LVS_OWNERDRAWFIXED
-                    | LVS_SHOWSELALWAYS
-                    | LVS_EDITLABELS,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                ID_LIST as HMENU,
-                hinst,
-                core::ptr::null(),
-            );
-            let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
-            // The UI scale (`dpi`, Options > UI) multiplies the monitor's.
-            let system_dpi = GetDpiForWindow(hwnd);
-            let dpi = crate::custom::scaled(system_dpi);
-            let mode = s.theme;
-            // The search the window starts with (Home's, or the last one),
-            // on one line as the box shows it (a session may hold one of
-            // several lines). The window's procedure ignores the change
-            // this makes: the App is not attached to it yet.
-            if !s.search.is_empty() {
-                let search = crate::bookmarks::one_line(&s.search);
-                SetWindowTextW(edit, wz(&search).as_ptr());
-                let end = search.encode_utf16().count();
-                SendMessageW(edit, EM_SETSEL, end, end as isize);
-            }
-            let opts = Options {
-                match_case: s.match_case,
-                match_path: s.match_path,
-                filter: s.filter,
-                sort: s.sort,
-            };
-            let (status_bar, on_top, layout) = (s.status_bar, s.on_top, s.columns);
-            Box::new(App {
-                hwnd,
-                edit,
-                list,
-                header,
-                dpi: Cell::new(dpi),
-                fonts: RefCell::new(Fonts::with(
-                    dpi,
-                    s.zoom,
-                    &s.custom
-                        .colors
-                        .resolved_font(crate::colors::Item::ResultList),
-                )),
-                ui_fonts: RefCell::new(Fonts::with(
-                    dpi,
-                    crate::zoom::DEFAULT,
-                    &s.custom.colors.resolved_font(crate::colors::Item::Default),
-                )),
-                zoom: Cell::new(s.zoom),
-                wheel: Cell::new(0),
-                filter_bar: Cell::new(s.filter_bar),
-                filter_rc: Cell::new(RECT::default()),
-                filter_open: Cell::new(false),
-                in_menu: Cell::new(false),
-                export: RefCell::new(None),
-                export_type: Cell::new(s.export_type),
-                pal: Cell::new(Palette::new(mode.is_dark())),
-                theme_mode: Cell::new(mode),
-                model: RefCell::new(Model::new(Arc::new(Search {
-                    query: String::new(),
-                    sort: SortSpec::default(),
-                    match_case: false,
-                    filelist: None,
-                    created_sort: None,
-                    slots: Default::default(),
-                    want: Default::default(),
-                    content: None,
-                }))),
-                icons: Icons::new(hwnd, WM_ICON, WM_TYPES, WM_TYPES_ASK),
-                w9: w9a::W9::new(hwnd),
-                scratch: RefCell::new(Scratch::default()),
-                search_rc: Cell::new(RECT::default()),
-                status_rc: Cell::new(RECT::default()),
-                status_visible: Cell::new(status_bar),
-                indicators: RefCell::new(Vec::new()),
-                hot_row: Cell::new(None),
-                hot_header: Cell::new(None),
-                search_hot: Cell::new(None),
-                search_pressed: Cell::new(None),
-                tooltip: Cell::new(core::ptr::null_mut()),
-                cell_tip: CellTip::default(),
-                type_ahead: RefCell::new(TypeAhead::default()),
-                dropdown: Dropdown::new(),
-                search_history: RefCell::new(history),
-                searches,
-                sessions,
-                nav_bar: Cell::new(s.nav_bar),
-                typing: Cell::new(false),
-                nav: RefCell::new(NavHistory::default()),
-                recorded: Cell::new(false),
-                enter_pending: Cell::new(false),
-                reselect: RefCell::new(None),
-                restoring: Cell::new(false),
-                select_all: Cell::new(false),
-                bulk: Cell::new(false),
-                bulk_changed: Cell::new(false),
-                sel: RefCell::default(),
-                selecting: RefCell::default(),
-                settled: Cell::new(false),
-                beeped: Cell::new(false),
-                bookmarks: marks,
-                bookmark_dialog: Cell::new(false),
-                runs,
-                note: RefCell::new(None),
-                window_icons: Cell::new([core::ptr::null_mut(); 2]),
-                menus,
-                on_top: Cell::new(on_top),
-                opts: Cell::new(opts),
-                worker: Worker::spawn(hwnd, WM_REPLY),
-                next_epoch: Cell::new(0),
-                want_status: Cell::new(false),
-                retry_when_shown: Cell::new(false),
-                last_focus: Cell::new(edit),
-                last_search: Cell::new(None),
-                prefs: RefCell::new(prefs),
-                writer: prefs::writer(),
-                layout: Cell::new(layout),
-                list_cols: Cell::new(cols::ListCols::default()),
-                columns_posted: Cell::new(false),
-                maximize_deferred: Cell::new(false),
-                shell_menu: RefCell::new(None),
-                fileops: FileOps::new(hwnd, WM_FILEOP),
-                own_drag: Cell::new(false),
-                renaming: RefCell::new(None),
-                rename_rect: Cell::new(RECT::default()),
-                last_click: Cell::new(POINT::default()),
-                settle: Cell::new(0),
-                cuts: RefCell::new(Vec::new()),
-                fetching: RefCell::new(None),
-                fetch_bypass: Cell::new(false),
-                busy: Cell::new(results::Busy::Idle),
-                background: Cell::new(crate::settings::Background::default()),
-                tray_on: Cell::new(false),
-                taskbar_created: crate::tray::taskbar_created(),
-                view: Cell::new(s.view),
-                thumbs: Thumbs::new(hwnd, WM_THUMB),
-                big_icons: Cell::new([0; 5]),
-                big_loads: crate::bigicons::BigIcons::new(hwnd, thumbview::WM_BIG_ICONS),
-                thumb_grid: Cell::new(None),
-                view_hot: Cell::new(None),
-                docks: RefCell::new(docks::Docks::new(s.docks)),
-                strips: RefCell::new([None, None]),
-                strip_capture: Cell::new(None),
-                regions: Cell::new(Regions::default()),
-                panes_shown: Cell::new(false),
-                custom: custom::Custom::new(&s.custom, system_dpi),
-                // Wave 1 (FRAMEWORK.md).
-
-                // F1 (preview pane).
-
-                // F2 (sidebars).
-                sidebars: sidebars::Sidebars::new(),
-                // F3 (tabs and windows).
-                tabs: RefCell::new(crate::tabs::TabList::new(
-                    crate::session::View::default(),
-                    s.tabs.max_closed,
-                )),
-                list_frozen: Cell::new(false),
-                new_window: Cell::new(false),
-                instance: RefCell::new(None),
-                instance_key: RefCell::new(String::new()),
-                exit_window: Cell::new(core::ptr::null_mut()),
-                // F4 (search tools).
-                tools: tools::Tools::new(),
-                // F5 (file tools).
-                file_tools: file_tools::Tools::new(&s.file_tools),
-                // F6 (integration and the Options pages).
-                ui: Cell::new(s.ui),
-                search_dirty: Cell::new(false),
-                single_click: Cell::new(false),
-                click_select: Cell::new(false),
-                // W4 (G1: data and file tools).
-                data_tools: datatools::DataTools::new(),
-            })
+        // The child controls of `hwnd`, on its thread.
+        let edit = class::create_plain(&Create {
+            ex_style: 0,
+            class: "EDIT",
+            title: "",
+            style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            rect: (0, 0, 0, 0),
+            parent: hwnd,
+            menu: class::id_menu(ID_EDIT),
+        });
+        let list = class::create_plain(&Create {
+            ex_style: 0,
+            class: lv::CLASS,
+            title: "",
+            style: WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | LVS_REPORT
+                | LVS_OWNERDATA
+                | LVS_OWNERDRAWFIXED
+                | LVS_SHOWSELALWAYS
+                | LVS_EDITLABELS,
+            rect: (0, 0, 0, 0),
+            parent: hwnd,
+            menu: class::id_menu(ID_LIST),
+        });
+        let header = lv::header(list);
+        // The UI scale (`dpi`, Options > UI) multiplies the monitor's.
+        let system_dpi = sys::dpi_for_window(hwnd);
+        let dpi = crate::custom::scaled(system_dpi);
+        let mode = s.theme;
+        // The search the window starts with (Home's, or the last one),
+        // on one line as the box shows it (a session may hold one of
+        // several lines). The window's procedure ignores the change
+        // this makes: the App is not attached to it yet.
+        if !s.search.is_empty() {
+            let search = crate::bookmarks::one_line(&s.search);
+            win::set_text(edit, &search);
+            let end = search.encode_utf16().count();
+            win::edit::set_sel(edit, end as i32, end as i32);
         }
+        let opts = Options {
+            match_case: s.match_case,
+            match_path: s.match_path,
+            filter: s.filter,
+            sort: s.sort,
+        };
+        let (status_bar, on_top, layout) = (s.status_bar, s.on_top, s.columns);
+        Box::new(App {
+            hwnd,
+            edit,
+            list,
+            header,
+            dpi: Cell::new(dpi),
+            fonts: RefCell::new(Fonts::with(
+                dpi,
+                s.zoom,
+                &s.custom
+                    .colors
+                    .resolved_font(crate::colors::Item::ResultList),
+            )),
+            ui_fonts: RefCell::new(Fonts::with(
+                dpi,
+                crate::zoom::DEFAULT,
+                &s.custom.colors.resolved_font(crate::colors::Item::Default),
+            )),
+            zoom: Cell::new(s.zoom),
+            wheel: Cell::new(0),
+            filter_bar: Cell::new(s.filter_bar),
+            filter_rc: Cell::new(RECT::default()),
+            filter_open: Cell::new(false),
+            in_menu: Cell::new(false),
+            export: RefCell::new(None),
+            export_type: Cell::new(s.export_type),
+            pal: Cell::new(Palette::new(mode.is_dark())),
+            theme_mode: Cell::new(mode),
+            model: RefCell::new(Model::new(Arc::new(Search {
+                query: String::new(),
+                sort: SortSpec::default(),
+                match_case: false,
+                filelist: None,
+                created_sort: None,
+                slots: Default::default(),
+                want: Default::default(),
+                content: None,
+            }))),
+            icons: Icons::new(hwnd, WM_ICON, WM_TYPES, WM_TYPES_ASK),
+            w9: w9a::W9::new(hwnd),
+            scratch: RefCell::new(Scratch::default()),
+            search_rc: Cell::new(RECT::default()),
+            status_rc: Cell::new(RECT::default()),
+            status_visible: Cell::new(status_bar),
+            indicators: RefCell::new(Vec::new()),
+            hot_row: Cell::new(None),
+            hot_header: Cell::new(None),
+            search_hot: Cell::new(None),
+            search_pressed: Cell::new(None),
+            tooltip: Cell::new(core::ptr::null_mut()),
+            cell_tip: CellTip::default(),
+            type_ahead: RefCell::new(TypeAhead::default()),
+            dropdown: Dropdown::new(),
+            search_history: RefCell::new(history),
+            searches,
+            sessions,
+            nav_bar: Cell::new(s.nav_bar),
+            typing: Cell::new(false),
+            nav: RefCell::new(NavHistory::default()),
+            recorded: Cell::new(false),
+            enter_pending: Cell::new(false),
+            reselect: RefCell::new(None),
+            restoring: Cell::new(false),
+            select_all: Cell::new(false),
+            bulk: Cell::new(false),
+            bulk_changed: Cell::new(false),
+            sel: RefCell::default(),
+            selecting: RefCell::default(),
+            settled: Cell::new(false),
+            beeped: Cell::new(false),
+            bookmarks: marks,
+            bookmark_dialog: Cell::new(false),
+            runs,
+            note: RefCell::new(None),
+            window_icons: Cell::new([core::ptr::null_mut(); 2]),
+            menus,
+            on_top: Cell::new(on_top),
+            opts: Cell::new(opts),
+            worker: Worker::spawn(hwnd, WM_REPLY),
+            next_epoch: Cell::new(0),
+            want_status: Cell::new(false),
+            retry_when_shown: Cell::new(false),
+            last_focus: Cell::new(edit),
+            last_search: Cell::new(None),
+            prefs: RefCell::new(prefs),
+            writer: prefs::writer(),
+            layout: Cell::new(layout),
+            list_cols: Cell::new(cols::ListCols::default()),
+            columns_posted: Cell::new(false),
+            maximize_deferred: Cell::new(false),
+            shell_menu: RefCell::new(None),
+            fileops: FileOps::new(hwnd, WM_FILEOP),
+            own_drag: Cell::new(false),
+            renaming: RefCell::new(None),
+            rename_rect: Cell::new(RECT::default()),
+            last_click: Cell::new(POINT::default()),
+            settle: Cell::new(0),
+            cuts: RefCell::new(Vec::new()),
+            fetching: RefCell::new(None),
+            fetch_bypass: Cell::new(false),
+            busy: Cell::new(results::Busy::Idle),
+            background: Cell::new(crate::settings::Background::default()),
+            tray_on: Cell::new(false),
+            taskbar_created: crate::tray::taskbar_created(),
+            view: Cell::new(s.view),
+            thumbs: Thumbs::new(hwnd, WM_THUMB),
+            big_icons: Cell::new([0; 5]),
+            big_loads: crate::bigicons::BigIcons::new(hwnd, thumbview::WM_BIG_ICONS),
+            thumb_grid: Cell::new(None),
+            view_hot: Cell::new(None),
+            docks: RefCell::new(docks::Docks::new(s.docks)),
+            strips: RefCell::new([None, None]),
+            strip_capture: Cell::new(None),
+            regions: Cell::new(Regions::default()),
+            panes_shown: Cell::new(false),
+            custom: custom::Custom::new(&s.custom, system_dpi),
+            // Wave 1 (FRAMEWORK.md).
+
+            // F1 (preview pane).
+
+            // F2 (sidebars).
+            sidebars: sidebars::Sidebars::new(),
+            // F3 (tabs and windows).
+            tabs: RefCell::new(crate::tabs::TabList::new(
+                crate::session::View::default(),
+                s.tabs.max_closed,
+            )),
+            list_frozen: Cell::new(false),
+            new_window: Cell::new(false),
+            instance: RefCell::new(None),
+            instance_key: RefCell::new(String::new()),
+            exit_window: Cell::new(core::ptr::null_mut()),
+            // F4 (search tools).
+            tools: tools::Tools::new(),
+            // F5 (file tools).
+            file_tools: file_tools::Tools::new(&s.file_tools),
+            // F6 (integration and the Options pages).
+            ui: Cell::new(s.ui),
+            search_dirty: Cell::new(false),
+            single_click: Cell::new(false),
+            click_select: Cell::new(false),
+            // W4 (G1: data and file tools).
+            data_tools: datatools::DataTools::new(),
+        })
     }
 
     /// Readies the window's controls; `default_size` sizes the window as
     /// goz-gui does when it has no saved place.
     fn init(&'static self, default_size: bool) {
-        let me = self as *const App as usize;
-        // SAFETY: `self` is leaked, so the subclass data stays valid.
-        unsafe {
-            SetWindowSubclass(self.edit, Some(edit::edit_proc), 1, me);
-            SetWindowSubclass(self.list, Some(list_proc), 1, me);
-            SetWindowSubclass(self.header, Some(header::subclass_proc), 1, me);
-            // Files dropped on the window or the search box become the
-            // search.
-            DragAcceptFiles(self.hwnd, 1);
-            DragAcceptFiles(self.edit, 1);
-        }
+        // `self` is leaked, so the subclasses may hold it.
+        subclass::set(self.edit, &edit::SUBCLASS, move |m| {
+            edit::edit_proc(self, m)
+        });
+        subclass::set(self.list, &LIST_SUBCLASS, move |m| list_proc(self, m));
+        subclass::set(self.header, &header::SUBCLASS, move |m| {
+            header::subclass_proc(self, m)
+        });
+        // Files dropped on the window or the search box become the search.
+        b1::drag_accept_files(self.hwnd, true);
+        b1::drag_accept_files(self.edit, true);
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
-        send(
-            self.list,
-            LVM_SETEXTENDEDLISTVIEWSTYLE,
-            ex as usize,
-            ex as isize,
-        );
+        lv::set_extended_style(self.list, ex, ex);
         // Full row select and one-click opening as Options > Results says,
         // sizes as Options > View says.
         self.apply_list_style();
@@ -1258,8 +1190,7 @@ impl App {
         // settings to be written.
         let places = self.prefs.borrow().base.places.clone();
         places::start(places, Box::new(move || self.settings_changed()));
-        let cue = wz("Search");
-        send(self.edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+        win::edit::set_cue_banner(self.edit, "Search", true);
         dropdown::create(self);
         self.tooltip.set(searchbox::create_tooltip(self));
         celltip::create(self);
@@ -1280,29 +1211,23 @@ impl App {
         // taskbar.
         self.start_custom();
         if default_size {
-            // SAFETY: sizes the window for its monitor's DPI before it shows.
-            unsafe {
-                SetWindowPos(
-                    self.hwnd,
-                    core::ptr::null_mut(),
-                    0,
-                    0,
-                    self.scale(1000),
-                    self.scale(640),
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
+            // Sizes the window for its monitor's DPI before it shows.
+            win::set_pos(
+                self.hwnd,
+                core::ptr::null_mut(),
+                (0, 0, self.scale(1000), self.scale(640)),
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
         self.layout();
         // The start search's caret was put at its end while the box had no
         // width, which scrolled the text out of it: from the start again,
         // then the caret at the end, scrolling only if the text is longer
         // than the box.
-        // SAFETY: reads the length of this thread's search box.
-        let len = unsafe { GetWindowTextLengthW(self.edit) }.max(0) as usize;
+        let len = win::text_len(self.edit);
         if len > 0 {
-            send(self.edit, EM_SETSEL, 0, 0);
-            send(self.edit, EM_SETSEL, len, len as isize);
+            win::edit::set_sel(self.edit, 0, 0);
+            win::edit::set_sel(self.edit, len as i32, len as i32);
         }
         self.arm_live();
     }
@@ -1328,8 +1253,7 @@ impl App {
     /// in Everything 1.5; never shorter than the row's icon.
     pub fn row_height(&self) -> i32 {
         let text = self.fonts.borrow().height + self.zscale(4);
-        // SAFETY: reads metrics.
-        let icon = unsafe { GetSystemMetricsForDpi(SM_CYSMICON, self.dpi.get()) };
+        let icon = sys::metric_for_dpi(SM_CYSMICON, self.dpi.get());
         text.max(self.zscale(19)).max(icon + self.scale(1))
     }
 
@@ -1341,9 +1265,9 @@ impl App {
 
     fn apply_fonts(&self) {
         let ui = self.search_font();
-        send(self.edit, WM_SETFONT, ui as usize, 1);
+        win::set_font(self.edit, ui, true);
         let font = self.fonts.borrow().normal;
-        send(self.list, WM_SETFONT, font as usize, 1);
+        win::set_font(self.list, font, true);
         celltip::set_font(self);
     }
 
@@ -1353,26 +1277,24 @@ impl App {
         // The monitor's own: the title bar and the taskbar are Windows'.
         let dpi = self.system_dpi();
         let old = self.window_icons.get();
-        // SAFETY: reads metrics; the icons are this module's resource.
-        let new = unsafe {
-            [
-                app_icon(GetSystemMetricsForDpi(SM_CXSMICON, dpi)),
-                app_icon(GetSystemMetricsForDpi(SM_CXICON, dpi)),
-            ]
-        };
+        // The icons are this module's resource.
+        let new = [
+            app_icon(sys::metric_for_dpi(SM_CXSMICON, dpi)),
+            app_icon(sys::metric_for_dpi(SM_CXICON, dpi)),
+        ];
         if new.iter().any(|i| i.is_null()) {
+            // Icons made above and given to no one.
             for icon in new.into_iter().filter(|i| !i.is_null()) {
-                // SAFETY: an icon made above and given to no one.
-                unsafe { DestroyIcon(icon) };
+                gdi::destroy_icon(icon);
             }
             return;
         }
-        send(self.hwnd, WM_SETICON, ICON_SMALL as usize, new[0] as isize);
-        send(self.hwnd, WM_SETICON, ICON_BIG as usize, new[1] as isize);
+        win::send_plain(self.hwnd, WM_SETICON, ICON_SMALL as usize, new[0] as isize);
+        win::send_plain(self.hwnd, WM_SETICON, ICON_BIG as usize, new[1] as isize);
         self.window_icons.set(new);
+        // Icons this window no longer uses, made by this function.
         for icon in old.into_iter().filter(|i| !i.is_null()) {
-            // SAFETY: icons this window no longer uses, made by this function.
-            unsafe { DestroyIcon(icon) };
+            gdi::destroy_icon(icon);
         }
     }
 
@@ -1403,8 +1325,8 @@ impl App {
     pub fn set_nav_bar_visible(&self, visible: bool) {
         self.nav_bar.set(visible);
         self.layout();
-        // SAFETY: repaints this thread's window.
-        unsafe { InvalidateRect(self.hwnd, core::ptr::null(), 1) };
+        // Repaints this thread's window.
+        win::invalidate(self.hwnd, None, true);
     }
 
     /// Shows or hides the status bar; the list takes its room.
@@ -1442,18 +1364,13 @@ impl App {
         theme::set_class(self.edit, dark.then_some("DarkMode_CFD"));
         // The search box's style (Fonts and Colors' Search Edit) is the
         // theme's own.
-        let current = send(
-            self.edit,
-            windows_sys::Win32::UI::WindowsAndMessaging::WM_GETFONT,
-            0,
-            0,
-        ) as HFONT;
+        let current: HFONT = win::font(self.edit);
         if self.search_font() != current {
-            send(self.edit, WM_SETFONT, self.search_font() as usize, 1);
+            win::set_font(self.edit, self.search_font(), true);
         }
-        send(self.list, LVM_SETBKCOLOR, 0, pal.list_bg as isize);
-        send(self.list, LVM_SETTEXTBKCOLOR, 0, pal.list_bg as isize);
-        send(self.list, LVM_SETTEXTCOLOR, 0, pal.list_fg as isize);
+        lv::set_bk_color(self.list, pal.list_bg);
+        lv::set_text_bk_color(self.list, pal.list_bg);
+        lv::set_text_color(self.list, pal.list_fg);
         syntax::apply_theme(dark);
         dialog::set_app_look(self.dialog_look());
         dropdown::apply_theme(self);
@@ -1461,16 +1378,13 @@ impl App {
         celltip::set_theme(self, dark);
         self.docks_theme(dark);
         theme::flush_menus();
-        // SAFETY: repaints this thread's windows.
-        unsafe {
-            DrawMenuBar(self.hwnd);
-            RedrawWindow(
-                self.hwnd,
-                core::ptr::null(),
-                core::ptr::null_mut(),
-                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
-            );
-        }
+        // Repaints this thread's windows.
+        b1::draw_menu_bar(self.hwnd);
+        win::redraw(
+            self.hwnd,
+            None,
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
+        );
     }
 
     /// Lays the window's regions out (`crate::layout`): the tab strip, the
@@ -1484,9 +1398,7 @@ impl App {
     /// `left_sidebar_wide` and `right_sidebar_wide` (256 px) with a 6 px
     /// divider each, as Everything's.
     fn layout(&self) {
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's window's size.
-        unsafe { GetClientRect(self.hwnd, &mut rc) };
+        let rc = win::client_rect(self.hwnd);
         let (tabs_h, find_h) = self.strip_heights();
         // Under the tab strip, Everything's 3 px above the frame: the 2 px
         // more under the menu bar make up for Everything's taller one, which
@@ -1587,699 +1499,725 @@ impl App {
                 strip.place(self, self.strip_rect(slot));
             }
         }
-        // SAFETY: repaints this thread's window (its children paint
-        // themselves).
-        unsafe { InvalidateRect(self.hwnd, core::ptr::null(), 0) };
+        // Repaints this thread's window (its children paint themselves).
+        win::invalidate(self.hwnd, None, false);
     }
 
-    unsafe fn handle(&self, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-        // SAFETY: each arm reads `w`/`l` as the message defines them.
-        unsafe {
-            // The shell's menu fills and draws its own items while it is up.
-            if matches!(
-                msg,
-                WM_INITMENUPOPUP | WM_MEASUREITEM | WM_DRAWITEM | WM_MENUCHAR
-            ) && let Some(answer) = self.shell_menu_message(msg, w, l)
-                && msg != WM_INITMENUPOPUP
-            {
-                return answer;
+    /// The main window's messages, from the moment the `App` is attached.
+    fn handle(&self, m: &Msg) -> LRESULT {
+        let (msg, w, l) = (m.id, m.w, m.l);
+        // The shell's menu fills and draws its own items while it is up.
+        if matches!(
+            msg,
+            WM_INITMENUPOPUP | WM_MEASUREITEM | WM_DRAWITEM | WM_MENUCHAR
+        ) && let Some(answer) = self.shell_menu_message(msg, w, l)
+            && msg != WM_INITMENUPOPUP
+        {
+            return answer;
+        }
+        // What a strip's own controls send their parent (this window)
+        // goes to the strip.
+        if matches!(
+            msg,
+            WM_COMMAND
+                | WM_NOTIFY
+                | WM_CTLCOLOREDIT
+                | WM_CTLCOLORSTATIC
+                | WM_CTLCOLORBTN
+                | WM_CTLCOLORLISTBOX
+                | WM_DRAWITEM
+        ) && let Some(answer) = self.strip_message(msg, w, l)
+        {
+            return answer;
+        }
+        // The strips see the mouse over them first (and all of it
+        // while one holds it); a button they take goes no further.
+        if matches!(
+            msg,
+            WM_MOUSEMOVE
+                | WM_MOUSELEAVE
+                | WM_CAPTURECHANGED
+                | WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_LBUTTONDBLCLK
+                | WM_RBUTTONDOWN
+                | WM_RBUTTONUP
+                | WM_MBUTTONDOWN
+                | WM_MBUTTONUP
+        ) && self.strip_mouse(msg, w, point(l))
+        {
+            return 0;
+        }
+        match msg {
+            WM_SIZE => {
+                // The dropdown hangs under the search frame where it was.
+                dropdown::close(self);
+                self.layout();
+                if w == SIZE_MAXIMIZED as usize {
+                    // The user maximized it: the state is the window's.
+                    self.maximize_deferred.set(false);
+                }
+                if w != SIZE_MINIMIZED as usize {
+                    self.arm_live();
+                    self.retry_if_waiting();
+                }
+                self.panes_window_shown(w != SIZE_MINIMIZED as usize && win::is_visible(self.hwnd));
+                self.settings_changed();
+                0
             }
-            // What a strip's own controls send their parent (this window)
-            // goes to the strip.
-            if matches!(
-                msg,
-                WM_COMMAND
-                    | WM_NOTIFY
-                    | WM_CTLCOLOREDIT
-                    | WM_CTLCOLORSTATIC
-                    | WM_CTLCOLORBTN
-                    | WM_CTLCOLORLISTBOX
-                    | WM_DRAWITEM
-            ) && let Some(answer) = self.strip_message(msg, w, l)
-            {
-                return answer;
+            WM_SHOWWINDOW => {
+                if w != 0 {
+                    self.arm_live();
+                    self.retry_if_waiting();
+                }
+                self.panes_window_shown(w != 0 && !win::is_iconic(self.hwnd));
+                m.def()
             }
-            // The strips see the mouse over them first (and all of it
-            // while one holds it); a button they take goes no further.
-            if matches!(
-                msg,
-                WM_MOUSEMOVE
-                    | WM_MOUSELEAVE
-                    | WM_CAPTURECHANGED
-                    | WM_LBUTTONDOWN
-                    | WM_LBUTTONUP
-                    | WM_LBUTTONDBLCLK
-                    | WM_RBUTTONDOWN
-                    | WM_RBUTTONUP
-                    | WM_MBUTTONDOWN
-                    | WM_MBUTTONUP
-            ) && self.strip_mouse(msg, w, point(l))
-            {
-                return 0;
+            WM_MOVE => {
+                dropdown::close(self);
+                self.settings_changed();
+                m.def()
             }
-            match msg {
-                WM_SIZE => {
-                    // The dropdown hangs under the search frame where it was.
-                    dropdown::close(self);
-                    self.layout();
-                    if w == SIZE_MAXIMIZED as usize {
-                        // The user maximized it: the state is the window's.
-                        self.maximize_deferred.set(false);
+            WM_ENTERMENULOOP => {
+                dropdown::close(self);
+                self.in_menu.set(true);
+                m.def()
+            }
+            WM_EXITMENULOOP => {
+                self.in_menu.set(false);
+                m.def()
+            }
+            WM_PAINT => {
+                paint::window(self);
+                0
+            }
+            WM_ERASEBKGND => 1,
+            WM_CTLCOLOREDIT => {
+                let pal = self.pal.get();
+                // The search box in Fonts and Colors' Search Edit.
+                let ink = if l as HWND == self.edit {
+                    pal.ink(
+                        crate::colors::Item::SearchEdit,
+                        crate::colors::State::Normal,
+                    )
+                } else {
+                    crate::theme::Ink {
+                        fg: pal.fg,
+                        bg: pal.bg,
                     }
-                    if w != SIZE_MINIMIZED as usize {
-                        self.arm_live();
-                        self.retry_if_waiting();
-                    }
-                    self.panes_window_shown(
-                        w != SIZE_MINIMIZED as usize && IsWindowVisible(self.hwnd) != 0,
-                    );
-                    self.settings_changed();
-                    0
+                };
+                let hdc = w as windows_sys::Win32::Graphics::Gdi::HDC;
+                gdi::set_text_color(hdc, ink.fg);
+                gdi::set_bk_color(hdc, ink.bg);
+                // The edit erases with the brush returned, on its own DC.
+                gdi::set_dc_brush_color(hdc, ink.bg);
+                gdi::stock_object(DC_BRUSH) as LRESULT
+            }
+            WM_MOUSEMOVE => {
+                // A divider being dragged takes the mouse.
+                if !self.divider_move(point(l)) {
+                    searchbox::mouse_move(self, point(l));
+                    status::view_hover(self, Some(point(l)));
                 }
-                WM_SHOWWINDOW => {
-                    if w != 0 {
-                        self.arm_live();
-                        self.retry_if_waiting();
-                    }
-                    self.panes_window_shown(w != 0 && IsIconic(self.hwnd) == 0);
-                    DefWindowProcW(self.hwnd, msg, w, l)
-                }
-                WM_MOVE => {
-                    dropdown::close(self);
-                    self.settings_changed();
-                    DefWindowProcW(self.hwnd, msg, w, l)
-                }
-                WM_ENTERMENULOOP => {
-                    dropdown::close(self);
-                    self.in_menu.set(true);
-                    DefWindowProcW(self.hwnd, msg, w, l)
-                }
-                WM_EXITMENULOOP => {
-                    self.in_menu.set(false);
-                    DefWindowProcW(self.hwnd, msg, w, l)
-                }
-                WM_PAINT => {
-                    paint::window(self);
-                    0
-                }
-                WM_ERASEBKGND => 1,
-                WM_CTLCOLOREDIT => {
-                    let pal = self.pal.get();
-                    // The search box in Fonts and Colors' Search Edit.
-                    let ink = if l as HWND == self.edit {
-                        pal.ink(
-                            crate::colors::Item::SearchEdit,
-                            crate::colors::State::Normal,
-                        )
-                    } else {
-                        crate::theme::Ink {
-                            fg: pal.fg,
-                            bg: pal.bg,
-                        }
-                    };
-                    SetTextColor(w as _, ink.fg);
-                    SetBkColor(w as _, ink.bg);
-                    // The edit erases with the brush returned, on its own DC.
-                    SetDCBrushColor(w as _, ink.bg);
-                    GetStockObject(DC_BRUSH) as LRESULT
-                }
-                WM_MOUSEMOVE => {
-                    // A divider being dragged takes the mouse.
-                    if !self.divider_move(point(l)) {
-                        searchbox::mouse_move(self, point(l));
-                        status::view_hover(self, Some(point(l)));
-                    }
-                    0
-                }
-                WM_MOUSELEAVE => {
-                    searchbox::mouse_leave(self);
-                    status::view_hover(self, None);
-                    0
-                }
-                WM_LBUTTONDOWN => {
-                    let pt = point(l);
-                    if self.divider_down(pt) {
-                        // A divider's drag starts.
-                    } else if in_rect(&self.filter_rc.get(), pt) {
-                        self.filter_bar_click();
-                    } else if let Some(button) = status::view_button_at(self, pt) {
-                        self.view_button(button);
-                    } else if !searchbox::button_down(self, pt)
-                        && in_rect(&self.search_rc.get(), pt)
-                    {
-                        // The frame round the text is the search box too,
-                        // its text selected as a click in it would.
-                        let had = GetFocus() == self.edit;
-                        self.focus_box();
-                        if !had && self.ui.get().select_on_click && GetFocus() == self.edit {
-                            send(self.edit, EM_SETSEL, 0, -1);
-                        }
-                    }
-                    0
-                }
-                WM_LBUTTONUP => {
-                    if !self.divider_up()
-                        && let Some(button) = searchbox::button_up(self, point(l))
-                    {
-                        self.search_button(button);
-                    }
-                    0
-                }
-                WM_CAPTURECHANGED => {
-                    self.divider_up();
-                    searchbox::capture_lost(self);
-                    0
-                }
-                WM_LBUTTONDBLCLK => {
-                    let pt = point(l);
-                    // A quick second click on a button is a click.
-                    if let Some(button) = status::view_button_at(self, pt) {
-                        self.view_button(button);
-                    } else if !searchbox::button_down(self, pt)
-                        && let Some(indicator) = status::indicator_at(self, pt)
-                    {
-                        self.turn_off(indicator);
-                    }
-                    0
-                }
-                // Browser Back, Forward and Home keys, and the mouse's side
-                // buttons, which DefWindowProc turns into these.
-                WM_APPCOMMAND => {
-                    match u32::from(hiword(l as usize)) & !FAPPCOMMAND_MASK {
-                        APPCOMMAND_BROWSER_BACKWARD => self.go_back(),
-                        APPCOMMAND_BROWSER_FORWARD => self.go_forward(),
-                        APPCOMMAND_BROWSER_HOME => self.go_home(),
-                        _ => return DefWindowProcW(self.hwnd, msg, w, l),
-                    }
-                    1
-                }
-                WM_MEASUREITEM => {
-                    let mis = &mut *(l as *mut MEASUREITEMSTRUCT);
-                    if mis.CtlType == ODT_LISTVIEW {
-                        mis.itemHeight = self.row_height() as u32;
-                    }
-                    1
-                }
-                WM_DRAWITEM => {
-                    let dis = &*(l as *const DRAWITEMSTRUCT);
-                    if dis.CtlType == ODT_LISTVIEW {
-                        paint::row(self, dis);
-                    }
-                    1
-                }
-                WM_NOTIFY => self.notify(l),
-                WM_COMMAND => {
-                    if l != 0 {
-                        if loword(w) as usize == ID_EDIT && u32::from(hiword(w)) == EN_CHANGE {
-                            self.text_changed();
-                        }
-                    } else {
-                        self.menu_command(loword(w));
-                    }
-                    0
-                }
-                WM_CONTEXTMENU => {
-                    if (w as HWND == self.list || w as HWND == self.header)
-                        && l != -1
-                        && self.over_header(point(l))
-                    {
-                        self.header_menu(point(l), header::item_at_screen(self, point(l)));
-                        0
-                    } else if w as HWND == self.list {
-                        self.list_menu(l);
-                        0
-                    } else if w as HWND == self.hwnd && self.status_menu(l) {
-                        // The status bar's menu (F2).
-                        0
-                    } else {
-                        DefWindowProcW(self.hwnd, msg, w, l)
+                0
+            }
+            WM_MOUSELEAVE => {
+                searchbox::mouse_leave(self);
+                status::view_hover(self, None);
+                0
+            }
+            WM_LBUTTONDOWN => {
+                let pt = point(l);
+                if self.divider_down(pt) {
+                    // A divider's drag starts.
+                } else if in_rect(&self.filter_rc.get(), pt) {
+                    self.filter_bar_click();
+                } else if let Some(button) = status::view_button_at(self, pt) {
+                    self.view_button(button);
+                } else if !searchbox::button_down(self, pt) && in_rect(&self.search_rc.get(), pt) {
+                    // The frame round the text is the search box too,
+                    // its text selected as a click in it would.
+                    let had = win::focus() == self.edit;
+                    self.focus_box();
+                    if !had && self.ui.get().select_on_click && win::focus() == self.edit {
+                        win::edit::select_all(self.edit);
                     }
                 }
-                // The window menu (HIWORD of lParam) is the system's own;
-                // the shell's submenus are the shell's (above).
-                WM_INITMENUPOPUP => {
-                    if hiword(l as usize) == 0 && self.shell_menu.borrow().is_none() {
-                        self.init_menu_popup(w as HMENU);
-                        // Options > Keyboard's keys after the items' tabs.
-                        self.relabel_menu(w as HMENU);
-                    }
-                    0
-                }
-                WM_SETCURSOR if u32::from(loword(l as usize)) == HTCLIENT && self.busy_cursor() => {
-                    1
-                }
-                // Over a divider: the resize cursor.
-                WM_SETCURSOR
-                    if w as HWND == self.hwnd
-                        && u32::from(loword(l as usize)) == HTCLIENT
-                        && self.divider_cursor() =>
+                0
+            }
+            WM_LBUTTONUP => {
+                if !self.divider_up()
+                    && let Some(button) = searchbox::button_up(self, point(l))
                 {
-                    1
+                    self.search_button(button);
                 }
-                results::WM_FETCHED => {
-                    self.fetch_done();
-                    0
-                }
-                selecting::WM_SELECTING => {
-                    self.selecting_due();
-                    0
-                }
-                // W4 (G1): the data tools' messages.
-                m if (crate::datatools::MSG_FIRST..crate::datatools::MSG_END).contains(&m) => {
-                    self.data_tools_message(m, w, l);
-                    0
-                }
-                // W6 (C): the File List Editor closed.
-                m if (crate::listedit::WM_EDITOR_CLOSED..crate::listedit::W6_MSG_END)
-                    .contains(&m) =>
+                0
+            }
+            WM_CAPTURECHANGED => {
+                self.divider_up();
+                searchbox::capture_lost(self);
+                0
+            }
+            WM_LBUTTONDBLCLK => {
+                let pt = point(l);
+                // A quick second click on a button is a click.
+                if let Some(button) = status::view_button_at(self, pt) {
+                    self.view_button(button);
+                } else if !searchbox::button_down(self, pt)
+                    && let Some(indicator) = status::indicator_at(self, pt)
                 {
-                    self.lists_message(m, w, l);
-                    0
+                    self.turn_off(indicator);
                 }
-                // W7 (C): a file-list term to edit, a slot's saved results.
-                m if (crate::slotedit::MSG_FIRST..crate::slotedit::MSG_END).contains(&m) => {
-                    self.w7_message(m, w, l);
-                    0
+                0
+            }
+            // Browser Back, Forward and Home keys, and the mouse's side
+            // buttons, which DefWindowProc turns into these.
+            WM_APPCOMMAND => {
+                match u32::from(hiword(l as usize)) & !FAPPCOMMAND_MASK {
+                    APPCOMMAND_BROWSER_BACKWARD => self.go_back(),
+                    APPCOMMAND_BROWSER_FORWARD => self.go_forward(),
+                    APPCOMMAND_BROWSER_HOME => self.go_home(),
+                    _ => return m.def(),
                 }
-                // W9 (B1): the disk's column values, the content search.
-                m if w9a::is_message(m) => {
-                    self.w9_message(m, w, l);
-                    0
+                1
+            }
+            WM_MEASUREITEM => {
+                if let Some(mut mis) = m.measure_item()
+                    && mis.CtlType == ODT_LISTVIEW
+                {
+                    mis.itemHeight = self.row_height() as u32;
                 }
-                WM_SERVICE => {
-                    if w != 0 {
-                        // gozd stopped or (re)started: search again, which
-                        // reconnects, or retries until it is up.
-                        self.start_search(true);
+                1
+            }
+            WM_DRAWITEM => {
+                if let Some(dis) = m.draw_item()
+                    && dis.CtlType == ODT_LISTVIEW
+                {
+                    paint::row(self, &dis);
+                }
+                1
+            }
+            WM_NOTIFY => self.notify(m),
+            WM_COMMAND => {
+                if l != 0 {
+                    if loword(w) as usize == ID_EDIT && u32::from(hiword(w)) == EN_CHANGE {
+                        self.text_changed();
                     }
-                    0
+                } else {
+                    self.menu_command(loword(w));
                 }
-                WM_TIMER => {
-                    KillTimer(self.hwnd, w);
-                    if w == TIMER_RETRY && !self.shown() {
-                        // Hidden since: once it shows.
-                        self.retry_when_shown.set(true);
-                    } else if w == TIMER_REFRESH || w == TIMER_RETRY {
-                        self.start_search(true);
-                    } else if w == TIMER_NAV {
-                        self.commit_nav();
-                        self.settle_search();
-                    } else if w == TIMER_NOTE {
-                        self.clear_note();
-                    } else if w == TIMER_SETTINGS {
-                        self.save_settings();
-                    } else if w == TIMER_HISTORY {
-                        self.save_history();
-                    } else if w == TIMER_SESSION {
-                        self.save_session(false);
-                        self.session_timer();
-                    } else if w == TIMER_RUNS {
-                        self.save_runs();
-                    } else if w == TIMER_STORE_RETRY {
-                        self.retry_writes();
-                    } else if w == TIMER_SETTLE {
-                        self.settle_tick();
-                    } else if w == celltip::TIMER {
-                        celltip::timer(self);
-                    } else if w == TIMER_LIVE {
-                        self.live_tick();
-                    } else if w == TIMER_REST {
-                        self.memory_rested();
-                    } else if w == selecting::TIMER_SELECTING {
-                        self.selecting_due();
-                    } else if slots::is_feature_timer(w) {
-                        self.feature_timer(w);
-                    } else if custom::is_timer(w) {
-                        self.custom_timer(w);
-                    } else if w9a::is_timer(w) {
-                        self.w9_timer(w);
-                    }
+                0
+            }
+            WM_CONTEXTMENU => {
+                if (w as HWND == self.list || w as HWND == self.header)
+                    && l != -1
+                    && self.over_header(point(l))
+                {
+                    self.header_menu(point(l), header::item_at_screen(self, point(l)));
                     0
-                }
-                WM_PANE_CLOSE => {
-                    if let Some(id) = crate::dock::PaneId::from_code(w) {
-                        self.show_pane(id, false);
-                    }
+                } else if w as HWND == self.list {
+                    self.list_menu(l);
                     0
-                }
-                m if slots::is_feature_message(m) => self
-                    .feature_message(m, w, l)
-                    .unwrap_or_else(|| DefWindowProcW(self.hwnd, msg, w, l)),
-                m if custom::is_message(m) => self
-                    .custom_message(m, w, l)
-                    .unwrap_or_else(|| DefWindowProcW(self.hwnd, msg, w, l)),
-                WM_EXPORT => {
-                    if w == crate::export::ENDED {
-                        let ended = Box::from_raw(l as *mut crate::export::Ended);
-                        self.export_ended(*ended);
-                    } else {
-                        self.export_progress();
-                    }
+                } else if w as HWND == self.hwnd && self.status_menu(l) {
+                    // The status bar's menu (F2).
                     0
+                } else {
+                    m.def()
                 }
-                WM_COLUMNS => {
-                    self.sync_columns();
-                    0
+            }
+            // The window menu (HIWORD of lParam) is the system's own;
+            // the shell's submenus are the shell's (above).
+            WM_INITMENUPOPUP => {
+                if hiword(l as usize) == 0 && self.shell_menu.borrow().is_none() {
+                    self.init_menu_popup(w as HMENU);
+                    // Options > Keyboard's keys after the items' tabs.
+                    self.relabel_menu(w as HMENU);
                 }
-                WM_STORE => {
-                    let text = Box::from_raw(l as *mut String);
-                    self.store_report(*text, w == prefs::STORE_FAILED);
-                    0
+                0
+            }
+            WM_SETCURSOR if u32::from(loword(l as usize)) == HTCLIENT && self.busy_cursor() => 1,
+            // Over a divider: the resize cursor.
+            WM_SETCURSOR
+                if w as HWND == self.hwnd
+                    && u32::from(loword(l as usize)) == HTCLIENT
+                    && self.divider_cursor() =>
+            {
+                1
+            }
+            results::WM_FETCHED => {
+                self.fetch_done();
+                0
+            }
+            selecting::WM_SELECTING => {
+                self.selecting_due();
+                0
+            }
+            // W4 (G1): the data tools' messages.
+            id if (crate::datatools::MSG_FIRST..crate::datatools::MSG_END).contains(&id) => {
+                self.data_tools_message(id, w, l);
+                0
+            }
+            // W6 (C): the File List Editor closed.
+            id if (crate::listedit::WM_EDITOR_CLOSED..crate::listedit::W6_MSG_END)
+                .contains(&id) =>
+            {
+                self.lists_message(id, w, l);
+                0
+            }
+            // W7 (C): a file-list term to edit, a slot's saved results.
+            id if (crate::slotedit::MSG_FIRST..crate::slotedit::MSG_END).contains(&id) => {
+                self.w7_message(id, w, l);
+                0
+            }
+            // W9 (B1): the disk's column values, the content search.
+            id if w9a::is_message(id) => {
+                self.w9_message(id, w, l);
+                0
+            }
+            WM_SERVICE => {
+                if w != 0 {
+                    // gozd stopped or (re)started: search again, which
+                    // reconnects, or retries until it is up.
+                    self.start_search(true);
                 }
-                WM_HISTORY => {
-                    let written = Box::from_raw(l as *mut crate::history_file::Written);
-                    self.history_written(*written);
-                    0
-                }
-                WM_BOOKMARKS => {
-                    let note = Box::from_raw(l as *mut Option<String>);
-                    self.bookmarks_written(*note);
-                    0
-                }
-                WM_RUNS => {
-                    let written = Box::from_raw(l as *mut crate::run_history_file::Written);
-                    self.runs_written(*written);
-                    0
-                }
-                // Windows is ending: the settings go out now, as the
-                // process may not get another chance. The session's timer
-                // keeps running: the end may be called off.
-                WM_QUERYENDSESSION => {
+                0
+            }
+            WM_TIMER => {
+                win::kill_timer(self.hwnd, w);
+                if w == TIMER_RETRY && !self.shown() {
+                    // Hidden since: once it shows.
+                    self.retry_when_shown.set(true);
+                } else if w == TIMER_REFRESH || w == TIMER_RETRY {
+                    self.start_search(true);
+                } else if w == TIMER_NAV {
+                    self.commit_nav();
+                    self.settle_search();
+                } else if w == TIMER_NOTE {
+                    self.clear_note();
+                } else if w == TIMER_SETTINGS {
                     self.save_settings();
+                } else if w == TIMER_HISTORY {
                     self.save_history();
-                    self.save_bookmarks();
+                } else if w == TIMER_SESSION {
+                    self.save_session(false);
+                    self.session_timer();
+                } else if w == TIMER_RUNS {
                     self.save_runs();
-                    self.save_session_now();
-                    1
+                } else if w == TIMER_STORE_RETRY {
+                    self.retry_writes();
+                } else if w == TIMER_SETTLE {
+                    self.settle_tick();
+                } else if w == celltip::TIMER {
+                    celltip::timer(self);
+                } else if w == TIMER_LIVE {
+                    self.live_tick();
+                } else if w == TIMER_REST {
+                    self.memory_rested();
+                } else if w == selecting::TIMER_SELECTING {
+                    self.selecting_due();
+                } else if slots::is_feature_timer(w) {
+                    self.feature_timer(w);
+                } else if custom::is_timer(w) {
+                    self.custom_timer(w);
+                } else if w9a::is_timer(w) {
+                    self.w9_timer(w);
                 }
-                WM_ENDSESSION => {
-                    if w != 0 {
-                        self.save_and_flush();
-                    } else {
-                        // Called off (another program said no): goz-gui
-                        // runs on, and its session is written as before.
-                        self.session_timer();
+                0
+            }
+            WM_PANE_CLOSE => {
+                if let Some(id) = crate::dock::PaneId::from_code(w) {
+                    self.show_pane(id, false);
+                }
+                0
+            }
+            id if slots::is_feature_message(id) => {
+                self.feature_message(id, w, l).unwrap_or_else(|| m.def())
+            }
+            id if custom::is_message(id) => {
+                self.custom_message(id, w, l).unwrap_or_else(|| m.def())
+            }
+            WM_EXPORT => {
+                if w == crate::export::ENDED {
+                    if let Some(ended) = parcel::take::<crate::export::Ended>(m) {
+                        self.export_ended(ended);
                     }
-                    0
+                } else {
+                    self.export_progress();
                 }
-                WM_FILEOP => {
-                    let done = Box::from_raw(l as *mut fileops::Done);
-                    self.file_op_done(*done);
-                    0
+                0
+            }
+            WM_COLUMNS => {
+                self.sync_columns();
+                0
+            }
+            WM_STORE => {
+                if let Some(text) = parcel::take::<String>(m) {
+                    self.store_report(text, w == prefs::STORE_FAILED);
                 }
-                WM_DRAG_DONE => {
-                    self.drag_done();
-                    0
+                0
+            }
+            WM_HISTORY => {
+                if let Some(written) = parcel::take::<crate::history_file::Written>(m) {
+                    self.history_written(written);
                 }
-                WM_RENAME_AGAIN => {
-                    self.rename_again();
-                    0
+                0
+            }
+            WM_BOOKMARKS => {
+                if let Some(note) = parcel::take::<Option<String>>(m) {
+                    self.bookmarks_written(note);
                 }
-                WM_DROPFILES => {
-                    self.drop_files(w as HDROP);
-                    0
+                0
+            }
+            WM_RUNS => {
+                if let Some(written) = parcel::take::<crate::run_history_file::Written>(m) {
+                    self.runs_written(written);
                 }
-                WM_REPLY => {
-                    let reply = Box::from_raw(l as *mut Reply);
-                    self.on_reply(*reply);
-                    0
+                0
+            }
+            // Windows is ending: the settings go out now, as the
+            // process may not get another chance. The session's timer
+            // keeps running: the end may be called off.
+            WM_QUERYENDSESSION => {
+                self.save_settings();
+                self.save_history();
+                self.save_bookmarks();
+                self.save_runs();
+                self.save_session_now();
+                1
+            }
+            WM_ENDSESSION => {
+                if w != 0 {
+                    self.save_and_flush();
+                } else {
+                    // Called off (another program said no): goz-gui
+                    // runs on, and its session is written as before.
+                    self.session_timer();
                 }
-                WM_ICON => {
-                    let reply = Box::from_raw(l as *mut IconReply);
+                0
+            }
+            WM_FILEOP => {
+                if let Some(done) = parcel::take::<fileops::Done>(m) {
+                    self.file_op_done(done);
+                }
+                0
+            }
+            WM_DRAG_DONE => {
+                self.drag_done();
+                0
+            }
+            WM_RENAME_AGAIN => {
+                self.rename_again();
+                0
+            }
+            WM_DROPFILES => {
+                self.drop_files(w as HDROP);
+                0
+            }
+            WM_REPLY => {
+                if let Some(reply) = parcel::take::<Reply>(m) {
+                    self.on_reply(reply);
+                }
+                0
+            }
+            WM_ICON => {
+                if let Some(reply) = parcel::take::<IconReply>(m) {
                     self.on_icon(&reply);
-                    0
                 }
-                WM_TYPES_ASK => {
-                    self.icons.types.send();
-                    0
+                0
+            }
+            WM_TYPES_ASK => {
+                self.icons.types.send();
+                0
+            }
+            WM_TYPES => {
+                // Rows of those types show their icons and names now
+                // (Details' rows and the thumbnail cells alike).
+                if self.icons.types.arrived() {
+                    win::invalidate(self.list, None, false);
                 }
-                WM_TYPES => {
-                    // Rows of those types show their icons and names now
-                    // (Details' rows and the thumbnail cells alike).
-                    if self.icons.types.arrived() {
-                        InvalidateRect(self.list, core::ptr::null(), 0);
+                0
+            }
+            WM_THUMB => {
+                // Only a thumbnail kept puts the rest off: one thrown
+                // away keeps nothing, and a hidden window (the
+                // thumbnails let go) sets no timer.
+                if let Some(reply) = parcel::take::<ThumbReply>(m)
+                    && self.on_thumb(reply)
+                {
+                    self.memory_settles();
+                }
+                0
+            }
+            thumbview::WM_BIG_ICONS => {
+                self.big_icons_loaded();
+                0
+            }
+            WM_ACTIVATE => {
+                // Options > Search's "Focus search on activate": the
+                // keyboard goes to the search box, its text selected,
+                // once the activation is done (Windows gives the
+                // keyboard back to where it was as it ends). Not for
+                // a click, whose control takes it where it lands.
+                let to_search = u32::from(loword(w)) == WA_ACTIVE
+                    && hiword(w) == 0
+                    && self.ui.get().focus_on_activate;
+                if u32::from(loword(w)) == WA_INACTIVE {
+                    dropdown::close(self);
+                    let focus = win::focus();
+                    // The search box, the results, or a pane's or
+                    // strip's window: it has the keyboard back after.
+                    if self.frame_of(focus).is_some() {
+                        self.last_focus.set(focus);
                     }
-                    0
-                }
-                WM_THUMB => {
-                    let reply = Box::from_raw(l as *mut ThumbReply);
-                    // Only a thumbnail kept puts the rest off: one thrown
-                    // away keeps nothing, and a hidden window (the
-                    // thumbnails let go) sets no timer.
-                    if self.on_thumb(*reply) {
-                        self.memory_settles();
+                } else {
+                    if to_search {
+                        self.last_focus.set(self.edit);
+                        win::post_app(self.hwnd, uiopts::WM_FOCUS_SEARCH, 0, 0);
                     }
-                    0
-                }
-                thumbview::WM_BIG_ICONS => {
-                    self.big_icons_loaded();
-                    0
-                }
-                WM_ACTIVATE => {
-                    // Options > Search's "Focus search on activate": the
-                    // keyboard goes to the search box, its text selected,
-                    // once the activation is done (Windows gives the
-                    // keyboard back to where it was as it ends). Not for
-                    // a click, whose control takes it where it lands.
-                    let to_search = u32::from(loword(w)) == WA_ACTIVE
-                        && hiword(w) == 0
-                        && self.ui.get().focus_on_activate;
-                    if u32::from(loword(w)) == WA_INACTIVE {
-                        dropdown::close(self);
-                        let focus = GetFocus();
-                        // The search box, the results, or a pane's or
-                        // strip's window: it has the keyboard back after.
-                        if self.frame_of(focus).is_some() {
-                            self.last_focus.set(focus);
-                        }
-                    } else {
-                        if to_search {
-                            self.last_focus.set(self.edit);
-                            PostMessageW(self.hwnd, uiopts::WM_FOCUS_SEARCH, 0, 0);
-                        }
-                        // A click on the search box that activates the
-                        // window selects its text too (select search on
-                        // mouse click), though the box had the keyboard.
-                        let mut pt = POINT::default();
-                        if u32::from(loword(w)) == WA_CLICKACTIVE
-                            && self.ui.get().select_on_click
-                            && GetCursorPos(&mut pt) != 0
-                            && WindowFromPoint(pt) == self.edit
-                        {
-                            self.click_select.set(true);
-                        }
-                        self.refresh_if_idle();
-                        self.arm_live();
+                    // A click on the search box that activates the
+                    // window selects its text too (select search on
+                    // mouse click), though the box had the keyboard.
+                    if u32::from(loword(w)) == WA_CLICKACTIVE
+                        && self.ui.get().select_on_click
+                        && b1::cursor_pos().is_some_and(|pt| win::from_point(pt) == self.edit)
+                    {
+                        self.click_select.set(true);
                     }
-                    DefWindowProcW(self.hwnd, msg, w, l)
+                    self.refresh_if_idle();
+                    self.arm_live();
                 }
-                WM_SETFOCUS => {
-                    SetFocus(self.focus_to_restore(self.last_focus.get()));
-                    0
+                m.def()
+            }
+            WM_SETFOCUS => {
+                win::set_focus(self.focus_to_restore(self.last_focus.get()));
+                0
+            }
+            WM_DPICHANGED => {
+                let dpi = self.ui_dpi_for(u32::from(hiword(w)));
+                if let Some(suggested) = m.dpi_rect() {
+                    self.on_dpi(dpi, &suggested);
                 }
-                WM_DPICHANGED => {
-                    let dpi = self.ui_dpi_for(u32::from(hiword(w)));
-                    self.on_dpi(dpi, &*(l as *const RECT));
-                    0
-                }
-                // What the window paints itself, for accessibility tools.
-                WM_GETOBJECT if crate::a11y::wants_client(l) => self
-                    .accessible_object(w)
-                    .unwrap_or_else(|| DefWindowProcW(self.hwnd, msg, w, l)),
-                WM_SETTINGCHANGE => {
-                    if l != 0
-                        && is_wide(l as *const u16, "ImmersiveColorSet")
-                        && (self.theme_mode.get() == ThemeMode::UserDefault
+                0
+            }
+            // What the window paints itself, for accessibility tools.
+            WM_GETOBJECT if crate::a11y::wants_client(l) => {
+                self.accessible_object(w).unwrap_or_else(|| m.def())
+            }
+            WM_SETTINGCHANGE => {
+                if m.setting_is("ImmersiveColorSet")
+                    && (self.theme_mode.get() == ThemeMode::UserDefault
                             // Windows' accent changed, which Fonts and
                             // Colors' accent of Default follows.
                             || self.custom_palette(self.pal.get().dark).inks
                                 != self.pal.get().inks)
-                    {
-                        self.apply_theme();
-                    }
-                    DefWindowProcW(self.hwnd, msg, w, l)
+                {
+                    self.apply_theme();
                 }
-                WM_GETMINMAXINFO => {
-                    let mmi = &mut *(l as *mut MINMAXINFO);
+                m.def()
+            }
+            WM_GETMINMAXINFO => {
+                if let Some(mut mmi) = m.min_max_info() {
                     mmi.ptMinTrackSize = POINT {
                         x: self.scale(420),
                         y: self.scale(240),
                     };
-                    0
                 }
-                paint::WM_UAHDRAWMENU if paint::draws_menubar(&self.pal.get()) => {
-                    paint::menubar(self, &*(l as *const paint::UahMenu));
-                    1
-                }
-                paint::WM_UAHDRAWMENUITEM if paint::draws_menubar(&self.pal.get()) => {
-                    paint::menubar_item(self, &*(l as *const paint::UahDrawMenuItem));
-                    1
-                }
-                WM_NCPAINT | WM_NCACTIVATE if paint::draws_menubar(&self.pal.get()) => {
-                    let r = DefWindowProcW(self.hwnd, msg, w, l);
-                    paint::menubar_line(self);
-                    r
-                }
-                // A new window (`-new-window`) ends when closed: running in
-                // the background and the tray are the first goz-gui's.
-                WM_CLOSE if self.background().run_in_background && !self.is_new_window() => {
-                    // goz-gui keeps running in the background.
-                    self.hide_to_background();
-                    0
-                }
-                // Only with the tray icon up (a New Window's has none).
-                WM_SYSCOMMAND
-                    if (w & 0xfff0) == SC_MINIMIZE as usize
-                        && self.background().minimize_to_tray
-                        && self.tray_on.get() =>
-                {
-                    self.hide_to_background();
-                    0
-                }
-                WM_HOTKEY => {
-                    self.on_hotkey(w);
-                    0
-                }
-                WM_TRAY => {
-                    self.on_tray(w, l);
-                    0
-                }
-                WM_LAUNCH => {
-                    let args = Box::from_raw(l as *mut Vec<String>);
-                    self.launch(*args);
-                    0
-                }
-                m if m == self.taskbar_created && m != 0 => {
-                    self.taskbar_restarted();
-                    0
-                }
-                WM_DESTROY => {
-                    self.remove_tray();
-                    // An export still running stops, and takes its tmp file
-                    // with it.
-                    let export = self.export.borrow_mut().take();
-                    if let Some(export) = export {
-                        export.finish();
-                    }
-                    // The window is still there to read its placement from.
-                    self.save_and_flush();
-                    // The features, then the panes' contents, let go of
-                    // what they hold; the settings keep the panes open for
-                    // next time.
-                    self.exit_features();
-                    self.exit_custom();
-                    self.close_all_panes();
-                    self.worker.quit();
-                    PostQuitMessage(0);
-                    0
-                }
-                _ => DefWindowProcW(self.hwnd, msg, w, l),
+                0
             }
+            paint::WM_UAHDRAWMENU if paint::draws_menubar(&self.pal.get()) => {
+                if let Some(um) = b1::uah_menu(m) {
+                    paint::menubar(self, &um);
+                }
+                1
+            }
+            paint::WM_UAHDRAWMENUITEM if paint::draws_menubar(&self.pal.get()) => {
+                if let Some(item) = b1::uah_draw_menu_item(m) {
+                    paint::menubar_item(self, &item);
+                }
+                1
+            }
+            WM_NCPAINT | WM_NCACTIVATE if paint::draws_menubar(&self.pal.get()) => {
+                let r = m.def();
+                paint::menubar_line(self);
+                r
+            }
+            // A new window (`-new-window`) ends when closed: running in
+            // the background and the tray are the first goz-gui's.
+            WM_CLOSE if self.background().run_in_background && !self.is_new_window() => {
+                // goz-gui keeps running in the background.
+                self.hide_to_background();
+                0
+            }
+            // Only with the tray icon up (a New Window's has none).
+            WM_SYSCOMMAND
+                if (w & 0xfff0) == SC_MINIMIZE as usize
+                    && self.background().minimize_to_tray
+                    && self.tray_on.get() =>
+            {
+                self.hide_to_background();
+                0
+            }
+            WM_HOTKEY => {
+                self.on_hotkey(w);
+                0
+            }
+            WM_TRAY => {
+                self.on_tray(w, l);
+                0
+            }
+            WM_LAUNCH => {
+                if let Some(args) = parcel::take::<Vec<String>>(m) {
+                    self.launch(args);
+                }
+                0
+            }
+            id if id == self.taskbar_created && id != 0 => {
+                self.taskbar_restarted();
+                0
+            }
+            WM_DESTROY => {
+                self.remove_tray();
+                // An export still running stops, and takes its tmp file
+                // with it.
+                let export = self.export.borrow_mut().take();
+                if let Some(export) = export {
+                    export.finish();
+                }
+                // The window is still there to read its placement from.
+                self.save_and_flush();
+                // The features, then the panes' contents, let go of
+                // what they hold; the settings keep the panes open for
+                // next time.
+                self.exit_features();
+                self.exit_custom();
+                self.close_all_panes();
+                self.worker.quit();
+                queue::post_quit(0);
+                0
+            }
+            _ => m.def(),
         }
     }
 
-    unsafe fn notify(&self, l: LPARAM) -> LRESULT {
-        // SAFETY: `l` points at the notification struct its code names.
-        unsafe {
-            let hdr = &*(l as *const NMHDR);
-            if !hdr.hwndFrom.is_null() && hdr.hwndFrom == self.tooltip.get() {
-                if hdr.code == TTN_GETDISPINFOW {
-                    searchbox::tooltip_text(self, &mut *(l as *mut NMTTDISPINFOW));
+    fn notify(&self, m: &Msg) -> LRESULT {
+        let Some(n) = m.notify() else {
+            return 0;
+        };
+        if !n.from().is_null() && n.from() == self.tooltip.get() {
+            if n.code() == TTN_GETDISPINFOW
+                && let Some(mut info) = n.get::<NMTTDISPINFOW>()
+            {
+                searchbox::tooltip_text(self, &mut info);
+            }
+            return 0;
+        }
+        if n.from() != self.list {
+            return 0;
+        }
+        match n.code() {
+            LVN_GETDISPINFOW => {
+                if let Some(mut info) = n.get::<NMLVDISPINFOW>() {
+                    self.disp_info(&mut info);
                 }
+            }
+            LVN_ODCACHEHINT => {
+                if let Some((from, to)) = n.get::<NMLVCACHEHINT>().map(|h| (h.iFrom, h.iTo)) {
+                    self.request_rows(from.max(0) as usize, to.max(0) as usize);
+                }
+            }
+            LVN_ODFINDITEMW => return -1,
+            LVN_BEGINDRAG | LVN_BEGINRDRAG => self.begin_drag(),
+            LVN_BEGINLABELEDITW => {
+                let item = n.get::<NMLVDISPINFOW>().map(|info| info.item.iItem);
+                return item.map_or(0, |item| LRESULT::from(self.begin_rename(item)));
+            }
+            LVN_ENDLABELEDITW => {
+                // The text typed (none when the edit was cancelled), as a
+                // NUL-terminated copy.
+                let text = n
+                    .get::<NMLVDISPINFOW>()
+                    .and_then(|info| info.text())
+                    .map(|t| win::wz_units(&t));
+                self.end_rename(text.as_ref().map_or(core::ptr::null(), |t| t.as_ptr()));
+                // The row changes once the rename is done.
                 return 0;
             }
-            if hdr.hwndFrom != self.list {
-                return 0;
+            LVN_COLUMNCLICK => {
+                if let Some(sub) = n.get::<NMLISTVIEW>().map(|nm| nm.iSubItem)
+                    && let Some(id) = self.column_id(sub.max(0) as usize)
+                {
+                    self.sort_by_column(id);
+                }
             }
-            match hdr.code {
-                LVN_GETDISPINFOW => self.disp_info(&mut *(l as *mut NMLVDISPINFOW)),
-                LVN_ODCACHEHINT => {
-                    let hint = &*(l as *const NMLVCACHEHINT);
-                    self.request_rows(hint.iFrom.max(0) as usize, hint.iTo.max(0) as usize);
+            // With one-click opening (Options > Results) the click
+            // opens, and the double-click that may follow does not
+            // again.
+            NM_DBLCLK if !self.single_click_open() => {
+                if let Some(nm) = n.get::<NMITEMACTIVATE>().map(|nm| *nm)
+                    && nm.iItem >= 0
+                {
+                    self.double_click(nm.ptAction);
                 }
-                LVN_ODFINDITEMW => return -1,
-                LVN_BEGINDRAG | LVN_BEGINRDRAG => self.begin_drag(),
-                LVN_BEGINLABELEDITW => {
-                    let info = &*(l as *const NMLVDISPINFOW);
-                    return LRESULT::from(self.begin_rename(info.item.iItem));
+            }
+            NM_CLICK if self.single_click_open() => {
+                // Ctrl and Shift pick rows; a plain click opens.
+                let keys = LVKF_ALT | LVKF_CONTROL | LVKF_SHIFT;
+                if let Some(nm) = n.get::<NMITEMACTIVATE>().map(|nm| *nm)
+                    && nm.iItem >= 0
+                    && nm.uKeyFlags & keys == 0
+                {
+                    self.double_click(nm.ptAction);
                 }
-                LVN_ENDLABELEDITW => {
-                    let info = &*(l as *const NMLVDISPINFOW);
-                    self.end_rename(info.item.pszText);
-                    // The row changes once the rename is done.
+            }
+            // Enter and the list's other keys never reach the list's own
+            // handling (list_proc runs them), so no NM_RETURN comes.
+            LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
+                // Kept as ranges, whoever changed it (`selection.rs`).
+                let change = results::selection_change(&n);
+                if let Some((rows, on)) = change.clone() {
+                    let mut sel = self.sel.borrow_mut();
+                    match rows {
+                        Some(rows) => sel.set(rows, on),
+                        None => sel.set_all(on),
+                    }
+                }
+                if self.bulk.get() {
+                    // Rows changed one by one by goz-gui: reported
+                    // once, after the run (`in_bulk`).
+                    self.bulk_changed.set(true);
                     return 0;
                 }
-                LVN_COLUMNCLICK => {
-                    let nm = &*(l as *const NMLISTVIEW);
-                    if let Some(id) = self.column_id(nm.iSubItem.max(0) as usize) {
-                        self.sort_by_column(id);
-                    }
+                // The user chose other rows: an action waiting for the
+                // rows chosen before is not wanted any more, and they
+                // are not Select All's every row (a move of the focus
+                // alone keeps both).
+                if !self.restoring.get() && change.is_some() {
+                    self.cancel_fetch();
+                    self.select_all.set(false);
                 }
-                // With one-click opening (Options > Results) the click
-                // opens, and the double-click that may follow does not
-                // again.
-                NM_DBLCLK if !self.single_click_open() => {
-                    let nm = &*(l as *const NMITEMACTIVATE);
-                    if nm.iItem >= 0 {
-                        self.double_click(nm.ptAction);
-                    }
-                }
-                NM_CLICK if self.single_click_open() => {
-                    let nm = &*(l as *const NMITEMACTIVATE);
-                    // Ctrl and Shift pick rows; a plain click opens.
-                    let keys = LVKF_ALT | LVKF_CONTROL | LVKF_SHIFT;
-                    if nm.iItem >= 0 && nm.uKeyFlags & keys == 0 {
-                        self.double_click(nm.ptAction);
-                    }
-                }
-                // Enter and the list's other keys never reach the list's own
-                // handling (list_proc runs them), so no NM_RETURN comes.
-                LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
-                    // Kept as ranges, whoever changed it (`selection.rs`).
-                    let change = results::selection_change(l);
-                    if let Some((rows, on)) = change.clone() {
-                        let mut sel = self.sel.borrow_mut();
-                        match rows {
-                            Some(rows) => sel.set(rows, on),
-                            None => sel.set_all(on),
-                        }
-                    }
-                    if self.bulk.get() {
-                        // Rows changed one by one by goz-gui: reported
-                        // once, after the run (`in_bulk`).
-                        self.bulk_changed.set(true);
-                        return 0;
-                    }
-                    // The user chose other rows: an action waiting for the
-                    // rows chosen before is not wanted any more, and they
-                    // are not Select All's every row (a move of the focus
-                    // alone keeps both).
-                    if !self.restoring.get() && change.is_some() {
-                        self.cancel_fetch();
-                        self.select_all.set(false);
-                    }
-                    self.selection_changed();
-                    self.invalidate_status();
-                    self.pane_event(PaneEvent::SelectionChanged);
-                }
-                NM_CUSTOMDRAW => {
-                    let cd = &*(l as *const NMCUSTOMDRAW);
-                    if self.view.get().thumbnails {
-                        return self.thumb_custom_draw(cd);
-                    }
-                    return match cd.dwDrawStage {
-                        CDDS_PREPAINT => CDRF_NOTIFYPOSTPAINT as LRESULT,
-                        CDDS_POSTPAINT => {
-                            paint::below_rows(self, cd.hdc);
-                            CDRF_DODEFAULT as LRESULT
-                        }
-                        _ => CDRF_DODEFAULT as LRESULT,
-                    };
-                }
-                _ => {}
+                self.selection_changed();
+                self.invalidate_status();
+                self.pane_event(PaneEvent::SelectionChanged);
             }
-            0
+            NM_CUSTOMDRAW => {
+                let Some(cd) = n.get::<NMCUSTOMDRAW>() else {
+                    return CDRF_DODEFAULT as LRESULT;
+                };
+                if self.view.get().thumbnails {
+                    return self.thumb_custom_draw(&cd);
+                }
+                return match cd.dwDrawStage {
+                    CDDS_PREPAINT => CDRF_NOTIFYPOSTPAINT as LRESULT,
+                    CDDS_POSTPAINT => {
+                        paint::below_rows(self, cd.hdc);
+                        CDRF_DODEFAULT as LRESULT
+                    }
+                    _ => CDRF_DODEFAULT as LRESULT,
+                };
+            }
+            _ => {}
         }
+        0
     }
 
     /// Text for accessibility tools (the list's own type-ahead never runs:
@@ -2287,7 +2225,7 @@ impl App {
     /// icon view measures. While rows change state one by one (`in_bulk`)
     /// there is none: the list would only measure it to invalidate the
     /// item, and the list repaints whole after.
-    fn disp_info(&self, info: &mut NMLVDISPINFOW) {
+    fn disp_info(&self, info: &mut win::View<NMLVDISPINFOW>) {
         if info.item.mask & LVIF_TEXT == 0
             || info.item.pszText.is_null()
             || info.item.cchTextMax <= 0
@@ -2308,12 +2246,8 @@ impl App {
                 paint::push_cell(self, row, id, &mut text);
             }
         }
-        let n = text.len().min(info.item.cchTextMax as usize - 1);
-        // SAFETY: the list gave a buffer of `cchTextMax` code units.
-        unsafe {
-            core::ptr::copy_nonoverlapping(text.as_ptr(), info.item.pszText, n);
-            *info.item.pszText.add(n) = 0;
-        }
+        // Into the list's buffer of `cchTextMax` code units, cut to fit.
+        info.set_text(&text);
     }
 
     /// The blocks holding the rows in view.
@@ -2390,20 +2324,16 @@ impl App {
         // another file under its box. It runs once the box is closed. Nor
         // while an action waits for its rows, which are this search's.
         if keep_place && (self.renaming() || self.fetch_waiting()) {
-            // SAFETY: a timer of this window.
-            unsafe { SetTimer(self.hwnd, TIMER_REFRESH, 1000, None) };
+            win::set_timer(self.hwnd, TIMER_REFRESH, 1000);
             return;
         }
         self.retry_when_shown.set(false);
-        // SAFETY: timers of this window.
-        unsafe {
-            KillTimer(self.hwnd, TIMER_REFRESH);
-            KillTimer(self.hwnd, TIMER_RETRY);
-            if !keep_place {
-                // A changed search becomes a navigation entry once it has
-                // stayed as it is for a moment.
-                SetTimer(self.hwnd, TIMER_NAV, nav::NAV_DELAY_MS, None);
-            }
+        win::kill_timer(self.hwnd, TIMER_REFRESH);
+        win::kill_timer(self.hwnd, TIMER_RETRY);
+        if !keep_place {
+            // A changed search becomes a navigation entry once it has stayed
+            // as it is for a moment.
+            win::set_timer(self.hwnd, TIMER_NAV, nav::NAV_DELAY_MS);
         }
         if !keep_place {
             // An Enter for the search before this one is spent, a note about
@@ -2502,24 +2432,19 @@ impl App {
             self.ui.get().hide_empty && scoped.trim().is_empty() && search.filelist.is_none();
         if let Some(why) = &refused {
             // W8: answered as gozd's refusal would be, without asking.
-            let failed = Box::into_raw(Box::new(Reply::Failed {
+            let failed = Reply::Failed {
                 epoch,
                 block: 0,
                 failure: Failure::Refused(why.clone()),
-            }));
-            // SAFETY: posts to this thread's window, which owns the box
-            // once the message is queued; if posting fails it is taken
-            // back.
-            unsafe {
-                if PostMessageW(self.hwnd, WM_REPLY, 0, failed as isize) == 0 {
-                    drop(Box::from_raw(failed));
-                }
-            }
+            };
+            // Posted to this thread's window, which takes it with the
+            // message; if posting fails it is dropped.
+            parcel::post(self.hwnd, WM_REPLY, 0, failed);
         } else if hidden {
             // Options > Results' "Hide results when the search is empty":
             // gozd is not asked; the empty answer comes as its would, so
             // the window takes it as any other.
-            let empty = Box::into_raw(Box::new(Reply::Block {
+            let empty = Reply::Block {
                 epoch,
                 block: 0,
                 rows: Vec::new(),
@@ -2528,15 +2453,10 @@ impl App {
                 metadata_pending: false,
                 total_size: None,
                 elapsed: Duration::ZERO,
-            }));
-            // SAFETY: posts to this thread's window, which owns the box
-            // once the message is queued; if posting fails it is taken
-            // back.
-            unsafe {
-                if PostMessageW(self.hwnd, WM_REPLY, 0, empty as isize) == 0 {
-                    drop(Box::from_raw(empty));
-                }
-            }
+            };
+            // Posted to this thread's window, which takes it with the
+            // message; if posting fails it is dropped.
+            parcel::post(self.hwnd, WM_REPLY, 0, empty);
         } else {
             self.worker.push(Job::Block {
                 epoch,
@@ -2570,8 +2490,7 @@ impl App {
         // Set only when it changed: a refresh (every live update) would
         // repaint the title bar for nothing.
         if window_text(self.hwnd) != title {
-            // SAFETY: a NUL-terminated title for this thread's window.
-            unsafe { SetWindowTextW(self.hwnd, wz(&title).as_ptr()) };
+            win::set_text(self.hwnd, &title);
         }
         self.apply_on_top();
         if !keep_place {
@@ -2608,8 +2527,7 @@ impl App {
     fn search_button(&self, button: Button) {
         match button {
             Button::Clear => {
-                // SAFETY: reads the length of this thread's search box.
-                if unsafe { GetWindowTextLengthW(self.edit) } > 0 {
+                if win::text_len(self.edit) > 0 {
                     self.command(menu::CLEAR_SEARCH);
                 } else {
                     self.focus_box();
@@ -2647,8 +2565,7 @@ impl App {
         };
         if refused {
             self.beeped.set(true);
-            // SAFETY: plays a system sound.
-            unsafe { MessageBeep(MB_ICONWARNING) };
+            sys::beep(MB_ICONWARNING);
         }
     }
 
@@ -2760,12 +2677,12 @@ impl App {
                             // its top.
                             self.restore_selection(kept.for_new_search());
                             if total > 0 {
-                                send(self.list, LVM_ENSUREVISIBLE, 0, 0);
+                                lv::ensure_visible(self.list, 0, false);
                             }
                         } else {
                             self.clear_selection();
                             if total > 0 {
-                                send(self.list, LVM_ENSUREVISIBLE, 0, 0);
+                                lv::ensure_visible(self.list, 0, false);
                             }
                         }
                         // W5: a file list's dates created, found as it is
@@ -2781,8 +2698,8 @@ impl App {
                         if !incomplete && self.data_tools.save_due.replace(false) {
                             self.save_to_slots(total);
                         }
-                        // SAFETY: repaints the list.
-                        unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
+                        // Repaints the list.
+                        win::invalidate(self.list, None, false);
                         self.pane_event(PaneEvent::ResultsChanged { refresh: keep });
                     }
                     None => {
@@ -2793,7 +2710,7 @@ impl App {
                         let first = u64::from(block) * u64::from(BLOCK_ROWS);
                         let last = (first + u64::from(BLOCK_ROWS)).min(total).saturating_sub(1);
                         if first <= last {
-                            send(self.list, LVM_REDRAWITEMS, first as usize, last as isize);
+                            lv::redraw_items(self.list, first as i32, last as i32);
                         }
                     }
                 }
@@ -2811,8 +2728,8 @@ impl App {
                     self.fetch_arrived(epoch, block);
                 }
                 if incomplete || metadata_pending {
-                    // SAFETY: a timer of this window.
-                    unsafe { SetTimer(self.hwnd, TIMER_REFRESH, 1000, None) };
+                    // A timer of this window.
+                    win::set_timer(self.hwnd, TIMER_REFRESH, 1000);
                 }
                 self.invalidate_status();
             }
@@ -2868,16 +2785,16 @@ impl App {
                 }
                 if retry {
                     if self.shown() {
-                        // SAFETY: a timer of this window.
-                        unsafe { SetTimer(self.hwnd, TIMER_RETRY, 2000, None) };
+                        // A timer of this window.
+                        win::set_timer(self.hwnd, TIMER_RETRY, 2000);
                     } else {
                         // Hidden or minimized: no busy retries meanwhile;
                         // the search runs again as it shows.
                         self.retry_when_shown.set(true);
                     }
                 }
-                // SAFETY: repaints the list.
-                unsafe { InvalidateRect(self.list, core::ptr::null(), 1) };
+                // Repaints the list.
+                win::invalidate(self.list, None, true);
                 self.invalidate_status();
             }
             Reply::Status(status) => {
@@ -2915,12 +2832,7 @@ impl App {
             row.icon
                 .set(if reply.icon >= 0 { reply.icon } else { GENERIC });
         }
-        send(
-            self.list,
-            LVM_REDRAWITEMS,
-            reply.index,
-            reply.index as isize,
-        );
+        lv::redraw_items(self.list, reply.index as i32, reply.index as i32);
     }
 
     fn set_count(&self, total: u64, keep: bool) {
@@ -2935,23 +2847,13 @@ impl App {
         // ranges have the new size before those reports, and are trimmed
         // to it after.
         self.sel.borrow_mut().set_count(count);
-        send(self.list, LVM_SETITEMCOUNT, count, flags as isize);
+        lv::set_item_count(self.list, count, flags);
         self.sel.borrow_mut().set_count(count);
     }
 
+    /// The state bits in `mask` of row `index` (`usize::MAX`: every row).
     fn set_state(&self, index: usize, state: u32, mask: u32) {
-        let item = LVITEMW {
-            state,
-            stateMask: mask,
-            // SAFETY: the rest of LVITEMW is plain data.
-            ..unsafe { core::mem::zeroed() }
-        };
-        send(
-            self.list,
-            LVM_SETITEMSTATE,
-            index,
-            (&raw const item) as isize,
-        );
+        lv::set_item_state(self.list, index as i32, state, mask);
     }
 
     /// No row selected or focused, and no anchor for Shift+click: all three
@@ -2960,33 +2862,27 @@ impl App {
         // Rows still to be set one by one belong to the selection replaced.
         self.drop_selecting();
         self.set_state(usize::MAX, 0, LVIS_SELECTED | LVIS_FOCUSED);
-        send(self.list, LVM_SETSELECTIONMARK, 0, -1);
+        lv::set_selection_mark(self.list, -1);
     }
 
     pub fn focus_list(&self) {
-        // SAFETY: focuses a child of this thread's window.
-        unsafe { SetFocus(self.list) };
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0);
-        let focused = send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        );
+        win::set_focus(self.list);
+        let count = lv::item_count(self.list);
+        let focused = lv::next_item(self.list, -1, LVNI_FOCUSED);
         if count > 0 && focused < 0 {
             self.set_state(
                 0,
                 LVIS_SELECTED | LVIS_FOCUSED,
                 LVIS_SELECTED | LVIS_FOCUSED,
             );
-            send(self.list, LVM_ENSUREVISIBLE, 0, 0);
+            lv::ensure_visible(self.list, 0, false);
         }
     }
 
     pub fn invalidate_status(&self) {
         let rc = self.status_rc.get();
-        // SAFETY: repaints part of this window.
-        unsafe { InvalidateRect(self.hwnd, &rc, 0) };
+        // Repaints part of this window.
+        win::invalidate(self.hwnd, Some(&rc), false);
     }
 
     /// Selected row indices, up to `cap`.
@@ -2994,7 +2890,7 @@ impl App {
         let mut out = Vec::new();
         let mut at = usize::MAX;
         while out.len() < cap {
-            let next = send(self.list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize);
+            let next = lv::next_item(self.list, at as i32, LVNI_SELECTED);
             if next < 0 {
                 break;
             }
@@ -3034,11 +2930,8 @@ impl App {
     /// (header.rs draws them, not the header's HDF_SORT* flags), and the
     /// sorted column's cells.
     pub(super) fn show_sort(&self) {
-        // SAFETY: invalidates this thread's windows.
-        unsafe {
-            InvalidateRect(self.header, core::ptr::null(), 0);
-            InvalidateRect(self.list, core::ptr::null(), 0);
-        }
+        win::invalidate(self.header, None, false);
+        win::invalidate(self.list, None, false);
     }
 
     /// The column the results are sorted by.
@@ -3110,18 +3003,18 @@ impl App {
         self.apply_fonts();
         self.remeasure_rows();
         self.rescale_columns();
-        // SAFETY: moves this thread's window to the rectangle Windows chose.
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                core::ptr::null_mut(),
+        // Moves this thread's window to the rectangle Windows chose.
+        win::set_pos(
+            self.hwnd,
+            core::ptr::null_mut(),
+            (
                 suggested.left,
                 suggested.top,
                 suggested.right - suggested.left,
                 suggested.bottom - suggested.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
+            ),
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         self.set_window_icons();
         self.docks_dpi(dpi);
         self.layout();
@@ -3146,13 +3039,12 @@ impl App {
     pub fn column_rects(&self, row: &RECT) -> Cells {
         let cols = self.list_cols.get();
         let n = cols.ids().len();
+        // The order array (all 0 if the list could not give it).
         let mut order = [0i32; crate::columns::LIST_COLS];
-        send(
-            self.list,
-            LVM_GETCOLUMNORDERARRAY,
-            n,
-            order.as_mut_ptr() as isize,
-        );
+        let got = lv::column_order(self.list, n);
+        if got.len() == n {
+            order[..n].copy_from_slice(&got);
+        }
         let mut out = Cells {
             cells: [(0, RECT::default()); crate::columns::LIST_COLS],
             len: 0,
@@ -3163,7 +3055,7 @@ impl App {
             let Some(&id) = cols.ids().get(index) else {
                 continue;
             };
-            let width = send(self.list, LVM_GETCOLUMNWIDTH, index, 0) as i32;
+            let width = lv::column_width(self.list, index as i32);
             out.cells[out.len] = (
                 id,
                 RECT {
@@ -3181,9 +3073,8 @@ impl App {
 
     /// Whether `pt` (screen) is on the list's header.
     fn over_header(&self, pt: POINT) -> bool {
-        let mut rc = RECT::default();
-        // SAFETY: reads the header's place on the screen.
-        unsafe { GetWindowRect(self.header, &mut rc) };
+        // The header's place on the screen.
+        let rc = win::window_rect(self.header);
         in_rect(&rc, pt)
     }
 }
@@ -3234,139 +3125,134 @@ fn status_text(s: &DaemonStatus) -> String {
     out
 }
 
-unsafe extern "system" fn list_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    data: usize,
-) -> LRESULT {
-    // SAFETY: `data` is the leaked `App`; `l` is read as each message defines.
-    unsafe {
-        let app = &*(data as *const App);
-        match msg {
-            // The header reports its custom draw to the list, its parent,
-            // and the user's drags and resizes of its items.
-            WM_NOTIFY => {
-                let hdr = &*(l as *const NMHDR);
-                if hdr.hwndFrom == app.header {
-                    match hdr.code {
-                        NM_CUSTOMDRAW => {
-                            return header::custom_draw(app, &*(l as *const NMCUSTOMDRAW));
+/// The results list's subclass ([`LIST_SUBCLASS`]).
+static LIST_SUBCLASS: subclass::Key = subclass::Key::new("results list");
+
+/// The results list's subclass: the header's notifications, the mouse over
+/// the rows, and the list's keys.
+fn list_proc(app: &App, m: &Msg) -> LRESULT {
+    let (msg, w, l) = (m.id, m.w, m.l);
+    match msg {
+        // The header reports its custom draw to the list, its parent,
+        // and the user's drags and resizes of its items.
+        WM_NOTIFY => {
+            if let Some(n) = m.notify()
+                && n.from() == app.header
+            {
+                match n.code() {
+                    NM_CUSTOMDRAW => {
+                        if let Some(cd) = n.get::<NMCUSTOMDRAW>() {
+                            return header::custom_draw(app, &cd);
                         }
-                        HDN_ENDDRAG | HDN_ENDTRACKW | HDN_ITEMCHANGEDW | HDN_DIVIDERDBLCLICKW => {
-                            let r = DefSubclassProc(hwnd, msg, w, l);
-                            app.columns_touched();
-                            return r;
-                        }
-                        _ => {}
                     }
+                    HDN_ENDDRAG | HDN_ENDTRACKW | HDN_ITEMCHANGEDW | HDN_DIVIDERDBLCLICKW => {
+                        let r = m.def();
+                        app.columns_touched();
+                        return r;
+                    }
+                    _ => {}
                 }
             }
-            WM_PAINT => {
-                let r = DefSubclassProc(hwnd, msg, w, l);
-                paint::empty_list(app);
-                return r;
-            }
-            WM_MOUSEMOVE => {
-                let pt = POINT {
-                    x: (l & 0xffff) as i16 as i32,
-                    y: ((l >> 16) & 0xffff) as i16 as i32,
-                };
-                hover::moved(app, pt);
-            }
-            WM_MOUSELEAVE => hover::left(app),
-            WM_LBUTTONDOWN => {
-                celltip::hide(app);
-                app.finish_selecting();
-                app.last_click.set(point(l));
-            }
-            WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
-                celltip::hide(app);
-                app.finish_selecting();
-            }
-            // A click acts on the selection as it is to be (`selecting.rs`).
-            WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK => app.finish_selecting(),
-            // Rename's box, the list's child, in the list's colours.
-            WM_CTLCOLOREDIT => {
-                let pal = app.pal.get();
-                SetTextColor(w as _, pal.list_fg);
-                SetBkColor(w as _, pal.list_bg);
-                SetDCBrushColor(w as _, pal.list_bg);
-                return GetStockObject(DC_BRUSH) as LRESULT;
-            }
-            // The list taking the keyboard means the search was the one
-            // wanted.
-            WM_SETFOCUS => {
-                let r = DefSubclassProc(hwnd, msg, w, l);
-                app.reset_type_ahead();
-                app.record_search();
-                return r;
-            }
-            WM_KEYDOWN => {
-                celltip::hide(app);
-                // A key acts on the selection as it is to be.
-                app.finish_selecting();
-                let cmd = keys::list_command(
-                    w as u16,
-                    key_down(VK_CONTROL),
-                    key_down(VK_SHIFT),
-                    key_down(VK_MENU),
-                );
-                if let Some(cmd) = cmd {
-                    app.command(cmd);
-                    return 0;
-                }
-                let r = DefSubclassProc(hwnd, msg, w, l);
-                hover::scrolled(app);
-                return r;
-            }
-            // Alt+key in the list: Alt+Up goes up one folder in the Folders
-            // pane (F2), Everything's global Up One Dir (the search box keeps
-            // it for its history); Alt+Backspace is Everything's Undo (F5),
-            // and its character is no menu's access key: no beep for it.
-            WM_SYSKEYDOWN => {
-                app.finish_selecting();
-                if w == usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_UP)
-                    && app.up_one_folder()
-                {
-                    return 0;
-                }
-                if let Some(cmd) =
-                    keys::list_alt_command(w as u16, key_down(VK_CONTROL), key_down(VK_SHIFT))
-                {
-                    app.command(cmd);
-                    return 0;
-                }
-            }
-            WM_SYSCHAR if w == 0x08 => return 0,
-            // The characters of the keys above (Enter, Esc, Ctrl+A…, and
-            // Ctrl+Backspace's DEL) do nothing more.
-            WM_CHAR if w < 0x20 || w == 0x7f => return 0,
-            // Printable ones go to goz-gui's own type-ahead, never the
-            // list's, which would ask for rows it cannot search
-            // (LVN_ODFINDITEMW).
-            WM_CHAR => {
-                app.finish_selecting();
-                app.type_ahead(w as u16);
-                return 0;
-            }
-            // Ctrl+wheel zooms the list (View > Zoom).
-            WM_MOUSEWHEEL if (w & MK_CONTROL as usize) != 0 => {
-                app.zoom_wheel(hiword(w) as i16 as i32);
-                return 0;
-            }
-            // Rows move under a mouse that stays put.
-            WM_MOUSEWHEEL | WM_VSCROLL | WM_HSCROLL => {
-                let r = DefSubclassProc(hwnd, msg, w, l);
-                hover::scrolled(app);
-                return r;
-            }
-            _ => {}
         }
-        DefSubclassProc(hwnd, msg, w, l)
+        WM_PAINT => {
+            let r = m.def();
+            paint::empty_list(app);
+            return r;
+        }
+        WM_MOUSEMOVE => {
+            hover::moved(app, m.point());
+        }
+        WM_MOUSELEAVE => hover::left(app),
+        WM_LBUTTONDOWN => {
+            celltip::hide(app);
+            app.finish_selecting();
+            app.last_click.set(point(l));
+        }
+        WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+            celltip::hide(app);
+            app.finish_selecting();
+        }
+        // A click acts on the selection as it is to be (`selecting.rs`).
+        WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK => app.finish_selecting(),
+        // Rename's box, the list's child, in the list's colours.
+        WM_CTLCOLOREDIT => {
+            let pal = app.pal.get();
+            let hdc = w as windows_sys::Win32::Graphics::Gdi::HDC;
+            gdi::set_text_color(hdc, pal.list_fg);
+            gdi::set_bk_color(hdc, pal.list_bg);
+            gdi::set_dc_brush_color(hdc, pal.list_bg);
+            return gdi::stock_object(DC_BRUSH) as LRESULT;
+        }
+        // The list taking the keyboard means the search was the one
+        // wanted.
+        WM_SETFOCUS => {
+            let r = m.def();
+            app.reset_type_ahead();
+            app.record_search();
+            return r;
+        }
+        WM_KEYDOWN => {
+            celltip::hide(app);
+            // A key acts on the selection as it is to be.
+            app.finish_selecting();
+            let cmd = keys::list_command(
+                w as u16,
+                key_down(VK_CONTROL),
+                key_down(VK_SHIFT),
+                key_down(VK_MENU),
+            );
+            if let Some(cmd) = cmd {
+                app.command(cmd);
+                return 0;
+            }
+            let r = m.def();
+            hover::scrolled(app);
+            return r;
+        }
+        // Alt+key in the list: Alt+Up goes up one folder in the Folders
+        // pane (F2), Everything's global Up One Dir (the search box keeps
+        // it for its history); Alt+Backspace is Everything's Undo (F5),
+        // and its character is no menu's access key: no beep for it.
+        WM_SYSKEYDOWN => {
+            app.finish_selecting();
+            if w == usize::from(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_UP)
+                && app.up_one_folder()
+            {
+                return 0;
+            }
+            if let Some(cmd) =
+                keys::list_alt_command(w as u16, key_down(VK_CONTROL), key_down(VK_SHIFT))
+            {
+                app.command(cmd);
+                return 0;
+            }
+        }
+        WM_SYSCHAR if w == 0x08 => return 0,
+        // The characters of the keys above (Enter, Esc, Ctrl+A…, and
+        // Ctrl+Backspace's DEL) do nothing more.
+        WM_CHAR if w < 0x20 || w == 0x7f => return 0,
+        // Printable ones go to goz-gui's own type-ahead, never the
+        // list's, which would ask for rows it cannot search
+        // (LVN_ODFINDITEMW).
+        WM_CHAR => {
+            app.finish_selecting();
+            app.type_ahead(w as u16);
+            return 0;
+        }
+        // Ctrl+wheel zooms the list (View > Zoom).
+        WM_MOUSEWHEEL if (w & MK_CONTROL as usize) != 0 => {
+            app.zoom_wheel(hiword(w) as i16 as i32);
+            return 0;
+        }
+        // Rows move under a mouse that stays put.
+        WM_MOUSEWHEEL | WM_VSCROLL | WM_HSCROLL => {
+            let r = m.def();
+            hover::scrolled(app);
+            return r;
+        }
+        _ => {}
     }
+    m.def()
 }
 
 #[cfg(test)]

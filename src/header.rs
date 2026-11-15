@@ -8,99 +8,68 @@
 //! a pressed item in that notification but not the one under the mouse, so
 //! its own subclass here tracks that.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DrawTextW, HDC,
-    InvalidateRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDIS_SELECTED, CDRF_DODEFAULT,
     CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, HDF_JUSTIFYMASK, HDF_RIGHT,
-    HDHITTESTINFO, HDI_FORMAT, HDI_TEXT, HDITEMW, HDLAYOUT, HDM_GETITEMCOUNT, HDM_GETITEMRECT,
-    HDM_GETITEMW, HDM_HITTEST, HDM_LAYOUT, NMCUSTOMDRAW, WM_MOUSELEAVE,
+    HDI_FORMAT, HDI_TEXT, HDM_LAYOUT, NMCUSTOMDRAW, WM_MOUSELEAVE,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-};
-use windows_sys::Win32::UI::Shell::DefSubclassProc;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowRect, SendMessageW, WM_CONTEXTMENU, WM_MBUTTONUP, WM_MOUSEMOVE,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CONTEXTMENU, WM_MBUTTONUP, WM_MOUSEMOVE};
 
 use crate::colors::{Item, State};
 use crate::paint::fill;
+use crate::win::ext::b1;
+use crate::win::{self, Msg, gdi, subclass};
 use crate::window::App;
 
 /// The space before and after an item's text, at 96 DPI.
 pub const TEXT_PAD: i32 = 6;
 
+/// The header's subclass ([`subclass_proc`]).
+pub static SUBCLASS: subclass::Key = subclass::Key::new("results header");
+
 /// The item at `pt` (the header's client coordinates).
 fn item_at(app: &App, pt: POINT) -> Option<usize> {
-    let mut hit = HDHITTESTINFO {
-        pt,
-        flags: 0,
-        iItem: -1,
-    };
-    let item = send(HDM_HITTEST, 0, (&raw mut hit) as isize, app);
-    usize::try_from(item).ok()
+    usize::try_from(b1::header_item_at(app.header, pt)).ok()
 }
 
 /// The item at `pt` (the screen).
 pub fn item_at_screen(app: &App, pt: POINT) -> Option<usize> {
-    let mut at = pt;
-    // SAFETY: maps a point into this thread's header.
-    unsafe { ScreenToClient(app.header, &mut at) };
+    // Maps a point into this thread's header.
+    let at = win::screen_to_client(app.header, pt);
     item_at(app, at)
-}
-
-fn client_point(l: LPARAM) -> POINT {
-    POINT {
-        x: (l & 0xffff) as i16 as i32,
-        y: ((l >> 16) & 0xffff) as i16 as i32,
-    }
 }
 
 /// The header's subclass: notes the item under the mouse, keeps the
 /// header at Everything's height, and has the column menu (right click)
 /// and removal (middle click).
-pub unsafe extern "system" fn subclass_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    data: usize,
-) -> LRESULT {
-    // SAFETY: `data` is the leaked `App` passed to SetWindowSubclass.
-    let app = unsafe { &*(data as *const App) };
-    match msg {
+pub fn subclass_proc(app: &App, m: &Msg) -> LRESULT {
+    let hwnd = m.hwnd;
+    match m.id {
         // The list asks where its header goes, and puts the rows under it.
         HDM_LAYOUT => {
-            // SAFETY: passes the message on, then adjusts the HDLAYOUT the
-            // list passed, whose pointers it owns across the call.
-            unsafe {
-                let r = DefSubclassProc(hwnd, msg, w, l);
-                let layout = &*(l as *const HDLAYOUT);
-                if !layout.prc.is_null() && !layout.pwpos.is_null() {
-                    let height = app.header_height();
-                    let top = (*layout.pwpos).y;
-                    (*layout.pwpos).cy = height;
-                    (*layout.prc).top = top + height;
-                }
-                return r;
-            }
+            // Passes the message on, then adjusts the HDLAYOUT the list
+            // passed.
+            let r = m.def();
+            b1::header_layout(m, |pos, rest| {
+                let height = app.header_height();
+                let top = pos.y;
+                pos.cy = height;
+                rest.top = top + height;
+            });
+            return r;
         }
         WM_CONTEXTMENU => {
             // The point is on the screen.
-            let pt = client_point(l);
+            let pt = m.point();
             // From the keyboard (-1, -1) there is no item: the menu goes at
             // the header's corner.
-            let (pt, item) = if l == -1 {
-                let mut rc = RECT::default();
-                // SAFETY: reads this thread's header's place.
-                unsafe { GetWindowRect(hwnd, &mut rc) };
+            let (pt, item) = if m.l == -1 {
+                // This thread's header's place.
+                let rc = win::window_rect(hwnd);
                 let corner = POINT {
                     x: rc.left,
                     y: rc.bottom,
@@ -113,33 +82,27 @@ pub unsafe extern "system" fn subclass_proc(
             return 0;
         }
         WM_MBUTTONUP => {
-            if let Some(item) = item_at(app, client_point(l)) {
+            if let Some(item) = item_at(app, m.point()) {
                 app.remove_column(item);
             }
             return 0;
         }
         WM_MOUSEMOVE => {
-            let mut tme = TRACKMOUSEEVENT {
-                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                dwFlags: TME_LEAVE,
-                hwndTrack: hwnd,
-                dwHoverTime: 0,
-            };
-            // SAFETY: asks for WM_MOUSELEAVE on this thread's header.
-            unsafe { TrackMouseEvent(&mut tme) };
-            set_hot(app, item_at(app, client_point(l)));
+            // Asks for WM_MOUSELEAVE on this thread's header.
+            win::track_leave(hwnd);
+            set_hot(app, item_at(app, m.point()));
         }
         WM_MOUSELEAVE => set_hot(app, None),
         _ => {}
     }
-    // SAFETY: passes the message on to the header.
-    unsafe { DefSubclassProc(hwnd, msg, w, l) }
+    // Passes the message on to the header.
+    m.def()
 }
 
 fn set_hot(app: &App, item: Option<usize>) {
     if app.hot_header.replace(item) != item {
-        // SAFETY: repaints this thread's header.
-        unsafe { InvalidateRect(app.header, core::ptr::null(), 0) };
+        // Repaints this thread's header.
+        win::invalidate(app.header, None, false);
     }
 }
 
@@ -160,24 +123,11 @@ pub fn custom_draw(app: &App, cd: &NMCUSTOMDRAW) -> LRESULT {
     }
 }
 
-fn send(msg: u32, w: usize, l: isize, app: &App) -> isize {
-    // SAFETY: a query to the header of this thread's list; any pointer in
-    // `l` is the caller's and lives across the synchronous call.
-    unsafe { SendMessageW(app.header, msg, w, l) }
-}
-
 fn item(app: &App, cd: &NMCUSTOMDRAW) {
     let index = cd.dwItemSpec;
-    let mut text = [0u16; 128];
-    let mut hdi = HDITEMW {
-        mask: HDI_TEXT | HDI_FORMAT,
-        pszText: text.as_mut_ptr(),
-        cchTextMax: text.len() as i32,
-        // SAFETY: the rest of HDITEMW is plain data.
-        ..unsafe { core::mem::zeroed() }
-    };
-    send(HDM_GETITEMW, index, (&raw mut hdi) as isize, app);
-    let len = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+    let (hdi, text) =
+        win::header::get_item(app.header, index as i32, HDI_TEXT | HDI_FORMAT).unwrap_or_default();
+    let text: Vec<u16> = text.unwrap_or_default().encode_utf16().collect();
 
     let pal = app.pal.get();
     let hdc = cd.hdc;
@@ -256,20 +206,17 @@ fn item(app: &App, cd: &NMCUSTOMDRAW) {
     };
     // Fonts and Colors' Header font.
     let font = app.part_font(Item::Header, pal.is_bold(Item::Header, state));
-    // SAFETY: draws into the header's DC; the old font is put back.
-    unsafe {
-        let old = SelectObject(hdc, font);
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, pal.ink(Item::Header, state).fg);
-        DrawTextW(
-            hdc,
-            text.as_mut_ptr(),
-            len as i32,
-            &mut text_rc,
-            align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
-        SelectObject(hdc, old);
-    }
+    // Draws into the header's DC; the old font is put back.
+    let old = gdi::Selected::new(hdc, font);
+    gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+    gdi::set_text_color(hdc, pal.ink(Item::Header, state).fg);
+    gdi::draw_text(
+        hdc,
+        &text,
+        &mut text_rc,
+        align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+    );
+    drop(old);
     if sorted {
         arrow(app, hdc, &rc);
     }
@@ -320,16 +267,14 @@ fn arrow(app: &App, hdc: HDC, rc: &RECT) {
 /// The header right of its last item, which the header itself would draw in
 /// its theme's light colours.
 fn rest(app: &App, hdc: HDC) {
-    let count = send(HDM_GETITEMCOUNT, 0, 0, app).max(0) as usize;
+    let count = win::header::item_count(app.header);
     let mut right = 0;
     for i in 0..count {
-        let mut rc = RECT::default();
-        send(HDM_GETITEMRECT, i, (&raw mut rc) as isize, app);
+        let rc = win::header::item_rect(app.header, i as i32).unwrap_or_default();
         right = right.max(rc.right);
     }
-    let mut client = RECT::default();
-    // SAFETY: reads the size of this thread's header.
-    unsafe { GetClientRect(app.header, &mut client) };
+    // The size of this thread's header.
+    let client = win::client_rect(app.header);
     if right >= client.right {
         return;
     }

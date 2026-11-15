@@ -16,20 +16,15 @@
 //! layout hides it, and its place then is not kept (its width is, as any
 //! hidden column's).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use windows_sys::Win32::Foundation::{POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{GetDC, InvalidateRect, ReleaseDC, SelectObject};
 use windows_sys::Win32::UI::Controls::{
-    LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVM_DELETECOLUMN,
-    LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNWIDTH, LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT,
-    LVM_GETTOPINDEX, LVM_INSERTCOLUMNW, LVM_SETCOLUMNORDERARRAY, LVM_SETCOLUMNWIDTH,
+    LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyMenu, PostMessageW};
 
-use super::{App, WM_COLUMNS, send};
+use super::{App, WM_COLUMNS};
 use crate::columns::{self, COL_CREATED, COL_NAME, COL_SIZE, LIST_COLS, Layout};
-use crate::wide::wz;
+use crate::win::ext::b1;
+use crate::win::{self, gdi, lv};
 use crate::{header, menu, paint};
 
 /// The list's columns by index: each one's id, `len` of them.
@@ -91,7 +86,7 @@ impl App {
         // The others go, from the last; the mirror follows each step, so
         // anything the list asks meanwhile gets the right ids.
         for index in (1..cols.len).rev() {
-            send(self.list, LVM_DELETECOLUMN, index, 0);
+            lv::delete_column(self.list, index as i32);
             cols.truncate(index);
             self.list_cols.set(cols);
         }
@@ -102,7 +97,6 @@ impl App {
             wanted.push(COL_CREATED);
         }
         for &id in &wanted[cols.len..] {
-            let mut text = wz(columns::title(id));
             let col = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT,
                 fmt: if id == COL_SIZE {
@@ -111,25 +105,13 @@ impl App {
                     LVCFMT_LEFT
                 },
                 cx: self.column_px(id),
-                pszText: text.as_mut_ptr(),
-                // SAFETY: the rest of LVCOLUMNW is plain data.
-                ..unsafe { core::mem::zeroed() }
+                ..Default::default()
             };
-            send(
-                self.list,
-                LVM_INSERTCOLUMNW,
-                cols.len,
-                (&raw const col) as isize,
-            );
+            lv::insert_column(self.list, cols.len as i32, col, Some(columns::title(id)));
             cols.push(id);
             self.list_cols.set(cols);
         }
-        send(
-            self.list,
-            LVM_SETCOLUMNWIDTH,
-            0,
-            self.column_px(COL_NAME) as isize,
-        );
+        lv::set_column_width(self.list, 0, self.column_px(COL_NAME));
         let brought = self.created_brought(&layout).then_some(&COL_CREATED);
         let order: Vec<i32> = layout
             .shown()
@@ -138,17 +120,10 @@ impl App {
             .filter_map(|&id| cols.index_of(id))
             .map(|i| i as i32)
             .collect();
-        send(
-            self.list,
-            LVM_SETCOLUMNORDERARRAY,
-            order.len(),
-            order.as_ptr() as isize,
-        );
-        // SAFETY: repaints this thread's list and header.
-        unsafe {
-            InvalidateRect(self.header, core::ptr::null(), 0);
-            InvalidateRect(self.list, core::ptr::null(), 0);
-        }
+        lv::set_column_order(self.list, &order);
+        // Repaints this thread's list and header.
+        win::invalidate(self.header, None, false);
+        win::invalidate(self.list, None, false);
         // W9: a column gozd gives, shown since the search.
         self.w9_columns_changed();
     }
@@ -157,8 +132,7 @@ impl App {
     /// header is done (its order array changes after HDN_ENDDRAG returns).
     pub(super) fn columns_touched(&self) {
         if !self.columns_posted.replace(true) {
-            // SAFETY: posts to this thread's window.
-            unsafe { PostMessageW(self.hwnd, WM_COLUMNS, 0, 0) };
+            win::post_app(self.hwnd, WM_COLUMNS, 0, 0);
         }
     }
 
@@ -167,13 +141,12 @@ impl App {
     pub(super) fn sync_columns(&self) {
         self.columns_posted.set(false);
         let cols = self.list_cols.get();
+        // The order array (all 0 if the list could not give it).
         let mut order = [0i32; LIST_COLS];
-        send(
-            self.list,
-            LVM_GETCOLUMNORDERARRAY,
-            cols.len,
-            order.as_mut_ptr() as isize,
-        );
+        let got = lv::column_order(self.list, cols.len);
+        if got.len() == cols.len {
+            order[..cols.len].copy_from_slice(&got);
+        }
         let old = self.layout.get();
         let mut layout = old;
         // Date Created brought by a file list is no column of the layout's:
@@ -186,7 +159,7 @@ impl App {
             .collect();
         layout.set_order(&shown);
         for (index, &id) in cols.ids().iter().enumerate() {
-            let px = send(self.list, LVM_GETCOLUMNWIDTH, index, 0) as i32;
+            let px = lv::column_width(self.list, index as i32);
             // A width goz-gui set reads back as it was; only the user's
             // own changes it, so it never drifts through rounding. A list
             // that cannot say (0: not in report view, or between rebuilding
@@ -205,12 +178,7 @@ impl App {
     pub(super) fn rescale_columns(&self) {
         let cols = self.list_cols.get();
         for (index, &id) in cols.ids().iter().enumerate() {
-            send(
-                self.list,
-                LVM_SETCOLUMNWIDTH,
-                index,
-                self.column_px(id) as isize,
-            );
+            lv::set_column_width(self.list, index as i32, self.column_px(id));
         }
     }
 
@@ -253,20 +221,20 @@ impl App {
         let title: Vec<u16> = columns::title(id).encode_utf16().collect();
         // The title in the header's font.
         let font = self.part_font(crate::colors::Item::Header, false);
-        // SAFETY: a DC of this thread's list, measured in and given back;
-        // the old font is put back first.
-        let title_w = unsafe {
-            let hdc = GetDC(self.list);
-            let old = SelectObject(hdc, font);
-            let w = paint::width(hdc, &title);
-            SelectObject(hdc, old);
-            ReleaseDC(self.list, hdc);
+        // A DC of this thread's list, measured in and given back; the old
+        // font is put back first.
+        let title_w = {
+            let dc = gdi::WindowDc::get(self.list);
+            let old = gdi::Selected::new(dc.hdc(), font);
+            let w = paint::width(dc.hdc(), &title);
+            drop(old);
+            drop(dc);
             w
         };
         let title_need = title_w + 2 * self.scale(header::TEXT_PAD);
-        let top = send(self.list, LVM_GETTOPINDEX, 0, 0).max(0) as usize;
-        let page = send(self.list, LVM_GETCOUNTPERPAGE, 0, 0).max(0) as usize;
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
+        let top = lv::top_index(self.list).max(0) as usize;
+        let page = lv::count_per_page(self.list).max(0) as usize;
+        let count = lv::item_count(self.list);
         // The rows in view, a partly shown one at the bottom included.
         let rows = top..(top + page + 1).min(count);
         let m = self.model.borrow();
@@ -286,7 +254,7 @@ impl App {
             .filter_map(|&i| Some((i, self.fit_px(i)?)))
             .collect();
         for (index, px) in widths {
-            send(self.list, LVM_SETCOLUMNWIDTH, index, px as isize);
+            lv::set_column_width(self.list, index as i32, px);
         }
         self.sync_columns();
     }
@@ -308,8 +276,8 @@ impl App {
         let on = on.filter(|_| on_id.is_some());
         let popup = menu::header_menu(&shown, on_id);
         let cmd = crate::popup::track(popup, self.hwnd, pt, "header menu", &|_| None);
-        // SAFETY: the menu this function made.
-        unsafe { DestroyMenu(popup) };
+        // The menu this function made.
+        b1::destroy_menu(popup);
         let Ok(cmd) = u16::try_from(cmd) else {
             return;
         };
