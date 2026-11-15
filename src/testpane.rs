@@ -10,7 +10,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::rc::Rc;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, TRANSPARENT,
 };
@@ -22,8 +22,8 @@ use crate::dock::{PaneId, Side};
 use crate::paint::fill;
 use crate::pane::{PaneContent, PaneSpec};
 use crate::strip::{Strip, StripSlot};
-use crate::win;
 use crate::win::gdi::{self, Selected};
+use crate::win::{self, Msg};
 use crate::window::App;
 
 /// What the variable asks for.
@@ -102,8 +102,8 @@ impl PaneContent for TestPane {
 
     fn place(&self, _app: &App, _rc: RECT) {}
 
-    fn message(&self, app: &App, pane: HWND, msg: u32, _w: WPARAM, _l: LPARAM) -> Option<LRESULT> {
-        if matches!(msg, WM_SETFOCUS | WM_KILLFOCUS)
+    fn handle(&self, app: &App, pane: HWND, m: &Msg) -> Option<LRESULT> {
+        if matches!(m.id, WM_SETFOCUS | WM_KILLFOCUS)
             && let Some(rc) = app.pane_client_rect(self.id)
         {
             win::invalidate(pane, Some(&rc), false);

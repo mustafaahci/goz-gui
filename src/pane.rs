@@ -24,7 +24,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     DC_BRUSH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, SRCCOPY, TRANSPARENT,
 };
@@ -101,23 +101,9 @@ pub trait PaneContent: Any {
     /// not its own, and answers those itself.
     ///
     /// `m` is the message as the pane window was given it: a notification's
-    /// structure is read with `m.notify()`. By default it goes to
-    /// [`PaneContent::message`].
-    fn handle(&self, app: &App, pane: HWND, m: &Msg) -> Option<LRESULT> {
-        self.message(app, pane, m.id, m.w, m.l)
-    }
-
-    /// [`PaneContent::handle`] by the message's parts, for a content that
-    /// reads nothing its `lParam` points at (or has not moved onto
-    /// `crate::win` yet).
-    fn message(
-        &self,
-        _app: &App,
-        _pane: HWND,
-        _msg: u32,
-        _w: WPARAM,
-        _l: LPARAM,
-    ) -> Option<LRESULT> {
+    /// structure is read with `m.notify()`. By default the content takes
+    /// none.
+    fn handle(&self, _app: &App, _pane: HWND, _m: &Msg) -> Option<LRESULT> {
         None
     }
 
