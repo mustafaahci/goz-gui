@@ -1,10 +1,12 @@
 //! Resources of programs and libraries, read without running them.
 
-use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
+use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE, HRSRC};
 use windows_sys::Win32::System::LibraryLoader::{
     EnumResourceNamesW, FindResourceW, LOAD_LIBRARY_AS_DATAFILE, LOAD_LIBRARY_AS_IMAGE_RESOURCE,
     LoadLibraryExW, LoadResource, LockResource, SizeofResource,
 };
+use windows_sys::Win32::System::ProcessStatus::GetMappedFileNameW;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_GUARD,
@@ -115,14 +117,51 @@ fn read_only_mapping(at: *const core::ffi::c_void) -> Option<MEMORY_BASIC_INFORM
         .then_some(mbi)
 }
 
-/// Whether the `size` bytes at `data` are a resource's, read where a file's
-/// resource directory says: in one run of read-only pages (see
-/// [`read_only_mapping`]) of `module`'s own mapping, or of a resource file
-/// the loader found for it (its language's .mui, a .mun: a mapping that is
-/// itself a PE file, MZ). A file made to lie is so read neither past what
-/// is mapped of it, nor in memory the process writes or another module's
-/// pages it has nothing to do with.
-fn readable(module: HMODULE, data: *const core::ffi::c_void, size: usize) -> bool {
+/// The name of the file mapped at `at` (GetMappedFileNameW: its path on
+/// its device), without its folders; `None` if `at` is not in a mapped
+/// file (or its path does not fit).
+fn mapped_file_name(at: *const core::ffi::c_void) -> Option<Vec<u16>> {
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: the calling process; the address is only looked up; the
+    // buffer and its length in units.
+    let n = unsafe {
+        GetMappedFileNameW(
+            GetCurrentProcess(),
+            at,
+            buf.as_mut_ptr(),
+            super::len_u32(buf.len()),
+        )
+    } as usize;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    buf.truncate(n);
+    let start = buf
+        .iter()
+        .rposition(|&c| c == u16::from(b'\\'))
+        .map_or(0, |i| i + 1);
+    Some(buf.split_off(start))
+}
+
+/// The allocation base of the mapping `at` is in, if it is in one.
+fn mapping_of(at: *const core::ffi::c_void) -> Option<usize> {
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: an out-struct and its size; the address is only looked up.
+    let n = unsafe { VirtualQuery(at, &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>()) };
+    (n != 0 && mbi.State == MEM_COMMIT && (mbi.Type == MEM_IMAGE || mbi.Type == MEM_MAPPED))
+        .then_some(mbi.AllocationBase as usize)
+}
+
+/// Whether the `size` bytes at `data` are resource `found`'s of `module`,
+/// read where its resource directory says: in one run of read-only pages
+/// (see [`read_only_mapping`]) of `module`'s own mapping, or of the
+/// resource file the loader found the resource in for it, which holds
+/// `found`, the resource's entry, and is its own resource file (its
+/// language's `<name>.mui`, its `<name>.mun`), mapped while the module
+/// is loaded. A file made to lie is so read neither past what is mapped
+/// of it, nor in memory the process writes, nor in another module's pages,
+/// which another thread could unmap or change during the copy.
+fn readable(module: HMODULE, found: HRSRC, data: *const core::ffi::c_void, size: usize) -> bool {
     let Some(region) = read_only_mapping(data) else {
         return false;
     };
@@ -138,12 +177,21 @@ fn readable(module: HMODULE, data: *const core::ffi::c_void, size: usize) -> boo
     if alloc == base {
         return true;
     }
-    let head = region.AllocationBase.cast_const();
-    read_only_mapping(head).is_some_and(|first| {
-        let room = (first.BaseAddress as usize).saturating_add(first.RegionSize);
-        // SAFETY: two bytes of a committed, read-only mapping's first page
-        // (checked just above to hold them), read as they are.
-        alloc.saturating_add(2) <= room && unsafe { *head.cast::<[u8; 2]>() } == *b"MZ"
+    // Another mapping: the one the loader found the entry in for this
+    // module, named for it.
+    if mapping_of(found.cast_const()) != Some(alloc) {
+        return false;
+    }
+    let (Some(own), Some(file)) = (
+        mapped_file_name(core::ptr::without_provenance(base)),
+        mapped_file_name(region.AllocationBase.cast_const()),
+    ) else {
+        return false;
+    };
+    [".mui", ".mun"].iter().any(|ext| {
+        let want: Vec<u16> = own.iter().copied().chain(ext.encode_utf16()).collect();
+        super::locale::compare_ordinal(&file, &want, true)
+            == windows_sys::Win32::Globalization::CSTR_EQUAL
     })
 }
 
@@ -155,15 +203,15 @@ fn readable(module: HMODULE, data: *const core::ffi::c_void, size: usize) -> boo
 unsafe fn copy(module: HMODULE, name: *const u16, kind: *const u16) -> Option<Vec<u8>> {
     // SAFETY: as the caller promises; the module stays loaded across the
     // calls.
-    let (data, size) = unsafe {
+    let (found, data, size) = unsafe {
         let found = FindResourceW(module, name, kind);
         if found.is_null() {
             return None;
         }
         let size = SizeofResource(module, found) as usize;
-        (LockResource(LoadResource(module, found)), size)
+        (found, LockResource(LoadResource(module, found)), size)
     };
-    if data.is_null() || size == 0 || !readable(module, data, size) {
+    if data.is_null() || size == 0 || !readable(module, found, data, size) {
         return None;
     }
     // SAFETY: `size` bytes of the loaded module's mapping, readable
@@ -192,7 +240,38 @@ mod tests {
         // Memory that is not the file's own mapping is never read as its
         // resource, readable or not.
         let elsewhere = [0u8; 16];
-        assert!(!readable(dll.0, elsewhere.as_ptr().cast(), 16));
-        assert!(!readable(dll.0, core::ptr::null(), 1));
+        let none = core::ptr::null_mut();
+        assert!(!readable(dll.0, none, elsewhere.as_ptr().cast(), 16));
+        assert!(!readable(dll.0, none, core::ptr::null(), 1));
+    }
+
+    #[test]
+    fn another_module_s_pages_are_no_resource_of_this_one() {
+        const RT_GROUP_ICON: u16 = 14;
+        // The icons of shell32 and imageres are in their .mun files (since
+        // Windows 10 1903): read there, where the loader found them.
+        let path: Vec<u16> = r"C:\Windows\System32\imageres.dll".encode_utf16().collect();
+        let imageres = DataFile::load(&path).unwrap();
+        assert_eq!(&imageres.nth(RT_GROUP_ICON, 0).unwrap()[..4], &[0, 0, 1, 0]);
+        let path: Vec<u16> = r"C:\Windows\System32\shell32.dll".encode_utf16().collect();
+        let shell32 = DataFile::load(&path).unwrap();
+        // SAFETY: the file this holds, loaded; numbered names.
+        let (found, data, size) = unsafe {
+            let found = FindResourceW(shell32.0, int_name(3), int_name(RT_GROUP_ICON));
+            assert!(!found.is_null(), "shell32's icon group 3");
+            let size = SizeofResource(shell32.0, found) as usize;
+            (found, LockResource(LoadResource(shell32.0, found)), size)
+        };
+        assert!(readable(shell32.0, found, data, size));
+        // The same pages, as another module's resource: refused (a file
+        // made to point its resource at them is not read there), whatever
+        // entry the loader found for it.
+        assert!(!readable(imageres.0, found, data, size));
+        assert!(!readable(imageres.0, core::ptr::null_mut(), data, size));
+        // An image mapped in the process (this program), read-only pages:
+        // another module's, refused too.
+        let exe = super::super::class::module();
+        let head: *const core::ffi::c_void = exe.cast_const().cast();
+        assert!(!readable(shell32.0, found, head, 2));
     }
 }
