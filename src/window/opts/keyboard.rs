@@ -8,31 +8,23 @@
 //! another command has where it would work is named, and taken from it by
 //! Add, as Everything unbinds the other.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
-use windows_sys::Win32::UI::Controls::{HKM_GETHOTKEY, HKM_SETHOTKEY};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT, VK_TAB,
-};
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT, VK_TAB};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_GROUPBOX, CBS_DROPDOWNLIST, DLGC_WANTALLKEYS, EN_CHANGE, ES_AUTOHSCROLL,
-    GetParent, LB_ADDSTRING, LB_ERR, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LBN_SELCHANGE,
-    LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, SendMessageW, SetWindowTextW, WM_CHAR, WM_COMMAND,
-    WM_GETDLGCODE, WM_KEYDOWN, WM_SYSCHAR, WM_SYSKEYDOWN, WS_BORDER, WS_EX_CLIENTEDGE, WS_TABSTOP,
-    WS_VSCROLL,
+    BN_CLICKED, BS_GROUPBOX, CBS_DROPDOWNLIST, DLGC_WANTALLKEYS, EN_CHANGE, ES_AUTOHSCROLL, LB_ERR,
+    LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, WM_CHAR, WM_COMMAND, WM_GETDLGCODE,
+    WM_KEYDOWN, WM_SYSCHAR, WM_SYSKEYDOWN, WS_BORDER, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::dialog::{Class, LIST_BOX};
 use crate::keymap::{self, Bindings, COMMANDS, Scope};
 use crate::options::{
-    LABEL, Page, Rows, combo_value, enable, fill_combo, item, order, send, set_text, text,
+    LABEL, Page, Rows, combo_value, enable, fill_combo, item, order, set_text, text,
 };
-use crate::wide::wz;
+use crate::win::{self, Msg, listbox, subclass, sys};
 use crate::window::App;
 
 /// Everything's control ids.
@@ -52,6 +44,9 @@ const USED_BY: u16 = 1172;
 
 /// The key box's notification to the page: a key was typed into it.
 const KEY_TYPED: u32 = 0x7001;
+
+/// The key box's subclass.
+static KEY_BOX: subclass::Key = subclass::Key::new("options keyboard: new shortcut box");
 
 const SCOPES: [(Scope, &str); 3] = [
     (Scope::Global, "Global"),
@@ -110,14 +105,14 @@ impl Keyboard {
             .get()
             .and_then(|c| shown.iter().position(|&i| i == c));
         self.quietly(|| {
-            send(page, COMMAND_LIST, LB_RESETCONTENT, 0, 0);
+            let list = item(page, COMMAND_LIST);
+            listbox::reset(list);
             for &i in &shown {
-                let w = wz(COMMANDS[i].label);
-                send(page, COMMAND_LIST, LB_ADDSTRING, 0, w.as_ptr() as isize);
+                listbox::add(list, COMMANDS[i].label);
             }
             let at = keep.unwrap_or(0);
             if !shown.is_empty() {
-                send(page, COMMAND_LIST, LB_SETCURSEL, at, 0);
+                listbox::set_cur_sel(list, at as i32);
             }
         });
         self.current.set(shown.get(keep.unwrap_or(0)).copied());
@@ -144,13 +139,13 @@ impl Keyboard {
             .unwrap_or_default();
         self.quietly(|| {
             set_text(page, GROUP, &title);
-            send(page, SHORTCUTS, LB_RESETCONTENT, 0, 0);
+            let list = item(page, SHORTCUTS);
+            listbox::reset(list);
             for n in &names {
-                let w = wz(n);
-                send(page, SHORTCUTS, LB_ADDSTRING, 0, w.as_ptr() as isize);
+                listbox::add(list, n);
             }
             if !names.is_empty() {
-                send(page, SHORTCUTS, LB_SETCURSEL, 0, 0);
+                listbox::set_cur_sel(list, 0);
             }
         });
         self.update_buttons(page);
@@ -201,8 +196,8 @@ impl Keyboard {
 
     fn remove(&self, page: HWND) {
         let Some(i) = self.current.get() else { return };
-        let at = send(page, SHORTCUTS, LB_GETCURSEL, 0, 0);
-        if at == LB_ERR as isize || at < 0 {
+        let at = listbox::cur_sel(item(page, SHORTCUTS));
+        if at == LB_ERR || at < 0 {
             return;
         }
         let code = self.keys.borrow().of(i).get(at as usize).copied();
@@ -214,65 +209,55 @@ impl Keyboard {
 }
 
 fn hotkey(page: HWND, id: u16) -> u16 {
-    send(page, id, HKM_GETHOTKEY, 0, 0) as u16
+    win::hotkey::get(item(page, id))
 }
 
 fn key_down(vk: u16) -> bool {
-    // SAFETY: reads this thread's keyboard state.
-    unsafe { GetKeyState(i32::from(vk)) < 0 }
+    sys::key_down(vk)
 }
 
 /// The new shortcut's box: takes the key pressed (with Ctrl, Alt and
 /// Shift) instead of typing, and shows its name; Tab and Shift+Tab still
 /// move on.
-unsafe extern "system" fn key_box_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
-    // SAFETY: the box's own messages, passed on as they came.
-    unsafe {
-        match msg {
-            WM_GETDLGCODE => {
-                if w as u16 == VK_TAB && !key_down(VK_CONTROL) && !key_down(VK_MENU) {
-                    return DefSubclassProc(hwnd, msg, w, l);
-                }
-                return DLGC_WANTALLKEYS as LRESULT;
+fn key_box_proc(m: &Msg) -> LRESULT {
+    let (hwnd, w, l) = (m.hwnd, m.w, m.l);
+    match m.id {
+        WM_GETDLGCODE => {
+            if w as u16 == VK_TAB && !key_down(VK_CONTROL) && !key_down(VK_MENU) {
+                return m.def();
             }
-            WM_KEYDOWN | WM_SYSKEYDOWN => {
-                let vk = w as u16;
-                if keymap::is_modifier(vk) {
-                    return 0;
-                }
-                let mut chord = vk & 0xff;
-                if key_down(VK_CONTROL) {
-                    chord |= keymap::CTRL;
-                }
-                if key_down(VK_MENU) || msg == WM_SYSKEYDOWN && l & (1 << 29) != 0 {
-                    chord |= keymap::ALT;
-                }
-                if key_down(VK_SHIFT) {
-                    chord |= keymap::SHIFT;
-                }
-                SetWindowTextW(hwnd, wz(&keymap::key_name(chord)).as_ptr());
-                let parent = GetParent(hwnd);
-                let id = windows_sys::Win32::UI::WindowsAndMessaging::GetDlgCtrlID(hwnd) as usize;
-                SendMessageW(
-                    parent,
-                    WM_COMMAND,
-                    (KEY_TYPED as usize) << 16 | (id & 0xffff),
-                    i64::from(chord) as isize,
-                );
+            return DLGC_WANTALLKEYS as LRESULT;
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let vk = w as u16;
+            if keymap::is_modifier(vk) {
                 return 0;
             }
-            WM_CHAR | WM_SYSCHAR => return 0,
-            _ => {}
+            let mut chord = vk & 0xff;
+            if key_down(VK_CONTROL) {
+                chord |= keymap::CTRL;
+            }
+            if key_down(VK_MENU) || m.id == WM_SYSKEYDOWN && l & (1 << 29) != 0 {
+                chord |= keymap::ALT;
+            }
+            if key_down(VK_SHIFT) {
+                chord |= keymap::SHIFT;
+            }
+            win::set_text(hwnd, &keymap::key_name(chord));
+            let parent = win::parent(hwnd);
+            let id = win::ctrl_id(hwnd) as usize;
+            win::send_plain(
+                parent,
+                WM_COMMAND,
+                (KEY_TYPED as usize) << 16 | (id & 0xffff),
+                i64::from(chord) as isize,
+            );
+            return 0;
         }
-        DefSubclassProc(hwnd, msg, w, l)
+        WM_CHAR | WM_SYSCHAR => return 0,
+        _ => {}
     }
+    m.def()
 }
 
 impl Page for Keyboard {
@@ -396,24 +381,12 @@ impl Page for Keyboard {
 
     fn fill(&self, app: &App, page: HWND) {
         let b = app.background();
-        send(
-            page,
-            SHOW_KEY,
-            HKM_SETHOTKEY,
-            usize::from(b.show_window_key),
-            0,
-        );
-        send(
-            page,
-            TOGGLE_KEY,
-            HKM_SETHOTKEY,
-            usize::from(b.toggle_window_key),
-            0,
-        );
+        win::hotkey::set(item(page, SHOW_KEY), b.show_window_key);
+        win::hotkey::set(item(page, TOGGLE_KEY), b.toggle_window_key);
         *self.keys.borrow_mut() = app.custom_settings().keys;
         fill_combo(page, SCOPE, &SCOPES, Scope::Global);
-        // SAFETY: subclasses this page's own box, which it outlives.
-        unsafe { SetWindowSubclass(item(page, NEW_KEY), Some(key_box_proc), 1, 0) };
+        // The subclass goes with the box.
+        subclass::set(item(page, NEW_KEY), &KEY_BOX, key_box_proc);
         self.list_commands(page);
     }
 
@@ -443,7 +416,7 @@ impl Page for Keyboard {
                 Some(0)
             }
             (COMMAND_LIST, LBN_SELCHANGE) => {
-                let at = send(page, COMMAND_LIST, LB_GETCURSEL, 0, 0);
+                let at = listbox::cur_sel(item(page, COMMAND_LIST));
                 let i = usize::try_from(at)
                     .ok()
                     .and_then(|at| self.shown.borrow().get(at).copied());
@@ -488,8 +461,8 @@ impl Page for Keyboard {
 
     /// Everything's: no hotkeys; goz-gui's own shortcuts.
     fn defaults(&self, page: HWND) {
-        send(page, SHOW_KEY, HKM_SETHOTKEY, 0, 0);
-        send(page, TOGGLE_KEY, HKM_SETHOTKEY, 0, 0);
+        win::hotkey::set(item(page, SHOW_KEY), 0);
+        win::hotkey::set(item(page, TOGGLE_KEY), 0);
         *self.keys.borrow_mut() = Bindings::default();
         self.show_command(page);
     }

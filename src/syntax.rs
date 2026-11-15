@@ -9,33 +9,31 @@
 //! not read the new syntax yet (`client::boolean_syntax`) gets lines
 //! saying what its searches of the index refuse.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::Cell;
 
 use goz_core::escompat::{HelpScreen, help};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DC_BRUSH, DEFAULT_CHARSET,
-    DeleteObject, EndPaint, FF_MODERN, FIXED_PITCH, FW_NORMAL, GetStockObject, HFONT,
-    InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SetBkColor, SetDCBrushColor, SetTextColor,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DC_BRUSH, DEFAULT_CHARSET, FF_MODERN, FIXED_PITCH,
+    FW_NORMAL, HDC, HFONT, LOGFONTW, OUT_DEFAULT_PRECIS,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::{EM_SETMARGINS, EM_SETSEL};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_CONTROL, VK_ESCAPE,
-};
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_ESCAPE};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::paint::fill;
 use crate::places::{self, Which};
 use crate::theme::{self, Palette};
-use crate::wide::wz;
+use crate::win::class::{self, Create, create_plain, id_menu};
+use crate::win::ext::b4 as ext;
+use crate::win::gdi::{self, Paint};
+use crate::win::{self, Msg, edit, subclass, sys};
 use crate::window::app_icon;
 
 const CLASS: &str = "goz-gui-syntax";
 const ID_TEXT: usize = 1;
+
+/// The text box's subclass (Esc, Ctrl+A).
+static TEXT_KEYS: subclass::Key = subclass::Key::new("search syntax text box keys");
 
 thread_local! {
     /// The window while it is open; one at a time.
@@ -265,109 +263,84 @@ fn text_column(table: &str) -> usize {
 pub fn show(owner: HWND, dark: bool) {
     let open = OPEN.get();
     if !open.is_null() {
-        // SAFETY: a window of this thread, still open.
-        unsafe {
-            ShowWindow(open, SW_RESTORE);
-            SetForegroundWindow(open);
-        }
+        win::show(open, SW_RESTORE);
+        win::set_foreground(open);
         return;
     }
     DARK.set(dark);
-    let class = wz(CLASS);
-    // SAFETY: registers the class the first time only, and creates the
-    // window and its text box on this thread. `existing` is a plain
-    // out-struct.
-    unsafe {
-        let hinst = GetModuleHandleW(core::ptr::null());
-        let mut existing: WNDCLASSEXW = core::mem::zeroed();
-        existing.cbSize = size_of::<WNDCLASSEXW>() as u32;
-        // The class stays registered once the window closes, and its icons
-        // with it; loading new ones for a registration that would fail
-        // leaks them, two icons per opening.
-        if GetClassInfoExW(hinst, class.as_ptr(), &mut existing) == 0 {
-            let wc = WNDCLASSEXW {
-                cbSize: size_of::<WNDCLASSEXW>() as u32,
-                lpfnWndProc: Some(wndproc),
-                hInstance: hinst,
-                hCursor: LoadCursorW(core::ptr::null_mut(), IDC_ARROW),
-                hIcon: app_icon(GetSystemMetrics(SM_CXICON)),
-                hIconSm: app_icon(GetSystemMetrics(SM_CXSMICON)),
-                lpszClassName: class.as_ptr(),
-                ..core::mem::zeroed()
-            };
-            if RegisterClassExW(&wc) == 0 {
-                for icon in [wc.hIcon, wc.hIconSm] {
-                    if !icon.is_null() {
-                        DestroyIcon(icon);
-                    }
+    // The class stays registered once the window closes, and its icons
+    // with it; loading new ones for a registration that would fail leaks
+    // them, two icons per opening.
+    if !ext::class_registered(CLASS) {
+        let c = class::Class {
+            cursor: sys::system_cursor(IDC_ARROW),
+            icon: app_icon(sys::metric(SM_CXICON)),
+            icon_small: app_icon(sys::metric(SM_CXSMICON)),
+            ..class::Class::new(CLASS)
+        };
+        if !c.register() {
+            for icon in [c.icon, c.icon_small] {
+                if !icon.is_null() {
+                    gdi::destroy_icon(icon);
                 }
-                return;
             }
-        }
-        // Centred on the main window, at its scale; then where it was last
-        // (`places`).
-        let dpi = crate::custom::window_dpi(owner) as i32;
-        let (w, h) = (720 * dpi / 96, 600 * dpi / 96);
-        let mut rc = RECT::default();
-        GetWindowRect(owner, &mut rc);
-        let x = rc.left + (rc.right - rc.left - w) / 2;
-        let y = rc.top + (rc.bottom - rc.top - h) / 2;
-        let hwnd = CreateWindowExW(
-            0,
-            class.as_ptr(),
-            wz("Search Syntax - goz").as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-            x,
-            y,
-            w,
-            h,
-            owner,
-            core::ptr::null_mut(),
-            hinst,
-            core::ptr::null(),
-        );
-        if hwnd.is_null() {
             return;
         }
-        let style = WS_CHILD
-            | WS_VISIBLE
-            | WS_VSCROLL
-            | WS_HSCROLL
-            | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL) as u32;
-        let edit = CreateWindowExW(
-            0,
-            wz("EDIT").as_ptr(),
-            core::ptr::null(),
-            style,
-            0,
-            0,
-            0,
-            0,
-            hwnd,
-            ID_TEXT as HMENU,
-            hinst,
-            core::ptr::null(),
-        );
-        SetWindowSubclass(edit, Some(text_proc), 1, 0);
-        OPEN.set(hwnd);
-        apply_fonts(hwnd);
-        let body = wz(&text().replace('\n', "\r\n"));
-        SetWindowTextW(edit, body.as_ptr());
-        SendMessageW(edit, EM_SETSEL, 0, 0);
-        apply_theme(dark);
-        places::restore(
-            hwnd,
-            Which::SearchSyntax,
-            core::ptr::null_mut(),
-            (w / 3, h / 4),
-        );
-        layout(hwnd);
-        // Shown already when it opens maximized.
-        if IsWindowVisible(hwnd) == 0 {
-            ShowWindow(hwnd, SW_SHOWNORMAL);
-        }
-        SetFocus(edit);
     }
+    // Centred on the main window, at its scale; then where it was last
+    // (`places`).
+    let dpi = crate::custom::window_dpi(owner) as i32;
+    let (w, h) = (720 * dpi / 96, 600 * dpi / 96);
+    let rc = win::window_rect(owner);
+    let x = rc.left + (rc.right - rc.left - w) / 2;
+    let y = rc.top + (rc.bottom - rc.top - h) / 2;
+    let hwnd = class::create(
+        &Create {
+            ex_style: 0,
+            class: CLASS,
+            title: "Search Syntax - goz",
+            style: WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            rect: (x, y, w, h),
+            parent: owner,
+            menu: core::ptr::null_mut(),
+        },
+        wndproc,
+    );
+    if hwnd.is_null() {
+        return;
+    }
+    let style = WS_CHILD
+        | WS_VISIBLE
+        | WS_VSCROLL
+        | WS_HSCROLL
+        | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL) as u32;
+    let text_box = create_plain(&Create {
+        ex_style: 0,
+        class: "EDIT",
+        title: "",
+        style,
+        rect: (0, 0, 0, 0),
+        parent: hwnd,
+        menu: id_menu(ID_TEXT),
+    });
+    subclass::set(text_box, &TEXT_KEYS, text_proc);
+    OPEN.set(hwnd);
+    apply_fonts(hwnd);
+    win::set_text(text_box, &text().replace('\n', "\r\n"));
+    edit::set_sel(text_box, 0, 0);
+    apply_theme(dark);
+    places::restore(
+        hwnd,
+        Which::SearchSyntax,
+        core::ptr::null_mut(),
+        (w / 3, h / 4),
+    );
+    layout(hwnd);
+    // Shown already when it opens maximized.
+    if !win::is_visible(hwnd) {
+        win::show(hwnd, SW_SHOWNORMAL);
+    }
+    win::set_focus(text_box);
 }
 
 /// Shows the text as gozd's syntax is now, if the window is open.
@@ -376,9 +349,7 @@ pub fn refresh() {
     if hwnd.is_null() {
         return;
     }
-    let body = wz(&text().replace('\n', "\r\n"));
-    // SAFETY: a NUL-terminated text for this thread's text box.
-    unsafe { SetWindowTextW(text_box(hwnd), body.as_ptr()) };
+    win::set_text(text_box(hwnd), &text().replace('\n', "\r\n"));
 }
 
 /// Keeps where the window is, if it is open (the settings are about to be
@@ -408,16 +379,12 @@ pub fn apply_theme(dark: bool) {
             "Explorer"
         }),
     );
-    // SAFETY: repaints this thread's window and its text box.
-    unsafe {
-        InvalidateRect(hwnd, core::ptr::null(), 1);
-        InvalidateRect(edit, core::ptr::null(), 1);
-    }
+    win::invalidate(hwnd, None, true);
+    win::invalidate(edit, None, true);
 }
 
 fn text_box(hwnd: HWND) -> HWND {
-    // SAFETY: looks up a child of this thread's window.
-    unsafe { GetDlgItem(hwnd, ID_TEXT as i32) }
+    win::dlg::item(hwnd, ID_TEXT as u16)
 }
 
 fn scale(hwnd: HWND, v: i32) -> i32 {
@@ -426,142 +393,114 @@ fn scale(hwnd: HWND, v: i32) -> i32 {
 
 /// A monospaced font at the window's DPI, so goz's two columns line up.
 fn apply_fonts(hwnd: HWND) {
-    let edit = text_box(hwnd);
-    // SAFETY: a font owned here; the old one is deleted once the text box
-    // has the new one.
-    unsafe {
-        let font = CreateFontW(
-            -scale(hwnd, 13),
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            u32::from(DEFAULT_CHARSET),
-            u32::from(OUT_DEFAULT_PRECIS),
-            u32::from(CLIP_DEFAULT_PRECIS),
-            u32::from(CLEARTYPE_QUALITY),
-            u32::from(FIXED_PITCH | FF_MODERN),
-            wz("Consolas").as_ptr(),
-        );
-        SendMessageW(edit, WM_SETFONT, font as usize, 1);
-        let margin = scale(hwnd, 6) as u32;
-        SendMessageW(
-            edit,
-            EM_SETMARGINS,
-            (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
-            (margin | margin << 16) as isize,
-        );
-        let old = FONT.replace(font);
-        if !old.is_null() {
-            DeleteObject(old);
-        }
+    let text = text_box(hwnd);
+    let mut lf = LOGFONTW {
+        lfHeight: -scale(hwnd, 13),
+        lfWeight: FW_NORMAL as i32,
+        lfCharSet: DEFAULT_CHARSET,
+        lfOutPrecision: OUT_DEFAULT_PRECIS,
+        lfClipPrecision: CLIP_DEFAULT_PRECIS,
+        lfQuality: CLEARTYPE_QUALITY,
+        lfPitchAndFamily: FIXED_PITCH | FF_MODERN,
+        ..Default::default()
+    };
+    for (to, from) in lf.lfFaceName.iter_mut().zip("Consolas".encode_utf16()) {
+        *to = from;
+    }
+    // A font owned here; the old one is deleted once the text box has the
+    // new one.
+    let font = gdi::create_font(&lf);
+    win::set_font(text, font, true);
+    let margin = scale(hwnd, 6) as u16;
+    edit::set_margins(text, EC_LEFTMARGIN | EC_RIGHTMARGIN, margin, margin);
+    let old = FONT.replace(font);
+    if !old.is_null() {
+        gdi::delete_object(old);
     }
 }
 
 fn layout(hwnd: HWND) {
-    let mut rc = RECT::default();
+    let rc = win::client_rect(hwnd);
     let inset = scale(hwnd, 6);
-    // SAFETY: reads and moves this thread's windows.
-    unsafe {
-        GetClientRect(hwnd, &mut rc);
-        MoveWindow(
-            text_box(hwnd),
-            inset,
-            inset,
-            (rc.right - 2 * inset).max(0),
-            (rc.bottom - 2 * inset).max(0),
-            1,
-        );
-    }
+    win::move_window(
+        text_box(hwnd),
+        inset,
+        inset,
+        (rc.right - 2 * inset).max(0),
+        (rc.bottom - 2 * inset).max(0),
+        true,
+    );
 }
 
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // SAFETY: each arm reads `w`/`l` as the message defines them.
-    unsafe {
-        match msg {
-            WM_SIZE => {
-                layout(hwnd);
-                0
-            }
-            WM_PAINT => {
-                let mut ps: PAINTSTRUCT = core::mem::zeroed();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                fill(hdc, &ps.rcPaint, Palette::new(DARK.get()).bg);
-                EndPaint(hwnd, &ps);
-                0
-            }
-            WM_ERASEBKGND => 1,
-            // A read-only text box asks for the static colours.
-            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
-                let pal = Palette::new(DARK.get());
-                SetTextColor(w as _, pal.fg);
-                SetBkColor(w as _, pal.bg);
-                SetDCBrushColor(w as _, pal.bg);
-                GetStockObject(DC_BRUSH) as LRESULT
-            }
-            WM_SETFOCUS => {
-                SetFocus(text_box(hwnd));
-                0
-            }
-            WM_DPICHANGED => {
-                let rc = &*(l as *const RECT);
-                SetWindowPos(
+fn wndproc(m: &Msg) -> LRESULT {
+    let hwnd = m.hwnd;
+    match m.id {
+        WM_SIZE => {
+            layout(hwnd);
+            0
+        }
+        WM_PAINT => {
+            let p = Paint::begin(hwnd);
+            fill(p.hdc(), &p.area(), Palette::new(DARK.get()).bg);
+            0
+        }
+        WM_ERASEBKGND => 1,
+        // A read-only text box asks for the static colours.
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
+            let pal = Palette::new(DARK.get());
+            let hdc = m.w as HDC;
+            gdi::set_text_color(hdc, pal.fg);
+            gdi::set_bk_color(hdc, pal.bg);
+            gdi::set_dc_brush_color(hdc, pal.bg);
+            gdi::stock_object(DC_BRUSH) as LRESULT
+        }
+        WM_SETFOCUS => {
+            win::set_focus(text_box(hwnd));
+            0
+        }
+        WM_DPICHANGED => {
+            if let Some(rc) = m.dpi_rect() {
+                win::set_pos(
                     hwnd,
                     core::ptr::null_mut(),
-                    rc.left,
-                    rc.top,
-                    rc.right - rc.left,
-                    rc.bottom - rc.top,
+                    (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top),
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                apply_fonts(hwnd);
-                layout(hwnd);
-                0
             }
-            WM_DESTROY => {
-                places::keep(hwnd, Which::SearchSyntax, core::ptr::null_mut());
-                OPEN.set(core::ptr::null_mut());
-                let font = FONT.replace(core::ptr::null_mut());
-                if !font.is_null() {
-                    DeleteObject(font);
-                }
-                0
-            }
-            _ => DefWindowProcW(hwnd, msg, w, l),
+            apply_fonts(hwnd);
+            layout(hwnd);
+            0
         }
+        WM_DESTROY => {
+            places::keep(hwnd, Which::SearchSyntax, core::ptr::null_mut());
+            OPEN.set(core::ptr::null_mut());
+            let font = FONT.replace(core::ptr::null_mut());
+            if !font.is_null() {
+                gdi::delete_object(font);
+            }
+            0
+        }
+        _ => m.def(),
     }
 }
 
 /// The text box's subclass: Esc closes the window, and Ctrl+A selects all
 /// the text, which a multi-line text box does not do by itself.
-unsafe extern "system" fn text_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
-    // SAFETY: passes messages on to the text box; closes its parent.
-    unsafe {
-        match msg {
-            WM_KEYDOWN if w == usize::from(VK_ESCAPE) => {
-                PostMessageW(GetParent(hwnd), WM_CLOSE, 0, 0);
-                return 0;
-            }
-            WM_KEYDOWN if w == usize::from(b'A') && GetKeyState(i32::from(VK_CONTROL)) < 0 => {
-                SendMessageW(hwnd, EM_SETSEL, 0, -1);
-                return 0;
-            }
-            // Esc and Ctrl+A as characters, handled above.
-            WM_CHAR if w == 0x1b || w == 0x01 => return 0,
-            _ => {}
+fn text_proc(m: &Msg) -> LRESULT {
+    match m.id {
+        WM_KEYDOWN if m.w == usize::from(VK_ESCAPE) => {
+            win::post_close(win::parent(m.hwnd));
+            return 0;
         }
-        DefSubclassProc(hwnd, msg, w, l)
+        WM_KEYDOWN if m.w == usize::from(b'A') && sys::key_down(VK_CONTROL) => {
+            edit::select_all(m.hwnd);
+            return 0;
+        }
+        // Esc and Ctrl+A as characters, handled above.
+        WM_CHAR if m.w == 0x1b || m.w == 0x01 => return 0,
+        _ => {}
     }
+    m.def()
 }
 
 #[cfg(test)]

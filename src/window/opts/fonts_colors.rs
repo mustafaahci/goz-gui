@@ -11,33 +11,27 @@
 //! Everything's (`crate::colors`). Color Filters... edits the colours rows
 //! take from their names (`color_filters`).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, EnumFontFamiliesExW, GetDC,
-    InvalidateRect, LOGFONTW, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW,
-    TRANSPARENT,
+    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
 };
 use windows_sys::Win32::System::SystemServices::{SS_LEFT, SS_OWNERDRAW};
 use windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_GROUPBOX,
-    CB_ADDSTRING, CB_ERR, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_RESETCONTENT,
-    CB_SELECTSTRING, CB_SETCURSEL, CB_SETEDITSEL, CBN_EDITCHANGE, CBN_SELCHANGE, CBS_DROPDOWN,
-    CBS_DROPDOWNLIST, CBS_SORT, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
-    LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, WM_COMMAND, WM_DRAWITEM, WS_BORDER, WS_GROUP,
-    WS_TABSTOP, WS_VSCROLL,
+    BN_CLICKED, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_GROUPBOX, CB_ERR, CBN_EDITCHANGE,
+    CBN_SELCHANGE, CBS_DROPDOWN, CBS_DROPDOWNLIST, CBS_SORT, LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT,
+    LBS_NOTIFY, WM_COMMAND, WM_DRAWITEM, WS_BORDER, WS_GROUP, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::colors::{Accent, AccentMode, Colors, FontSpec, Item, Look, SIZES, State, Weight};
 use crate::dialog::{Class, LIST_BOX};
-use crate::options::{Invalid, LABEL, Page, Rows, enable, item, order, send, set_text, text};
+use crate::options::{Invalid, LABEL, Page, Rows, enable, item, order, set_text, text};
 use crate::paint::fill;
 use crate::theme::{Ink, Palette};
-use crate::wide::wz;
+use crate::win::ext::b4 as ext;
+use crate::win::{self, Msg, combo, dlg, gdi, listbox};
 use crate::window::App;
 
 /// Everything's control ids.
@@ -45,9 +39,6 @@ const THEME: u16 = 1532;
 const ITEM: u16 = 1534;
 const FONT: u16 = 1142;
 const SIZE: u16 = 1143;
-/// `CB_SETEDITSEL`'s lParam that takes the selection away: a start of -1
-/// (low word), no end.
-const NO_SELECTION: isize = 0xffff;
 const ACCENT_NONE: u16 = 1398;
 const ACCENT_DEFAULT: u16 = 1399;
 const ACCENT_CUSTOM: u16 = 1400;
@@ -160,12 +151,12 @@ impl FontsColors {
     fn fill_states(&self, page: HWND) {
         self.state.set(0);
         self.quietly(|| {
-            send(page, STATES, LB_RESETCONTENT, 0, 0);
+            let list = item(page, STATES);
+            listbox::reset(list);
             for s in self.item().states() {
-                let w = wz(s.label());
-                send(page, STATES, LB_ADDSTRING, 0, w.as_ptr() as isize);
+                listbox::add(list, s.label());
             }
-            send(page, STATES, LB_SETCURSEL, 0, 0);
+            listbox::set_cur_sel(list, 0);
         });
     }
 
@@ -185,12 +176,11 @@ impl FontsColors {
             } else {
                 font.face.clone()
             };
-            let w = wz(&face);
-            if send(page, FONT, CB_SELECTSTRING, usize::MAX, w.as_ptr() as isize) == CB_ERR as isize
-            {
+            let fonts = dlg::item(page, FONT);
+            if ext::combo_select_string(fonts, -1, &face) == CB_ERR {
                 // A face this system has not: listed so it shows.
-                send(page, FONT, CB_ADDSTRING, 0, w.as_ptr() as isize);
-                send(page, FONT, CB_SELECTSTRING, usize::MAX, w.as_ptr() as isize);
+                combo::add(fonts, &face);
+                ext::combo_select_string(fonts, -1, &face);
             }
             let size = if font.size == 0 {
                 DEFAULT.to_owned()
@@ -200,15 +190,16 @@ impl FontsColors {
             set_text(page, SIZE, &size);
             // Setting the box's text selects it, and a combo box's text
             // shows its selection with or without the keyboard: none,
-            // until the box is used (as the Font list beside it).
-            send(page, SIZE, CB_SETEDITSEL, 0, NO_SELECTION);
+            // until the box is used (as the Font list beside it). A start
+            // of -1 takes the selection away.
+            combo::set_edit_sel(dlg::item(page, SIZE), -1, 0);
             for (id, mode) in [
                 (ACCENT_NONE, AccentMode::None),
                 (ACCENT_DEFAULT, AccentMode::Default),
                 (ACCENT_CUSTOM, AccentMode::Custom),
             ] {
                 let on = has_accent && accent.mode == mode;
-                send(page, id, BM_SETCHECK, usize::from(on), 0);
+                dlg::set_checked(page, id, on);
             }
             set_text(
                 page,
@@ -216,8 +207,8 @@ impl FontsColors {
                 &format!("Settings for {} item state", state.label()),
             );
             let radio = |default: u16, custom: u16, on_custom: bool| {
-                send(page, default, BM_SETCHECK, usize::from(!on_custom), 0);
-                send(page, custom, BM_SETCHECK, usize::from(on_custom), 0);
+                dlg::set_checked(page, default, !on_custom);
+                dlg::set_checked(page, custom, on_custom);
             };
             radio(FG_DEFAULT, FG_CUSTOM, look.fg.is_some());
             radio(BG_DEFAULT, BG_CUSTOM, look.bg.is_some());
@@ -226,13 +217,7 @@ impl FontsColors {
                 STYLE_CUSTOM,
                 has_bold && look.bold != Weight::Default,
             );
-            send(
-                page,
-                BOLD,
-                BM_SETCHECK,
-                usize::from(has_bold && look.bold == Weight::Bold),
-                0,
-            );
+            dlg::set_checked(page, BOLD, has_bold && look.bold == Weight::Bold);
         });
         // Only what goz-gui draws can be chosen.
         for id in [FONT, SIZE] {
@@ -257,8 +242,7 @@ impl FontsColors {
 
     fn repaint(&self, page: HWND) {
         for id in [SAMPLE, FG_SWATCH, BG_SWATCH, ACCENT_SWATCH] {
-            // SAFETY: repaints a control of this thread's page.
-            unsafe { InvalidateRect(item(page, id), core::ptr::null(), 0) };
+            win::invalidate(item(page, id), None, false);
         }
     }
 
@@ -359,48 +343,39 @@ impl FontsColors {
                     &[("Annual report 2024.pdf", false)]
                 };
                 let mut x = rc.left + 4;
-                // SAFETY: draws on the control's own DC for this paint; the
-                // old font is put back.
-                unsafe {
-                    let old = SelectObject(hdc, base);
-                    SetBkMode(hdc, TRANSPARENT as i32);
-                    for &(part, is_match) in parts {
-                        let mut w: Vec<u16> = part.encode_utf16().collect();
-                        SelectObject(hdc, if is_match { matched } else { base });
-                        let mut size = windows_sys::Win32::Foundation::SIZE::default();
-                        windows_sys::Win32::Graphics::Gdi::GetTextExtentPoint32W(
-                            hdc,
-                            w.as_ptr(),
-                            w.len() as i32,
-                            &mut size,
-                        );
-                        let mut r = RECT {
-                            left: x,
-                            right: (x + size.cx).min(rc.right),
-                            ..rc
-                        };
-                        if is_match && let Some(b) = pal.hl_bg {
-                            fill(hdc, &r, b);
-                        }
-                        SetTextColor(
-                            hdc,
-                            if is_match {
-                                pal.hl_fg.unwrap_or(fg)
-                            } else {
-                                fg
-                            },
-                        );
-                        DrawTextW(
-                            hdc,
-                            w.as_mut_ptr(),
-                            w.len() as i32,
-                            &mut r,
-                            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-                        );
-                        x += size.cx;
+                // On the control's own DC for this paint; the old font is
+                // put back.
+                let old = gdi::select(hdc, base);
+                gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+                for &(part, is_match) in parts {
+                    let w: Vec<u16> = part.encode_utf16().collect();
+                    gdi::select(hdc, if is_match { matched } else { base });
+                    let size = gdi::text_extent(hdc, &w);
+                    let mut r = RECT {
+                        left: x,
+                        right: (x + size.cx).min(rc.right),
+                        ..rc
+                    };
+                    if is_match && let Some(b) = pal.hl_bg {
+                        fill(hdc, &r, b);
                     }
-                    SelectObject(hdc, old);
+                    gdi::set_text_color(
+                        hdc,
+                        if is_match {
+                            pal.hl_fg.unwrap_or(fg)
+                        } else {
+                            fg
+                        },
+                    );
+                    gdi::draw_text(
+                        hdc,
+                        &w,
+                        &mut r,
+                        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                    );
+                    x += size.cx;
                 }
+                gdi::select(hdc, old);
             }
             _ => {}
         }
@@ -410,37 +385,11 @@ impl FontsColors {
 /// The font families this system has, sorted, each once (vertical
 /// `@` faces left out).
 fn font_families() -> Vec<String> {
-    unsafe extern "system" fn each(
-        lf: *const LOGFONTW,
-        _tm: *const TEXTMETRICW,
-        _kind: u32,
-        l: LPARAM,
-    ) -> i32 {
-        // SAFETY: `l` is the vector `font_families` passed, alive for the
-        // enumeration; `lf` is the face Windows enumerates.
-        unsafe {
-            let out = &mut *(l as *mut Vec<String>);
-            let face = &(*lf).lfFaceName;
-            let n = face.iter().position(|&c| c == 0).unwrap_or(face.len());
-            let name = String::from_utf16_lossy(&face[..n]);
-            if !name.starts_with('@') && !name.is_empty() {
-                out.push(name);
-            }
-        }
-        1
-    }
-    let mut out: Vec<String> = Vec::new();
-    // SAFETY: enumerates the screen DC's fonts into `out`, which outlives
-    // the call; the DC is released.
-    unsafe {
-        let hdc = GetDC(core::ptr::null_mut());
-        let lf = LOGFONTW {
-            lfCharSet: 1, // DEFAULT_CHARSET: every face once per charset.
-            ..core::mem::zeroed()
-        };
-        EnumFontFamiliesExW(hdc, &lf, Some(each), (&raw mut out) as LPARAM, 0);
-        ReleaseDC(core::ptr::null_mut(), hdc);
-    }
+    // DEFAULT_CHARSET: every face once per charset.
+    let mut out: Vec<String> = ext::font_faces(1)
+        .into_iter()
+        .filter(|name| !name.starts_with('@') && !name.is_empty())
+        .collect();
     out.sort_by_key(|s| s.to_lowercase());
     out.dedup();
     out
@@ -456,24 +405,16 @@ pub fn size_of_text(t: &str) -> Option<u32> {
 }
 
 fn combo_text(page: HWND, id: u16) -> String {
-    let at = send(page, id, CB_GETCURSEL, 0, 0);
+    let list = item(page, id);
+    let at = combo::cur_sel(list);
     if at < 0 {
         return text(page, id);
     }
-    let n = send(page, id, CB_GETLBTEXTLEN, at as usize, 0).max(0) as usize;
-    let mut buf = vec![0u16; n + 1];
-    send(
-        page,
-        id,
-        CB_GETLBTEXT,
-        at as usize,
-        buf.as_mut_ptr() as isize,
-    );
-    String::from_utf16_lossy(&buf[..n])
+    combo::text(list, at)
 }
 
 fn checked(page: HWND, id: u16) -> bool {
-    send(page, id, BM_GETCHECK, 0, 0) == 1
+    dlg::is_checked(page, id)
 }
 
 impl Page for FontsColors {
@@ -693,24 +634,23 @@ impl Page for FontsColors {
         self.item.set(0);
         self.quietly(|| {
             crate::options::fill_combo(page, THEME, &THEMES, self.dark.get());
-            send(page, ITEM, CB_RESETCONTENT, 0, 0);
+            let items = item(page, ITEM);
+            combo::reset(items);
             for i in Item::ALL {
-                let w = wz(i.label());
-                send(page, ITEM, CB_ADDSTRING, 0, w.as_ptr() as isize);
+                combo::add(items, i.label());
             }
-            send(page, ITEM, CB_SETCURSEL, 0, 0);
-            send(page, FONT, CB_RESETCONTENT, 0, 0);
-            let d = wz(DEFAULT);
-            send(page, FONT, CB_ADDSTRING, 0, d.as_ptr() as isize);
+            combo::set_cur_sel(items, 0);
+            let fonts = item(page, FONT);
+            combo::reset(fonts);
+            combo::add(fonts, DEFAULT);
             for f in font_families() {
-                let w = wz(&f);
-                send(page, FONT, CB_ADDSTRING, 0, w.as_ptr() as isize);
+                combo::add(fonts, &f);
             }
-            send(page, SIZE, CB_RESETCONTENT, 0, 0);
-            send(page, SIZE, CB_ADDSTRING, 0, d.as_ptr() as isize);
+            let sizes = item(page, SIZE);
+            combo::reset(sizes);
+            combo::add(sizes, DEFAULT);
             for s in SIZES {
-                let w = wz(&s.to_string());
-                send(page, SIZE, CB_ADDSTRING, 0, w.as_ptr() as isize);
+                combo::add(sizes, &s.to_string());
             }
         });
         self.fill_states(page);
@@ -751,23 +691,22 @@ impl Page for FontsColors {
         }
     }
 
-    fn message(&self, app: &App, page: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<isize> {
-        if msg == WM_DRAWITEM {
-            // SAFETY: WM_DRAWITEM's lParam is the item's DRAWITEMSTRUCT.
-            let dis = unsafe { &*(l as *const DRAWITEMSTRUCT) };
+    fn message_msg(&self, app: &App, page: HWND, m: &Msg) -> Option<isize> {
+        if m.id == WM_DRAWITEM {
+            let dis = m.draw_item()?;
             if matches!(
                 dis.CtlID as u16,
                 SAMPLE | FG_SWATCH | BG_SWATCH | ACCENT_SWATCH
             ) {
-                self.draw(app, dis);
+                self.draw(app, &dis);
                 return Some(1);
             }
             return None;
         }
-        if msg != WM_COMMAND {
+        if m.id != WM_COMMAND {
             return None;
         }
-        let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+        let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
         if self.busy.get() {
             return Some(0);
         }
@@ -779,7 +718,7 @@ impl Page for FontsColors {
                 Some(0)
             }
             (ITEM, CBN_SELCHANGE) => {
-                let at = send(page, ITEM, CB_GETCURSEL, 0, 0);
+                let at = combo::cur_sel(item(page, ITEM));
                 self.item
                     .set(usize::try_from(at).unwrap_or(0).min(Item::ALL.len() - 1));
                 self.fill_states(page);
@@ -787,7 +726,7 @@ impl Page for FontsColors {
                 Some(0)
             }
             (STATES, LBN_SELCHANGE) => {
-                let at = send(page, STATES, LB_GETCURSEL, 0, 0);
+                let at = listbox::cur_sel(item(page, STATES));
                 self.state.set(usize::try_from(at).unwrap_or(0));
                 self.show(page);
                 Some(0)

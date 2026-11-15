@@ -17,43 +17,36 @@
 //! borrow across a page's method, and a page must not hold one of its own
 //! across a call that sends messages.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::Cell;
+use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, EndPaint, HFONT,
-    InvalidateRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
 };
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::{
-    ETDT_DISABLE, ETDT_ENABLE, ETDT_USETABTEXTURE, EnableThemeDialogTexture, HTREEITEM, NMHDR,
-    NMTREEVIEWW, TCIF_TEXT, TCITEMW, TCM_GETITEMRECT, TCM_INSERTITEMW, TCM_SETITEMW, TVE_EXPAND,
-    TVGN_CARET, TVI_LAST, TVI_ROOT, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0,
-    TVITEMW, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETEXTENDEDSTYLE,
-    TVN_SELCHANGEDW, TVS_EX_DOUBLEBUFFER, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
+    ETDT_DISABLE, ETDT_ENABLE, ETDT_USETABTEXTURE, HTREEITEM, NMTREEVIEWW, TCITEMW, TVE_EXPAND,
+    TVGN_CARET, TVIF_PARAM, TVITEMEXW, TVN_SELCHANGEDW, TVS_EX_DOUBLEBUFFER, TVS_HASLINES,
+    TVS_LINESATROOT, TVS_SHOWSELALWAYS,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX,
-    CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST,
-    EN_CHANGE, ES_AUTOHSCROLL, ES_NUMBER, EndDialog, GWLP_USERDATA, GetClientRect, GetDlgItem,
-    GetWindowRect, IDCANCEL, IDOK, MB_ICONWARNING, MB_OK, MINMAXINFO, MapDialogRect, SW_HIDE,
-    SW_SHOWNA, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowWindow, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_GETFONT,
-    WM_GETMINMAXINFO, WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE,
+    BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX, CBN_SELCHANGE, CBS_DROPDOWNLIST,
+    EN_CHANGE, ES_AUTOHSCROLL, ES_NUMBER, IDCANCEL, IDOK, MB_ICONWARNING, MB_OK, SW_HIDE,
+    SW_SHOWNA, SWP_NOACTIVATE, SWP_NOZORDER, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_INITDIALOG, WM_NOTIFY, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE,
     WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE, WS_GROUP, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use crate::dialog::{
     self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, anchor, apply_theme,
-    center_on_owner, common, state,
+    center_on_owner, common_msg,
 };
 use crate::places::{self, Which};
 use crate::theme::Palette;
-use crate::wide::{window_text, wz};
+use crate::win::ext::b4 as ext;
+use crate::win::gdi::{self, Paint, Selected};
+use crate::win::{self, Msg, combo, dlg, subclass, tab, tv};
 use crate::window::App;
 
 /// The room a page's rows have, in dialog units: right of the tree, inside
@@ -172,11 +165,18 @@ pub trait Page {
     /// or Apply like any change). (No change is noted meanwhile.)
     fn defaults(&self, page: HWND);
 
-    /// Any message to the page's window, first: a button of its own (`Some`
-    /// takes it, so it is no change), `WM_NOTIFY`, ... `Some` is the
-    /// dialog procedure's answer.
+    /// Any message to the page's window, first, by its numbers: a button of
+    /// its own (`Some` takes it, so it is no change), a timer, ... `Some`
+    /// is the dialog procedure's answer.
     fn message(&self, _app: &App, _page: HWND, _msg: u32, _w: WPARAM, _l: LPARAM) -> Option<isize> {
         None
+    }
+
+    /// Any message to the page's window, first, as the system delivered
+    /// it: for a page that reads what its `lParam` points at (`WM_NOTIFY`,
+    /// `WM_DRAWITEM`). By default [`Page::message`] of its numbers.
+    fn message_msg(&self, app: &App, page: HWND, m: &Msg) -> Option<isize> {
+        self.message(app, page, m.id, m.w, m.l)
     }
 }
 
@@ -383,36 +383,27 @@ impl<'a> Rows<'a> {
 
 /// Control `id` of `page`.
 pub fn item(page: HWND, id: u16) -> HWND {
-    // SAFETY: looks up a child of this thread's dialog.
-    unsafe { GetDlgItem(page, i32::from(id)) }
-}
-
-/// Sends `msg` to control `id` of `page`.
-pub fn send(page: HWND, id: u16, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: a message to a control of this thread's dialog; any pointer
-    // in `l` is the caller's and outlives the synchronous call.
-    unsafe { SendMessageW(item(page, id), msg, w, l) }
+    dlg::item(page, id)
 }
 
 pub fn set_check(page: HWND, id: u16, on: bool) {
-    send(page, id, BM_SETCHECK, usize::from(on), 0);
+    dlg::set_checked(page, id, on);
 }
 
 pub fn checked(page: HWND, id: u16) -> bool {
-    send(page, id, BM_GETCHECK, 0, 0) == 1
+    dlg::is_checked(page, id)
 }
 
 pub fn enable(page: HWND, id: u16, on: bool) {
-    // SAFETY: a control of this thread's dialog.
-    unsafe { EnableWindow(item(page, id), on.into()) };
+    win::enable(item(page, id), on);
 }
 
 /// Fills a drop-down list with `items`' labels and selects `current`'s.
 pub fn fill_combo<T: Copy + PartialEq>(page: HWND, id: u16, items: &[(T, &str)], current: T) {
-    send(page, id, CB_RESETCONTENT, 0, 0);
+    let list = item(page, id);
+    combo::reset(list);
     for (_, label) in items {
-        let text = wz(label);
-        send(page, id, CB_ADDSTRING, 0, text.as_ptr() as isize);
+        combo::add(list, label);
     }
     select_combo(page, id, items, current);
 }
@@ -420,23 +411,21 @@ pub fn fill_combo<T: Copy + PartialEq>(page: HWND, id: u16, items: &[(T, &str)],
 /// Selects `current`'s label in a list [`fill_combo`] filled.
 pub fn select_combo<T: Copy + PartialEq>(page: HWND, id: u16, items: &[(T, &str)], current: T) {
     let at = items.iter().position(|(v, _)| *v == current).unwrap_or(0);
-    send(page, id, CB_SETCURSEL, at, 0);
+    combo::set_cur_sel(item(page, id), at as i32);
 }
 
 /// The value of the label selected in a list [`fill_combo`] filled.
 pub fn combo_value<T: Copy>(page: HWND, id: u16, items: &[(T, &str)]) -> T {
-    let at = send(page, id, CB_GETCURSEL, 0, 0).max(0) as usize;
+    let at = combo::cur_sel(item(page, id)).max(0) as usize;
     items[at.min(items.len() - 1)].0
 }
 
 pub fn set_text(page: HWND, id: u16, text: &str) {
-    let text = wz(text);
-    // SAFETY: a NUL-terminated string for a control of this thread's dialog.
-    unsafe { SetWindowTextW(item(page, id), text.as_ptr()) };
+    win::set_text(item(page, id), text);
 }
 
 pub fn text(page: HWND, id: u16) -> String {
-    window_text(item(page, id))
+    win::text(item(page, id))
 }
 
 /// Days as typed, within 1..=36500; `fallback` if not a number.
@@ -484,17 +473,12 @@ struct Held {
     item: Cell<HTREEITEM>,
 }
 
-/// What a page's window knows of the dialog (its GWLP_USERDATA).
-struct PageRef {
-    dialog: *const Dialog<'static>,
-    index: usize,
-}
-
-struct Dialog<'a> {
-    app: &'a App,
+/// The dialog, which the frame's procedure, each page's window and the
+/// tab's subclass hold (an `Rc` of it).
+struct Dialog {
+    /// The window's, which lives as long as its thread.
+    app: &'static App,
     pages: Vec<Held>,
-    /// One per page, made once: their places stay put.
-    refs: Vec<PageRef>,
     /// The page shown.
     current: Cell<Option<usize>>,
     look: Cell<Look>,
@@ -504,6 +488,9 @@ struct Dialog<'a> {
     min: Cell<(i32, i32)>,
     frame: Cell<HWND>,
 }
+
+/// The tab's subclass, which paints it in the dark theme.
+static TAB_FACE: subclass::Key = subclass::Key::new("options tab, dark");
 
 /// Shows the dialog over the window, with `pages` in the tree, on the
 /// page named `first` (the first page if none is). Returns the name of the
@@ -533,22 +520,25 @@ pub fn show(app: &App, pages: Vec<Box<dyn Page>>, first: &str) -> String {
         .iter()
         .position(|h| h.page.name().eq_ignore_ascii_case(first))
         .unwrap_or(0);
-    let mut dialog = Dialog {
+    // The pages' windows outlive this call's borrow of the window's `App`
+    // in their handlers: they hold the thread's, which is the same window's
+    // and lives as long as the thread. A window not attached yet has no
+    // Options to show (as when the dialog cannot be made).
+    let Some(app) = crate::window::app_of(app.hwnd) else {
+        return pages
+            .get(start)
+            .map(|h| h.page.name().to_owned())
+            .unwrap_or_default();
+    };
+    let dialog = Rc::new(Dialog {
         app,
         pages,
-        refs: Vec::new(),
         current: Cell::new(None),
         look: Cell::new(dialog::app_look()),
         filling: Cell::new(false),
         min: Cell::new((0, 0)),
         frame: Cell::new(core::ptr::null_mut()),
-    };
-    // The pages' windows find the dialog through these; it stays where it
-    // is until `show` returns, after they are gone.
-    let me = (&raw const dialog).cast::<Dialog<'static>>();
-    dialog.refs = (0..dialog.pages.len())
-        .map(|index| PageRef { dialog: me, index })
-        .collect();
+    });
 
     let mut t = Template::new("Options", WS_THICKFRAME, DLG_W, DLG_H);
     let tree_style = WS_TABSTOP | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS;
@@ -578,12 +568,7 @@ pub fn show(app: &App, pages: Vec<Box<dyn Page>>, first: &str) -> String {
         0,
         TAB_AT,
     );
-    let state = Init {
-        dialog: &dialog,
-        nested,
-        start,
-    };
-    t.run(app.hwnd, Some(frame_proc), (&raw const state) as LPARAM);
+    t.show(app.hwnd, &|m| frame_proc(&dialog, &nested, start, m));
     let last = dialog.current.get().unwrap_or(start);
     dialog
         .pages
@@ -592,62 +577,42 @@ pub fn show(app: &App, pages: Vec<Box<dyn Page>>, first: &str) -> String {
         .unwrap_or_default()
 }
 
-/// What WM_INITDIALOG gets.
-struct Init<'a, 'b> {
-    dialog: &'a Dialog<'b>,
-    /// Each page (in the dialog's order) sits under the one before it.
-    nested: Vec<bool>,
-    start: usize,
-}
-
 fn ctrl(dlg: HWND, id: u16) -> HWND {
     item(dlg, id)
 }
 
 /// `units` in pixels of `dlg`.
 fn px(dlg: HWND, (x, y, cx, cy): Units) -> RECT {
-    let mut r = RECT {
+    let r = RECT {
         left: x.into(),
         top: y.into(),
         right: i32::from(x) + i32::from(cx),
         bottom: i32::from(y) + i32::from(cy),
     };
-    // SAFETY: converts within this thread's dialog.
-    unsafe { MapDialogRect(dlg, &mut r) };
-    r
+    dlg::map_rect(dlg, r)
 }
 
-impl Dialog<'_> {
-    fn init(&self, dlg: HWND, nested: &[bool], start: usize) {
+impl Dialog {
+    fn init(self: &Rc<Self>, dlg: HWND, nested: &[bool], start: usize) {
         self.frame.set(dlg);
         let tree = ctrl(dlg, TREE);
-        send(
-            dlg,
-            TREE,
-            TVM_SETEXTENDEDSTYLE,
-            TVS_EX_DOUBLEBUFFER as usize,
-            TVS_EX_DOUBLEBUFFER as isize,
-        );
-        let mut parent: HTREEITEM = TVI_ROOT;
+        tv::set_extended_style(tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
+        let mut parent: HTREEITEM = tv::ROOT;
         let mut tops = Vec::new();
         for (i, held) in self.pages.iter().enumerate() {
             let under = nested.get(i).copied().unwrap_or(false);
-            let mut text = wz(held.page.name());
-            let ins = TVINSERTSTRUCTW {
-                hParent: if under { parent } else { TVI_ROOT },
-                hInsertAfter: TVI_LAST,
-                Anonymous: TVINSERTSTRUCTW_0 {
-                    item: TVITEMW {
-                        mask: TVIF_TEXT | TVIF_PARAM,
-                        pszText: text.as_mut_ptr(),
-                        lParam: i as LPARAM,
-                        // SAFETY: the rest of TVITEMW is plain data.
-                        ..unsafe { core::mem::zeroed() }
-                    },
-                },
+            let item = TVITEMEXW {
+                mask: TVIF_PARAM,
+                lParam: i as LPARAM,
+                ..Default::default()
             };
-            // SAFETY: the struct and its text outlive the synchronous call.
-            let h = unsafe { SendMessageW(tree, TVM_INSERTITEMW, 0, (&raw const ins) as isize) };
+            let h = tv::insert(
+                tree,
+                if under { parent } else { tv::ROOT },
+                tv::LAST,
+                item,
+                Some(held.page.name()),
+            );
             held.item.set(h);
             if !under {
                 parent = h;
@@ -656,34 +621,16 @@ impl Dialog<'_> {
         }
         // Everything shows every page's place open.
         for h in tops {
-            // SAFETY: an item of this thread's tree.
-            unsafe { SendMessageW(tree, TVM_EXPAND, TVE_EXPAND as usize, h) };
+            tv::expand(tree, h, TVE_EXPAND);
         }
         // The tab that names the page.
-        let mut name = wz("");
-        let tab = TCITEMW {
-            mask: TCIF_TEXT,
-            pszText: name.as_mut_ptr(),
-            // SAFETY: the rest of TCITEMW is plain data.
-            ..unsafe { core::mem::zeroed() }
-        };
-        send(dlg, TAB, TCM_INSERTITEMW, 0, (&raw const tab) as isize);
-        // SAFETY: the subclass's data is this dialog, which outlives it
-        // (the subclass goes at the tab's WM_NCDESTROY, before `show`
-        // returns).
-        unsafe {
-            SetWindowSubclass(
-                ctrl(dlg, TAB),
-                Some(tab_proc),
-                1,
-                (self as *const Dialog<'_>).cast::<()>() as usize,
-            )
-        };
+        tab::insert(ctrl(dlg, TAB), 0, TCITEMW::default(), "");
+        // The subclass goes with the tab, before `show` returns.
+        let me = Rc::clone(self);
+        subclass::set(ctrl(dlg, TAB), &TAB_FACE, move |m| tab_proc(&me, m));
         apply_theme(dlg, self.look.get().dark);
         center_on_owner(dlg);
-        let mut wr = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetWindowRect(dlg, &mut wr) };
+        let wr = win::window_rect(dlg);
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
         places::restore(dlg, Which::Options, core::ptr::null_mut(), self.min.get());
         self.layout(dlg);
@@ -692,16 +639,13 @@ impl Dialog<'_> {
     }
 
     /// Selects page `i` in the tree, which shows it (TVN_SELCHANGED).
-    fn select(&self, i: usize) {
+    fn select(self: &Rc<Self>, i: usize) {
         let Some(held) = self.pages.get(i) else {
             return;
         };
         let tree = ctrl(self.frame.get(), TREE);
-        // SAFETY: an item of this thread's tree.
-        unsafe {
-            SendMessageW(tree, TVM_SELECTITEM, TVGN_CARET as usize, held.item.get());
-            SendMessageW(tree, TVM_ENSUREVISIBLE, 0, held.item.get());
-        }
+        tv::select_item(tree, TVGN_CARET, held.item.get());
+        tv::ensure_visible(tree, held.item.get());
         // Selecting the item already selected notifies nothing.
         if self.current.get() != Some(i) {
             self.show_page(i);
@@ -711,9 +655,7 @@ impl Dialog<'_> {
     /// The page area: right of the tree, inside the tab, above Restore
     /// Defaults, as the dialog is sized now.
     fn page_rect(&self, dlg: HWND) -> RECT {
-        let mut client = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetClientRect(dlg, &mut client) };
+        let client = win::client_rect(dlg);
         let base = px(dlg, (0, 0, DLG_W, DLG_H));
         let grew = (
             (client.right - base.right).max(0),
@@ -735,26 +677,20 @@ impl Dialog<'_> {
         for held in &self.pages {
             let h = held.hwnd.get();
             if !h.is_null() {
-                // SAFETY: moves this thread's page.
-                unsafe {
-                    SetWindowPos(
-                        h,
-                        core::ptr::null_mut(),
-                        r.left,
-                        r.top,
-                        r.right - r.left,
-                        r.bottom - r.top,
-                        SWP_NOACTIVATE | SWP_NOZORDER,
-                    )
-                };
+                win::set_pos(
+                    h,
+                    core::ptr::null_mut(),
+                    (r.left, r.top, r.right - r.left, r.bottom - r.top),
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
             }
         }
-        // SAFETY: the tab's frame is drawn for the whole of it.
-        unsafe { InvalidateRect(ctrl(dlg, TAB), core::ptr::null(), 1) };
+        // The tab's frame is drawn for the whole of it.
+        win::invalidate(ctrl(dlg, TAB), None, true);
     }
 
     /// Makes page `i`'s window: its controls, filled and themed.
-    fn make_page(&self, i: usize) -> HWND {
+    fn make_page(self: &Rc<Self>, i: usize) -> HWND {
         let held = &self.pages[i];
         let mut t = Template::child(PAGE_W, PAGE_AREA_H);
         held.page.build(&mut Rows::new(&mut t));
@@ -770,12 +706,8 @@ impl Dialog<'_> {
             (PAGE_W - mx - w, PAGE_AREA_H - my - h, w, h),
         );
         let dlg = self.frame.get();
-        let hwnd = crate::legacy::create_child(
-            &t,
-            dlg,
-            Some(page_proc),
-            (&raw const self.refs[i]) as LPARAM,
-        );
+        let me = Rc::clone(self);
+        let hwnd = t.create_child(dlg, move |m| page_proc(&me, i, m));
         if hwnd.is_null() {
             return hwnd;
         }
@@ -786,38 +718,31 @@ impl Dialog<'_> {
         held.page.update_enabled(hwnd);
         self.theme_page(hwnd, self.look.get().dark);
         let r = self.page_rect(dlg);
-        // SAFETY: places the page over the tab, right after the tree in
-        // the z-order: its controls come next in the Tab order, and it is
-        // drawn over the tab.
-        unsafe {
-            SetWindowPos(
-                hwnd,
-                ctrl(dlg, TREE),
-                r.left,
-                r.top,
-                r.right - r.left,
-                r.bottom - r.top,
-                SWP_NOACTIVATE,
-            )
-        };
+        // Over the tab, right after the tree in the z-order: its controls
+        // come next in the Tab order, and it is drawn over the tab.
+        win::set_pos(
+            hwnd,
+            ctrl(dlg, TREE),
+            (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            SWP_NOACTIVATE,
+        );
         hwnd
     }
 
     fn theme_page(&self, page: HWND, dark: bool) {
-        // SAFETY: the light theme draws the tab's own face behind the
-        // page's controls, as on any tab; the dark theme paints its own.
+        // The light theme draws the tab's own face behind the page's
+        // controls, as on any tab; the dark theme paints its own.
         let flags = if dark {
             ETDT_DISABLE
         } else {
             ETDT_ENABLE | ETDT_USETABTEXTURE
         };
-        // SAFETY: as above, on this thread's page.
-        unsafe { EnableThemeDialogTexture(page, flags) };
+        ext::enable_theme_dialog_texture(page, flags);
         apply_theme(page, dark);
     }
 
     /// Shows page `i` (making it the first time) instead of the one shown.
-    fn show_page(&self, i: usize) {
+    fn show_page(self: &Rc<Self>, i: usize) {
         let Some(held) = self.pages.get(i) else {
             return;
         };
@@ -826,29 +751,18 @@ impl Dialog<'_> {
             hwnd = self.make_page(i);
         }
         let old = self.current.replace(Some(i));
-        // SAFETY: shows and hides this thread's pages.
-        unsafe {
-            if !hwnd.is_null() {
-                ShowWindow(hwnd, SW_SHOWNA);
-            }
-            if let Some(o) = old.filter(|&o| o != i) {
-                let h = self.pages[o].hwnd.get();
-                if !h.is_null() {
-                    ShowWindow(h, SW_HIDE);
-                }
+        if !hwnd.is_null() {
+            win::show(hwnd, SW_SHOWNA);
+        }
+        if let Some(o) = old.filter(|&o| o != i) {
+            let h = self.pages[o].hwnd.get();
+            if !h.is_null() {
+                win::show(h, SW_HIDE);
             }
         }
         let dlg = self.frame.get();
-        let mut name = wz(held.page.name());
-        let tab = TCITEMW {
-            mask: TCIF_TEXT,
-            pszText: name.as_mut_ptr(),
-            // SAFETY: the rest of TCITEMW is plain data.
-            ..unsafe { core::mem::zeroed() }
-        };
-        send(dlg, TAB, TCM_SETITEMW, 0, (&raw const tab) as isize);
-        // SAFETY: repaints this thread's tab.
-        unsafe { InvalidateRect(ctrl(dlg, TAB), core::ptr::null(), 1) };
+        tab::set_text(ctrl(dlg, TAB), 0, held.page.name());
+        win::invalidate(ctrl(dlg, TAB), None, true);
     }
 
     /// A control of page `i` changed.
@@ -861,7 +775,7 @@ impl Dialog<'_> {
 
     /// OK and Apply: checks the pages changed, then applies them. False
     /// when a check failed (its page is shown, the user told why).
-    fn apply(&self) -> bool {
+    fn apply(self: &Rc<Self>) -> bool {
         let dlg = self.frame.get();
         for (i, held) in self.pages.iter().enumerate() {
             let h = held.hwnd.get();
@@ -873,8 +787,7 @@ impl Dialog<'_> {
                 crate::msgbox::show(dlg, &bad.message, "Options", MB_OK | MB_ICONWARNING);
                 let c = item(h, bad.control);
                 if !c.is_null() {
-                    // SAFETY: focuses a control of this thread's page.
-                    unsafe { SetFocus(c) };
+                    win::set_focus(c);
                 }
                 return false;
             }
@@ -927,67 +840,58 @@ impl Dialog<'_> {
     }
 }
 
-unsafe extern "system" fn frame_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Init` that `show` keeps alive through the
-        // modal call; its dialog outlives the window.
-        let init = unsafe { &*(l as *const Init<'_, '_>) };
-        let d = init.dialog;
-        // SAFETY: as above.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, (&raw const *d) as isize) };
-        d.init(dlg, &init.nested, init.start);
+/// The frame's procedure: `nested` says which pages (in the dialog's
+/// order) sit under the one before, `start` which is shown first.
+fn frame_proc(d: &Rc<Dialog>, nested: &[bool], start: usize, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if m.id == WM_INITDIALOG {
+        d.init(dlg, nested, start);
         return 1;
     }
-    // SAFETY: GWLP_USERDATA is the `Dialog` from `show`, or null.
-    let Some(d) = (unsafe { state::<Dialog<'_>>(dlg) }) else {
-        return 0;
-    };
-    if msg == WM_SETTINGCHANGE {
-        if let Some(new) = d.look.get().after_setting_change(l) {
+    if m.id == WM_SETTINGCHANGE {
+        if let Some(new) = d.look.get().after_setting_change_msg(m) {
             d.retheme(new);
         }
         return 1;
     }
-    if let Some(answer) = common(dlg, msg, w, l, &d.look) {
+    if let Some(answer) = common_msg(m, &d.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_SIZE => {
             d.layout(dlg);
             1
         }
         WM_GETMINMAXINFO => {
             let (mw, mh) = d.min.get();
-            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
-            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = mw;
-            mmi.ptMinTrackSize.y = mh;
+            if let Some(mut mmi) = m.min_max_info() {
+                mmi.ptMinTrackSize.x = mw;
+                mmi.ptMinTrackSize.y = mh;
+            }
             1
         }
         WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR from a control.
-            let hdr = unsafe { &*(l as *const NMHDR) };
-            if hdr.idFrom == usize::from(TREE) && hdr.code == TVN_SELCHANGEDW {
-                // SAFETY: TVN_SELCHANGED's lParam is an NMTREEVIEWW.
-                let nm = unsafe { &*(l as *const NMTREEVIEWW) };
-                if let Ok(i) = usize::try_from(nm.itemNew.lParam) {
+            if let Some(n) = m.notify()
+                && n.id() == usize::from(TREE)
+                && n.code() == TVN_SELCHANGEDW
+            {
+                let page = n
+                    .get::<NMTREEVIEWW>()
+                    .and_then(|nm| usize::try_from(nm.itemNew.lParam).ok());
+                if let Some(i) = page {
                     d.show_page(i);
                 }
             }
             0
         }
         WM_COMMAND => {
-            match (w & 0xffff) as u16 {
+            match win::loword(m.w) {
                 OK => {
                     if d.apply() {
-                        // SAFETY: ends this modal dialog.
-                        unsafe { EndDialog(dlg, 1) };
+                        dlg::end(dlg, 1);
                     }
                 }
-                // SAFETY: ends this modal dialog.
-                CANCEL => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                CANCEL => dlg::end(dlg, 0),
                 APPLY => {
                     d.apply();
                 }
@@ -1003,22 +907,12 @@ unsafe extern "system" fn frame_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) 
     }
 }
 
-unsafe extern "system" fn page_proc(page: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is one of the dialog's `PageRef`s, which stay where
-        // they are until the dialog has ended.
-        unsafe { SetWindowLongPtrW(page, GWLP_USERDATA, l) };
-        return 0;
-    }
-    // SAFETY: GWLP_USERDATA is a `PageRef` from `make_page`, or null.
-    let Some(r) = (unsafe { state::<PageRef>(page) }) else {
-        return 0;
-    };
-    // SAFETY: the dialog outlives its pages' windows (they are its
-    // children).
-    let d = unsafe { &*r.dialog };
-    let held = &d.pages[r.index];
-    match msg {
+/// Page `index`'s procedure.
+fn page_proc(d: &Dialog, index: usize, m: &Msg) -> isize {
+    let page = m.hwnd;
+    let held = &d.pages[index];
+    match m.id {
+        WM_INITDIALOG => return 0,
         // Only top-level windows hear of it; the frame re-themes the pages.
         WM_SETTINGCHANGE => return 0,
         // Restore Defaults keeps to the page's bottom right corner.
@@ -1026,24 +920,24 @@ unsafe extern "system" fn page_proc(page: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             place_restore(page);
             return 1;
         }
-        WM_COMMAND if (w & 0xffff) as u16 == RESTORE => {
-            if ((w >> 16) & 0xffff) as u32 == BN_CLICKED {
-                d.restore_defaults(r.index);
+        WM_COMMAND if win::loword(m.w) == RESTORE => {
+            if u32::from(win::hiword(m.w)) == BN_CLICKED {
+                d.restore_defaults(index);
             }
             return 1;
         }
         _ => {}
     }
-    if let Some(answer) = held.page.message(d.app, page, msg, w, l) {
+    if let Some(answer) = held.page.message_msg(d.app, page, m) {
         return answer;
     }
-    if let Some(answer) = common(page, msg, w, l, &d.look) {
+    if let Some(answer) = common_msg(m, &d.look) {
         return answer;
     }
-    if msg == WM_COMMAND && !d.filling.get() {
-        let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+    if m.id == WM_COMMAND && !d.filling.get() {
+        let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
         if held.page.changed(page, id, code) {
-            d.page_changed(r.index);
+            d.page_changed(index);
         }
         return 1;
     }
@@ -1061,129 +955,112 @@ fn place_restore(page: HWND) {
     let (mx, my) = RESTORE_MARGIN;
     let room = px(page, (0, 0, w + mx, h + my));
     let size = px(page, (0, 0, w, h));
-    let mut client = RECT::default();
-    // SAFETY: reads and moves this thread's page and its button.
-    unsafe {
-        GetClientRect(page, &mut client);
-        SetWindowPos(
-            button,
-            core::ptr::null_mut(),
+    let client = win::client_rect(page);
+    win::set_pos(
+        button,
+        core::ptr::null_mut(),
+        (
             client.right - room.right,
             client.bottom - room.bottom,
             size.right,
             size.bottom,
-            SWP_NOACTIVATE | SWP_NOZORDER,
-        );
-    }
+        ),
+        SWP_NOACTIVATE | SWP_NOZORDER,
+    );
 }
 
 /// The tab that names the page: Windows' own in the light theme; in the
 /// dark one drawn here (the control has no dark style), as a tab in the
 /// header's colour joined to a frame around the page.
-unsafe extern "system" fn tab_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    data: usize,
-) -> LRESULT {
-    // SAFETY: `data` is the dialog, which outlives the subclass (removed
-    // at WM_NCDESTROY); the messages' parameters are read as defined.
-    unsafe {
-        let d = &*(data as *const Dialog<'_>);
-        match msg {
-            WM_ERASEBKGND if d.look.get().dark => return 1,
-            WM_PAINT if d.look.get().dark => {
-                paint_dark_tab(hwnd, d);
-                return 0;
-            }
-            WM_NCDESTROY => {
-                RemoveWindowSubclass(hwnd, Some(tab_proc), 1);
-            }
-            _ => {}
+fn tab_proc(d: &Dialog, m: &Msg) -> LRESULT {
+    match m.id {
+        WM_ERASEBKGND if d.look.get().dark => return 1,
+        WM_PAINT if d.look.get().dark => {
+            paint_dark_tab(m.hwnd, d);
+            return 0;
         }
-        DefSubclassProc(hwnd, msg, w, l)
+        _ => {}
     }
+    m.def()
 }
 
-fn paint_dark_tab(hwnd: HWND, d: &Dialog<'_>) {
+fn paint_dark_tab(hwnd: HWND, d: &Dialog) {
     let pal = Palette::new(true);
-    // SAFETY: a standard WM_PAINT on this thread's tab; the font selected
-    // is put back.
-    unsafe {
-        let mut ps: PAINTSTRUCT = core::mem::zeroed();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let mut client = RECT::default();
-        GetClientRect(hwnd, &mut client);
-        crate::paint::fill(hdc, &client, pal.chrome);
-        let mut tab = RECT::default();
-        SendMessageW(hwnd, TCM_GETITEMRECT, 0, (&raw mut tab) as isize);
-        // The frame around the page, from just under the tab.
-        let frame = RECT {
-            left: client.left,
-            top: tab.bottom,
-            right: client.right,
-            bottom: client.bottom,
-        };
-        let line = |r: RECT| crate::paint::fill(hdc, &r, pal.line);
-        line(RECT {
-            bottom: frame.top + 1,
-            ..frame
-        });
-        line(RECT {
-            top: frame.bottom - 1,
-            ..frame
-        });
-        line(RECT {
-            right: frame.left + 1,
-            ..frame
-        });
-        line(RECT {
-            left: frame.right - 1,
-            ..frame
-        });
-        // The tab, a little taller than the row, open towards the page.
-        let t = RECT {
-            top: tab.top - 2,
-            bottom: tab.bottom + 1,
-            ..tab
-        };
-        crate::paint::fill(hdc, &t, pal.chrome);
-        line(RECT {
-            bottom: t.top + 1,
-            ..t
-        });
-        line(RECT {
-            right: t.left + 1,
-            ..t
-        });
-        line(RECT {
-            left: t.right - 1,
-            ..t
-        });
-        let name = d
-            .current
-            .get()
-            .map(|i| d.pages[i].page.name())
-            .unwrap_or_default();
-        let mut text: Vec<u16> = name.encode_utf16().collect();
-        let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HFONT;
-        let old = SelectObject(hdc, font);
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, pal.fg);
-        let mut tr = t;
-        DrawTextW(
-            hdc,
-            text.as_mut_ptr(),
-            text.len() as i32,
-            &mut tr,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
-        SelectObject(hdc, old);
-        EndPaint(hwnd, &ps);
-    }
+    // A standard WM_PAINT; the font selected is put back (before the paint
+    // ends).
+    let paint = Paint::begin(hwnd);
+    let hdc = paint.hdc();
+    let client = win::client_rect(hwnd);
+    crate::paint::fill(hdc, &client, pal.chrome);
+    let tab = tab::item_rect(hwnd, 0).unwrap_or_default();
+    // The frame around the page, from just under the tab.
+    let frame = RECT {
+        left: client.left,
+        top: tab.bottom,
+        right: client.right,
+        bottom: client.bottom,
+    };
+    let line = |r: RECT| crate::paint::fill(hdc, &r, pal.line);
+    line(RECT {
+        bottom: frame.top + 1,
+        ..frame
+    });
+    line(RECT {
+        top: frame.bottom - 1,
+        ..frame
+    });
+    line(RECT {
+        right: frame.left + 1,
+        ..frame
+    });
+    line(RECT {
+        left: frame.right - 1,
+        ..frame
+    });
+    // The tab, a little taller than the row, open towards the page.
+    let t = RECT {
+        top: tab.top - 2,
+        bottom: tab.bottom + 1,
+        ..tab
+    };
+    crate::paint::fill(hdc, &t, pal.chrome);
+    line(RECT {
+        bottom: t.top + 1,
+        ..t
+    });
+    line(RECT {
+        right: t.left + 1,
+        ..t
+    });
+    line(RECT {
+        left: t.right - 1,
+        ..t
+    });
+    let name = d
+        .current
+        .get()
+        .map(|i| d.pages[i].page.name())
+        .unwrap_or_default();
+    let text: Vec<u16> = name.encode_utf16().collect();
+    let _font = Selected::new(hdc, win::font(hwnd));
+    gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+    gdi::set_text_color(hdc, pal.fg);
+    let mut tr = t;
+    gdi::draw_text(
+        hdc,
+        &text,
+        &mut tr,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
 }
+
+// The old raw-procedure bridges this batch was the last to use (the pages
+// were made with `legacy::create_child`; this dialog and the message box
+// read WM_SETTINGCHANGE with `Look::after_setting_change`): referenced
+// here so they are not dead code until `legacy.rs` goes, and this with it.
+const _: fn(&Template, HWND, windows_sys::Win32::UI::WindowsAndMessaging::DLGPROC, LPARAM) -> HWND =
+    crate::legacy::create_child;
+const _: fn(Look, LPARAM) -> Option<Look> = Look::after_setting_change;
 
 #[cfg(test)]
 mod tests {
