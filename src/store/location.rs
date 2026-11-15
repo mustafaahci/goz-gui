@@ -26,8 +26,6 @@
 //! - `GOZ_GUI_DESKTOP_DIR=<folder>`: Create Shortcut puts a shortcut it
 //!   cannot make beside its item there instead of on the Desktop.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -180,25 +178,12 @@ pub fn is_data_file(path: &Path) -> bool {
 /// The user's roaming AppData folder: the APPDATA variable, else where the
 /// shell says it is.
 fn roaming_app_data() -> Option<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_RoamingAppData, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::FOLDERID_RoamingAppData;
 
     if let Some(dir) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(dir));
     }
-    let mut p: *mut u16 = core::ptr::null_mut();
-    // SAFETY: the shell allocates a NUL-terminated path into `p`, read up to
-    // its NUL and then freed with the allocator the shell used.
-    unsafe {
-        let hr = SHGetKnownFolderPath(&FOLDERID_RoamingAppData, 0, core::ptr::null_mut(), &mut p);
-        let path = (hr >= 0 && !p.is_null()).then(|| {
-            let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-            PathBuf::from(OsString::from_wide(core::slice::from_raw_parts(p, len)))
-        });
-        CoTaskMemFree(p.cast());
-        path
-    }
+    crate::win::ext::b8::known_folder_path(&FOLDERID_RoamingAppData).map(PathBuf::from)
 }
 
 /// Whether the variable asks for a dry run: set, and not empty or `0`.

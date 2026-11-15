@@ -1,9 +1,10 @@
 //! UTF-16 helpers for the Win32 boundary.
 
+// `is_wide` is still called by files not yet on `crate::win` (which has
+// `Msg::setting_is` for it); it goes, and this with it, once they are.
 #![allow(unsafe_code)] // Not yet moved onto `crate::win`.
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
 
 /// `s` as a NUL-terminated UTF-16 string.
 pub fn wz(s: &str) -> Vec<u16> {
@@ -20,17 +21,7 @@ pub fn nul(s: &[u16]) -> Vec<u16> {
 
 /// The text of a window, such as the search edit.
 pub fn window_text(hwnd: HWND) -> String {
-    // SAFETY: `hwnd` is a window of this thread; the buffer holds `len + 1`
-    // code units, the count passed in.
-    unsafe {
-        let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 {
-            return String::new();
-        }
-        let mut buf = vec![0u16; len as usize + 1];
-        let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
-        String::from_utf16_lossy(&buf[..n.max(0) as usize])
-    }
+    crate::win::text(hwnd)
 }
 
 /// Whether the NUL-terminated string at `p` is `s`, such as the setting a

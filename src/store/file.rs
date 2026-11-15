@@ -34,8 +34,6 @@
 //!   tries again too, wherever it is read: only a damaged file another
 //!   program holds waits so.)
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -44,15 +42,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, HANDLE,
-    WAIT_ABANDONED, WAIT_OBJECT_0,
+    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, GetFileAttributesW,
-    INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    SetFileAttributesW,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
+    INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
-use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+
+use crate::win::ext::b8::{self, NamedMutex, OwnedMutex};
 
 /// How long a write waits for another goz-gui writing the same file. A
 /// write is milliseconds; one held longer is a goz-gui hung or suspended.
@@ -155,9 +152,8 @@ fn retrying<T>(
 /// Whether `path` is a folder or a read-only file: "Access is denied" for
 /// a rename onto it is no passing hold, and is not tried again.
 fn refuses_for_good(path: &[u16]) -> bool {
-    // SAFETY: a NUL-terminated path; a missing file gives
-    // INVALID_FILE_ATTRIBUTES.
-    let attributes = unsafe { GetFileAttributesW(path.as_ptr()) };
+    // A missing file gives INVALID_FILE_ATTRIBUTES.
+    let attributes = b8::file_attributes(path);
     attributes != INVALID_FILE_ATTRIBUTES
         && attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY) != 0
 }
@@ -174,19 +170,11 @@ fn replace_after(from: &Path, to: &Path, waits: &[u64]) -> io::Result<()> {
     retrying(
         waits,
         || {
-            // SAFETY: two NUL-terminated paths that live across the call.
-            let ok = unsafe {
-                MoveFileExW(
-                    from.as_ptr(),
-                    to.as_ptr(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            };
-            if ok == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
+            b8::move_file(
+                &from,
+                &to,
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
         },
         || refuses_for_good(&to),
     )
@@ -223,8 +211,8 @@ fn put(path: &Path, bytes: &[u8], force: bool) -> io::Result<()> {
     if force {
         // A rename over a read-only file is refused; hidden is cleared too,
         // so the file never keeps an attribute the user did not give it.
-        // SAFETY: a NUL-terminated path; a file not there just fails.
-        unsafe { SetFileAttributesW(wide(path).as_ptr(), FILE_ATTRIBUTE_NORMAL) };
+        // A file not there just fails.
+        b8::set_file_attributes(&wide(path), FILE_ATTRIBUTE_NORMAL);
     }
     let result = replace(&tmp, path);
     if result.is_err() {
@@ -413,15 +401,7 @@ fn move_aside(path: &Path) -> io::Result<PathBuf> {
         // the file (a scan of the file just found damaged).
         let moved = retrying(
             &RETRY_WAITS_MS,
-            || {
-                // SAFETY: two NUL-terminated paths that live across the call.
-                if unsafe { MoveFileExW(from.as_ptr(), dest.as_ptr(), MOVEFILE_WRITE_THROUGH) } != 0
-                {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            },
+            || b8::move_file(&from, &dest, MOVEFILE_WRITE_THROUGH),
             || to.exists() || refuses_for_good(&from),
         );
         let e = match moved {
@@ -438,7 +418,10 @@ fn move_aside(path: &Path) -> io::Result<PathBuf> {
 /// One goz-gui at a time reads, merges and writes a file: a named mutex
 /// per file, held by whoever is doing it. A process killed while holding
 /// it releases it (the next one gets WAIT_ABANDONED, which still owns it).
-pub struct Lock(HANDLE);
+/// Released and closed when it drops.
+pub struct Lock {
+    _held: OwnedMutex,
+}
 
 /// A stable 64-bit FNV-1a hash, for the mutex's name.
 fn fnv(text: &str) -> u64 {
@@ -468,21 +451,14 @@ enum Acquired {
 }
 
 fn acquire(path: &Path, timeout: Duration) -> Acquired {
-    let name: Vec<u16> = lock_name(path).encode_utf16().chain(Some(0)).collect();
-    // SAFETY: a NUL-terminated name; the handle is closed by Drop, or here.
-    unsafe {
-        let h = CreateMutexW(core::ptr::null(), 0, name.as_ptr());
-        if h.is_null() {
-            return Acquired::NoMutex;
-        }
-        let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
-        match WaitForSingleObject(h, ms) {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Acquired::Held(Lock(h)),
-            _ => {
-                CloseHandle(h);
-                Acquired::Busy
-            }
-        }
+    let Some((mutex, _)) = NamedMutex::create(&lock_name(path)) else {
+        return Acquired::NoMutex;
+    };
+    let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    match mutex.lock(ms) {
+        Ok(owned) => Acquired::Held(Lock { _held: owned }),
+        // Its handle is closed as it drops.
+        Err(_) => Acquired::Busy,
     }
 }
 
@@ -513,16 +489,6 @@ impl Lock {
                 name_of(path),
                 timeout.as_secs_f32()
             )),
-        }
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        // SAFETY: a mutex this thread owns, and its handle.
-        unsafe {
-            ReleaseMutex(self.0);
-            CloseHandle(self.0);
         }
     }
 }
@@ -567,16 +533,11 @@ pub mod tests {
     }
 
     fn attributes(path: &Path) -> u32 {
-        // SAFETY: a NUL-terminated path.
-        unsafe { GetFileAttributesW(wide(path).as_ptr()) }
+        b8::file_attributes(&wide(path))
     }
 
     fn set_attributes(path: &Path, attributes: u32) {
-        // SAFETY: a NUL-terminated path.
-        assert_ne!(
-            unsafe { SetFileAttributesW(wide(path).as_ptr(), attributes) },
-            0
-        );
+        assert!(b8::set_file_attributes(&wide(path), attributes));
     }
 
     #[test]
@@ -843,18 +804,14 @@ pub mod tests {
         let tmp = dir.join("other.tmp");
         fs::write(&tmp, b"x").expect("tmp");
         let (from, to) = (wide(&tmp), wide(&path));
-        // SAFETY: two NUL-terminated paths.
-        let once = unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        let refused = io::Error::last_os_error();
+        let once = b8::move_file(
+            &from,
+            &to,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        );
         assert_eq!(
-            (once, refused.raw_os_error()),
-            (0, Some(ERROR_ACCESS_DENIED as i32))
+            once.map_err(|refused| refused.raw_os_error()),
+            Err(Some(ERROR_ACCESS_DENIED as i32))
         );
         // Let go of after a moment: the write waits for it.
         let release = std::thread::spawn(move || {

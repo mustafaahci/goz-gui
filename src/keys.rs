@@ -10,18 +10,16 @@
 //! The tables here are goz-gui's defaults. Options > Keyboard rebinds them
 //! (`crate::keymap`): what is in force is asked of `keymap::current`.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_ADD, VK_BACK, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F11,
     VK_HOME, VK_INSERT, VK_LEFT, VK_NUMPAD0, VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS,
     VK_RETURN, VK_RIGHT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ACCEL, CreateAcceleratorTableW, DestroyAcceleratorTable, FALT, FCONTROL, FSHIFT, FVIRTKEY,
-    HACCEL,
+    ACCEL, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL,
 };
 
+use crate::win::ext::b8::AccelTable;
 use crate::{keymap, menu, searchtools};
 
 pub const NONE: u8 = 0;
@@ -164,8 +162,16 @@ pub const LIST_KEYS: &[(u8, u16, u16)] = &[
 /// it renames in the list.
 pub const SEARCH_BOX_KEYS: &[(u8, u16, u16)] = &[(NONE, VK_F2, searchtools::ADVANCED_SEARCH)];
 
-/// An accelerator table of the window's shortcuts in force.
+/// An accelerator table of the window's shortcuts in force; whoever takes
+/// it destroys it.
 pub fn accelerators() -> HACCEL {
+    made().map_or(core::ptr::null_mut(), AccelTable::into_raw)
+}
+
+/// The table of the window's shortcuts in force (Windows copies them). An
+/// empty table cannot be made: `None`, whose null handle
+/// TranslateAccelerator takes as "no shortcuts".
+fn made() -> Option<AccelTable> {
     let current = keymap::current();
     let table: Vec<ACCEL> = current
         .global
@@ -176,34 +182,28 @@ pub fn accelerators() -> HACCEL {
             cmd,
         })
         .collect();
-    // SAFETY: the table and its length; Windows copies it. (An empty
-    // table cannot be made: a length of 0 fails and gives null, which
-    // TranslateAccelerator takes as "no shortcuts".)
-    unsafe { CreateAcceleratorTableW(table.as_ptr(), table.len() as i32) }
+    AccelTable::new(&table)
 }
 
 thread_local! {
     /// This thread's table, and the keys' generation it was made from.
-    static TABLE: core::cell::Cell<(HACCEL, u32)> =
-        const { core::cell::Cell::new((core::ptr::null_mut(), u32::MAX)) };
+    static TABLE: core::cell::RefCell<(Option<AccelTable>, u32)> =
+        const { core::cell::RefCell::new((None, u32::MAX)) };
 }
 
 /// The accelerator table of the shortcuts in force, made again once
 /// Options > Keyboard changed them (the old one is destroyed).
 pub fn table() -> HACCEL {
     let generation = keymap::generation();
-    TABLE.with(|t| {
-        let (handle, made_for) = t.get();
-        if made_for == generation {
-            return handle;
+    TABLE.with_borrow_mut(|(table, made_for)| {
+        if *made_for != generation {
+            // The new one is made before the old one is destroyed.
+            *table = made();
+            *made_for = generation;
         }
-        let new = accelerators();
-        if !handle.is_null() {
-            // SAFETY: a table this function made and no one else holds.
-            unsafe { DestroyAcceleratorTable(handle) };
-        }
-        t.set((new, generation));
-        new
+        table
+            .as_ref()
+            .map_or(core::ptr::null_mut(), AccelTable::handle)
     })
 }
 

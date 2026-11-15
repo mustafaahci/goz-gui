@@ -1,18 +1,14 @@
 //! The notification-area (tray) icon: shown while `show_tray_icon` is on,
 //! put back when Explorer restarts, and its click and menu.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
-    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    HICON, IDI_APPLICATION, LoadIconW, RegisterWindowMessageW,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{HICON, IDI_APPLICATION};
 
-use crate::wide::wz;
+use crate::win::ext::b8;
 
 /// The icon's id among goz-gui's (it has one).
 const ID: u32 = 1;
@@ -20,9 +16,7 @@ const ID: u32 = 1;
 /// The message Explorer broadcasts when it (re)starts: tray icons must be
 /// added again.
 pub fn taskbar_created() -> u32 {
-    let name = wz("TaskbarCreated");
-    // SAFETY: a NUL-terminated name.
-    unsafe { RegisterWindowMessageW(name.as_ptr()) }
+    b8::register_message("TaskbarCreated")
 }
 
 fn data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -30,8 +24,7 @@ fn data(hwnd: HWND) -> NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: ID,
-        // SAFETY: the rest of NOTIFYICONDATAW is plain data.
-        ..unsafe { core::mem::zeroed() }
+        ..Default::default()
     }
 }
 
@@ -43,20 +36,18 @@ pub fn add(hwnd: HWND, msg: u32, icon: HICON, tip: &str) -> bool {
     d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     d.uCallbackMessage = msg;
     d.hIcon = if icon.is_null() {
-        // SAFETY: a system icon, shared, never destroyed.
-        unsafe { LoadIconW(core::ptr::null_mut(), IDI_APPLICATION) }
+        // A system icon, shared, never destroyed.
+        b8::system_icon(IDI_APPLICATION)
     } else {
         icon
     };
     let tip: Vec<u16> = tip.encode_utf16().take(d.szTip.len() - 1).collect();
     d.szTip[..tip.len()].copy_from_slice(&tip);
     d.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-    // SAFETY: a filled NOTIFYICONDATAW for this process's window.
-    unsafe { Shell_NotifyIconW(NIM_ADD, &d) != 0 && Shell_NotifyIconW(NIM_SETVERSION, &d) != 0 }
+    b8::notify_icon(NIM_ADD, &d) && b8::notify_icon(NIM_SETVERSION, &d)
 }
 
 pub fn remove(hwnd: HWND) {
-    let d = data(hwnd);
-    // SAFETY: names the icon `add` made; deleting a missing one is harmless.
-    unsafe { Shell_NotifyIconW(NIM_DELETE, &d) };
+    // Names the icon `add` made; deleting a missing one is harmless.
+    b8::notify_icon(NIM_DELETE, &data(hwnd));
 }

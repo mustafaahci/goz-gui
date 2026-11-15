@@ -13,23 +13,14 @@
 //! another class, titled with the key, through which Exit in any of them
 //! closes them all, as Everything's Exit ends every window.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
-};
-use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, FindWindowExW, GWLP_USERDATA,
-    GetWindowLongPtrW, GetWindowThreadProcessId, HWND_MESSAGE, PostMessageW, RegisterClassExW,
-    SMTO_ABORTIFHUNG, SendMessageTimeoutW, SetWindowLongPtrW, WM_APP, WM_COPYDATA, WNDCLASSEXW,
-};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_MESSAGE, WM_APP, WM_COPYDATA};
 
-use crate::wide::wz;
+use crate::win::class::{self, Class, Create};
+use crate::win::ext::b8::{self, NamedMutex};
+use crate::win::{self, Msg, parcel};
 
 /// The message-only windows' class.
 const CLASS: &str = "goz-gui-instance";
@@ -63,39 +54,27 @@ pub fn key(instance: Option<&str>) -> String {
 /// lets go of it at once, so the instance ends with the first goz-gui
 /// even while another window of the folder (`-new-window`) runs on.
 pub fn claim(key: &str) -> bool {
-    static HELD: OnceLock<usize> = OnceLock::new();
-    let name = wz(&format!("Local\\{key}"));
-    // SAFETY: a named mutex in this session, never released or closed by
-    // the first: the process holding it is the instance. Another closes
-    // the handle it was given to the existing one.
-    unsafe {
-        let m: HANDLE = CreateMutexW(core::ptr::null(), 0, name.as_ptr());
-        let first = !m.is_null() && GetLastError() != ERROR_ALREADY_EXISTS;
-        if first {
-            let _ = HELD.set(m as usize);
-        } else if !m.is_null() {
-            CloseHandle(m);
-        }
-        first
+    static HELD: OnceLock<NamedMutex> = OnceLock::new();
+    // A named mutex in this session, never released or closed by the
+    // first: the process holding it is the instance. Another closes the
+    // handle it was given to the existing one.
+    let Some((m, existed)) = NamedMutex::create(&format!("Local\\{key}")) else {
+        return false;
+    };
+    let first = !existed;
+    if first && let Err(m) = HELD.set(m) {
+        // Held until the process ends, as the first one is.
+        std::mem::forget(m);
     }
+    first
 }
 
 /// The running instance's window, waiting up to about 3 s for it to appear
 /// (it may itself be starting).
 fn find(key: &str) -> Option<HWND> {
-    let class = wz(CLASS);
-    let title = wz(key);
     for _ in 0..60 {
-        // SAFETY: NUL-terminated strings; HWND_MESSAGE searches the
-        // message-only windows.
-        let hwnd = unsafe {
-            FindWindowExW(
-                HWND_MESSAGE,
-                core::ptr::null_mut(),
-                class.as_ptr(),
-                title.as_ptr(),
-            )
-        };
+        // HWND_MESSAGE searches the message-only windows.
+        let hwnd = win::find_child(HWND_MESSAGE, core::ptr::null_mut(), Some(CLASS), Some(key));
         if !hwnd.is_null() {
             return Some(hwnd);
         }
@@ -133,111 +112,47 @@ pub fn forward(key: &str, args: &[String]) -> bool {
     let Some(hwnd) = find(key) else {
         return false;
     };
-    let data = encode(args);
-    let cds = COPYDATASTRUCT {
-        dwData: MAGIC,
-        cbData: (data.len() * 2) as u32,
-        lpData: data.as_ptr() as *mut core::ffi::c_void,
-    };
-    // SAFETY: the window found above; the data outlives the synchronous
-    // send; a hung instance is given up on after 5 s.
-    unsafe {
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        AllowSetForegroundWindow(pid);
-        let mut answer = 0usize;
-        SendMessageTimeoutW(
-            hwnd,
-            WM_COPYDATA,
-            0,
-            (&raw const cds) as LPARAM,
-            SMTO_ABORTIFHUNG,
-            5000,
-            &mut answer,
-        ) != 0
-            && answer == 1
-    }
+    let data: Vec<u8> = encode(args).iter().flat_map(|u| u.to_ne_bytes()).collect();
+    b8::allow_set_foreground(win::process_of(hwnd));
+    // A hung instance is given up on after 5 s.
+    b8::send_copy_data(hwnd, core::ptr::null_mut(), MAGIC, &data, 5000) == Some(1)
+}
+
+/// The message-only window of class `class`, titled `key`, whose messages
+/// go to `handler`; the class is registered first (once: a second
+/// registration fails harmlessly).
+fn message_window(class: &str, key: &str, handler: impl Fn(&Msg) -> isize + 'static) -> HWND {
+    Class::new(class).register();
+    class::create(
+        &Create {
+            ex_style: 0,
+            class,
+            title: key,
+            style: 0,
+            rect: (0, 0, 0, 0),
+            parent: HWND_MESSAGE,
+            menu: core::ptr::null_mut(),
+        },
+        handler,
+    )
 }
 
 /// Makes this instance's message-only window; each command line it is sent
-/// is posted to `main` as `msg` with a `Box<Vec<String>>` in lParam.
+/// is posted to `main` as `msg` with a `Vec<String>` as a parcel
+/// (`win::parcel::take`).
 pub fn listen(key: &str, main: HWND, msg: u32) -> HWND {
-    let class = wz(CLASS);
-    let title = wz(key);
-    // SAFETY: registers and creates a window of this thread; the target
-    // and message travel in its GWLP_USERDATA as a leaked pair that lives
-    // as long as the process.
-    unsafe {
-        let hinst = GetModuleHandleW(core::ptr::null());
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(proc),
-            hInstance: hinst,
-            lpszClassName: class.as_ptr(),
-            ..core::mem::zeroed()
-        };
-        RegisterClassExW(&wc);
-        let hwnd = CreateWindowExW(
-            0,
-            class.as_ptr(),
-            title.as_ptr(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            core::ptr::null_mut(),
-            hinst,
-            core::ptr::null(),
-        );
-        if !hwnd.is_null() {
-            let target: &'static (usize, u32) = Box::leak(Box::new((main as usize, msg)));
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, target as *const (usize, u32) as isize);
-        }
-        hwnd
-    }
+    let main = main as usize;
+    message_window(CLASS, key, move |m| proc(m, main as HWND, msg))
 }
 
 /// Makes this window's message-only window for Exit (`exit_others`): a
 /// request to end is posted to `main` as `msg`. Every window of the
 /// instance has one, titled with its `key`.
 pub fn listen_window(key: &str, main: HWND, msg: u32) -> HWND {
-    let class = wz(WINDOW_CLASS);
-    let title = wz(key);
-    // SAFETY: registers and creates a window of this thread; the target
-    // and message travel in its GWLP_USERDATA as a leaked pair that lives
-    // as long as the process.
-    unsafe {
-        let hinst = GetModuleHandleW(core::ptr::null());
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(window_proc),
-            hInstance: hinst,
-            lpszClassName: class.as_ptr(),
-            ..core::mem::zeroed()
-        };
-        RegisterClassExW(&wc);
-        let hwnd = CreateWindowExW(
-            0,
-            class.as_ptr(),
-            title.as_ptr(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            core::ptr::null_mut(),
-            hinst,
-            core::ptr::null(),
-        );
-        if !hwnd.is_null() {
-            let target: &'static (usize, u32) = Box::leak(Box::new((main as usize, msg)));
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, target as *const (usize, u32) as isize);
-        }
-        hwnd
-    }
+    let main = main as usize;
+    message_window(WINDOW_CLASS, key, move |m| {
+        window_proc(m, main as HWND, msg)
+    })
 }
 
 /// Asks every other window of the instance `key` to end (`own` is this
@@ -247,32 +162,26 @@ pub fn listen_window(key: &str, main: HWND, msg: u32) -> HWND {
 /// window that hangs holds nothing up; the processes asked are returned,
 /// for a caller that must wait for them to end.
 pub fn exit_others(key: &str, own: HWND, discard: bool) -> Vec<u32> {
-    let class = wz(WINDOW_CLASS);
-    let title = wz(key);
     let mut asked = Vec::new();
     let mut after: HWND = core::ptr::null_mut();
     // At most as many as there could be windows: the loop always ends.
     for _ in 0..4096 {
-        // SAFETY: NUL-terminated strings; HWND_MESSAGE searches the
-        // message-only windows, after the one found last.
-        let found = unsafe { FindWindowExW(HWND_MESSAGE, after, class.as_ptr(), title.as_ptr()) };
+        // HWND_MESSAGE searches the message-only windows, after the one
+        // found last.
+        let found = win::find_child(HWND_MESSAGE, after, Some(WINDOW_CLASS), Some(key));
         if found.is_null() {
             break;
         }
         if found != own {
-            let mut pid = 0u32;
-            // SAFETY: posts a message with no pointers to a window, and
-            // reads the process it belongs to; one gone meanwhile is
-            // reported and ignored.
-            unsafe {
-                GetWindowThreadProcessId(found, &mut pid);
-                if PostMessageW(found, WM_EXIT_REQUEST, usize::from(discard), 0) != 0
-                    && pid != 0
-                    && pid != std::process::id()
-                    && !asked.contains(&pid)
-                {
-                    asked.push(pid);
-                }
+            // Reads the process it belongs to, and posts it a message with
+            // no pointers; one gone meanwhile is reported and ignored.
+            let pid = win::process_of(found);
+            if win::post_app(found, WM_EXIT_REQUEST, usize::from(discard), 0)
+                && pid != 0
+                && pid != std::process::id()
+                && !asked.contains(&pid)
+            {
+                asked.push(pid);
             }
         }
         after = found;
@@ -280,47 +189,32 @@ pub fn exit_others(key: &str, own: HWND, discard: bool) -> Vec<u32> {
     asked
 }
 
-unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // SAFETY: GWLP_USERDATA is the pair `listen_window` leaked, or null
-    // before it is set.
-    unsafe {
-        if msg == WM_EXIT_REQUEST {
-            let target = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const (usize, u32);
-            if let Some(&(main, post)) = target.as_ref() {
-                PostMessageW(main as HWND, post, w, 0);
-            }
-            return 0;
-        }
-        DefWindowProcW(hwnd, msg, w, l)
+fn window_proc(m: &Msg, main: HWND, post: u32) -> isize {
+    if m.id == WM_EXIT_REQUEST {
+        win::post_app(main, post, m.w, 0);
+        return 0;
     }
+    m.def()
 }
 
-unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // SAFETY: GWLP_USERDATA is the pair `listen` leaked, or null before it
-    // is set; WM_COPYDATA's lParam is a COPYDATASTRUCT valid during the
-    // call.
-    unsafe {
-        if msg == WM_COPYDATA && l != 0 {
-            let target = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const (usize, u32);
-            let cds = &*(l as *const COPYDATASTRUCT);
-            if target.is_null() || cds.dwData != MAGIC || !cds.cbData.is_multiple_of(2) {
-                return 0;
-            }
-            let units = if cds.cbData == 0 || cds.lpData.is_null() {
-                &[][..]
-            } else {
-                core::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2)
-            };
-            let (main, post) = *target;
-            let args = Box::into_raw(Box::new(decode(units)));
-            if PostMessageW(main as HWND, post, 0, args as LPARAM) == 0 {
-                drop(Box::from_raw(args));
-                return 0;
-            }
-            return 1;
+fn proc(m: &Msg, main: HWND, post: u32) -> isize {
+    if m.id == WM_COPYDATA && m.l != 0 {
+        // A copy of what came, made while the call runs.
+        let Some((magic, bytes)) = m.copy_data() else {
+            return 0;
+        };
+        if magic != MAGIC || !bytes.len().is_multiple_of(2) {
+            return 0;
         }
-        DefWindowProcW(hwnd, msg, w, l)
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_ne_bytes(c))
+            .collect();
+        return isize::from(parcel::post(main, post, 0, decode(&units)));
     }
+    m.def()
 }
 
 #[cfg(test)]

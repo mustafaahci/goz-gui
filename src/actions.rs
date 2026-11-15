@@ -7,35 +7,18 @@
 //! runs on a thread of its own and the window never waits for it. So does
 //! Properties, whose items are parsed from their paths on the disk.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::collections::{HashMap, VecDeque};
-use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HWND};
-use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
-};
-use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-use windows_sys::Win32::System::Threading::{GetThreadId, WaitForSingleObject};
-use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
-use windows_sys::Win32::UI::Shell::{
-    ILClone, ILCreateFromPathW, ILFindChild, ILFindLastID, ILFree, ILIsEqual, ILIsParent,
-    ILRemoveLastID, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHARD_PATHW, SHAddToRecentDocs,
-    SHCreateDataObject, SHELLEXECUTEINFOW, SHMultiFileProperties, SHOP_FILEPATH,
-    SHObjectProperties, SHOpenFolderAndSelectItems, ShellExecuteExW,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW,
-    PostThreadMessageW, SW_HIDE, SW_SHOWNORMAL, TranslateMessage, WM_APP,
-};
-use windows_sys::core::GUID;
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL, WM_APP};
 
 use crate::store::location::dry_run_instead;
-use crate::wide::{nul, wz};
+use crate::win;
+use crate::win::com::Apartment;
+use crate::win::ext::b8::{self, DataObject, Execute, Pidl};
 
 /// In a test's dry run (`GOZ_GUI_DRY_RUN`), notes the action in the data
 /// folder's `dry-run.log` instead of running it, and returns true.
@@ -89,9 +72,7 @@ pub fn open(hwnd: HWND, targets: Vec<Target>) {
             let dir = parent_folder(&target.path);
             let opened = execute(owner, None, &target.path, None, dir, SW_SHOWNORMAL, None);
             if opened && !target.is_dir {
-                let path = nul(&target.path);
-                // SAFETY: a NUL-terminated path, as SHARD_PATHW says.
-                unsafe { SHAddToRecentDocs(SHARD_PATHW as u32, path.as_ptr().cast()) };
+                b8::add_to_recent_docs(&target.path);
             }
         }
     });
@@ -140,85 +121,40 @@ pub fn reveal(paths: Vec<Vec<u16>>) {
 /// Opens `folder` with `items` (paths in it) selected; with no folder, or a
 /// single item, each item's own folder.
 fn reveal_in(folder: Option<&[u16]>, items: &[&[u16]]) {
-    // SAFETY: each path is NUL-terminated for the call that parses it; every
-    // PIDL made here is freed here, after the last call that reads it (the
-    // children point into their item's PIDL).
-    unsafe {
-        let pidls: Vec<*mut ITEMIDLIST> = items
-            .iter()
-            .map(|p| ILCreateFromPathW(nul(p).as_ptr()))
-            .filter(|p| !p.is_null())
-            .collect();
-        let parent = match folder {
-            Some(folder) if pidls.len() > 1 => ILCreateFromPathW(nul(folder).as_ptr()),
-            _ => core::ptr::null_mut(),
-        };
-        if parent.is_null() {
-            for &pidl in &pidls {
-                SHOpenFolderAndSelectItems(pidl, 0, core::ptr::null(), 0);
+    // Every PIDL made here is freed as it drops, after the last call that
+    // reads it.
+    let pidls: Vec<Pidl> = items.iter().filter_map(|p| Pidl::from_path(p)).collect();
+    let parent = match folder {
+        Some(folder) if pidls.len() > 1 => Pidl::from_path(folder),
+        _ => None,
+    };
+    match parent {
+        None => {
+            for pidl in &pidls {
+                b8::open_folder_and_select(pidl, &[]);
             }
-        } else {
-            let children: Vec<*const ITEMIDLIST> = pidls
-                .iter()
-                .map(|&p| ILFindLastID(p).cast_const())
-                .collect();
-            SHOpenFolderAndSelectItems(parent, children.len() as u32, children.as_ptr(), 0);
-            ILFree(parent);
         }
-        for pidl in pidls {
-            ILFree(pidl);
+        Some(parent) => {
+            let children: Vec<&Pidl> = pidls.iter().collect();
+            b8::open_folder_and_select(&parent, &children);
         }
-    }
-}
-
-/// IDataObject's interface id.
-const IID_IDATA_OBJECT: GUID = GUID::from_u128(0x0000010e_0000_0000_c000_000000000046);
-
-/// The start of every COM object's method table: IUnknown's three methods.
-/// Only Release is called.
-#[repr(C)]
-struct IUnknownVtbl {
-    _query_interface: usize,
-    _add_ref: usize,
-    release: unsafe extern "system" fn(this: *mut core::ffi::c_void) -> u32,
-}
-
-/// Drops this code's reference to a COM object.
-///
-/// # Safety
-/// `object` must be a live COM interface pointer this code holds a
-/// reference to; it must not be used afterwards.
-unsafe fn release(object: *mut core::ffi::c_void) {
-    // SAFETY: a COM object starts with a pointer to its method table, which
-    // starts with IUnknown's methods.
-    unsafe {
-        let vtbl = *(object as *const *const IUnknownVtbl);
-        ((*vtbl).release)(object);
     }
 }
 
 /// The deepest folder holding every one of `pidls` (absolute, at least
-/// one), as a new PIDL the caller frees. It is never one of them: a folder
-/// selected with a file inside it is held by the folder's parent.
-///
-/// # Safety
-/// Each of `pidls` must be a valid absolute PIDL.
-unsafe fn common_folder(pidls: &[*mut ITEMIDLIST]) -> *mut ITEMIDLIST {
-    // SAFETY: the clone is this function's until returned; removing IDs
-    // from it stops at the desktop's empty PIDL, the parent of everything.
-    unsafe {
-        let folder = ILClone(pidls[0]);
-        if folder.is_null() {
-            return folder;
-        }
-        ILRemoveLastID(folder);
-        for &pidl in &pidls[1..] {
-            while (ILIsParent(folder, pidl, 0) == 0 || ILIsEqual(folder, pidl) != 0)
-                && ILRemoveLastID(folder) != 0
-            {}
-        }
-        folder
+/// one), as a new PIDL. It is never one of them: a folder selected with a
+/// file inside it is held by the folder's parent.
+fn common_folder(pidls: &[Pidl]) -> Option<Pidl> {
+    // Removing IDs from the copy stops at the desktop's empty PIDL, the
+    // parent of everything.
+    let mut folder = pidls[0].try_clone()?;
+    folder.remove_last_id();
+    for pidl in &pidls[1..] {
+        while (!folder.is_parent_of(pidl, false) || folder.is_equal(pidl))
+            && folder.remove_last_id()
+        {}
     }
+    Some(folder)
 }
 
 /// Properties sheets waiting for the sheet thread, with their owners.
@@ -259,9 +195,9 @@ pub fn properties(hwnd: HWND, paths: Vec<Vec<u16>>) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push_back((hwnd as usize, paths));
-    // SAFETY: posts to a thread of this process. If its queue does not
-    // exist yet, it looks at the jobs once it does (see `sheet_thread`).
-    unsafe { PostThreadMessageW(sheets.thread, WAKE, 0, 0) };
+    // If its queue does not exist yet, it looks at the jobs once it does
+    // (see `sheet_thread`).
+    win::queue::post_thread(sheets.thread, WAKE, 0, 0);
 }
 
 fn spawn_sheet_thread() -> Option<Arc<SheetQueue>> {
@@ -274,9 +210,7 @@ fn spawn_sheet_thread() -> Option<Arc<SheetQueue>> {
             }
         })
         .ok()?;
-    // SAFETY: the handle of the thread just started, open until `handle`
-    // is dropped below.
-    let thread = unsafe { GetThreadId(handle.as_raw_handle()) };
+    let thread = b8::thread_id_of(&handle);
     let queue = Arc::new(SheetQueue {
         jobs: Mutex::new(VecDeque::new()),
         thread,
@@ -286,38 +220,35 @@ fn spawn_sheet_thread() -> Option<Arc<SheetQueue>> {
 }
 
 fn sheet_thread(queue: &SheetQueue) {
-    // SAFETY: COM for the shell calls, for the life of the thread; then a
-    // standard message loop over a zeroed MSG.
-    unsafe {
-        CoInitializeEx(
-            core::ptr::null(),
-            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        );
-        let mut msg: MSG = core::mem::zeroed();
-        // Makes the thread's message queue, so that a wake posted from now
-        // on waits in it; jobs pushed before it are found below anyway.
-        PeekMessageW(&mut msg, core::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+    // COM for the shell calls, for the life of the thread; then a standard
+    // message loop.
+    if let Some(com) = Apartment::sta() {
+        com.keep();
+    }
+    // Makes the thread's message queue, so that a wake posted from now on
+    // waits in it; jobs pushed before it are found below anyway.
+    win::queue::ensure();
+    loop {
+        // After every message, not only after a wake: a modal loop inside
+        // a COM call may have taken the wake.
         loop {
-            // After every message, not only after a wake: a modal loop
-            // inside a COM call may have taken the wake.
-            loop {
-                let job = queue
-                    .jobs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .pop_front();
-                let Some((owner, paths)) = job else { break };
-                properties_now(owner as HWND, &paths);
-            }
-            if GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0) <= 0 {
-                return;
-            }
-            if msg.hwnd.is_null() && msg.message == WAKE {
-                continue;
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            let job = queue
+                .jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            let Some((owner, paths)) = job else { break };
+            properties_now(owner as HWND, &paths);
         }
+        let Some(q) = win::queue::get(core::ptr::null_mut()) else {
+            return;
+        };
+        let msg = q.msg();
+        if msg.hwnd.is_null() && msg.message == WAKE {
+            continue;
+        }
+        win::queue::translate(&q);
+        win::queue::dispatch(&q);
     }
 }
 
@@ -326,59 +257,31 @@ fn properties_now(hwnd: HWND, paths: &[Vec<u16>]) {
     match paths {
         [] => {}
         [one] => {
-            let file = nul(one);
-            // SAFETY: `file` is NUL-terminated.
-            unsafe {
-                SHObjectProperties(hwnd, SHOP_FILEPATH as u32, file.as_ptr(), core::ptr::null())
-            };
+            b8::object_properties(hwnd, one);
         }
         many => {
-            // SAFETY: each path is NUL-terminated for the call that parses
-            // it; the children point into their item's PIDL, and
             // SHCreateDataObject copies what it keeps, so every PIDL is
-            // freed after it; the data object is released once the sheet
-            // holds its own reference.
-            unsafe {
-                let pidls: Vec<*mut ITEMIDLIST> = many
-                    .iter()
-                    .map(|p| ILCreateFromPathW(nul(p).as_ptr()))
-                    .filter(|p| !p.is_null())
-                    .collect();
+            // freed (as it drops) once the data object is made; the data
+            // object is released once the sheet holds its own reference.
+            let data = {
+                let pidls: Vec<Pidl> = many.iter().filter_map(|p| Pidl::from_path(p)).collect();
                 // The sheet wants the items as children of a folder: with
                 // the desktop as their folder and the full PIDLs as children
                 // it shows only "The properties for this item are not
                 // available". Their common folder works, items in several
                 // folders included ("Various Folders").
                 let folder = if pidls.is_empty() {
-                    core::ptr::null_mut()
+                    None
                 } else {
                     common_folder(&pidls)
                 };
-                let mut data = core::ptr::null_mut();
-                let made = !folder.is_null() && {
-                    let children: Vec<*const ITEMIDLIST> = pidls
-                        .iter()
-                        .map(|&p| ILFindChild(folder, p).cast_const())
-                        .collect();
-                    SHCreateDataObject(
-                        folder,
-                        children.len() as u32,
-                        children.as_ptr(),
-                        core::ptr::null_mut(),
-                        &IID_IDATA_OBJECT,
-                        &mut data,
-                    ) >= 0
-                };
-                if !folder.is_null() {
-                    ILFree(folder);
-                }
-                for pidl in pidls {
-                    ILFree(pidl);
-                }
-                if made && !data.is_null() {
-                    SHMultiFileProperties(data, 0);
-                    release(data);
-                }
+                folder.and_then(|folder| {
+                    let children: Vec<&Pidl> = pidls.iter().collect();
+                    DataObject::of_children(&folder, &children)
+                })
+            };
+            if let Some(data) = data {
+                data.show_properties();
             }
         }
     }
@@ -402,18 +305,10 @@ pub fn in_background(f: impl FnOnce() + Send + 'static) {
     let spawned = std::thread::Builder::new()
         .name("goz-shell".into())
         .spawn(move || {
-            // SAFETY: initialises COM for this thread, which ends below.
-            let hr = unsafe {
-                CoInitializeEx(
-                    core::ptr::null(),
-                    (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-                )
-            };
+            // COM for this thread, which ends below.
+            let com = Apartment::sta();
             f();
-            if hr >= 0 {
-                // SAFETY: pairs the successful CoInitializeEx above.
-                unsafe { CoUninitialize() };
-            }
+            drop(com);
             RUNNING.fetch_sub(1, Ordering::SeqCst);
         });
     // Without a thread there is nothing to run it on; the action is lost,
@@ -449,42 +344,22 @@ fn execute(
     show: i32,
     wait_ms: Option<u32>,
 ) -> bool {
-    let verb = verb.map(wz);
-    let file = nul(file);
-    let params = params.map(wz);
-    let dir = dir.map(nul);
-    let ptr = |s: &Option<Vec<u16>>| s.as_ref().map_or(core::ptr::null(), |s| s.as_ptr());
-    let mut info = SHELLEXECUTEINFOW {
-        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-        // The thread may end right after: finish any asynchronous part first.
-        fMask: SEE_MASK_NOASYNC
-            | if wait_ms.is_some() {
-                SEE_MASK_NOCLOSEPROCESS
-            } else {
-                0
-            },
-        hwnd: owner as HWND,
-        lpVerb: ptr(&verb),
-        lpFile: file.as_ptr(),
-        lpParameters: ptr(&params),
-        lpDirectory: ptr(&dir),
-        nShow: show,
-        ..Default::default()
-    };
-    // SAFETY: every string is NUL-terminated and outlives the call; the
-    // process handle, if any, is closed once waited on.
-    unsafe {
-        if ShellExecuteExW(&mut info) == 0 {
-            return false;
-        }
-        match wait_ms {
-            Some(ms) if !info.hProcess.is_null() => {
-                let done = WaitForSingleObject(info.hProcess, ms) == 0;
-                CloseHandle(info.hProcess);
-                done
-            }
-            _ => true,
-        }
+    // The thread may end right after: the shell finishes any asynchronous
+    // part first (`shell_execute`'s SEE_MASK_NOASYNC).
+    let ran = b8::shell_execute(&Execute {
+        owner: owner as HWND,
+        verb,
+        file,
+        params,
+        dir,
+        show,
+        process: wait_ms.is_some(),
+    });
+    match (ran, wait_ms) {
+        (Err(_), _) => false,
+        // The process handle is closed as it drops, once waited on.
+        (Ok(Some(process)), Some(ms)) => process.wait(ms),
+        (Ok(_), _) => true,
     }
 }
 
@@ -545,13 +420,7 @@ impl Service {
 
 /// The system folder, such as `C:\Windows\system32`.
 fn system_dir() -> String {
-    let mut buf = [0u16; 260];
-    // SAFETY: the buffer and its length.
-    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
-    if n == 0 || n > buf.len() {
-        return r"C:\Windows\System32".into();
-    }
-    String::from_utf16_lossy(&buf[..n])
+    b8::system_dir().unwrap_or_else(|| r"C:\Windows\System32".into())
 }
 
 /// Starts, stops or restarts the goz service, elevated (Windows asks the
@@ -565,8 +434,8 @@ pub fn service(hwnd: HWND, what: Service, msg: u32) {
     };
     if dry_run(verb, []) {
         // Nothing ran, so there is nothing to search again for.
-        // SAFETY: posts to this thread's window.
-        unsafe { PostMessageW(hwnd, msg, 0, 0) };
+        // Posts to this thread's window.
+        win::post_app(hwnd, msg, 0, 0);
         return;
     }
     let owner = hwnd as usize;
@@ -584,8 +453,8 @@ pub fn service(hwnd: HWND, what: Service, msg: u32) {
             SW_HIDE,
             Some(60_000),
         );
-        // SAFETY: posts to the window, which ignores it if it is gone.
-        unsafe { PostMessageW(owner as HWND, msg, usize::from(ran), 0) };
+        // Posts to the window, which ignores it if it is gone.
+        win::post_app(owner as HWND, msg, usize::from(ran), 0);
     });
 }
 
