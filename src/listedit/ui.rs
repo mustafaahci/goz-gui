@@ -48,8 +48,6 @@
 //! (Ctrl+V): files copied in Explorer as a drop adds them, or text, a name a
 //! line (`GOZ_GUI_PASTE_TEXT` in a test).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,55 +55,45 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromRect,
+use windows::Win32::UI::Shell::{
+    FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR,
 };
-use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
+use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Graphics::Gdi::MONITOR_DEFAULTTONULL;
 use windows_sys::Win32::System::SystemServices::{SS_ENDELLIPSIS, SS_LEFT, SS_NOPREFIX};
 use windows_sys::Win32::UI::Controls::{
-    HDF_SORTDOWN, HDF_SORTUP, HDI_FORMAT, HDITEMW, HDM_GETITEMW, HDM_SETITEMW, LVCF_FMT, LVCF_TEXT,
-    LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED,
-    LVM_GETHEADER, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_INSERTCOLUMNW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_KEYDOWN,
-    LVN_ODFINDITEMW, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    HDF_SORTDOWN, HDF_SORTUP, HDI_FORMAT, HDITEMW, LVCF_FMT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT,
+    LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVN_COLUMNCLICK, LVN_GETDISPINFOW,
+    LVN_KEYDOWN, LVN_ODFINDITEMW, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
     LVS_EX_HEADERDRAGDROP, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, NM_CUSTOMDRAW, NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW,
+    LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, NM_CUSTOMDRAW, NMLISTVIEW, NMLVCUSTOMDRAW,
     NMLVDISPINFOW, NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_SHIFT,
-};
-use windows_sys::Win32::UI::Shell::{
-    DefSubclassProc, DragAcceptFiles, DragFinish, HDROP, RemoveWindowSubclass, SetWindowSubclass,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_DELETE, VK_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateMenu, DWLP_MSGRESULT, DrawMenuBar, EnableMenuItem, EndDialog, GWLP_USERDATA,
-    GetClientRect, GetWindowRect, HMENU, IDCANCEL, IDNO, IDOK, IDYES, IsIconic, IsWindow,
-    MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNOCANCEL, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED,
-    MF_POPUP, MINMAXINFO, MoveWindow, PostMessageW, SIZE_MAXIMIZED, SIZE_RESTORED, SW_RESTORE,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DROPFILES, WM_EXITSIZEMOVE,
-    WM_GETMINMAXINFO, WM_INITDIALOG, WM_INITMENUPOPUP, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY,
-    WM_SETTINGCHANGE, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_TABSTOP,
-    WS_THICKFRAME,
+    HMENU, IDCANCEL, IDNO, IDOK, IDYES, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNOCANCEL,
+    MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, SIZE_MAXIMIZED, SIZE_RESTORED, SW_RESTORE, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
+    WM_INITDIALOG, WM_INITMENUPOPUP, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY, WM_SETTINGCHANGE,
+    WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
 };
 
 use super::scan::{Job, Saving, Source};
 use super::{
-    COLUMNS, Column, EXPORT_DIALOG, Entry, Export, IMPORT_DIALOG, WM_EDITOR_CLOSED, WM_EDITOR_LOOK,
-    WM_EDITOR_OPEN, WM_FOUND, WM_SAVED, cmd, items_text,
+    COLUMNS, Column, EXPORT_DIALOG, Entry, Export, IMPORT_DIALOG, WM_DROPPED, WM_EDITOR_CLOSED,
+    WM_EDITOR_LOOK, WM_EDITOR_OPEN, WM_FOUND, WM_SAVED, cmd, items_text,
 };
-use crate::dialog::{self, Class, Look, Quiet, Template, common, list_custom_draw, state};
-use crate::filetools::ui::{copy_text, item, send, set_state, units};
+use crate::dialog::{self, Class, Look, Quiet, Template, common_msg, list_custom_draw};
+use crate::filetools::ui::{item, set_state, units};
 use crate::menu::{self, Item};
 use crate::msgbox;
 use crate::paint;
 use crate::places::{self, Place, Which};
 use crate::store::location;
 use crate::theme::Palette;
-use crate::wide::wz;
+use crate::win::com::Apartment;
+use crate::win::ext::b6::{self, OpenDialog};
+use crate::win::{self, Msg, View, dlg, header, lv, parcel, subclass, sys};
 
 const TITLE: &str = "File List Editor";
 const ID_LIST: u16 = 100;
@@ -113,7 +101,7 @@ const ID_STATUS: u16 = 101;
 /// The window's first size, in dialog units.
 const SIZE: (i16, i16) = (520, 300);
 /// The subclass that paints the menu bar dark.
-const FRAME_SUBCLASS: usize = 0x4c45;
+static FRAME_SUBCLASS: subclass::Key = subclass::Key::new("file list editor frame");
 /// How long closing waits for a save still writing.
 const SAVE_WAIT: Duration = Duration::from_secs(30);
 /// How long closing waits for adding or opening to stop.
@@ -184,8 +172,7 @@ fn open_window() -> Option<HWND> {
     let slot = editor();
     let r = slot.as_ref().filter(|r| !r.thread.is_finished())?;
     let h = r.hwnd.load(Ordering::Acquire) as HWND;
-    // SAFETY: asks whether a window handle names a window.
-    (!h.is_null() && unsafe { IsWindow(h) } != 0).then_some(h)
+    win::is_window(h).then_some(h)
 }
 
 /// Tools > File List Editor... (and W6's `-edit`, `-filelist-editor`):
@@ -198,19 +185,16 @@ pub fn open(start: Start) {
         && !r.thread.is_finished()
     {
         let h = r.hwnd.load(Ordering::Acquire) as HWND;
-        // SAFETY: shows and raises a window of this process (the editor's),
-        // and posts it the list to open; a window gone meanwhile is
-        // refused.
-        unsafe {
-            if !h.is_null() && IsWindow(h) != 0 {
-                if IsIconic(h) != 0 {
-                    ShowWindow(h, SW_RESTORE);
-                }
-                SetForegroundWindow(h);
-                if let Some(file) = start.file {
-                    *lock(&PENDING) = Some(file);
-                    PostMessageW(h, WM_EDITOR_OPEN, 0, 0);
-                }
+        // Shows and raises the editor's window, and posts it the list to
+        // open; a window gone meanwhile is refused.
+        if win::is_window(h) {
+            if win::is_iconic(h) {
+                win::show(h, SW_RESTORE);
+            }
+            win::set_foreground(h);
+            if let Some(file) = start.file {
+                *lock(&PENDING) = Some(file);
+                win::post_app(h, WM_EDITOR_OPEN, 0, 0);
             }
         }
         return;
@@ -231,16 +215,13 @@ pub fn open(start: Start) {
 /// W6: goz-gui's window changed View > Theme: the editor open follows.
 pub fn set_look(look: Look) {
     if let Some(h) = open_window() {
-        // SAFETY: a plain post to the editor's window; one gone meanwhile
-        // drops it.
-        unsafe {
-            PostMessageW(
-                h,
-                WM_EDITOR_LOOK,
-                usize::from(look.dark),
-                isize::from(look.follow_system),
-            )
-        };
+        // A window gone meanwhile drops it.
+        win::post_app(
+            h,
+            WM_EDITOR_LOOK,
+            usize::from(look.dark),
+            isize::from(look.follow_system),
+        );
     }
 }
 
@@ -256,9 +237,8 @@ pub fn finish() {
     if let Some(r) = running {
         let h = r.hwnd.load(Ordering::Acquire);
         if h != 0 {
-            // SAFETY: a plain post to the editor's window; one gone meanwhile
-            // drops it.
-            unsafe { PostMessageW(h as HWND, WM_CLOSE, 0, 0) };
+            // A window gone meanwhile drops it.
+            win::post_close(h as HWND);
         }
         let _ = r.thread.join();
     }
@@ -276,8 +256,8 @@ fn run(start: Start, hwnd: Arc<AtomicUsize>) {
         export_selection,
         owner,
     } = start;
-    // SAFETY: this thread's own COM, given back as it ends.
-    let com = unsafe { CoInitializeEx(core::ptr::null(), COINIT_APARTMENTTHREADED as u32) } >= 0;
+    // This thread's own COM, given back as it ends.
+    let com = Apartment::sta();
     // Message boxes on this thread take the window's look.
     dialog::set_app_look(look);
     // Opened by a command posted while goz-gui was not in front (a test),
@@ -327,20 +307,13 @@ fn run(start: Start, hwnd: Arc<AtomicUsize>) {
         0,
         (4, SIZE.1 - 10, SIZE.0 - 8, 8),
     );
-    t.run(
-        core::ptr::null_mut(),
-        Some(dialog_proc),
-        (&raw const state) as LPARAM,
-    );
+    t.show(core::ptr::null_mut(), &|m| dialog_proc(&state, m));
     drop(quiet);
     hwnd.store(0, Ordering::Release);
     if let Some(job) = state.job.take() {
         job.stop();
     }
-    if com {
-        // SAFETY: the CoInitializeEx above.
-        unsafe { CoUninitialize() };
-    }
+    drop(com);
 }
 
 /// What waits for a save to finish: the command the "Save changes?"
@@ -416,39 +389,31 @@ struct Editor {
 }
 
 fn beep() {
-    // SAFETY: plays a system sound.
-    unsafe { MessageBeep(MB_OK) };
+    sys::beep(MB_OK);
 }
 
 fn set_text(hwnd: HWND, text: &str) {
-    let z = wz(text);
-    // SAFETY: NUL-terminated text for a window of this thread.
-    unsafe { SetWindowTextW(hwnd, z.as_ptr()) };
+    win::set_text(hwnd, text);
 }
 
 /// A menu bar of popups `(title, items)`.
 fn menu_bar(menus: &[(&str, &[Item<'_>])]) -> HMENU {
-    // SAFETY: a new menu, filled with popups this function makes; the
-    // window it is set on destroys it.
-    unsafe {
-        let bar = CreateMenu();
-        for &(title, items) in menus {
-            let popup = menu::submenu(items);
-            AppendMenuW(bar, MF_POPUP, popup as usize, wz(title).as_ptr());
-        }
-        bar
+    // A new menu, filled with popups this function makes; the window it is
+    // set on destroys it.
+    let bar = b6::create_menu();
+    for &(title, items) in menus {
+        let popup = menu::submenu(items);
+        b6::append_popup(bar, popup, title);
     }
+    bar
 }
 
 fn enable_item(m: HMENU, id: u16, on: bool) {
-    // SAFETY: changes an item of a menu of this thread's window.
-    unsafe {
-        EnableMenuItem(
-            m,
-            u32::from(id),
-            MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED },
-        )
-    };
+    b6::enable_menu_item(
+        m,
+        u32::from(id),
+        MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED },
+    );
 }
 
 impl Editor {
@@ -479,23 +444,21 @@ impl Editor {
         let list = Editor::list(dlg);
         let ex =
             LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_HEADERDRAGDROP;
-        send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
+        lv::set_extended_style(list, ex, ex);
         let dpi = crate::custom::window_dpi(list) as i32;
         for (i, &(column, title, width)) in COLUMNS.iter().enumerate() {
-            let mut text = wz(title);
             let col = LVCOLUMNW {
-                mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT,
+                mask: LVCF_WIDTH | LVCF_FMT,
                 fmt: if column == Column::Size {
                     LVCFMT_RIGHT
                 } else {
                     LVCFMT_LEFT
                 },
                 cx: width * dpi / 96,
-                pszText: text.as_mut_ptr(),
-                // SAFETY: the rest of LVCOLUMNW is plain data.
-                ..unsafe { core::mem::zeroed() }
+                ..Default::default()
             };
-            send(list, LVM_INSERTCOLUMNW, i, (&raw const col) as isize);
+            // The title goes in as the column's text (LVCF_TEXT).
+            lv::insert_column(list, i as i32, col, Some(title));
         }
         let bar = menu_bar(&[
             (
@@ -532,21 +495,16 @@ impl Editor {
                 ],
             ),
         ]);
-        // SAFETY: gives this thread's dialog its menu bar, and lets files
-        // be dropped on it.
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::SetMenu(dlg, bar);
-            DragAcceptFiles(dlg, 1);
-        }
+        // The dialog's menu bar; files may be dropped on it (each drop comes
+        // as WM_DROPPED).
+        b6::set_menu(dlg, bar);
+        b6::accept_files(dlg, WM_DROPPED);
         let dark = self.look.get().dark;
         dialog::theme_new(dlg, dark);
-        // SAFETY: subclasses this thread's dialog; the subclass removes
-        // itself as the dialog goes.
-        unsafe { SetWindowSubclass(dlg, Some(frame_proc), FRAME_SUBCLASS, usize::from(dark)) };
+        // The subclass removes itself as the dialog goes.
+        set_frame(dlg, dark);
         self.place(dlg);
-        let mut wr = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetWindowRect(dlg, &mut wr) };
+        let wr = win::window_rect(dlg);
         let min = ((wr.right - wr.left) / 2, (wr.bottom - wr.top) / 2);
         self.min.set(min);
         // W6: where it was last, on the monitors there are now.
@@ -562,8 +520,7 @@ impl Editor {
         self.layout(dlg);
         self.show_title(dlg);
         self.show_count(dlg);
-        // SAFETY: gives this thread's list the keyboard.
-        unsafe { SetFocus(list) };
+        win::set_focus(list);
         // W6: `-edit`'s list.
         let file = self.start_file.take();
         if let Some(path) = file {
@@ -618,74 +575,51 @@ impl Editor {
         self.look.set(look);
         dialog::set_app_look(look);
         dialog::apply_theme(dlg, look.dark);
-        // SAFETY: updates this thread's subclass of the dialog, and
-        // repaints its menu bar and list.
-        unsafe {
-            SetWindowSubclass(
-                dlg,
-                Some(frame_proc),
-                FRAME_SUBCLASS,
-                usize::from(look.dark),
-            );
-            DrawMenuBar(dlg);
-            InvalidateRect(Editor::list(dlg), core::ptr::null(), 1);
-        }
+        // The dialog's frame subclass anew, and its menu bar and list
+        // repainted.
+        set_frame(dlg, look.dark);
+        b6::draw_menu_bar(dlg);
+        win::invalidate(Editor::list(dlg), None, true);
     }
 
     /// Centred over the main window, inside the work area of the monitor
     /// it is on (a window off every monitor stays where it is put).
     fn place(&self, dlg: HWND) {
         let near = self.near;
-        let mut d = RECT::default();
-        // SAFETY: reads and moves this thread's dialog; plain out-structs.
-        unsafe {
-            GetWindowRect(dlg, &mut d);
-            let (w, h) = (d.right - d.left, d.bottom - d.top);
-            let mut x = near.left + (near.right - near.left - w) / 2;
-            let mut y = near.top + (near.bottom - near.top - h) / 2;
-            let monitor = MonitorFromRect(&near, MONITOR_DEFAULTTONULL);
-            if !monitor.is_null() {
-                let mut mi = MONITORINFO {
-                    cbSize: size_of::<MONITORINFO>() as u32,
-                    ..core::mem::zeroed()
-                };
-                if GetMonitorInfoW(monitor, &mut mi) != 0 {
-                    let work = mi.rcWork;
-                    x = x.min(work.right - w).max(work.left);
-                    y = y.min(work.bottom - h).max(work.top);
-                }
-            }
-            SetWindowPos(
-                dlg,
-                core::ptr::null_mut(),
-                x,
-                y,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+        let d = win::window_rect(dlg);
+        let (w, h) = (d.right - d.left, d.bottom - d.top);
+        let mut x = near.left + (near.right - near.left - w) / 2;
+        let mut y = near.top + (near.bottom - near.top - h) / 2;
+        let monitor = sys::monitor_from_rect(&near, MONITOR_DEFAULTTONULL);
+        if !monitor.is_null()
+            && let Some(mi) = sys::monitor_info(monitor)
+        {
+            let work = mi.rcWork;
+            x = x.min(work.right - w).max(work.left);
+            y = y.min(work.bottom - h).max(work.top);
         }
+        win::set_pos(
+            dlg,
+            core::ptr::null_mut(),
+            (x, y, 0, 0),
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 
     /// The list takes the window but for the status line under it.
     fn layout(&self, dlg: HWND) {
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetClientRect(dlg, &mut rc) };
+        let rc = win::client_rect(dlg);
         let (m, line) = units(dlg, 4, 12);
         let (w, h) = (rc.right, rc.bottom);
-        // SAFETY: moves controls of this thread's dialog.
-        unsafe {
-            MoveWindow(Editor::list(dlg), 0, 0, w, (h - line).max(0), 1);
-            MoveWindow(
-                item(dlg, ID_STATUS),
-                m,
-                h - line + m / 2,
-                (w - 2 * m).max(0),
-                line - m,
-                1,
-            );
-        }
+        win::move_window(Editor::list(dlg), 0, 0, w, (h - line).max(0), true);
+        win::move_window(
+            item(dlg, ID_STATUS),
+            m,
+            h - line + m / 2,
+            (w - 2 * m).max(0),
+            line - m,
+            true,
+        );
     }
 
     fn show_title(&self, dlg: HWND) {
@@ -700,7 +634,7 @@ impl Editor {
     /// The status line at rest: how many items, and what is selected.
     fn show_count(&self, dlg: HWND) {
         let n = self.entries.borrow().len();
-        let selected = send(Editor::list(dlg), LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize;
+        let selected = lv::selected_count(Editor::list(dlg));
         let text = if selected > 0 {
             format!(
                 "{} ({} selected)",
@@ -720,21 +654,15 @@ impl Editor {
         let n = self.entries.borrow().len();
         let list = Editor::list(dlg);
         if keep {
-            send(
-                list,
-                LVM_SETITEMCOUNT,
-                n,
-                (LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL) as isize,
-            );
+            lv::set_item_count(list, n, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
         } else {
-            send(list, LVM_SETITEMCOUNT, n, 0);
+            lv::set_item_count(list, n, 0);
             set_state(list, usize::MAX, 0, LVIS_SELECTED | LVIS_FOCUSED);
             if n > 0 {
                 set_state(list, 0, LVIS_FOCUSED, LVIS_FOCUSED);
             }
         }
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(list, core::ptr::null(), 1) };
+        win::invalidate(list, None, true);
     }
 
     /// The selected rows, in order.
@@ -742,9 +670,7 @@ impl Editor {
         let list = Editor::list(dlg);
         let mut out = Vec::new();
         let mut at = usize::MAX;
-        while let Ok(next) =
-            usize::try_from(send(list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize))
-        {
+        while let Ok(next) = usize::try_from(lv::next_item(list, at as i32, LVNI_SELECTED)) {
             out.push(next);
             at = next;
         }
@@ -786,7 +712,7 @@ impl Editor {
         let busy = self.busy();
         let saving = self.saving.borrow().is_some();
         let rows = !self.entries.borrow().is_empty();
-        let selected = send(Editor::list(dlg), LVM_GETSELECTEDCOUNT, 0, 0) > 0;
+        let selected = lv::selected_count(Editor::list(dlg)) > 0;
         enable_item(m, cmd::SAVE, !busy && !saving);
         enable_item(m, cmd::SAVE_AS, !busy && !saving);
         enable_item(m, cmd::EXPORT, !busy && !saving && rows);
@@ -865,8 +791,7 @@ impl Editor {
         if changed {
             self.changed();
         }
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(Editor::list(dlg), core::ptr::null(), 1) };
+        win::invalidate(Editor::list(dlg), None, true);
     }
 
     fn say(&self, dlg: HWND, text: &str) {
@@ -1197,8 +1122,7 @@ impl Editor {
         if !self.settle(dlg, After::Close) {
             return;
         }
-        // SAFETY: ends this thread's dialog.
-        unsafe { EndDialog(dlg, 0) };
+        dlg::end(dlg, 0);
     }
 
     /// Edit > Add Files...: files chosen in Windows' Open dialog.
@@ -1238,15 +1162,10 @@ impl Editor {
         );
     }
 
-    /// Files and folders dropped on the editor: files as they are, folders
-    /// with everything under them.
-    fn dropped(&self, dlg: HWND, drop: HDROP) {
-        // SAFETY: the HDROP WM_DROPFILES brought, read whole, then freed.
-        let paths = unsafe {
-            let paths = crate::clipboard::dropped_files(drop);
-            DragFinish(drop);
-            paths
-        };
+    /// Files and folders dropped on the editor (`paths`, read whole from
+    /// the drop, which is freed by now): files as they are, folders with
+    /// everything under them.
+    fn dropped(&self, dlg: HWND, paths: Vec<Vec<u16>>) {
         if self.busy() {
             beep();
             return;
@@ -1535,26 +1454,27 @@ impl Editor {
     }
 
     fn show_arrow(&self, dlg: HWND) {
-        let header = send(Editor::list(dlg), LVM_GETHEADER, 0, 0) as HWND;
+        let columns = lv::header(Editor::list(dlg));
         let sort = self.sort.get();
         for (i, &(column, _, _)) in COLUMNS.iter().enumerate() {
-            let mut hd = HDITEMW {
-                mask: HDI_FORMAT,
-                // SAFETY: the rest of HDITEMW is plain data.
-                ..unsafe { core::mem::zeroed() }
-            };
-            send(header, HDM_GETITEMW, i, (&raw mut hd) as isize);
+            let mut hd = header::get_item(columns, i as i32, HDI_FORMAT).map_or(
+                HDITEMW {
+                    mask: HDI_FORMAT,
+                    ..Default::default()
+                },
+                |(hd, _)| hd,
+            );
             hd.fmt &= !(HDF_SORTUP | HDF_SORTDOWN);
             if let Some((c, ascending)) = sort
                 && c == column
             {
                 hd.fmt |= if ascending { HDF_SORTUP } else { HDF_SORTDOWN };
             }
-            send(header, HDM_SETITEMW, i, (&raw const hd) as isize);
+            header::set_item(columns, i as i32, hd, None);
         }
     }
 
-    fn disp_info(&self, info: &mut NMLVDISPINFOW) {
+    fn disp_info(&self, info: &mut View<'_, NMLVDISPINFOW>) {
         if info.item.mask & LVIF_TEXT == 0 {
             return;
         }
@@ -1605,19 +1525,13 @@ impl Editor {
         if let Some(e) = kind {
             text.extend_from_slice(&super::type_name(&e));
         }
-        // SAFETY: the list gave a buffer of `cchTextMax` code units.
-        unsafe { copy_text(&text, info.item.pszText, info.item.cchTextMax) };
+        // Into the list's buffer of `cchTextMax` code units.
+        info.set_text(&text);
     }
 
     /// A key in the list: the menus' shortcuts.
     fn key(&self, dlg: HWND, vk: u16) {
-        // SAFETY: reads this thread's keyboard state.
-        let (ctrl, shift) = unsafe {
-            (
-                GetKeyState(i32::from(VK_CONTROL)) < 0,
-                GetKeyState(i32::from(VK_SHIFT)) < 0,
-            )
-        };
+        let (ctrl, shift) = (sys::key_down(VK_CONTROL), sys::key_down(VK_SHIFT));
         let id = match (ctrl, shift, vk) {
             (false, false, VK_DELETE) => cmd::REMOVE,
             (true, false, k) if k == u16::from(b'A') => cmd::SELECT_ALL,
@@ -1633,158 +1547,148 @@ impl Editor {
     }
 
     /// The list's notifications; `Some` is DWLP_MSGRESULT's value.
-    ///
-    /// # Safety
-    /// `l` is a WM_NOTIFY's lParam from the list.
-    unsafe fn notify(&self, dlg: HWND, l: LPARAM) -> Option<isize> {
-        // SAFETY: as the caller promises; each code's struct is read as
-        // the list sends it.
-        unsafe {
-            let hdr = &*(l as *const NMHDR);
-            match hdr.code {
-                NM_CUSTOMDRAW => {
-                    let cd = &*(l as *const NMLVCUSTOMDRAW);
-                    return Some(list_custom_draw(hdr.hwndFrom, cd, self.look.get().dark));
-                }
-                LVN_GETDISPINFOW => self.disp_info(&mut *(l as *mut NMLVDISPINFOW)),
-                LVN_ODFINDITEMW => return Some(-1),
-                LVN_COLUMNCLICK => {
-                    let nm = &*(l as *const NMLISTVIEW);
-                    if let Some(c) = usize::try_from(nm.iSubItem).ok().and_then(Column::at) {
-                        self.sort_by(dlg, c);
-                    }
-                }
-                LVN_KEYDOWN => self.key(dlg, (*(l as *const NMLVKEYDOWN)).wVKey),
-                // The count with what is selected, unless the line says
-                // something else now.
-                windows_sys::Win32::UI::Controls::LVN_ITEMCHANGED
-                | windows_sys::Win32::UI::Controls::LVN_ODSTATECHANGED
-                    if !self.busy() && self.saving.borrow().is_none() =>
-                {
-                    self.show_count(dlg);
-                }
-                _ => {}
+    fn notify(&self, dlg: HWND, m: &Msg) -> Option<isize> {
+        let n = m.notify()?;
+        match n.code() {
+            NM_CUSTOMDRAW => {
+                let cd = n.get::<NMLVCUSTOMDRAW>()?;
+                return Some(list_custom_draw(n.from(), &cd, self.look.get().dark));
             }
-            None
+            LVN_GETDISPINFOW => {
+                if let Some(mut info) = n.get::<NMLVDISPINFOW>() {
+                    self.disp_info(&mut info);
+                }
+            }
+            LVN_ODFINDITEMW => return Some(-1),
+            LVN_COLUMNCLICK => {
+                let sub = n.get::<NMLISTVIEW>().map(|nm| nm.iSubItem);
+                if let Some(c) = sub
+                    .and_then(|s| usize::try_from(s).ok())
+                    .and_then(Column::at)
+                {
+                    self.sort_by(dlg, c);
+                }
+            }
+            LVN_KEYDOWN => {
+                let vk = n.get::<NMLVKEYDOWN>()?.wVKey;
+                self.key(dlg, vk);
+            }
+            // The count with what is selected, unless the line says
+            // something else now.
+            windows_sys::Win32::UI::Controls::LVN_ITEMCHANGED
+            | windows_sys::Win32::UI::Controls::LVN_ODSTATECHANGED
+                if !self.busy() && self.saving.borrow().is_none() =>
+            {
+                self.show_count(dlg);
+            }
+            _ => {}
         }
+        None
     }
 }
 
 /// Edit > Add Files...: Windows' Open dialog, several files at once; the
 /// files chosen (none when cancelled).
 pub(crate) fn pick_files(owner: HWND) -> Vec<String> {
-    use windows::Win32::Foundation::HWND as WHWND;
-    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
-    use windows::Win32::UI::Shell::{
-        FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR,
-        FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
-    };
-    use windows::core::PCWSTR;
-    let title = wz("Add Files");
     let mut out = Vec::new();
-    // SAFETY: COM is initialised on this (the editor's) thread; the dialog
-    // runs its own loop while nothing of the editor is borrowed; every
-    // string lives across the call that takes it, and each path the dialog
-    // gives is freed after it is read.
-    unsafe {
-        let Ok(dialog) =
-            CoCreateInstance::<_, IFileOpenDialog>(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
-        else {
-            return out;
+    // COM is initialised on this (the editor's) thread; the dialog runs its
+    // own loop while nothing of the editor is borrowed.
+    let Some(dialog) = OpenDialog::new() else {
+        return out;
+    };
+    let Some(options) = dialog.options() else {
+        return out;
+    };
+    dialog.set_options(
+        options | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR,
+    );
+    dialog.set_title("Add Files");
+    if !dialog.show(owner) {
+        return out;
+    }
+    let Some(items) = dialog.results() else {
+        return out;
+    };
+    let n = items.count().unwrap_or(0);
+    for i in 0..n {
+        let Some(item) = items.get(i) else {
+            continue;
         };
-        let Ok(options) = dialog.GetOptions() else {
-            return out;
-        };
-        let _ = dialog.SetOptions(
-            options
-                | FOS_ALLOWMULTISELECT
-                | FOS_FILEMUSTEXIST
-                | FOS_FORCEFILESYSTEM
-                | FOS_NOCHANGEDIR,
-        );
-        let _ = dialog.SetTitle(PCWSTR(title.as_ptr()));
-        if dialog.Show(Some(WHWND(owner))).is_err() {
-            return out;
-        }
-        let Ok(items) = dialog.GetResults() else {
-            return out;
-        };
-        let n = items.GetCount().unwrap_or(0);
-        for i in 0..n {
-            let Ok(item) = items.GetItemAt(i) else {
-                continue;
-            };
-            if let Ok(name) = item.GetDisplayName(SIGDN_FILESYSPATH) {
-                if let Ok(path) = name.to_string() {
-                    out.push(path);
-                }
-                CoTaskMemFree(Some(name.0.cast()));
-            }
+        if let Some(path) = b6::shell_item_path(&item).and_then(|p| String::from_utf16(&p).ok()) {
+            out.push(path);
         }
     }
     out
 }
 
-/// Paints the dialog's menu bar dark (the subclass data: whether it is).
-unsafe extern "system" fn frame_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    data: usize,
-) -> LRESULT {
-    // SAFETY: the messages are the window's own, their lParams as Windows
-    // sends them; each call goes to the next procedure in the chain.
-    unsafe {
-        if data != 0 {
-            let pal = Palette::new(true);
-            match msg {
-                paint::WM_UAHDRAWMENU => {
-                    paint::menubar_of(hwnd, &pal, &*(l as *const paint::UahMenu));
-                    return 1;
+/// Sets (or sets anew) the dialog's frame subclass, which paints its menu
+/// bar dark when `dark`.
+fn set_frame(dlg: HWND, dark: bool) {
+    subclass::set(dlg, &FRAME_SUBCLASS, move |m| frame_proc(m, dark));
+}
+
+/// Paints the dialog's menu bar dark (when `dark`).
+fn frame_proc(m: &Msg, dark: bool) -> isize {
+    // Each call goes to the next procedure in the chain.
+    let hwnd = m.hwnd;
+    if dark {
+        let pal = Palette::new(true);
+        match m.id {
+            b6::WM_UAHDRAWMENU => {
+                if let Some(um) = b6::uah_draw_menu(m) {
+                    paint::menubar_of(hwnd, &pal, &uah_menu(um));
                 }
-                paint::WM_UAHDRAWMENUITEM => {
-                    paint::menubar_item_of(&pal, &*(l as *const paint::UahDrawMenuItem));
-                    return 1;
-                }
-                WM_NCPAINT | WM_NCACTIVATE => {
-                    let r = DefSubclassProc(hwnd, msg, w, l);
-                    paint::menubar_line_of(hwnd, &pal);
-                    return r;
-                }
-                _ => {}
+                return 1;
             }
+            b6::WM_UAHDRAWMENUITEM => {
+                if let Some(item) = b6::uah_draw_menu_item(m) {
+                    let item = paint::UahDrawMenuItem {
+                        dis: item.dis,
+                        um: uah_menu(item.um),
+                        umi: paint::UahMenuItem {
+                            position: item.umi.position,
+                            metrics: item.umi.metrics,
+                            popup: item.umi.popup,
+                        },
+                    };
+                    paint::menubar_item_of(&pal, &item);
+                }
+                return 1;
+            }
+            WM_NCPAINT | WM_NCACTIVATE => {
+                let r = m.def();
+                paint::menubar_line_of(hwnd, &pal);
+                return r;
+            }
+            _ => {}
         }
-        if msg == WM_DESTROY {
-            RemoveWindowSubclass(hwnd, Some(frame_proc), FRAME_SUBCLASS);
-        }
-        DefSubclassProc(hwnd, msg, w, l)
+    }
+    if m.id == WM_DESTROY {
+        subclass::remove(hwnd, &FRAME_SUBCLASS);
+    }
+    m.def()
+}
+
+/// The menu bar's UAHMENU as `paint` takes it.
+fn uah_menu(um: b6::UahMenu) -> paint::UahMenu {
+    paint::UahMenu {
+        hmenu: um.hmenu,
+        hdc: um.hdc,
+        flags: um.flags,
     }
 }
 
-unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Editor` that `run` keeps alive until the
-        // dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Editor` from `run`, or null before.
-    let Some(s) = (unsafe { state::<Editor>(dlg) }) else {
-        return 0;
-    };
+fn dialog_proc(s: &Editor, m: &Msg) -> isize {
+    let (dlg, msg, w, l) = (m.hwnd, m.id, m.w, m.l);
     let dark = s.look.get().dark;
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+    if let Some(answer) = common_msg(m, &s.look) {
         if msg == WM_SETTINGCHANGE && s.look.get().dark != dark {
             // The system's theme changed, and the editor follows it: the
-            // menu bar too.
+            // menu bar too (the dialog's frame subclass anew, its menu bar
+            // repainted).
             let dark = s.look.get().dark;
-            // SAFETY: updates this thread's subclass of the dialog, and
-            // repaints its menu bar.
-            unsafe {
-                SetWindowSubclass(dlg, Some(frame_proc), FRAME_SUBCLASS, usize::from(dark));
-                DrawMenuBar(dlg);
-            }
+            set_frame(dlg, dark);
+            b6::draw_menu_bar(dlg);
         }
         return answer;
     }
@@ -1822,22 +1726,19 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
         }
         WM_GETMINMAXINFO => {
             let (w, h) = s.min.get();
-            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
-            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = w;
-            mmi.ptMinTrackSize.y = h;
+            if let Some(mut mmi) = m.min_max_info() {
+                mmi.ptMinTrackSize.x = w;
+                mmi.ptMinTrackSize.y = h;
+            }
             1
         }
         WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR.
-            let from_list = unsafe { (*(l as *const NMHDR)).idFrom } == usize::from(ID_LIST);
+            let from_list = m.notify().is_some_and(|n| n.id() == usize::from(ID_LIST));
             if !from_list {
                 return 0;
             }
-            // SAFETY: a notification from the list.
-            if let Some(answer) = unsafe { s.notify(dlg, l) } {
-                // SAFETY: the answer of this dialog's WM_NOTIFY.
-                unsafe { SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, answer) };
+            if let Some(answer) = s.notify(dlg, m) {
+                dlg::set_result(dlg, answer);
             }
             1
         }
@@ -1846,7 +1747,7 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
             0
         }
         WM_COMMAND => {
-            let id = (w & 0xffff) as u16;
+            let id = win::loword(w);
             match i32::from(id) {
                 // Esc: adding or opening stops; the window stays.
                 IDCANCEL => s.stop(),
@@ -1860,8 +1761,11 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
             s.close(dlg);
             1
         }
-        WM_DROPFILES => {
-            s.dropped(dlg, w as HDROP);
+        WM_DROPPED => {
+            // The paths of files dropped on the editor (`b6::accept_files`).
+            if let Some(paths) = parcel::take::<Vec<Vec<u16>>>(m) {
+                s.dropped(dlg, paths);
+            }
             1
         }
         WM_FOUND => {
@@ -1877,9 +1781,8 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
             // W6: its place for goz-gui's window, which is told.
             s.keep(dlg);
             if s.owner != 0 {
-                // SAFETY: a plain post to goz-gui's window; one gone
-                // meanwhile drops it.
-                unsafe { PostMessageW(s.owner as HWND, WM_EDITOR_CLOSED, 0, 0) };
+                // A window gone meanwhile drops it.
+                win::post_app(s.owner as HWND, WM_EDITOR_CLOSED, 0, 0);
             }
             0
         }

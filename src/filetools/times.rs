@@ -2,13 +2,9 @@
 //! dates its Custom boxes take (Everything's: `YYYY-MM-DDThh:mm:ss`, the
 //! earliest value for what is left out, in local time).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
-use windows_sys::Win32::System::Time::{
-    FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime,
-    TzSpecificLocalTimeToSystemTime,
-};
+
+use crate::win::ext::b6;
 
 /// A file's times, as FILETIMEs (UTC).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -146,19 +142,10 @@ impl Local {
             wSecond: self.second,
             wMilliseconds: self.millis,
         };
-        // SAFETY: plain in- and out-structs; a null time zone is the
-        // current one.
-        unsafe {
-            let mut utc: SYSTEMTIME = core::mem::zeroed();
-            if TzSpecificLocalTimeToSystemTime(core::ptr::null(), &local, &mut utc) == 0 {
-                return None;
-            }
-            let mut ft = FILETIME::default();
-            if SystemTimeToFileTime(&utc, &mut ft) == 0 {
-                return None;
-            }
-            Some((u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime))
-        }
+        // In the current time zone.
+        let utc = b6::local_to_utc(&local)?;
+        let ft = b6::system_time_to_file_time(&utc)?;
+        Some((u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime))
     }
 
     /// The local time of a FILETIME (UTC).
@@ -167,26 +154,18 @@ impl Local {
             dwLowDateTime: ft as u32,
             dwHighDateTime: (ft >> 32) as u32,
         };
-        // SAFETY: plain in- and out-structs; a null time zone is the
-        // current one.
-        unsafe {
-            let mut utc: SYSTEMTIME = core::mem::zeroed();
-            let mut local: SYSTEMTIME = core::mem::zeroed();
-            if FileTimeToSystemTime(&ft, &mut utc) == 0
-                || SystemTimeToTzSpecificLocalTime(core::ptr::null(), &utc, &mut local) == 0
-            {
-                return None;
-            }
-            Some(Local {
-                year: local.wYear,
-                month: local.wMonth,
-                day: local.wDay,
-                hour: local.wHour,
-                minute: local.wMinute,
-                second: local.wSecond,
-                millis: local.wMilliseconds,
-            })
-        }
+        // In the current time zone.
+        let utc = b6::file_time_to_system_time(&ft)?;
+        let local = b6::utc_to_local(&utc)?;
+        Some(Local {
+            year: local.wYear,
+            month: local.wMonth,
+            day: local.wDay,
+            hour: local.wHour,
+            minute: local.wMinute,
+            second: local.wSecond,
+            millis: local.wMilliseconds,
+        })
     }
 
     /// As ISO 8601 (`2024-05-01T09:30:00`).
