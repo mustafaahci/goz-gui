@@ -766,3 +766,84 @@ fn private_messages_go_only_to_goz_gui_s_own_windows() {
     super::destroy(parent);
     super::destroy(ours);
 }
+
+static FORGER: subclass::Key = subclass::Key::new("test header forger");
+
+#[test]
+fn a_notification_is_read_by_its_header_as_delivered() {
+    use windows_sys::Win32::UI::Controls::{
+        LVN_GETDISPINFOW, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW, NMLVDISPINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_NOTIFY;
+    let (button, parent) = hidden_control("Button", 0);
+    let (list, list_parent) = hidden_control(super::lv::CLASS, 0);
+    // What a procedure makes of the notification: its code and sender, and
+    // whether it is read as a list view's custom draw or display info.
+    type Seen = (u32, HWND, bool, bool);
+    // The window's own procedure, after the subclass.
+    let seen: Rc<RefCell<Vec<Seen>>> = Rc::new(RefCell::new(Vec::new()));
+    let s = Rc::clone(&seen);
+    let hwnd = window(move |m| {
+        if let Some(n) = m.notify() {
+            s.borrow_mut().push((
+                n.code(),
+                n.from(),
+                n.get::<NMLVCUSTOMDRAW>().is_some(),
+                n.get::<NMLVDISPINFOW>().is_some(),
+            ));
+        }
+        m.def()
+    });
+    // The subclass writes the header through its (writable) custom draw
+    // view: 0, the sender a list view; 1, the code too; 2, the same, the
+    // view forgotten and the message not passed on.
+    let how = Rc::new(Cell::new(0));
+    let same: Rc<RefCell<Vec<Seen>>> = Rc::new(RefCell::new(Vec::new()));
+    let (h, s) = (Rc::clone(&how), Rc::clone(&same));
+    assert!(subclass::set(hwnd, &FORGER, move |m| {
+        let Some(n) = m.notify() else {
+            return m.def();
+        };
+        let mut cd = n.get::<NMCUSTOMDRAW>().expect("a custom draw");
+        cd.hdr.hwndFrom = list;
+        if h.get() > 0 {
+            cd.hdr.code = LVN_GETDISPINFOW;
+        }
+        if h.get() == 2 {
+            core::mem::forget(cd);
+            return 0;
+        }
+        drop(cd);
+        // The same message, however asked: read as delivered.
+        let again = m.notify().expect("again");
+        s.borrow_mut().push((
+            again.code(),
+            again.from(),
+            again.get::<NMLVCUSTOMDRAW>().is_some(),
+            n.get::<NMLVDISPINFOW>().is_some(),
+        ));
+        m.def()
+    }));
+    for forge in 0..3 {
+        how.set(forge);
+        let mut cd = NMCUSTOMDRAW {
+            hdr: NMHDR {
+                hwndFrom: button,
+                idFrom: 1,
+                code: NM_CUSTOMDRAW,
+            },
+            ..Default::default()
+        };
+        // SAFETY: WM_NOTIFY's lParam is an NMHDR, here a button's
+        // NMCUSTOMDRAW (no bigger), alive for the call.
+        unsafe { super::send_raw(hwnd, WM_NOTIFY, 1, (&raw mut cd) as isize) };
+        // The control finds the header as it gave it.
+        assert_eq!((cd.hdr.code, cd.hdr.hwndFrom), (NM_CUSTOMDRAW, button));
+    }
+    let delivered: Seen = (NM_CUSTOMDRAW, button, false, false);
+    assert_eq!(*same.borrow(), vec![delivered; 2]);
+    assert_eq!(*seen.borrow(), vec![delivered; 2]);
+    super::destroy(hwnd);
+    super::destroy(parent);
+    super::destroy(list_parent);
+}

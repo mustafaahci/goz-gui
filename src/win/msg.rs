@@ -64,6 +64,13 @@ pub struct Msg {
     /// Whether a [`View`] of the `lParam` is out: one at a time, so a view
     /// never aliases another, and none while the message is passed on.
     lent: Cell<bool>,
+    /// A WM_NOTIFY's header as [`Msg::notify`] first read it, before any
+    /// view of the structure was lent: what decides which structure the
+    /// notification comes with ([`Notify::get`]), and what is put back in
+    /// the structure before the message goes on and as the procedure
+    /// returns (a custom draw structure is lent writable whole, header
+    /// and all).
+    header: Cell<Option<NMHDR>>,
 }
 
 impl Msg {
@@ -78,6 +85,7 @@ impl Msg {
             l,
             via: Via::Made,
             lent: Cell::new(false),
+            header: Cell::new(None),
         }
     }
 
@@ -95,6 +103,7 @@ impl Msg {
             l,
             via,
             lent: Cell::new(false),
+            header: Cell::new(None),
         }
     }
 
@@ -108,6 +117,7 @@ impl Msg {
     /// processing may write to what it points at.
     pub fn def(&self) -> LRESULT {
         assert!(!self.lent.get(), "a view of the message is still out");
+        self.restore_header();
         match self.via {
             // SAFETY: the parameters as the system delivered them, to the
             // window they were delivered to.
@@ -161,15 +171,51 @@ impl Msg {
         Some(View::lend(ptr, &self.lent))
     }
 
-    /// `WM_NOTIFY`'s notification.
+    /// `WM_NOTIFY`'s notification. Its header is read once, the first
+    /// time this is asked, before any view of its structure is lent: every
+    /// [`Notify`] of the message has that header, whatever a view writes.
     pub fn notify(&self) -> Option<Notify<'_>> {
         if self.id != WM_NOTIFY {
             return None;
         }
-        // SAFETY: a delivered WM_NOTIFY's lParam is an NMHDR (or a structure
-        // that starts with one); it is copied out, not kept.
-        let hdr = unsafe { self.view_lparam::<NMHDR>() }.map(|v| *v)?;
+        let hdr = match self.header.get() {
+            Some(hdr) => hdr,
+            None => {
+                // SAFETY: a delivered WM_NOTIFY's lParam is an NMHDR (or a
+                // structure that starts with one); it is copied out. No view
+                // of it is out yet: one is lent only through a `Notify`,
+                // which is made only after this.
+                let hdr = unsafe { self.view_lparam::<NMHDR>() }.map(|v| *v)?;
+                self.header.set(Some(hdr));
+                hdr
+            }
+        };
         Some(Notify { msg: self, hdr })
+    }
+
+    /// Puts back the WM_NOTIFY header [`Msg::notify`] read, if a view of
+    /// the structure changed it: the next procedure, and the control the
+    /// answer goes back to, find the header as it was delivered, and so
+    /// the structure it came with. Nothing for any other message, or for
+    /// one whose notification was not asked for (no view of it was lent).
+    fn restore_header(&self) {
+        let Some(hdr) = self.header.get() else {
+            return;
+        };
+        let p = self.l as *mut NMHDR;
+        // SAFETY: the header was read from this delivered WM_NOTIFY's
+        // lParam (`notify`), a structure valid for reads and writes while
+        // the procedure runs (see `view_lparam`), which it still does. No
+        // reference into it lives: `def` checks no view is out, and the
+        // message drops after every view, which borrows it (a view that
+        // was forgotten makes a reference only while it is dereferenced,
+        // which it no longer can be).
+        unsafe {
+            let now = p.read();
+            if now.hwndFrom != hdr.hwndFrom || now.idFrom != hdr.idFrom || now.code != hdr.code {
+                p.write(hdr);
+            }
+        }
     }
 
     /// `WM_DRAWITEM`'s DRAWITEMSTRUCT.
@@ -273,6 +319,15 @@ impl Msg {
     }
 }
 
+impl Drop for Msg {
+    /// A notification's header goes back as it was delivered before its
+    /// procedure returns (see [`Msg::notify`]): whoever reads the structure
+    /// after (an outer procedure of the chain, the control) finds it so.
+    fn drop(&mut self) {
+        self.restore_header();
+    }
+}
+
 /// What a message's `lParam` points at, lent for as long as the procedure
 /// runs: one view of a message at a time (see [`Msg::def`]).
 pub struct View<'a, T> {
@@ -342,7 +397,10 @@ macro_rules! writable {
 
 // Handles and integers only. A custom draw structure's `dwItemSpec` (an
 // index, or a tree's item) is not read back by its control, and nothing
-// here makes a tree item of it; its `hdc` is a handle GDI checks.
+// here makes a tree item of it; its `hdc` is a handle GDI checks. Its
+// header decides nothing once written: a notification's structure is told
+// by the header its message read first, and the header goes back as it was
+// before anything else reads the structure (`Msg::restore_header`).
 writable!(
     WINDOWPOS,
     MINMAXINFO,
@@ -358,12 +416,13 @@ impl<T> Drop for View<'_, T> {
     }
 }
 
-/// A `WM_NOTIFY` notification: its header (copied), and the structure it
-/// came in by [`Notify::get`].
+/// A `WM_NOTIFY` notification: its header, as it was delivered (read-only:
+/// it decides which structure the notification comes with), and that
+/// structure, by [`Notify::get`].
 pub struct Notify<'a> {
     msg: &'a Msg,
-    /// The notification's header, copied.
-    pub hdr: NMHDR,
+    /// The notification's header as the message read it first.
+    hdr: NMHDR,
 }
 
 impl<'a> Notify<'a> {
@@ -388,13 +447,15 @@ impl<'a> Notify<'a> {
     }
 
     /// The notification's structure as a `T`, if this notification is one
-    /// that comes with a `T`.
+    /// that comes with a `T`: as its header was delivered, whatever a view
+    /// of the structure has written there since.
     pub fn get<T: NotifyStruct>(&self) -> Option<View<'a, T>> {
         if !T::comes_with(self) {
             return None;
         }
-        // SAFETY: `comes_with` vouches that this notification's lParam is a
-        // `T`.
+        // SAFETY: `comes_with` vouches, from the header as delivered (the
+        // copy here, which nothing changes), that this notification's
+        // lParam is a `T`.
         unsafe { self.msg.view_lparam() }
     }
 }
@@ -403,7 +464,8 @@ impl<'a> Notify<'a> {
 ///
 /// # Safety
 /// `comes_with` is true only for notifications whose lParam points at a
-/// `Self`.
+/// `Self`, judged from the notification's header as delivered
+/// ([`Notify::code`], [`Notify::from`], [`Notify::sender_is`]).
 pub unsafe trait NotifyStruct {
     fn comes_with(n: &Notify) -> bool;
 }
