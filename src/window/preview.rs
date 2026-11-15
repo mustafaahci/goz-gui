@@ -3,18 +3,14 @@
 //! passes back, and Everything's layout menu that a right-click on the
 //! preview opens.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{MF_CHECKED, MF_STRING, MF_UNCHECKED};
 
 use super::App;
 use crate::dock::PaneId;
 use crate::menu;
 use crate::preview::{self, TAB_BACK_OUT, TAB_OUT, WM_REPLIES, WM_RETIRE};
-use crate::wide::wz;
+use crate::win::ext::b2;
 
 impl App {
     /// A command of the preview's range (`menu::F1_FIRST`..): true when it
@@ -74,28 +70,24 @@ impl App {
                 items.push((cmd, label.into(), self.pane_visible(id)));
             }
         }
-        // SAFETY: a popup menu made here and destroyed after it closes.
-        let popup = unsafe { CreatePopupMenu() };
+        // A popup menu made here and destroyed after it closes.
+        let popup = b2::create_popup_menu();
         if popup.is_null() {
             return;
         }
         for (i, (cmd, label, checked)) in items.iter().enumerate() {
-            let label = wz(label);
             let check = if *checked { MF_CHECKED } else { MF_UNCHECKED };
-            // SAFETY: appends to the menu just made; the label outlives
-            // the call (the menu copies it).
-            unsafe {
-                if i == first_pane {
-                    AppendMenuW(popup, MF_SEPARATOR, 0, core::ptr::null());
-                }
-                AppendMenuW(popup, MF_STRING | check, usize::from(*cmd), label.as_ptr());
+            // The menu copies the label.
+            if i == first_pane {
+                b2::append_separator(popup);
             }
+            b2::append_menu(popup, MF_STRING | check, usize::from(*cmd), label);
         }
         // Shown (or, in a test's dump, written out) while no state of the
         // window is borrowed.
         let cmd = crate::popup::track(popup, self.hwnd, POINT { x, y }, "layout menu", &|_| None);
-        // SAFETY: the menu made above, closed now.
-        unsafe { DestroyMenu(popup) };
+        // The menu made above, closed now.
+        b2::destroy_menu(popup);
         if cmd > 0 {
             self.command(cmd as u16);
         }
