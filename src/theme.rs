@@ -9,7 +9,7 @@
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::colors::{Item, SLOTS, State, slot};
-use crate::win::ext::b4::{self as ext, AppMode};
+use crate::win::ext::b4::{self as ext, AppMode, Hive};
 
 /// A part's text and background colours.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -266,14 +266,14 @@ impl Palette {
 /// Whether the user picked the dark app theme.
 pub fn system_dark() -> bool {
     let key = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
-    ext::hkcu_dword(key, "AppsUseLightTheme") == Some(0)
+    ext::reg_dword(Hive::CurrentUser, key, "AppsUseLightTheme") == Some(0)
 }
 
 /// Windows' accent colour (Settings > Personalization > Colors), for an
 /// accent of Default in Options > Fonts and Colors; Windows' default blue
 /// if it cannot be read.
 pub fn system_accent() -> u32 {
-    match ext::hkcu_dword(r"Software\Microsoft\Windows\DWM", "AccentColor") {
+    match ext::reg_dword(Hive::CurrentUser, r"Software\Microsoft\Windows\DWM", "AccentColor") {
         // 0xAABBGGRR: the low three bytes are a COLORREF.
         Some(data) => data & 0x00ff_ffff,
         None => rgb(0x00, 0x78, 0xd4),

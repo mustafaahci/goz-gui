@@ -7,25 +7,44 @@ use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
-use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
+};
 use windows_sys::Win32::UI::Controls::SetWindowTheme;
 
 use crate::win::wz;
 
 // ---- The registry ----
 
-/// The DWORD `value` of the current user's key `key` (a path under
-/// HKEY_CURRENT_USER); `None` if it is not there or is not a DWORD.
-pub fn hkcu_dword(key: &str, value: &str) -> Option<u32> {
+/// A registry hive goz-gui reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hive {
+    CurrentUser,
+    LocalMachine,
+}
+
+impl Hive {
+    fn key(self) -> HKEY {
+        match self {
+            Hive::CurrentUser => HKEY_CURRENT_USER,
+            Hive::LocalMachine => HKEY_LOCAL_MACHINE,
+        }
+    }
+}
+
+/// The DWORD `value` of key `key` (a path under `hive`); `None` if it is
+/// not there or is not a DWORD.
+pub fn reg_dword(hive: Hive, key: &str, value: &str) -> Option<u32> {
     let key = wz(key);
     let value = wz(value);
     let mut data: u32 = 0;
     let mut size = size_of::<u32>() as u32;
-    // SAFETY: NUL-terminated names read during the call; a DWORD out
-    // (RRF_RT_REG_DWORD: nothing else is written) whose size is passed.
+    // SAFETY: a predefined key; NUL-terminated names read during the call;
+    // a DWORD out (RRF_RT_REG_DWORD: nothing else is written) whose size is
+    // passed.
     let rc = unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
+            hive.key(),
             key.as_ptr(),
             value.as_ptr(),
             RRF_RT_REG_DWORD,
@@ -35,6 +54,57 @@ pub fn hkcu_dword(key: &str, value: &str) -> Option<u32> {
         )
     };
     (rc == ERROR_SUCCESS).then_some(data)
+}
+
+/// The string `value` of key `key` (a path under `hive`), if it is there,
+/// is a REG_SZ and fits in `cap` UTF-16 units with its NUL.
+pub fn reg_string(hive: Hive, key: &str, value: &str, cap: usize) -> Option<String> {
+    let key = wz(key);
+    let value = wz(value);
+    let mut buf = vec![0u16; cap];
+    let mut size = u32::try_from(buf.len() * 2).unwrap_or(u32::MAX & !1);
+    // SAFETY: a predefined key; NUL-terminated names read during the call;
+    // the buffer, whose size in bytes is passed (at most its own), written
+    // during the call.
+    let rc = unsafe {
+        RegGetValueW(
+            hive.key(),
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            core::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    // `size` is the bytes written, its NUL included.
+    buf.truncate((size as usize / 2).saturating_sub(1));
+    Some(String::from_utf16_lossy(&buf))
+}
+
+/// This process's memory counters (K32GetProcessMemoryInfo).
+pub fn process_memory()
+-> Option<windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    let mut c = PROCESS_MEMORY_COUNTERS_EX {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: an out-struct whose size is passed, for this process (the
+    // pseudo-handle GetCurrentProcess gives, which needs no closing).
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(),
+            c.cb,
+        )
+    };
+    (ok != 0).then_some(c)
 }
 
 // ---- Visual styles and DWM ----
@@ -297,4 +367,29 @@ pub fn choose_color(
     // COLORREFs, read and written during the modal call; no hook, no
     // template (their flags are masked off, their fields null).
     (unsafe { ChooseColorW(&mut cc) } != 0).then_some(cc.rgbResult)
+}
+
+/// Whether this module has registered a window class `name`
+/// (GetClassInfoExW).
+pub fn class_registered(name: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassInfoExW, WNDCLASSEXW};
+    let z = wz(name);
+    let mut wc = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a NUL-terminated name read during the call; an out-struct
+    // with its size (what it is given back is not kept).
+    unsafe { GetClassInfoExW(crate::win::class::module(), z.as_ptr(), &mut wc) != 0 }
+}
+
+/// SetPixelV: paints one pixel of `hdc` in colour `c`.
+pub fn set_pixel(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    x: i32,
+    y: i32,
+    c: windows_sys::Win32::Foundation::COLORREF,
+) -> bool {
+    // SAFETY: no pointers; GDI checks the DC.
+    unsafe { windows_sys::Win32::Graphics::Gdi::SetPixelV(hdc, x, y, c) != 0 }
 }
