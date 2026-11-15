@@ -156,14 +156,25 @@ pub fn set(kind: Kind, handler: impl Fn(&Event) -> Option<LRESULT> + 'static) ->
 
 impl Drop for Hook {
     fn drop(&mut self) {
-        let left = HANDLERS.with_borrow_mut(|h| {
+        // A hook kept in a thread-local may drop as the thread ends, after
+        // these thread-locals have gone: then the thread's hooks go with it
+        // and there is nothing left to undo.
+        let Ok(left) = HANDLERS.try_with(|h| {
+            let mut h = h.borrow_mut();
             h.retain(|&(_, id, _)| id != self.id);
             h.iter().any(|&(k, ..)| k == self.kind)
-        });
+        }) else {
+            return;
+        };
         if !left {
-            let hook = SYSTEM.with_borrow_mut(|s| {
-                core::mem::replace(&mut s[self.kind.index()], core::ptr::null_mut())
-            });
+            let hook = SYSTEM
+                .try_with(|s| {
+                    core::mem::replace(
+                        &mut s.borrow_mut()[self.kind.index()],
+                        core::ptr::null_mut(),
+                    )
+                })
+                .unwrap_or(core::ptr::null_mut());
             if !hook.is_null() {
                 // SAFETY: the hook `set` put in on this thread.
                 unsafe { UnhookWindowsHookEx(hook) };
