@@ -9,8 +9,6 @@
 //! message back into the window procedure (most `SendMessageW` calls to the
 //! list can), which is what keeps re-entrancy from panicking.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
@@ -919,16 +917,6 @@ pub fn app_icon(size: i32) -> HICON {
     // A resource of this module by its id; a missing one is reported as
     // null, which callers accept.
     b1::module_icon(1, size)
-}
-
-/// Sends any message, for the window's modules not yet moved onto
-/// `crate::win`'s typed wrappers (the code here no longer calls it). It
-/// goes, and this file's `allow(unsafe_code)` with it, once none of them
-/// does.
-fn send(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: a message to a window of this thread; any pointer in `l` is
-    // the caller's and lives across the synchronous call.
-    unsafe { SendMessageW(hwnd, msg, w, l) }
 }
 
 // `wide::is_wide` had its one caller here (WM_SETTINGCHANGE, which reads
