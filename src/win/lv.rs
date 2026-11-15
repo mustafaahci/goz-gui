@@ -4,20 +4,26 @@
 //! The item and column structures go in by value: the pointers in them
 //! (the text, column arrays) are set here, never taken from the caller.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use windows_sys::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::UI::Controls::{
-    HIMAGELIST, LVCF_TEXT, LVCOLUMNW, LVHITTESTINFO, LVIF_COLFMT, LVIF_COLUMNS, LVIF_TEXT, LVITEMW,
-    LVM_ARRANGE, LVM_CANCELEDITLABEL, LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_EDITLABELW,
-    LVM_ENSUREVISIBLE, LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNW, LVM_GETCOLUMNWIDTH,
-    LVM_GETCOUNTPERPAGE, LVM_GETEDITCONTROL, LVM_GETHEADER, LVM_GETHOTITEM, LVM_GETIMAGELIST,
-    LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSPACING, LVM_GETITEMSTATE, LVM_GETITEMW,
-    LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_GETSELECTIONMARK, LVM_GETSTRINGWIDTHW,
-    LVM_GETSUBITEMRECT, LVM_GETTOPINDEX, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETBKCOLOR, LVM_SETCOLUMNORDERARRAY, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETICONSPACING, LVM_SETIMAGELIST, LVM_SETITEMCOUNT,
-    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SETSELECTIONMARK, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
-    LVM_SUBITEMHITTEST,
+    HIMAGELIST, IMAGE_LIST_DRAW_STYLE, ImageList_Draw, LVCF_TEXT, LVCOLUMNW, LVHITTESTINFO,
+    LVIF_COLFMT, LVIF_COLUMNS, LVIF_TEXT, LVITEMW, LVM_ARRANGE, LVM_CANCELEDITLABEL,
+    LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_EDITLABELW, LVM_ENSUREVISIBLE,
+    LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNW, LVM_GETCOLUMNWIDTH, LVM_GETCOUNTPERPAGE,
+    LVM_GETEDITCONTROL, LVM_GETHEADER, LVM_GETHOTITEM, LVM_GETIMAGELIST, LVM_GETITEMCOUNT,
+    LVM_GETITEMRECT, LVM_GETITEMSPACING, LVM_GETITEMSTATE, LVM_GETITEMW, LVM_GETNEXTITEM,
+    LVM_GETSELECTEDCOUNT, LVM_GETSELECTIONMARK, LVM_GETSTRINGWIDTHW, LVM_GETSUBITEMRECT,
+    LVM_GETTOPINDEX, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_REDRAWITEMS, LVM_SCROLL,
+    LVM_SETBKCOLOR, LVM_SETCOLUMNORDERARRAY, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETICONSPACING, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
+    LVM_SETSELECTIONMARK, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVM_SUBITEMHITTEST,
 };
+
+use super::imagelist::{ImageList, SystemList};
 
 /// The class these messages are for.
 pub const CLASS: &str = "SysListView32";
@@ -169,14 +175,134 @@ pub fn hot_item(lv: HWND) -> i32 {
     send_int(lv, LVM_GETHOTITEM, 0, 0) as i32
 }
 
-/// Image list `which` (LVSIL_*).
-pub fn image_list(lv: HWND, which: u32) -> HIMAGELIST {
-    send_int(lv, LVM_GETIMAGELIST, which as usize, 0)
+/// Draws image `i` of the list's image list `which` (LVSIL_*) on `hdc` at
+/// `x, y`; false if the list has none (or the image did not draw).
+pub fn draw_image(
+    lv: HWND,
+    which: u32,
+    i: i32,
+    hdc: HDC,
+    at: (i32, i32),
+    style: IMAGE_LIST_DRAW_STYLE,
+) -> bool {
+    let il = send_int(lv, LVM_GETIMAGELIST, which as usize, 0);
+    if il == 0 {
+        return false;
+    }
+    // SAFETY: the list's own image list, which it keeps alive while it
+    // shows it: one it was given here (`set_image_list`: one it destroys
+    // only with itself, or a system list) or by the system. Nothing here
+    // can change it during the call (drawing sends the list no message).
+    unsafe { ImageList_Draw(il, i, hdc, at.0, at.1, style) != 0 }
 }
 
-/// Sets image list `which` (LVSIL_*); the one before.
-pub fn set_image_list(lv: HWND, which: u32, il: HIMAGELIST) -> HIMAGELIST {
-    send_int(lv, LVM_SETIMAGELIST, which as usize, il)
+/// What a list view was given as one of its image lists by
+/// [`set_image_list`] or [`set_system_image_list`], while it shows it.
+#[derive(Clone, Copy)]
+enum Given {
+    /// A list given up whole ([`ImageList::into_unique`]): the list view's
+    /// own, destroyed with it (or, given back, goz-gui's again).
+    Own(HIMAGELIST),
+    /// A reference of its own to a system list
+    /// ([`SystemList::new_reference`]): released with it (or, given back,
+    /// by goz-gui).
+    System(HIMAGELIST),
+}
+
+thread_local! {
+    /// What each list view of this thread was given, by its window and
+    /// image list kind (LVSIL_*), until it gives it back or is destroyed.
+    static GIVEN: RefCell<HashMap<(usize, u32), Given>> = RefCell::new(HashMap::new());
+}
+
+static GIVEN_KEY: super::subclass::Key = super::subclass::Key::new("list view image lists");
+
+/// Gives the list view `lv` (one of this thread) image list `which`
+/// (LVSIL_*): `list`, which it takes whole (a list view destroys its image
+/// lists with itself, unless it has LVS_SHAREIMAGELISTS: then the list is
+/// kept for the process), or none. The list it had, if it was given it
+/// here, is goz-gui's again and destroyed (a system list's reference,
+/// released). False, and `list` dropped, if it is not a list view of this
+/// thread, or `list` is held elsewhere too (a clone, or a tree showing
+/// it), which the list view could then destroy under its other holders.
+pub fn set_image_list(lv: HWND, which: u32, list: Option<ImageList>) -> bool {
+    let il = match list.map(ImageList::into_unique) {
+        None => 0,
+        Some(Ok(il)) => il,
+        Some(Err(_shared)) => return false,
+    };
+    let given = (il != 0).then_some(Given::Own(il));
+    let ok = give(lv, which, il, given);
+    if !ok && il != 0 {
+        // SAFETY: the list given up above, which the list view did not take.
+        drop(unsafe { ImageList::reclaim(il) });
+    }
+    ok
+}
+
+/// Gives the list view `lv` (one of this thread) the shell's system image
+/// list `list` as its image list `which` (LVSIL_*), with a reference of its
+/// own: a list view without LVS_SHAREIMAGELISTS destroys its lists with
+/// itself, which for a system list releases that reference. The list it
+/// had is let go as in [`set_image_list`]. False if `lv` is not a list
+/// view of this thread.
+pub fn set_system_image_list(lv: HWND, which: u32, list: SystemList) -> bool {
+    let il = list.new_reference();
+    if il == 0 {
+        return false;
+    }
+    let ok = give(lv, which, il, Some(Given::System(il)));
+    if !ok {
+        release_system(il);
+    }
+    ok
+}
+
+/// Releases a reference to a system list (an `IImageList*` of its own,
+/// from SHGetImageList).
+fn release_system(il: HIMAGELIST) {
+    // SAFETY: a reference SHGetImageList gave (`SystemList::new_reference`)
+    // which nothing holds any more, released once; the list itself lives
+    // on (`imagelist::system` keeps one).
+    drop(unsafe {
+        <windows::core::IUnknown as windows::core::Interface>::from_raw(
+            il as *mut core::ffi::c_void,
+        )
+    });
+}
+
+/// Sends LVM_SETIMAGELIST of `il` to `lv`, notes `given` for it, and lets
+/// go of the list it gives back if it was one given here.
+fn give(lv: HWND, which: u32, il: HIMAGELIST, given: Option<Given>) -> bool {
+    if !super::class_is(lv, CLASS) || !super::is_this_thread(lv) {
+        return false;
+    }
+    // Its entries go with it: its own lists are then its to destroy.
+    if !super::subclass::has(lv, &GIVEN_KEY)
+        && !super::subclass::set(lv, &GIVEN_KEY, |m| {
+            if m.id == windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY {
+                let key = m.hwnd as usize;
+                GIVEN.with_borrow_mut(|g| g.retain(|&(h, _), _| h != key));
+            }
+            m.def()
+        })
+    {
+        return false;
+    }
+    let key = (lv as usize, which);
+    let before = GIVEN.with_borrow_mut(|g| match given {
+        Some(given) => g.insert(key, given),
+        None => g.remove(&key),
+    });
+    let old = send_int(lv, LVM_SETIMAGELIST, which as usize, il);
+    match before {
+        // SAFETY: the list given up whole here before, which the list view
+        // no longer shows (it gave it back): goz-gui's again.
+        Some(Given::Own(had)) if had == old && old != 0 => drop(unsafe { ImageList::reclaim(old) }),
+        Some(Given::System(had)) if had == old && old != 0 => release_system(old),
+        _ => {}
+    }
+    true
 }
 
 /// Deletes every item; false if it could not.

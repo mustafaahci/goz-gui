@@ -13,7 +13,7 @@ use windows_sys::Win32::Graphics::Gdi::HFONT;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_HOT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NEWFONT,
-    CDRF_NOTIFYITEMDRAW, HIMAGELIST, HTREEITEM, ILC_COLOR32, ILC_MASK, ILD_NORMAL, NMTVCUSTOMDRAW,
+    CDRF_NOTIFYITEMDRAW, HTREEITEM, ILC_COLOR32, ILC_MASK, ILD_NORMAL, NMTVCUSTOMDRAW,
     TVE_COLLAPSE, TVE_EXPAND, TVGN_CARET, TVGN_CHILD, TVGN_DROPHILITE, TVGN_NEXT, TVGN_ROOT,
     TVI_FIRST, TVI_LAST, TVI_ROOT, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE,
     TVIF_STATE, TVIS_EXPANDED, TVITEMW, TVSIL_NORMAL,
@@ -21,11 +21,11 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Shell::{
     SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SIID_FIND,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
 
 use crate::colors::{Item, State};
 use crate::theme::{self, Palette};
-use crate::win::imagelist::ImageList;
+use crate::win::icon::Icon;
+use crate::win::imagelist::{ImageList, SystemList};
 use crate::win::{self, gdi, imagelist, tv};
 
 /// No item: the tree's root (as a parent), or nothing (as an answer).
@@ -291,17 +291,17 @@ fn stock_search_icon() -> i32 {
 
 /// The system image list to copy `size` px icons from: the one whose icons
 /// are that size or the least larger, else the largest.
-fn system_list(size: i32) -> HIMAGELIST {
+fn system_list(size: i32) -> Option<SystemList> {
     // SHIL_LARGE (32), SHIL_SMALL (16), SHIL_EXTRALARGE (48).
-    let mut best: Option<(i32, HIMAGELIST)> = None;
-    let mut largest: Option<(i32, HIMAGELIST)> = None;
+    let mut best: Option<(i32, SystemList)> = None;
+    let mut largest: Option<(i32, SystemList)> = None;
     for which in [1, 0, 2] {
         // The shell hands out its own image list, which lives as long as
         // the process; it is never released.
         let Some(list) = win::imagelist::system(which) else {
             continue;
         };
-        let (cx, _) = imagelist::icon_size(list).unwrap_or((0, 0));
+        let (cx, _) = imagelist::icon_size(&list).unwrap_or((0, 0));
         if cx >= size && best.is_none_or(|(b, _)| cx < b) {
             best = Some((cx, list));
         }
@@ -309,7 +309,7 @@ fn system_list(size: i32) -> HIMAGELIST {
             largest = Some((cx, list));
         }
     }
-    best.or(largest).map_or(0, |(_, list)| list)
+    best.or(largest).map(|(_, list)| list)
 }
 
 /// A tree's own image list: the icons it shows, at one size. The list is
@@ -336,10 +336,6 @@ impl Images {
         }
     }
 
-    pub fn handle(&self) -> HIMAGELIST {
-        self.list.as_ref().map_or(0, ImageList::handle)
-    }
-
     pub fn size(&self) -> i32 {
         self.size
     }
@@ -359,35 +355,33 @@ impl Images {
     }
 
     fn add(&self, source: Source) -> bool {
-        let system = |index: i32| -> HICON {
-            let list = system_list(self.size);
-            if list == 0 || index < 0 {
-                return core::ptr::null_mut();
+        let system = |index: i32| -> Option<Icon> {
+            let list = system_list(self.size)?;
+            if index < 0 {
+                return None;
             }
-            // A copy of one of the system list's icons, ours to destroy.
-            win::imagelist::icon(list, index, ILD_NORMAL)
+            // A copy of one of the system list's icons, destroyed as it
+            // drops.
+            win::imagelist::icon(&list, index, ILD_NORMAL)
         };
-        let icon: HICON = match source {
+        let icon = match source {
             // A build without an icon of its own (no assets/goz.ico) shows
             // the shell's search icon: the magnifier, as Everything's top
             // item has its own.
             Source::App => {
-                let own = crate::window::app_icon(self.size);
-                if own.is_null() {
-                    system(stock_search_icon())
-                } else {
-                    own
-                }
+                crate::window::app_icon(self.size).or_else(|| system(stock_search_icon()))
             }
             Source::System(index) => system(index),
         };
-        if icon.is_null() {
+        let Some(icon) = icon else {
             return false;
-        }
-        // The list copies the icon (drawn at its own size), after which
-        // the copy made above is destroyed.
-        let at = self.list.as_ref().map_or(-1, |l| l.replace_icon(-1, icon));
-        gdi::destroy_icon(icon);
+        };
+        // The list copies the icon (drawn at its own size); the copy made
+        // above is destroyed as it drops.
+        let at = self
+            .list
+            .as_ref()
+            .map_or(-1, |l| l.replace_icon(-1, icon.handle()));
         at >= 0
     }
 
@@ -411,7 +405,8 @@ impl Images {
     }
 }
 
-/// Hands `tree` the image list `images` (`None`: none).
+/// Hands `tree` the image list `images` (`None`: none), which the tree
+/// keeps alive while it shows it (`tv::set_image_list`).
 pub fn set_images(tree: HWND, images: Option<&Images>) {
-    tv::set_image_list(tree, TVSIL_NORMAL, images.map_or(0, Images::handle));
+    tv::set_image_list(tree, TVSIL_NORMAL, images.and_then(|i| i.list.as_ref()));
 }

@@ -1,14 +1,20 @@
 //! Tree-view messages (SysTreeView32), each sent only to a tree view. The
 //! item structures go in by value, their text pointers set here.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use windows_sys::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
 use windows_sys::Win32::UI::Controls::{
-    HIMAGELIST, HTREEITEM, TVHITTESTINFO, TVI_LAST, TVI_ROOT, TVIF_TEXT, TVINSERTSTRUCTW,
-    TVITEMEXW, TVITEMW, TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMRECT,
-    TVM_GETITEMW, TVM_GETNEXTITEM, TVM_GETTOOLTIPS, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM,
-    TVM_SETBKCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETIMAGELIST, TVM_SETITEMHEIGHT, TVM_SETITEMW,
-    TVM_SETLINECOLOR, TVM_SETTEXTCOLOR,
+    HTREEITEM, TVHITTESTINFO, TVI_LAST, TVI_ROOT, TVIF_TEXT, TVINSERTSTRUCTW, TVITEMEXW, TVITEMW,
+    TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM,
+    TVM_GETTOOLTIPS, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETBKCOLOR,
+    TVM_SETEXTENDEDSTYLE, TVM_SETIMAGELIST, TVM_SETITEMHEIGHT, TVM_SETITEMW, TVM_SETLINECOLOR,
+    TVM_SETTEXTCOLOR,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY;
+
+use super::imagelist::{self, ImageList, SystemList};
 
 /// The class these messages are for.
 pub const CLASS: &str = "SysTreeView32";
@@ -81,9 +87,76 @@ pub fn set_extended_style(tv: HWND, mask: u32, style: u32) {
     send_int(tv, TVM_SETEXTENDEDSTYLE, mask as usize, style as isize);
 }
 
-/// Sets image list `which` (TVSIL_*); the one before.
-pub fn set_image_list(tv: HWND, which: u32, il: HIMAGELIST) -> HIMAGELIST {
-    send_int(tv, TVM_SETIMAGELIST, which as usize, il)
+thread_local! {
+    /// The image lists the trees of this thread show, given them by
+    /// [`set_image_list`]: kept (a clone of each) until another is given
+    /// or the tree is destroyed, as a tree never destroys its lists.
+    static SHOWN: RefCell<HashMap<(usize, u32), ImageList>> = RefCell::new(HashMap::new());
+}
+
+static SHOWN_KEY: super::subclass::Key = super::subclass::Key::new("tree view image lists");
+
+/// Gives the tree `tv` (one of this thread) image list `which` (TVSIL_*):
+/// `list` (`None`: none). A tree never destroys its lists, so this keeps
+/// `list` alive (a clone of it) for as long as the tree shows it: until
+/// it is given another, or is destroyed. False if `tv` is not a tree of
+/// this thread.
+pub fn set_image_list(tv: HWND, which: u32, list: Option<&ImageList>) -> bool {
+    if !holds_lists(tv) {
+        return false;
+    }
+    let il = list.map_or(0, imagelist::raw_of);
+    send_int(tv, TVM_SETIMAGELIST, which as usize, il);
+    // The list it showed before, if it was one given here, is let go
+    // after the tree no longer shows it.
+    let before = SHOWN.with_borrow_mut(|s| match list {
+        Some(list) => s.insert((tv as usize, which), list.clone()),
+        None => s.remove(&(tv as usize, which)),
+    });
+    drop(before);
+    true
+}
+
+/// Gives the tree `tv` the shell's system image list `list` as its image
+/// list `which` (TVSIL_*): the list lives as long as the process. False if
+/// `tv` is not a tree of this thread.
+pub fn set_system_image_list(tv: HWND, which: u32, list: SystemList) -> bool {
+    if !holds_lists(tv) {
+        return false;
+    }
+    send_int(
+        tv,
+        TVM_SETIMAGELIST,
+        which as usize,
+        imagelist::raw_of(&list),
+    );
+    let before = SHOWN.with_borrow_mut(|s| s.remove(&(tv as usize, which)));
+    drop(before);
+    true
+}
+
+/// Whether `tv` is a tree of this thread whose image lists given here go
+/// with it (a subclass lets them go as it is destroyed).
+fn holds_lists(tv: HWND) -> bool {
+    if !super::class_is(tv, CLASS) || !super::is_this_thread(tv) {
+        return false;
+    }
+    super::subclass::has(tv, &SHOWN_KEY)
+        || super::subclass::set(tv, &SHOWN_KEY, |m| {
+            let answer = m.def();
+            if m.id == WM_NCDESTROY {
+                // The tree is gone: its lists are let go (out of the map
+                // first, dropped after).
+                let key = m.hwnd as usize;
+                let gone: Vec<ImageList> = SHOWN.with_borrow_mut(|s| {
+                    s.extract_if(|&(h, _), _| h == key)
+                        .map(|(_, l)| l)
+                        .collect()
+                });
+                drop(gone);
+            }
+            answer
+        })
 }
 
 /// The tree's tooltip control.

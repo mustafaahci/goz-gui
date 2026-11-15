@@ -63,7 +63,9 @@ impl App {
         }
         if b.tray_icon() {
             if !self.tray_on.get() {
-                let icon = self.window_icons.get()[0];
+                let icon = self.window_icons.borrow()[0]
+                    .as_ref()
+                    .map_or(core::ptr::null_mut(), win::icon::Icon::handle);
                 self.tray_on.set(tray::add(self.hwnd, WM_TRAY, icon, "goz"));
             }
         } else if self.tray_on.replace(false) {

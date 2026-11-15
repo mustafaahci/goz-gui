@@ -17,7 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateBitmap, EnumFontFamiliesExW, GetPixel, GetTextColor, GetTextExtentExPointW, RoundRect,
     STRETCH_BLT_MODE, SetBrushOrgEx, SetDCPenColor, SetPixelV, SetStretchBltMode,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{DI_FLAGS, DestroyIcon, DrawIconEx, HICON};
+use windows_sys::Win32::UI::WindowsAndMessaging::{DI_FLAGS, DrawIconEx, HICON};
 
 /// A window's painting, from BeginPaint to EndPaint (when this drops).
 pub struct Paint {
@@ -556,12 +556,6 @@ pub fn draw_icon(
 ) -> bool {
     // SAFETY: no pointers.
     unsafe { DrawIconEx(hdc, x, y, icon, cx, cy, 0, core::ptr::null_mut(), flags) != 0 }
-}
-
-/// Destroys an icon made for the caller.
-pub fn destroy_icon(icon: HICON) {
-    // SAFETY: no pointers.
-    unsafe { DestroyIcon(icon) };
 }
 
 #[cfg(test)]

@@ -18,10 +18,10 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
-    CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, CLR_DEFAULT, CLR_NONE, HIMAGELIST, ILC_COLOR32,
-    ILD_ASYNC, ILD_SCALE, ILD_TRANSPARENT, IMAGELISTDRAWPARAMS, LVA_DEFAULT, LVIR_ICON,
-    LVIS_FOCUSED, LVIS_SELECTED, LVNI_FOCUSED, LVS_AUTOARRANGE, LVS_ICON, LVS_OWNERDRAWFIXED,
-    LVS_REPORT, LVS_TYPEMASK, LVSIL_NORMAL, NMCUSTOMDRAW,
+    CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, CLR_DEFAULT, CLR_NONE, ILC_COLOR32, ILD_ASYNC,
+    ILD_SCALE, ILD_TRANSPARENT, IMAGELISTDRAWPARAMS, LVA_DEFAULT, LVIR_ICON, LVIS_FOCUSED,
+    LVIS_SELECTED, LVNI_FOCUSED, LVS_AUTOARRANGE, LVS_ICON, LVS_OWNERDRAWFIXED, LVS_REPORT,
+    LVS_TYPEMASK, LVSIL_NORMAL, NMCUSTOMDRAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_APP;
 
@@ -32,7 +32,7 @@ use crate::status::ViewButton;
 use crate::thumbs::{Bitmap, Picture, ThumbReply};
 use crate::view::{self, View};
 use crate::win::dib::Canvas;
-use crate::win::imagelist::ImageList;
+use crate::win::imagelist::{ImageList, SystemList};
 use crate::win::{self, gdi, imagelist, lv};
 use crate::window::Fonts;
 
@@ -129,16 +129,9 @@ impl App {
             let line = self.fonts.borrow().height;
             let (cx, cy) = view::spacing(v.size, dpi, line);
             // An empty image list the list owns from here on; the one it
-            // gives back was made here before and is not used.
+            // had, made here before, is destroyed (`lv::set_image_list`).
             let images = ImageList::create(side, side, ILC_COLOR32, 0, 1);
-            let old = lv::set_image_list(
-                self.list,
-                LVSIL_NORMAL,
-                images.map_or(0, ImageList::into_raw),
-            );
-            if old != 0 {
-                imagelist::destroy(old);
-            }
+            lv::set_image_list(self.list, LVSIL_NORMAL, images);
             win::lv::set_icon_spacing(self.list, cx, cy);
             // Icon view, its items in rows in order (auto-arranged), and not
             // owner-drawn: owner draw is Details' only, and left on it
@@ -398,8 +391,7 @@ impl App {
         // Whether the icon drawn is the one wanted, to be loaded if it is
         // not, or a stand-in, drawn only if it is.
         let mut wanted = true;
-        if jumbo {
-            let list = self.big_icons(true);
+        if jumbo && let Some(list) = self.big_icons(true) {
             // A type with no icon that big (.cfg, .md, .toml) is in
             // Windows' jumbo list as its 48 px icon in the top left corner
             // of an empty 256 px square: shrunk to the cell, it would be a
@@ -421,11 +413,10 @@ impl App {
             }
         }
         let which = if jumbo { SHIL_JUMBO } else { SHIL_EXTRALARGE };
-        let list = self.big_icons(jumbo);
-        if list == 0 {
+        let Some(list) = self.big_icons(jumbo) else {
             return;
-        }
-        let (cx, cy) = imagelist::icon_size(list).unwrap_or((0, 0));
+        };
+        let (cx, cy) = imagelist::icon_size(&list).unwrap_or((0, 0));
         let (x, y, w, h, style) = if cx <= side && cy <= side {
             let x = square.left + (side - cx) / 2;
             let y = square.top + (side - cy) / 2;
@@ -454,8 +445,6 @@ impl App {
             )
         };
         let params = IMAGELISTDRAWPARAMS {
-            cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
-            himl: list,
             i: icon,
             hdcDst: hdc,
             x,
@@ -467,7 +456,7 @@ impl App {
             fStyle: style,
             ..Default::default()
         };
-        if !self.big_loads.draw(&params, wanted) {
+        if !self.big_loads.draw(list, &params, wanted) {
             self.stand_in(hdc, icon, square, which);
         }
     }
@@ -480,17 +469,14 @@ impl App {
     fn stand_in(&self, hdc: HDC, icon: i32, square: &RECT, wanted: i32) {
         let side = square.right - square.left;
         for which in stand_ins(wanted) {
-            let list = self.system_list(which);
-            if list == 0 {
+            let Some(list) = self.system_list(which) else {
                 continue;
-            }
-            let (cx, cy) = imagelist::icon_size(list).unwrap_or((0, 0));
+            };
+            let (cx, cy) = imagelist::icon_size(&list).unwrap_or((0, 0));
             if cx > side || cy > side {
                 continue;
             }
             let params = IMAGELISTDRAWPARAMS {
-                cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
-                himl: list,
                 i: icon,
                 hdcDst: hdc,
                 x: square.left + (side - cx) / 2,
@@ -500,7 +486,7 @@ impl App {
                 fStyle: ILD_TRANSPARENT,
                 ..Default::default()
             };
-            if self.big_loads.draw(&params, false) {
+            if self.big_loads.draw(list, &params, false) {
                 return;
             }
         }
@@ -516,11 +502,10 @@ impl App {
         let side = square.right - square.left;
         let mut chosen = None;
         for which in [SHIL_SMALL, SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO] {
-            let list = self.system_list(which);
-            if list == 0 {
+            let Some(list) = self.system_list(which) else {
                 continue;
-            }
-            let (cx, _) = imagelist::icon_size(list).unwrap_or((0, 0));
+            };
+            let (cx, _) = imagelist::icon_size(&list).unwrap_or((0, 0));
             if cx >= side {
                 chosen = Some((list, cx));
                 break;
@@ -538,8 +523,6 @@ impl App {
             return;
         }
         let params = IMAGELISTDRAWPARAMS {
-            cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
-            himl: list,
             i: icon,
             hdcDst: hdc,
             x: square.left,
@@ -555,12 +538,14 @@ impl App {
             },
             ..Default::default()
         };
-        if !self.big_loads.draw(&params, true) {
+        if !self.big_loads.draw(list, &params, true)
+            && let Some(small) = self.icons.list
+        {
             // The small icon meanwhile, centred, drawn as Details draws it
             // at 100 % (the icons' thread has loaded it already).
-            let (cx, cy) = imagelist::icon_size(self.icons.list).unwrap_or((0, 0));
+            let (cx, cy) = imagelist::icon_size(&small).unwrap_or((0, 0));
             imagelist::draw(
-                self.icons.list,
+                &small,
                 icon,
                 hdc,
                 (square.left + (side - cx) / 2, square.top + (side - cy) / 2),
@@ -579,25 +564,14 @@ impl App {
 
     /// The system image list of 48 px icons, or of 256 px ones (`jumbo`),
     /// asked for once.
-    fn big_icons(&self, jumbo: bool) -> HIMAGELIST {
+    fn big_icons(&self, jumbo: bool) -> Option<SystemList> {
         self.system_list(if jumbo { SHIL_JUMBO } else { SHIL_EXTRALARGE })
     }
 
-    /// The system image list `which` (`SHIL_*`), asked for once.
-    fn system_list(&self, which: i32) -> HIMAGELIST {
-        let mut lists = self.big_icons.get();
-        let Some(slot) = usize::try_from(which).ok().filter(|&s| s < lists.len()) else {
-            return 0;
-        };
-        if lists[slot] == 0 {
-            // The shell hands out its own image list, which lives as long
-            // as the process; it is kept, never released.
-            if let Some(list) = win::imagelist::system(which) {
-                lists[slot] = list as usize;
-                self.big_icons.set(lists);
-            }
-        }
-        lists[slot] as HIMAGELIST
+    /// The system image list `which` (`SHIL_*`), asked of the shell once:
+    /// it lives as long as the process (`win::imagelist::system`).
+    fn system_list(&self, which: i32) -> Option<SystemList> {
+        win::imagelist::system(which)
     }
 
     /// A thumbnail came from the thread: kept, and its item redrawn if it
@@ -707,12 +681,9 @@ fn draw_bitmap(hdc: HDC, bitmap: &Bitmap, square: &RECT) {
 /// left corner of an otherwise empty square; `None` while the icon is not
 /// loaded. Worked out once per icon (two draws into a scratch bitmap) and
 /// kept: the system list's indexes last as long as the process.
-fn jumbo_is_padded(list: HIMAGELIST, icon: i32) -> Option<bool> {
+fn jumbo_is_padded(list: SystemList, icon: i32) -> Option<bool> {
     thread_local! {
         static PADDED: RefCell<HashMap<i32, bool>> = RefCell::new(HashMap::new());
-    }
-    if list == 0 {
-        return Some(false);
     }
     if let Some(known) = PADDED.with(|p| p.borrow().get(&icon).copied()) {
         return Some(known);
@@ -746,11 +717,11 @@ enum Extent {
 /// list's icon side. It is drawn twice into a scratch bitmap, on black and
 /// on white, so that no colour of its own can hide one of its pixels; only
 /// if it is loaded (`ILD_ASYNC`).
-fn drawn_extent(list: HIMAGELIST, icon: i32) -> Extent {
+fn drawn_extent(list: SystemList, icon: i32) -> Extent {
     // A DIB section and a memory DC made, used and deleted here
     // (`dib::Canvas`): its pixels are copied out between the draws, once
     // what was drawn is in them.
-    let (cx, cy) = imagelist::icon_size(list).unwrap_or((0, 0));
+    let (cx, cy) = imagelist::icon_size(&list).unwrap_or((0, 0));
     if cx <= 0 || cy <= 0 {
         return Extent::Unknown;
     }
@@ -758,7 +729,6 @@ fn drawn_extent(list: HIMAGELIST, icon: i32) -> Extent {
         return Extent::Unknown;
     };
     let params = IMAGELISTDRAWPARAMS {
-        himl: list,
         hdcDst: canvas.hdc(),
         i: icon,
         rgbBk: CLR_NONE as u32,
@@ -770,7 +740,7 @@ fn drawn_extent(list: HIMAGELIST, icon: i32) -> Extent {
     let mut loaded = true;
     for back in [0u32, 0x00ff_ffff] {
         canvas.fill(back.to_le_bytes());
-        if !imagelist::draw_indirect(&params) {
+        if !imagelist::draw_indirect(&list, &params) {
             loaded = false;
             break;
         }

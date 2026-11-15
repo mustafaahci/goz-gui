@@ -37,7 +37,11 @@ pub fn name_text_offset(app: &App) -> i32 {
 /// system's DPI, so smaller at a UI scale or on a monitor of more DPI).
 pub fn row_icon_side(app: &App) -> i32 {
     // The size of the system image list's icons, and a metric.
-    let cx = imagelist::icon_size(app.icons.list).map_or(0, |(cx, _)| cx);
+    let cx = app
+        .icons
+        .list
+        .and_then(|l| imagelist::icon_size(&l))
+        .map_or(0, |(cx, _)| cx);
     let wanted = sys::metric_for_dpi(SM_CXSMICON, app.dpi.get());
     cx.max(wanted)
 }
@@ -257,7 +261,11 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                 {
                     other.icon.set(UNSET);
                 }
-                let cx = imagelist::icon_size(app.icons.list).map_or(0, |(cx, _)| cx);
+                let cx = app
+                    .icons
+                    .list
+                    .and_then(|l| imagelist::icon_size(&l))
+                    .map_or(0, |(cx, _)| cx);
                 let side = row_icon_side(app);
                 if inner.right - inner.left > side {
                     let y = rc.top + (rc.bottom - rc.top - side) / 2;
@@ -271,14 +279,8 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
                             bottom: y + side,
                         };
                         app.draw_row_icon(hdc, icon, &square);
-                    } else {
-                        imagelist::draw(
-                            app.icons.list,
-                            icon,
-                            hdc,
-                            (inner.left, y),
-                            ILD_TRANSPARENT,
-                        );
+                    } else if let Some(list) = app.icons.list {
+                        imagelist::draw(&list, icon, hdc, (inner.left, y), ILD_TRANSPARENT);
                     }
                 }
                 inner.left += side + app.scale(ICON_GAP);

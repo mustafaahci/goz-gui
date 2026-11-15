@@ -30,13 +30,12 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Threading::INFINITE;
-use windows_sys::Win32::UI::Controls::{
-    HIMAGELIST, ILD_ASYNC, ILD_TRANSPARENT, IMAGELISTDRAWPARAMS,
-};
+use windows_sys::Win32::UI::Controls::{ILD_ASYNC, ILD_TRANSPARENT, IMAGELISTDRAWPARAMS};
 
 use crate::thumbs::Bitmap;
 use crate::win::com::Apartment;
 use crate::win::dib::Canvas;
+use crate::win::imagelist::SystemList;
 use crate::win::imagelist::draw_indirect;
 use crate::win::sync::Event;
 use crate::win::{self, gdi, imagelist};
@@ -51,9 +50,19 @@ const TELL_EVERY: Duration = Duration::from_millis(40);
 /// (Large at 100 %), 28 at 192 px (Large at 150 %).
 const SHRUNK_BUDGET: usize = 4 << 20;
 
-/// An icon of one of the system's image lists: the list (its handle) and
-/// the icon's index in it.
+/// An icon of one of the system's image lists: the list (its SHIL_*, see
+/// [`key_of`]) and the icon's index in it.
 pub type Key = (usize, i32);
+
+/// A system list as a key's first half: which of the lists it is.
+fn key_of(list: SystemList) -> usize {
+    list.which() as usize
+}
+
+/// The system list a key names.
+fn list_of(key: usize) -> Option<SystemList> {
+    imagelist::system(i32::try_from(key).ok()?)
+}
 
 /// An icon of a system list (as `Key`) shrunk to a cell's side, in pixels.
 pub type Shrink = (usize, i32, i32);
@@ -206,39 +215,40 @@ impl BigIcons {
         }
     }
 
-    /// Draws as `params` says if the icon is loaded; else it is loaded on
-    /// the thread (when `ask`) and false is given. An icon the thread
-    /// loaded that still does not draw this way is drawn as it comes.
-    pub fn draw(&self, params: &IMAGELISTDRAWPARAMS, ask: bool) -> bool {
+    /// Draws image `params.i` of `list` as `params` says if the icon is
+    /// loaded; else it is loaded on the thread (when `ask`) and false is
+    /// given. An icon the thread loaded that still does not draw this way
+    /// is drawn as it comes.
+    pub fn draw(&self, list: SystemList, params: &IMAGELISTDRAWPARAMS, ask: bool) -> bool {
         let quick = IMAGELISTDRAWPARAMS {
             fStyle: params.fStyle | ILD_ASYNC,
             ..*params
         };
         // The caller's parameters, for a system image list.
-        if draw_indirect(&quick) {
+        if draw_indirect(&list, &quick) {
             return true;
         }
-        let key = (params.himl as usize, params.i);
+        let key = (key_of(list), params.i);
         if self.book.borrow().was_loaded(key) {
-            return draw_indirect(params);
+            return draw_indirect(&list, params);
         }
         if ask {
-            self.load(params.himl, params.i);
+            self.load(list, params.i);
         }
         false
     }
 
     /// Whether icon `icon` of `list` was asked of the thread and is not
     /// loaded yet.
-    pub fn waiting(&self, list: HIMAGELIST, icon: i32) -> bool {
-        self.book.borrow().waiting((list as usize, icon))
+    pub fn waiting(&self, list: SystemList, icon: i32) -> bool {
+        self.book.borrow().waiting((key_of(list), icon))
     }
 
     /// Icon `icon` of `list` is to be loaded on the thread, unless it was
     /// asked for already.
-    pub fn load(&self, list: HIMAGELIST, icon: i32) {
-        let key = (list as usize, icon);
-        if icon < 0 || list == 0 || !self.book.borrow().wants(key) {
+    pub fn load(&self, list: SystemList, icon: i32) {
+        let key = (key_of(list), icon);
+        if icon < 0 || !self.book.borrow().wants(key) {
             return;
         }
         let dropped = {
@@ -272,15 +282,15 @@ impl BigIcons {
     /// meanwhile, or for good if it could not be made.
     pub fn draw_shrunk(
         &self,
-        list: HIMAGELIST,
+        list: SystemList,
         icon: i32,
         side: i32,
         draw: impl FnOnce(&Bitmap),
     ) -> bool {
-        if icon < 0 || list == 0 || side <= 0 {
+        if icon < 0 || side <= 0 {
             return false;
         }
-        let key = (list as usize, icon, side);
+        let key = (key_of(list), icon, side);
         {
             // Drawn while borrowed: GDI only, nothing that can call back.
             let pictures = self.pictures.borrow();
@@ -384,7 +394,9 @@ fn load_thread(shared: &Shared) {
             Some(Job::Load((list, icon))) => {
                 // The system image list lives as long as the process, and
                 // takes draws from any thread.
-                imagelist::draw(list as HIMAGELIST, icon, dc.hdc(), (0, 0), ILD_TRANSPARENT);
+                if let Some(list) = list_of(list) {
+                    imagelist::draw(&list, icon, dc.hdc(), (0, 0), ILD_TRANSPARENT);
+                }
                 shared
                     .done
                     .lock()
@@ -393,7 +405,7 @@ fn load_thread(shared: &Shared) {
             }
             Some(Job::Shrink(key)) => {
                 let (list, icon, side) = key;
-                let picture = make_shrunk(list as HIMAGELIST, icon, side);
+                let picture = list_of(list).and_then(|list| make_shrunk(list, icon, side));
                 shared
                     .shrunk
                     .lock()
@@ -452,9 +464,9 @@ fn next_job(shared: &Shared) -> Option<Job> {
 /// `bigicon::render` does), then shrunk. `None` if the list's icons are
 /// not bigger than `side`, or it could not be drawn. Loads the icon if the
 /// list has not.
-fn make_shrunk(list: HIMAGELIST, icon: i32, side: i32) -> Option<Bitmap> {
+fn make_shrunk(list: SystemList, icon: i32, side: i32) -> Option<Bitmap> {
     // The size of a system image list.
-    let (cx, cy) = imagelist::icon_size(list).unwrap_or((0, 0));
+    let (cx, cy) = imagelist::icon_size(&list).unwrap_or((0, 0));
     if cx != cy || cx <= side || side <= 0 {
         return None;
     }
@@ -466,7 +478,7 @@ fn make_shrunk(list: HIMAGELIST, icon: i32, side: i32) -> Option<Bitmap> {
         let mut drawn = true;
         for back in [[0, 0, 0, 0], [255, 255, 255, 0]] {
             scratch.fill(back);
-            if !imagelist::draw(list, icon, scratch.hdc(), (0, 0), ILD_TRANSPARENT) {
+            if !imagelist::draw(&list, icon, scratch.hdc(), (0, 0), ILD_TRANSPARENT) {
                 drawn = false;
                 break;
             }

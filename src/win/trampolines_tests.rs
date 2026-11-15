@@ -451,3 +451,51 @@ fn a_queued_message_is_taken_and_dispatched_once() {
     assert_eq!(got.borrow().last(), Some(&(WM_COMMAND, 0x1_0009)));
     super::destroy(hwnd);
 }
+
+#[test]
+fn a_control_keeps_the_image_lists_it_shows_alive() {
+    use super::imagelist::{self, ImageList};
+    use super::{lv, tv};
+    use windows_sys::Win32::UI::Controls::{
+        ILC_COLOR32, LVSIL_NORMAL, LVSIL_SMALL, TVM_GETIMAGELIST, TVSIL_NORMAL,
+    };
+    let list = || ImageList::create(16, 16, ILC_COLOR32, 1, 1).expect("an image list");
+    // A list view takes a list whole, never one held elsewhere too.
+    let (view, parent) = hidden_control(lv::CLASS, 0);
+    let shared = list();
+    assert!(!lv::set_image_list(
+        view,
+        LVSIL_NORMAL,
+        Some(shared.clone())
+    ));
+    assert!(lv::set_image_list(view, LVSIL_NORMAL, Some(list())));
+    // Replaced: the one before is goz-gui's again (and destroyed).
+    assert!(lv::set_image_list(view, LVSIL_NORMAL, Some(shared)));
+    assert!(lv::set_image_list(view, LVSIL_NORMAL, None));
+    // A system list goes in with a reference of its own.
+    let small = imagelist::system(1).expect("the small icons");
+    assert!(lv::set_system_image_list(view, LVSIL_SMALL, small));
+    assert!(lv::set_system_image_list(view, LVSIL_SMALL, small));
+    super::destroy(parent);
+    assert!(
+        imagelist::icon_size(&small).is_some(),
+        "the system list lives"
+    );
+    // A tree shows a list that goz-gui let go: the tree keeps it.
+    let (tree, parent) = hidden_control(tv::CLASS, 0);
+    let mine = list();
+    assert!(tv::set_image_list(tree, TVSIL_NORMAL, Some(&mine)));
+    drop(mine);
+    // SAFETY: TVM_GETIMAGELIST takes a kind and gives a handle.
+    let shown = unsafe { super::send_raw(tree, TVM_GETIMAGELIST, TVSIL_NORMAL as usize, 0) };
+    assert_ne!(shown, 0);
+    let mut size = (0, 0);
+    // SAFETY: the list the tree shows, which `tv::set_image_list` keeps
+    // alive while it does; two out-values.
+    let ok = unsafe {
+        windows_sys::Win32::UI::Controls::ImageList_GetIconSize(shown, &mut size.0, &mut size.1)
+    };
+    assert!(ok != 0 && size == (16, 16));
+    assert!(!tv::set_image_list(view, TVSIL_NORMAL, None), "gone");
+    super::destroy(parent);
+}

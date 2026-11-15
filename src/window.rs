@@ -53,6 +53,7 @@ use crate::thumbs::{ThumbReply, Thumbs};
 use crate::typeahead::TypeAhead;
 use crate::view::View;
 use crate::win::class::{self, Class, Create};
+use crate::win::icon::Icon;
 use crate::win::{self, Msg, gdi, lv, parcel, queue, subclass, sys};
 use crate::{
     dialog, dropdown, format, header, hover, keys, menu, msgbox, paint, places, searchbox, shell,
@@ -379,7 +380,7 @@ pub struct App {
     /// as an action that took only the rows held of a selection.
     note: RefCell<Option<String>>,
     /// The title bar and taskbar icons made for the window's DPI.
-    window_icons: Cell<[HICON; 2]>,
+    window_icons: RefCell<[Option<Icon>; 2]>,
     menus: menu::Bar,
     on_top: Cell<OnTop>,
     opts: Cell<Options>,
@@ -440,9 +441,6 @@ pub struct App {
     view: Cell<View>,
     /// The thumbnails made, and the thread making them.
     pub thumbs: Thumbs,
-    /// The system's icon lists (HIMAGELIST) by `SHIL_*`: 32, 16, 48 and
-    /// 256 px (and 16 again, by the system's metrics), once asked.
-    big_icons: Cell<[usize; 5]>,
     /// Their icons not loaded yet, loaded on a thread (`bigicons.rs`).
     big_loads: crate::bigicons::BigIcons,
     /// The icon view's layout while the list paints (taken as it starts).
@@ -717,8 +715,9 @@ See Help > Search Syntax and the README for goz-gui's switches."
         // Double-clicks reach the status bar's indicators.
         style: CS_DBLCLKS,
         cursor: sys::system_cursor(IDC_ARROW),
-        icon: app_icon(sys::metric(SM_CXICON)),
-        icon_small: app_icon(sys::metric(SM_CXSMICON)),
+        // Kept by the class for the process.
+        icon: app_icon(sys::metric(SM_CXICON)).map_or(core::ptr::null_mut(), Icon::leak),
+        icon_small: app_icon(sys::metric(SM_CXSMICON)).map_or(core::ptr::null_mut(), Icon::leak),
         background: core::ptr::null_mut(),
     }
     .register();
@@ -921,9 +920,8 @@ pub fn app_of(main: HWND) -> Option<&'static App> {
 
 /// goz-gui's icon, resource 1 (build.rs embeds it), at `size` pixels; null
 /// if the build has none.
-pub fn app_icon(size: i32) -> HICON {
-    // A resource of this module by its id; a missing one is reported as
-    // null, which callers accept.
+pub fn app_icon(size: i32) -> Option<Icon> {
+    // A resource of this module by its id; `None` for a missing one.
     win::icon::from_module(1, size)
 }
 
@@ -1083,7 +1081,7 @@ impl App {
             bookmark_dialog: Cell::new(false),
             runs,
             note: RefCell::new(None),
-            window_icons: Cell::new([core::ptr::null_mut(); 2]),
+            window_icons: RefCell::new([None, None]),
             menus,
             on_top: Cell::new(on_top),
             opts: Cell::new(opts),
@@ -1115,7 +1113,6 @@ impl App {
             taskbar_created: crate::tray::taskbar_created(),
             view: Cell::new(s.view),
             thumbs: Thumbs::new(hwnd, WM_THUMB),
-            big_icons: Cell::new([0; 5]),
             big_loads: crate::bigicons::BigIcons::new(hwnd, thumbview::WM_BIG_ICONS),
             thumb_grid: Cell::new(None),
             view_hot: Cell::new(None),
@@ -1267,26 +1264,30 @@ impl App {
     fn set_window_icons(&self) {
         // The monitor's own: the title bar and the taskbar are Windows'.
         let dpi = self.system_dpi();
-        let old = self.window_icons.get();
-        // The icons are this module's resource.
-        let new = [
+        // The icons are this module's resource; one made here and given to
+        // no one is destroyed as it drops.
+        let (Some(small), Some(big)) = (
             app_icon(sys::metric_for_dpi(SM_CXSMICON, dpi)),
             app_icon(sys::metric_for_dpi(SM_CXICON, dpi)),
-        ];
-        if new.iter().any(|i| i.is_null()) {
-            // Icons made above and given to no one.
-            for icon in new.into_iter().filter(|i| !i.is_null()) {
-                gdi::destroy_icon(icon);
-            }
+        ) else {
             return;
-        }
-        win::send_plain(self.hwnd, WM_SETICON, ICON_SMALL as usize, new[0] as isize);
-        win::send_plain(self.hwnd, WM_SETICON, ICON_BIG as usize, new[1] as isize);
-        self.window_icons.set(new);
-        // Icons this window no longer uses, made by this function.
-        for icon in old.into_iter().filter(|i| !i.is_null()) {
-            gdi::destroy_icon(icon);
-        }
+        };
+        win::send_plain(
+            self.hwnd,
+            WM_SETICON,
+            ICON_SMALL as usize,
+            small.handle() as isize,
+        );
+        win::send_plain(
+            self.hwnd,
+            WM_SETICON,
+            ICON_BIG as usize,
+            big.handle() as isize,
+        );
+        // The icons this window no longer uses, made by this function, are
+        // destroyed as they drop.
+        let old = self.window_icons.replace([Some(small), Some(big)]);
+        drop(old);
     }
 
     pub fn theme_mode(&self) -> ThemeMode {

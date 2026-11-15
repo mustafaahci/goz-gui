@@ -25,8 +25,7 @@ pub use organize::organize;
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::UI::Controls::{
-    HIMAGELIST, HTREEITEM, TVE_EXPAND, TVGN_CARET, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE,
-    TVITEMEXW,
+    HTREEITEM, TVE_EXPAND, TVGN_CARET, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE, TVITEMEXW,
 };
 use windows_sys::Win32::UI::Shell::{SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -37,6 +36,7 @@ use crate::bookmarks::ops::Op;
 use crate::bookmarks::tree::{Item, TOP, Tree};
 use crate::bookmarks::{Bookmarks, FolderPath, Settings, within};
 use crate::msgbox;
+use crate::win::imagelist::SystemList;
 use crate::win::{self, dlg, tv};
 
 /// Posted to an open Find or Organize dialog when the bookmarks changed
@@ -95,8 +95,8 @@ fn ask(owner: HWND, title: &str, text: &str) -> bool {
 /// plain file's for a bookmark (Everything's bookmark icon is a page too).
 #[derive(Clone, Copy)]
 struct Icons {
-    /// The system's small image list (shared: never destroyed here).
-    list: HIMAGELIST,
+    /// The system's small image list (`None` if the shell could not say).
+    list: Option<SystemList>,
     folder: i32,
     bookmark: i32,
 }
@@ -107,12 +107,12 @@ fn icons() -> Icons {
         let name: Vec<u16> = name.encode_utf16().collect();
         win::icon::sys_icon(&name, attributes, SHGFI_USEFILEATTRIBUTES | SHGFI_SMALLICON)
     };
-    let (list, folder) = lookup("folder", FILE_ATTRIBUTE_DIRECTORY);
-    let (_, bookmark) = lookup("bookmark", FILE_ATTRIBUTE_NORMAL);
+    let folder = lookup("folder", FILE_ATTRIBUTE_DIRECTORY);
+    let bookmark = lookup("bookmark", FILE_ATTRIBUTE_NORMAL);
     Icons {
-        list,
-        folder,
-        bookmark,
+        list: folder.map(|(list, _)| list),
+        folder: folder.map_or(0, |(_, i)| i),
+        bookmark: bookmark.map_or(0, |(_, i)| i),
     }
 }
 

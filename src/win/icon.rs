@@ -3,16 +3,17 @@
 //! image lists' entries.
 
 use windows_sys::Win32::Graphics::Gdi::DeleteObject;
-use windows_sys::Win32::UI::Controls::{HIMAGELIST, LoadIconWithScaleDown};
+use windows_sys::Win32::UI::Controls::LoadIconWithScaleDown;
 use windows_sys::Win32::UI::Shell::{
-    SHDefExtractIconW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_SYSICONINDEX, SHGSI_ICONLOCATION,
-    SHGSI_SYSICONINDEX, SHGetStockIconInfo, SHSTOCKICONID, SHSTOCKICONINFO,
-    Shell_GetCachedImageIndexW,
+    SHDefExtractIconW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
+    SHGSI_ICONLOCATION, SHGSI_SYSICONINDEX, SHGetStockIconInfo, SHIL_LARGE, SHIL_SMALL,
+    SHSTOCKICONID, SHSTOCKICONINFO, Shell_GetCachedImageIndexW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, GetIconInfo, HICON, ICONINFO, IMAGE_ICON, LR_DEFAULTCOLOR, LoadIconW, LoadImageW,
 };
 
+use super::imagelist::SystemList;
 use super::{nul_ended, until_nul};
 
 /// A resource id (MAKEINTRESOURCE) as the name pointer a call takes: the
@@ -50,6 +51,14 @@ impl Icon {
     /// The icon's handle, to draw with (it stays this icon's).
     pub fn handle(&self) -> HICON {
         self.0
+    }
+
+    /// Gives the icon up for the rest of the process, never destroyed: for
+    /// a window class, which keeps the icons it is registered with.
+    pub fn leak(self) -> HICON {
+        let icon = self.0;
+        core::mem::forget(self);
+        icon
     }
 
     /// The width of its image, in pixels.
@@ -112,24 +121,34 @@ pub fn cached_image_index(file: &[u16], index: i32) -> i32 {
     unsafe { Shell_GetCachedImageIndexW(file.as_ptr(), index, 0) }
 }
 
-/// The system image list (null if the shell could not say) and the
-/// index in it of the icon of `path` (SHGetFileInfoW with
-/// SHGFI_SYSICONINDEX and `flags`, such as SHGFI_SMALLICON, or
-/// SHGFI_USEFILEATTRIBUTES with `attributes`). SHGFI_ICON is ignored: no
-/// icon is made.
-pub fn sys_icon(path: &[u16], attributes: u32, flags: SHGFI_FLAGS) -> (HIMAGELIST, i32) {
+/// The system image list and the index in it of the icon of `path`
+/// (SHGetFileInfoW with SHGFI_SYSICONINDEX and `flags`, such as
+/// SHGFI_SMALLICON, or SHGFI_USEFILEATTRIBUTES with `attributes`); `None`
+/// if the shell could not say. The list is the small icons' with
+/// SHGFI_SMALLICON, else the large ones' (the shell numbers its icons alike
+/// in all of its lists). SHGFI_ICON is ignored: no icon is made.
+pub fn sys_icon(path: &[u16], attributes: u32, flags: SHGFI_FLAGS) -> Option<(SystemList, i32)> {
     let flags = (flags & !SHGFI_ICON) | SHGFI_SYSICONINDEX;
     let (list, info) = super::shell::file_info(path, attributes, flags);
-    (list as HIMAGELIST, info.iIcon)
+    if list == 0 {
+        return None;
+    }
+    let which = if flags & SHGFI_SMALLICON != 0 {
+        SHIL_SMALL
+    } else {
+        SHIL_LARGE
+    };
+    Some((super::imagelist::system(which as i32)?, info.iIcon))
 }
 
 /// Icon resource `id` of this program (one build.rs embeds) at `size`
-/// pixels; null if there is none. The caller owns it (`gdi::destroy_icon`).
-pub fn from_module(id: u16, size: i32) -> HICON {
+/// pixels, destroyed when it drops; `None` if there is none.
+pub fn from_module(id: u16, size: i32) -> Option<Icon> {
     let name = core::ptr::without_provenance(usize::from(id));
     // SAFETY: MAKEINTRESOURCE(id): an id below 0x10000 as the name, which
-    // LoadImageW reads as an id, never as a string.
-    unsafe {
+    // LoadImageW reads as an id, never as a string. Without LR_SHARED the
+    // icon is the caller's to destroy.
+    let icon = unsafe {
         LoadImageW(
             super::class::module(),
             name,
@@ -138,7 +157,8 @@ pub fn from_module(id: u16, size: i32) -> HICON {
             size,
             LR_DEFAULTCOLOR,
         )
-    }
+    };
+    Icon::own(icon)
 }
 
 /// One of the system's icons (IDI_APPLICATION…, as a number), shared:

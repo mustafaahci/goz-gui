@@ -135,6 +135,15 @@ pub fn class_is(hwnd: HWND, name: &str) -> bool {
     want.next().is_none()
 }
 
+/// Whether `hwnd` is a window of the calling thread (false for one that is
+/// not there).
+pub(crate) fn is_this_thread(hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    // SAFETY: no pointers (no process id asked for).
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, core::ptr::null_mut()) };
+    thread != 0 && thread == sys::thread_id()
+}
+
 /// A pointer to the units of `s` for a call that takes a pointer and a
 /// length: a real address even when `s` is empty. An empty slice's own
 /// pointer is dangling (fine for Rust, as nothing is read), but parts of

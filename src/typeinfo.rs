@@ -34,10 +34,11 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Threading::INFINITE;
-use windows_sys::Win32::UI::Controls::{HIMAGELIST, ILD_TRANSPARENT};
+use windows_sys::Win32::UI::Controls::ILD_TRANSPARENT;
 
 use crate::filetype::{self, Key};
 use crate::win::com::Apartment;
+use crate::win::imagelist::SystemList;
 use crate::win::sync::Event;
 use crate::win::{self, gdi, imagelist};
 
@@ -117,7 +118,7 @@ struct Shared {
     hwnd: usize,
     msg: u32,
     /// The system image list of small icons, which the window draws from.
-    list: usize,
+    list: Option<SystemList>,
 }
 
 pub struct TypeInfo {
@@ -137,7 +138,13 @@ impl TypeInfo {
     /// system image list the window draws the answers' icons from; the
     /// thread starts now and loads `first` from it (the icons drawn before
     /// any answer comes).
-    pub fn new(hwnd: HWND, msg: u32, ask_msg: u32, list: HIMAGELIST, first: Vec<i32>) -> TypeInfo {
+    pub fn new(
+        hwnd: HWND,
+        msg: u32,
+        ask_msg: u32,
+        list: Option<SystemList>,
+        first: Vec<i32>,
+    ) -> TypeInfo {
         // A manual-reset event.
         let work = Event::new(true, false).expect("CreateEventW failed");
         let info = TypeInfo {
@@ -148,7 +155,7 @@ impl TypeInfo {
                 work,
                 hwnd: hwnd as usize,
                 msg,
-                list: list as usize,
+                list,
             }),
             book: RefCell::new(Book::default()),
             ask_msg,
@@ -264,7 +271,9 @@ fn lookup_thread(shared: &Shared, first: Vec<i32>) {
         if icon >= 0 && loaded.insert(icon) {
             // The system image list lives as long as the process, and takes
             // draws from any thread.
-            imagelist::draw(shared.list as HIMAGELIST, icon, dc, (0, 0), ILD_TRANSPARENT);
+            if let Some(list) = shared.list {
+                imagelist::draw(&list, icon, dc, (0, 0), ILD_TRANSPARENT);
+            }
         }
     };
     for icon in first {

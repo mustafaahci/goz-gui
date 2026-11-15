@@ -204,7 +204,9 @@ fn pick_proc(s: &Pick<'_>, m: &Msg) -> isize {
     match m.id {
         WM_INITDIALOG => {
             let view = dlg::item(dlg, ID_TREE);
-            tv::set_image_list(view, TVSIL_NORMAL, s.icons.list);
+            if let Some(icons) = s.icons.list {
+                tv::set_system_image_list(view, TVSIL_NORMAL, icons);
+            }
             let made = fill_tree(view, s.tree, s.skip, s.icons);
             tree_select(view, &made, s.select);
             *s.made.borrow_mut() = made;

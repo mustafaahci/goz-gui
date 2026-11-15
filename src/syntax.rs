@@ -271,19 +271,27 @@ pub fn show(owner: HWND, dark: bool) {
     // with it; loading new ones for a registration that would fail leaks
     // them, two icons per opening.
     if !win::class::is_registered(CLASS) {
+        let icons = [
+            app_icon(sys::metric(SM_CXICON)),
+            app_icon(sys::metric(SM_CXSMICON)),
+        ];
+        let handle = |i: &Option<win::icon::Icon>| {
+            i.as_ref()
+                .map_or(core::ptr::null_mut(), win::icon::Icon::handle)
+        };
         let c = class::Class {
             cursor: sys::system_cursor(IDC_ARROW),
-            icon: app_icon(sys::metric(SM_CXICON)),
-            icon_small: app_icon(sys::metric(SM_CXSMICON)),
+            icon: handle(&icons[0]),
+            icon_small: handle(&icons[1]),
             ..class::Class::new(CLASS)
         };
         if !c.register() {
-            for icon in [c.icon, c.icon_small] {
-                if !icon.is_null() {
-                    gdi::destroy_icon(icon);
-                }
-            }
+            // Given to no class: destroyed as they drop.
             return;
+        }
+        // Kept by the class for the process.
+        for icon in icons.into_iter().flatten() {
+            icon.leak();
         }
     }
     // Centred on the main window, at its scale; then where it was last

@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows_sys::Win32::System::Threading::INFINITE;
-use windows_sys::Win32::UI::Controls::HIMAGELIST;
 use windows_sys::Win32::UI::Shell::{SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SIID_DOCNOASSOC};
 
 use crate::client::Row;
@@ -23,6 +22,7 @@ use crate::typeinfo::TypeInfo;
 use crate::win;
 use crate::win::com::Apartment;
 use crate::win::icon;
+use crate::win::imagelist::SystemList;
 use crate::win::parcel;
 use crate::win::sync::Event;
 
@@ -70,7 +70,8 @@ struct Shared {
 }
 
 pub struct Icons {
-    pub list: HIMAGELIST,
+    /// The shell's small icons (`None` if the shell could not say).
+    pub list: Option<SystemList>,
     folder: i32,
     /// A file's icon while its type's is looked up: the document of no
     /// known type (the shell's stock icon), asked for as the window starts.
@@ -91,7 +92,8 @@ impl Icons {
             &win::wz("folder"),
             FILE_ATTRIBUTE_DIRECTORY,
             SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
-        );
+        )
+        .map_or((None, 0), |(list, folder)| (Some(list), folder));
         // The stock icon's index only (0.3 ms; the same lookup by the name
         // "file" took 2.5 to 3.4 ms).
         let generic = icon::stock_index(SIID_DOCNOASSOC).map_or(0, |i| i.max(0));
@@ -229,12 +231,11 @@ fn icon_thread(shared: &Shared) {
             }
             continue;
         };
-        let (list, icon) = icon::sys_icon(&path, 0, SHGFI_SMALLICON);
-        let ok = list != 0;
+        let found = icon::sys_icon(&path, 0, SHGFI_SMALLICON);
         let reply = IconReply {
             epoch,
             index,
-            icon: if ok { icon } else { GENERIC },
+            icon: found.map_or(GENERIC, |(_, icon)| icon),
         };
         // The window takes the reply once posted; it is dropped if not.
         parcel::post(shared.hwnd as HWND, shared.msg, 0, reply);

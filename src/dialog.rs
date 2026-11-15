@@ -43,8 +43,7 @@ use crate::win::class::{Create, create_plain, id_menu};
 use crate::win::hook::{self, Event, Hook, Kind};
 use crate::win::uxtheme::{self, Theme};
 use crate::win::{
-    self, Msg, Notify, button, combo, dlg, edit, gdi, header, imagelist, listbox, lv, subclass,
-    sys, tv,
+    self, Msg, Notify, button, combo, dlg, edit, gdi, header, listbox, lv, subclass, sys, tv,
 };
 
 pub use crate::win::dlg::{Class, Template};
@@ -799,25 +798,23 @@ fn paint_selected_row(list: HWND, hdc: HDC, row: i32) {
         if focused { pal.sel } else { pal.sel_inactive },
     );
     // The row's icon, when the list has them.
-    let images = lv::image_list(list, LVSIL_SMALL);
-    if images != 0 {
-        let it = LVITEMW {
-            mask: LVIF_IMAGE,
-            iItem: row,
-            ..Default::default()
-        };
-        if let Some((it, _)) = lv::get_item(list, it, 0)
-            && it.iImage >= 0
-            && let Some(icon) = lv::item_rect(list, row, LVIR_ICON as i32)
-        {
-            imagelist::draw(
-                images,
-                it.iImage,
-                hdc,
-                (icon.left, icon.top),
-                ILD_TRANSPARENT,
-            );
-        }
+    let it = LVITEMW {
+        mask: LVIF_IMAGE,
+        iItem: row,
+        ..Default::default()
+    };
+    if let Some((it, _)) = lv::get_item(list, it, 0)
+        && it.iImage >= 0
+        && let Some(icon) = lv::item_rect(list, row, LVIR_ICON as i32)
+    {
+        lv::draw_image(
+            list,
+            LVSIL_SMALL,
+            it.iImage,
+            hdc,
+            (icon.left, icon.top),
+            ILD_TRANSPARENT,
+        );
     }
     let columns = header::item_count(lv::header(list)) as i32;
     let pad = |v: i32| v * crate::custom::window_dpi(list) as i32 / 96;

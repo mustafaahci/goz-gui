@@ -284,7 +284,9 @@ impl Organize<'_> {
         let list = Organize::list_view(dlg);
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
         lv::set_extended_style(list, ex, ex);
-        lv::set_image_list(list, LVSIL_SMALL, self.icons.list);
+        if let Some(icons) = self.icons.list {
+            lv::set_system_image_list(list, LVSIL_SMALL, icons);
+        }
         let dpi = crate::custom::window_dpi(dlg) as i32;
         for (i, (title, width)) in COLUMNS.into_iter().enumerate() {
             let col = LVCOLUMNW {
@@ -295,7 +297,9 @@ impl Organize<'_> {
             lv::insert_column(list, i as i32, col, Some(title));
         }
         let tree = Organize::tree_view(dlg);
-        tv::set_image_list(tree, TVSIL_NORMAL, self.icons.list);
+        if let Some(icons) = self.icons.list {
+            tv::set_system_image_list(tree, TVSIL_NORMAL, icons);
+        }
         tv::set_extended_style(tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
         // The list outlives the box (both go with the dialog), and the
         // subclass goes with the box.
