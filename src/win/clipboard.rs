@@ -13,7 +13,6 @@ use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows_sys::Win32::System::Ole::{CF_HDROP, CF_TEXT, CF_UNICODETEXT};
-use windows_sys::Win32::UI::Shell::HDROP;
 
 use super::wz;
 
@@ -76,16 +75,13 @@ impl Clipboard {
     }
 
     /// The paths of the files on it (CF_HDROP); empty when it holds none.
+    /// Read from a copy of the block, no further than its size: another
+    /// program put it there, and DragQueryFileW would walk it for its
+    /// NULs without a bound.
     pub fn files(&self) -> Vec<Vec<u16>> {
-        // SAFETY: the clipboard is open; the handle stays its own while it
-        // is.
-        let drop = unsafe { GetClipboardData(u32::from(CF_HDROP)) } as HDROP;
-        if drop.is_null() {
-            return Vec::new();
-        }
-        // SAFETY: the clipboard's CF_HDROP, valid while it is open (for
-        // the call), and not freed here (it stays the clipboard's).
-        unsafe { super::dropfiles::read_paths(drop) }
+        self.data(u32::from(CF_HDROP))
+            .map(|bytes| drop_paths(&bytes))
+            .unwrap_or_default()
     }
 
     /// Puts `data` on it as `format` (text, CF_HDROP or a registered
@@ -115,6 +111,54 @@ impl Clipboard {
             ok
         }
     }
+}
+
+/// The paths a DROPFILES block holds (a CF_HDROP's): its header, then from
+/// its `pFiles` offset the paths, each NUL-terminated, an empty one last,
+/// in UTF-16 (`fWide`) or the ANSI code page. Read no further than
+/// `bytes`, whatever the header says: a path cut off by its end is left
+/// out.
+fn drop_paths(bytes: &[u8]) -> Vec<Vec<u16>> {
+    /// DROPFILES: pFiles (4 bytes), pt (8), fNC (4), fWide (4).
+    const HEADER: usize = 20;
+    let word = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if bytes.len() < HEADER {
+        return Vec::new();
+    }
+    let Some(list) = bytes.get(word(0) as usize..) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if word(16) != 0 {
+        let units: Vec<u16> = list
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| u16::from_le_bytes(b))
+            .collect();
+        let mut rest = units.as_slice();
+        while let Some(end) = rest.iter().position(|&u| u == 0) {
+            if end == 0 {
+                break;
+            }
+            out.push(rest[..end].to_vec());
+            rest = &rest[end + 1..];
+        }
+    } else {
+        let mut rest = list;
+        while let Some(end) = rest.iter().position(|&b| b == 0) {
+            if end == 0 {
+                break;
+            }
+            out.push(super::locale::ansi_to_wide(&rest[..end]));
+            rest = &rest[end + 1..];
+        }
+    }
+    out
 }
 
 impl Drop for Clipboard {
@@ -147,6 +191,33 @@ pub fn register_format(name: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drop_is_read_within_its_block() {
+        let head = |offset: u32, wide: bool| {
+            let mut b = offset.to_le_bytes().to_vec();
+            b.extend([0; 12]);
+            b.extend(u32::from(wide).to_le_bytes());
+            b
+        };
+        let units = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        // UTF-16: two paths, then the empty one.
+        let mut wide = head(20, true);
+        for u in units("C:\\a\0D:\\b c\0\0") {
+            wide.extend(u.to_le_bytes());
+        }
+        assert_eq!(drop_paths(&wide), vec![units(r"C:\a"), units(r"D:\b c")]);
+        // Cut off before its NUL: the last path is left out, nothing read
+        // past the end.
+        assert_eq!(drop_paths(&wide[..wide.len() - 8]), vec![units(r"C:\a")]);
+        // ANSI.
+        let mut ansi = head(20, false);
+        ansi.extend(b"C:\\x\0\0");
+        assert_eq!(drop_paths(&ansi), vec![units(r"C:\x")]);
+        // An offset past the end, or a block too small for its header.
+        assert!(drop_paths(&head(4000, true)).is_empty());
+        assert!(drop_paths(&[1, 2, 3]).is_empty());
+    }
 
     #[test]
     fn only_global_memory_formats_are_read_or_put() {
