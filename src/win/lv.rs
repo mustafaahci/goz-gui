@@ -11,16 +11,17 @@ use windows_sys::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::UI::Controls::{
     HIMAGELIST, IMAGE_LIST_DRAW_STYLE, ImageList_Draw, LVCF_TEXT, LVCOLUMNW, LVHITTESTINFO,
-    LVIF_COLFMT, LVIF_COLUMNS, LVIF_TEXT, LVITEMW, LVM_ARRANGE, LVM_CANCELEDITLABEL,
-    LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_EDITLABELW, LVM_ENSUREVISIBLE,
+    LVIF_COLFMT, LVIF_COLUMNS, LVIF_NORECOMPUTE, LVIF_TEXT, LVITEMW, LVM_ARRANGE,
+    LVM_CANCELEDITLABEL, LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_EDITLABELW, LVM_ENSUREVISIBLE,
     LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNW, LVM_GETCOLUMNWIDTH, LVM_GETCOUNTPERPAGE,
     LVM_GETEDITCONTROL, LVM_GETHEADER, LVM_GETHOTITEM, LVM_GETIMAGELIST, LVM_GETITEMCOUNT,
-    LVM_GETITEMRECT, LVM_GETITEMSPACING, LVM_GETITEMSTATE, LVM_GETITEMW, LVM_GETNEXTITEM,
-    LVM_GETSELECTEDCOUNT, LVM_GETSELECTIONMARK, LVM_GETSTRINGWIDTHW, LVM_GETSUBITEMRECT,
-    LVM_GETTOPINDEX, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_REDRAWITEMS, LVM_SCROLL,
-    LVM_SETBKCOLOR, LVM_SETCOLUMNORDERARRAY, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETICONSPACING, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
-    LVM_SETSELECTIONMARK, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVM_SUBITEMHITTEST,
+    LVM_GETITEMRECT, LVM_GETITEMSPACING, LVM_GETITEMSTATE, LVM_GETITEMTEXTW, LVM_GETITEMW,
+    LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_GETSELECTIONMARK, LVM_GETSTRINGWIDTHW,
+    LVM_GETSUBITEMRECT, LVM_GETTOPINDEX, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETBKCOLOR, LVM_SETCOLUMNORDERARRAY, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETICONSPACING, LVM_SETIMAGELIST, LVM_SETITEMCOUNT,
+    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SETSELECTIONMARK, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
+    LVM_SUBITEMHITTEST,
 };
 
 use super::imagelist::{ImageList, SystemList};
@@ -430,10 +431,12 @@ pub fn string_width(lv: HWND, text: &str) -> i32 {
 
 /// An item's text, and the text-free fields `item` asks for (LVIF_*): the
 /// item `item.iItem`, subitem `item.iSubItem`. The text is the item's when
-/// `item.mask` has LVIF_TEXT, up to `max` units.
+/// `item.mask` has LVIF_TEXT, up to `max` units. LVIF_NORECOMPUTE is
+/// dropped: with it a callback item's text comes back as the
+/// LPSTR_TEXTCALLBACKW marker, not a pointer.
 pub fn get_item(lv: HWND, item: LVITEMW, max: usize) -> Option<(LVITEMW, Option<String>)> {
     let mut it = item;
-    it.mask &= !(LVIF_COLUMNS | LVIF_COLFMT);
+    it.mask &= !(LVIF_COLUMNS | LVIF_COLFMT | LVIF_NORECOMPUTE);
     it.puColumns = core::ptr::null_mut();
     it.piColFmt = core::ptr::null_mut();
     let mut buf = vec![
@@ -459,9 +462,12 @@ pub fn get_item(lv: HWND, item: LVITEMW, max: usize) -> Option<(LVITEMW, Option<
 }
 
 /// The text an LVITEMW came back with: in the buffer, or (for a callback
-/// list) where the list pointed instead.
+/// list) where the list pointed instead; none for the callback marker
+/// (LPSTR_TEXTCALLBACKW, -1), which is no pointer.
 fn text_of(it: &LVITEMW, buf: &[u16]) -> String {
-    if it.pszText == buf.as_ptr().cast_mut() || it.pszText.is_null() {
+    if it.pszText as isize == -1 {
+        String::new()
+    } else if it.pszText == buf.as_ptr().cast_mut() || it.pszText.is_null() {
         String::from_utf16_lossy(super::until_nul(buf))
     } else {
         // SAFETY: a list may point pszText at its own NUL-terminated copy,
@@ -472,17 +478,30 @@ fn text_of(it: &LVITEMW, buf: &[u16]) -> String {
     }
 }
 
-/// The text of subitem `sub` of item `item`, up to `max` units.
+/// The text of subitem `sub` of item `item`, up to `max` units
+/// (LVM_GETITEMTEXTW, which copies it into the buffer given whatever the
+/// item's text is: the list's, or a callback's).
 pub fn item_text(lv: HWND, item: i32, sub: i32, max: usize) -> String {
+    let mut buf = vec![0u16; max.max(1)];
     let it = LVITEMW {
-        mask: LVIF_TEXT,
-        iItem: item,
         iSubItem: sub,
+        pszText: buf.as_mut_ptr(),
+        cchTextMax: super::len_i32(buf.len()),
         ..Default::default()
     };
-    get_item(lv, it, max)
-        .and_then(|(_, t)| t)
-        .unwrap_or_default()
+    // SAFETY: LVM_GETITEMTEXTW's lParam is an LVITEMW whose subitem and
+    // text buffer of cchTextMax units it reads, the buffer written (the
+    // text copied in, cut to fit, NUL-terminated).
+    let n = unsafe {
+        send(
+            lv,
+            LVM_GETITEMTEXTW,
+            item as isize as usize,
+            (&raw const it) as isize,
+        )
+    };
+    let n = usize::try_from(n).unwrap_or(0).min(buf.len());
+    String::from_utf16_lossy(super::until_nul(&buf[..n]))
 }
 
 /// Inserts `item` (at `item.iItem`), with `text`; its index, -1 if not.

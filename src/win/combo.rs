@@ -3,8 +3,8 @@
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Controls::{COMBOBOXINFO, GetComboBoxInfo};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CB_ADDSTRING, CB_DELETESTRING, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_RESETCONTENT,
-    CB_SELECTSTRING, CB_SETCURSEL, CB_SETEDITSEL,
+    CB_ADDSTRING, CB_DELETESTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SELECTSTRING, CB_SETCURSEL,
+    CB_SETEDITSEL,
 };
 
 fn send_int(c: HWND, msg: u32, w: usize, l: isize) -> isize {
@@ -40,27 +40,23 @@ pub fn set_cur_sel(c: HWND, i: i32) -> i32 {
     send_int(c, CB_SETCURSEL, i as isize as usize, 0) as i32
 }
 
-/// The text of item `i` (empty if there is none).
+/// The text of item `i` of combo box `c`, one of this thread (empty if
+/// there is none, or `c` is not one).
+///
+/// CB_GETLBTEXT takes a buffer but not its length, which CB_GETLBTEXTLEN
+/// is asked for first, and the box asks both of its list with messages:
+/// a subclass of the box or of its list could answer the length with less
+/// than the text. So both are asked of the list (the box's ComboLBox,
+/// from GetComboBoxInfo) through the ComboLBox class's own procedure,
+/// called directly, with no subclass in between.
 pub fn text(c: HWND, i: i32) -> String {
-    let len = send_int(c, CB_GETLBTEXTLEN, i as isize as usize, 0);
-    let Ok(len) = usize::try_from(len) else {
+    let Some(list) = info(c).map(|ci| ci.hwndList) else {
         return String::new();
     };
-    // Room for the text and its NUL, or for the item's data, which a list
-    // without strings copies instead.
-    let mut buf = vec![0u16; (len + 1).max(8)];
-    // SAFETY: a buffer with room for the text CB_GETLBTEXTLEN measured and
-    // its NUL (or the item data).
-    let n = unsafe {
-        super::send_raw(
-            c,
-            CB_GETLBTEXT,
-            i as isize as usize,
-            buf.as_mut_ptr() as isize,
-        )
-    };
-    let n = usize::try_from(n).unwrap_or(0).min(len);
-    String::from_utf16_lossy(&buf[..n])
+    match super::system_class_proc(list, "ComboLBox") {
+        Some(proc) => super::listbox::text_through(list, proc, i),
+        None => String::new(),
+    }
 }
 
 /// Selects the first item after `after` (-1: from the start) whose text

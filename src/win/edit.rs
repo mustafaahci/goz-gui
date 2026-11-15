@@ -1,5 +1,12 @@
-//! Edit-control messages. EM_* below WM_USER mean the same to every
-//! window; the cue banner (ECM_FIRST and up) is sent only to an edit box.
+//! Edit-control messages. EM_* are below WM_USER, and the ones here other
+//! than EM_CHARFROMPOS mean the same to every window: to an edit box, and
+//! to a Rich Edit, which redefines a few of them (EM_CHARFROMPOS takes a
+//! POINTL's address there, EM_POSFROMCHAR one to write to), checked against
+//! its documentation: EM_GETSEL, EM_SETSEL, EM_REPLACESEL, EM_UNDO,
+//! EM_CANUNDO, EM_SETLIMITTEXT, EM_GETMARGINS, EM_SETMARGINS, EM_SETRECTNP
+//! (its wParam 0: absolute coordinates) and EM_SETTABSTOPS take the same
+//! parameters in both. EM_CHARFROMPOS and the cue banner (ECM_FIRST and
+//! up) are sent only to an edit box.
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::UI::Controls::{
@@ -8,7 +15,7 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-/// The class the cue banner's message is for.
+/// The class the cue banner's and EM_CHARFROMPOS's messages are sent to.
 pub const CLASS: &str = "Edit";
 
 fn send_int(e: HWND, msg: u32, w: usize, l: isize) -> isize {
@@ -97,10 +104,11 @@ pub fn set_limit(e: HWND, units: usize) {
 }
 
 /// EM_CHARFROMPOS: (character index, line) nearest `pt` (client
-/// coordinates).
+/// coordinates), of an edit box (0, 0 for another window). Sent only to an
+/// Edit: a Rich Edit takes EM_CHARFROMPOS's lParam as a POINTL's address.
 pub fn char_from_pos(e: HWND, pt: POINT) -> (u16, u16) {
     let v = send_int(
-        e,
+        super::of_class(e, CLASS),
         EM_CHARFROMPOS,
         0,
         super::make_lparam(pt.x as u16, pt.y as u16),

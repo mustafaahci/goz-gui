@@ -2,8 +2,8 @@
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    LB_ADDSTRING, LB_DELETESTRING, LB_GETCURSEL, LB_GETTEXT, LB_GETTEXTLEN, LB_INSERTSTRING,
-    LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT,
+    CallWindowProcW, LB_ADDSTRING, LB_DELETESTRING, LB_GETCURSEL, LB_GETTEXT, LB_GETTEXTLEN,
+    LB_INSERTSTRING, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT,
 };
 
 fn send_int(lb: HWND, msg: u32, w: usize, l: isize) -> isize {
@@ -53,25 +53,38 @@ pub fn set_cur_sel(lb: HWND, i: i32) -> i32 {
     send_int(lb, LB_SETCURSEL, i as isize as usize, 0) as i32
 }
 
-/// The text of item `i` (empty if there is none).
+/// The text of item `i` of list box `lb`, a ListBox of this thread (empty
+/// if there is none, or `lb` is not one).
+///
+/// LB_GETTEXT takes a buffer but not its length, which LB_GETTEXTLEN is
+/// asked for first: a subclass of the box could answer that with less
+/// than the text. So both go to the ListBox class's own procedure,
+/// called directly, with no subclass in between.
 pub fn text(lb: HWND, i: i32) -> String {
-    let len = send_int(lb, LB_GETTEXTLEN, i as isize as usize, 0);
+    match super::system_class_proc(lb, "ListBox") {
+        Some(proc) => text_through(lb, proc, i),
+        None => String::new(),
+    }
+}
+
+/// The text of item `i` of the list `lb`, asked of `proc`, the list's
+/// class's own procedure (one handling LB_GETTEXTLEN and LB_GETTEXT, the
+/// ListBox's or the ComboLBox's, from [`super::system_class_proc`]).
+pub(crate) fn text_through(lb: HWND, proc: super::WndProc, i: i32) -> String {
+    let w = i as isize as usize;
+    // SAFETY: LB_GETTEXTLEN has an index and no pointer; to the list's own
+    // class procedure, for a window of that class of this thread
+    // (`system_class_proc`).
+    let len = unsafe { CallWindowProcW(Some(proc), lb, LB_GETTEXTLEN, w, 0) };
     let Ok(len) = usize::try_from(len) else {
         return String::new();
     };
     // Room for the text and its NUL, or the item's data, which a list
     // without strings copies instead.
     let mut buf = vec![0u16; (len + 1).max(8)];
-    // SAFETY: a buffer with room for what LB_GETTEXTLEN measured and a NUL
-    // (or the item data).
-    let n = unsafe {
-        super::send_raw(
-            lb,
-            LB_GETTEXT,
-            i as isize as usize,
-            buf.as_mut_ptr() as isize,
-        )
-    };
+    // SAFETY: a buffer with room for what the same procedure measured
+    // above and a NUL (or the item data), nothing having run in between.
+    let n = unsafe { CallWindowProcW(Some(proc), lb, LB_GETTEXT, w, buf.as_mut_ptr() as isize) };
     let n = usize::try_from(n).unwrap_or(0).min(len);
     String::from_utf16_lossy(&buf[..n])
 }

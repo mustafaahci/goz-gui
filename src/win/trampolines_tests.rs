@@ -599,3 +599,100 @@ fn a_tree_item_acts_on_its_own_tree_and_only_while_it_is_there() {
     assert!(!tv::delete_item(b1));
     super::destroy(host_a);
 }
+
+static FORGE: subclass::Key = subclass::Key::new("test forged length");
+
+/// Subclasses `hwnd` to answer `len_msg` with 1, whatever the text: a
+/// length a buffer would be sized by.
+fn forge_length(hwnd: HWND, len_msg: u32) {
+    assert!(subclass::set(hwnd, &FORGE, move |m| {
+        if m.id == len_msg { 1 } else { m.def() }
+    }));
+}
+
+#[test]
+fn a_list_s_text_is_measured_by_its_own_class() {
+    use super::{combo, listbox};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CB_GETLBTEXTLEN, CBS_DROPDOWNLIST, CBS_HASSTRINGS, LB_GETTEXTLEN, LBS_HASSTRINGS,
+    };
+    let long = "a text much longer than the one unit its subclass says";
+    let (lb, parent) = hidden_control("ListBox", LBS_HASSTRINGS as u32);
+    assert_eq!(listbox::add(lb, long), 0);
+    forge_length(lb, LB_GETTEXTLEN);
+    assert_eq!(listbox::text(lb, 0), long);
+    assert_eq!(listbox::text(lb, 5), "");
+    // Not a list box: nothing.
+    assert_eq!(listbox::text(parent, 0), "");
+    super::destroy(parent);
+
+    let (c, parent) = hidden_control("ComboBox", (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32);
+    assert_eq!(combo::add(c, long), 0);
+    forge_length(c, CB_GETLBTEXTLEN);
+    let list = combo::info(c).expect("a combo box").hwndList;
+    forge_length(list, LB_GETTEXTLEN);
+    assert_eq!(combo::text(c, 0), long);
+    assert_eq!(combo::text(parent, 0), "");
+    super::destroy(parent);
+}
+
+#[test]
+fn a_callback_item_s_text_is_copied_never_followed() {
+    use super::lv;
+    use windows_sys::Win32::UI::Controls::{
+        LVIF_NORECOMPUTE, LVIF_TEXT, LVITEMW, LVM_INSERTITEMW, LVN_GETDISPINFOW, LVS_REPORT,
+        NMLVDISPINFOW,
+    };
+    let _ = Class::new(CLASS).register();
+    super::sys::init_common_controls(windows_sys::Win32::UI::Controls::ICC_LISTVIEW_CLASSES);
+    let host = class::create(
+        &Create {
+            ex_style: 0,
+            class: CLASS,
+            title: "",
+            style: WS_POPUP,
+            rect: (0, 0, 200, 200),
+            parent: core::ptr::null_mut(),
+            menu: core::ptr::null_mut(),
+        },
+        |m| {
+            if let Some(n) = m.notify()
+                && n.code() == LVN_GETDISPINFOW
+                && let Some(mut info) = n.get::<NMLVDISPINFOW>()
+            {
+                info.set_text(&"called back".encode_utf16().collect::<Vec<_>>());
+                return 0;
+            }
+            m.def()
+        },
+    );
+    let view = class::create_plain(&Create {
+        ex_style: 0,
+        class: lv::CLASS,
+        title: "",
+        style: WS_CHILD | LVS_REPORT,
+        rect: (0, 0, 200, 200),
+        parent: host,
+        menu: class::id_menu(1),
+    });
+    let item = LVITEMW {
+        mask: LVIF_TEXT,
+        // LPSTR_TEXTCALLBACKW.
+        pszText: core::ptr::without_provenance_mut(usize::MAX),
+        ..Default::default()
+    };
+    // SAFETY: LVM_INSERTITEMW's lParam is an LVITEMW, here with the
+    // callback marker as its text, read during the call.
+    let at = unsafe { super::send_raw(view, LVM_INSERTITEMW, 0, (&raw const item) as isize) };
+    assert_eq!(at, 0);
+    // LVIF_NORECOMPUTE would give the marker back: it is dropped.
+    let ask = LVITEMW {
+        mask: LVIF_TEXT | LVIF_NORECOMPUTE,
+        ..Default::default()
+    };
+    let (_, text) = lv::get_item(view, ask, 64).expect("the item");
+    assert_eq!(text.as_deref(), Some("called back"));
+    assert_eq!(lv::item_text(view, 0, 0, 64), "called back");
+    assert_eq!(lv::item_text(view, 0, 0, 4), "cal");
+    super::destroy(host);
+}

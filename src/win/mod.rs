@@ -144,6 +144,38 @@ pub(crate) fn is_this_thread(hwnd: HWND) -> bool {
     thread != 0 && thread == sys::thread_id()
 }
 
+/// A window procedure, as a class has one.
+pub(crate) type WndProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
+
+/// The procedure of the system's own window class `name` (GetClassInfoExW
+/// with no instance: the class of the system or of the common controls in
+/// this activation context), if `hwnd` is a window of this thread whose
+/// class's procedure is that one (GetClassLongPtrW). Called directly
+/// (CallWindowProcW), it is the class's own code for the window, with no
+/// subclass of the window in front of it.
+pub(crate) fn system_class_proc(hwnd: HWND, name: &str) -> Option<WndProc> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GCLP_WNDPROC, GetClassInfoExW, GetClassLongPtrW, WNDCLASSEXW,
+    };
+    if !is_this_thread(hwnd) {
+        return None;
+    }
+    let z = wz(name);
+    let mut wc = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a NUL-terminated name read during the call; an out-struct
+    // with its size (its pointers are not followed here).
+    if unsafe { GetClassInfoExW(core::ptr::null_mut(), z.as_ptr(), &mut wc) } == 0 {
+        return None;
+    }
+    let system = wc.lpfnWndProc?;
+    // SAFETY: no pointers: the address of the window's class's procedure.
+    let class = unsafe { GetClassLongPtrW(hwnd, GCLP_WNDPROC) };
+    (class != 0 && class == system as usize).then_some(system)
+}
+
 /// A pointer to the units of `s` for a call that takes a pointer and a
 /// length: a real address even when `s` is empty. An empty slice's own
 /// pointer is dangling (fine for Rust, as nothing is read), but parts of
