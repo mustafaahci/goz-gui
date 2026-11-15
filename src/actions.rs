@@ -248,7 +248,7 @@ fn sheet_thread(queue: &SheetQueue) {
             continue;
         }
         win::queue::translate(&q);
-        win::queue::dispatch(&q);
+        win::queue::dispatch(q);
     }
 }
 

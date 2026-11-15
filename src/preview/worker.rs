@@ -32,8 +32,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT, VK_TAB};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ACCEL, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE,
-    QS_ALLINPUT, WM_COMMAND, WM_KEYDOWN, WM_SYSKEYDOWN,
+    ACCEL, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL, MSG, MWMO_INPUTAVAILABLE, QS_ALLINPUT,
+    WM_COMMAND, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 use super::image::{Decoded, Wic};
@@ -953,9 +953,9 @@ impl Frame {
 
 /// Dispatches every message waiting in this thread's queue.
 fn dispatch_all() {
-    while let Some(q) = queue::peek(core::ptr::null_mut(), (0, 0), PM_REMOVE) {
+    while let Some(q) = queue::take(core::ptr::null_mut(), (0, 0)) {
         queue::translate(&q);
-        queue::dispatch(&q);
+        queue::dispatch(q);
     }
 }
 

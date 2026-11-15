@@ -32,7 +32,6 @@ use windows_sys::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS;
 use windows_sys::Win32::UI::Shell::{
     SHGFI_DISPLAYNAME, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SSF_SHOWALLOBJECTS, SSF_SHOWSUPERHIDDEN,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::PM_REMOVE;
 
 use crate::win::com::Apartment;
 use crate::win::file::{Find, Search};
@@ -514,7 +513,7 @@ pub fn close(alive: &Alive, hwnd: HWND, msg: u32) {
 fn drain(hwnd: HWND, msg: u32) {
     // Takes this thread's own posted messages off its queue; each one's
     // parcel is a `Reply` from `spawn`.
-    while let Some(q) = queue::peek(hwnd, (msg, msg), PM_REMOVE) {
+    while let Some(q) = queue::take(hwnd, (msg, msg)) {
         let m = q.msg();
         drop(parcel::take::<Reply>(&Msg::new(
             m.hwnd, m.message, m.wParam, m.lParam,

@@ -24,7 +24,7 @@ use windows::core::HRESULT;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Globalization::CSTR_EQUAL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_APP, WM_QUIT,
+    MWMO_INPUTAVAILABLE, QS_ALLINPUT, WM_APP, WM_QUIT,
 };
 
 use crate::filetools::{self, Change, Sink, StepResult};
@@ -244,7 +244,7 @@ fn thread(queue: &Queue, owner: usize, message: u32) {
             continue;
         }
         let mut quit = false;
-        while let Some(q) = win::queue::peek(core::ptr::null_mut(), (0, 0), PM_REMOVE) {
+        while let Some(q) = win::queue::take(core::ptr::null_mut(), (0, 0)) {
             let msg = q.msg();
             if msg.message == WM_QUIT {
                 quit = true;
@@ -254,7 +254,7 @@ fn thread(queue: &Queue, owner: usize, message: u32) {
                 continue;
             }
             win::queue::translate(&q);
-            win::queue::dispatch(&q);
+            win::queue::dispatch(q);
         }
         if quit {
             break;

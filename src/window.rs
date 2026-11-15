@@ -872,9 +872,14 @@ See Help > Search Syntax and the README for goz-gui's switches."
         {
             continue;
         }
-        if ours && queue::translate_accelerator(hwnd, keys::table(), &q) {
-            continue;
-        }
+        let q = if ours {
+            match queue::translate_accelerator(hwnd, keys::table(), q) {
+                Some(q) => q,
+                None => continue,
+            }
+        } else {
+            q
+        };
         // Tab and Shift+Tab go round the tab stops: the search box, the
         // panes that are tab stops, the results (a pane or strip may
         // keep it among its own controls); so does Ctrl+Tab while no
@@ -887,7 +892,7 @@ See Help > Search Syntax and the README for goz-gui's switches."
             continue;
         }
         queue::translate(&q);
-        queue::dispatch(&q);
+        queue::dispatch(q);
     };
     crate::trace::finish();
     // W5: the File List Editor is asked to close (it asks about unsaved

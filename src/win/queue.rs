@@ -3,20 +3,26 @@
 //! A message taken from the queue is a [`Queued`], which only this module
 //! makes: so what is dispatched to a window procedure (and so reaches a
 //! trampoline as a delivered [`super::Msg`]) is what the system queued,
-//! never a message made up in Rust.
+//! never a message made up in Rust. A `Queued` is taken off the queue
+//! once and dispatched at most once ([`dispatch`] takes it by value, and
+//! [`translate_accelerator`] gives it back only when it did not use it),
+//! as the system hands its messages out: a WM_DROPFILES's drop, say, is
+//! freed after the one delivery ([`super::dropfiles`]). A message looked
+//! at and left in the queue ([`peek`]) is a plain copy.
 
 use windows_sys::Win32::Foundation::{HANDLE, HWND, LRESULT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, CopyAcceleratorTableW, CreateAcceleratorTableW, DestroyAcceleratorTable,
     DispatchMessageW, GetInputState, GetMessageW, HACCEL, MSG,
     MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, MsgWaitForMultipleObjectsEx, PEEK_MESSAGE_REMOVE_TYPE,
-    PeekMessageW, PostQuitMessage, PostThreadMessageW, QUEUE_STATUS_FLAGS, TranslateAcceleratorW,
-    TranslateMessage,
+    PM_REMOVE, PeekMessageW, PostQuitMessage, PostThreadMessageW, QUEUE_STATUS_FLAGS,
+    TranslateAcceleratorW, TranslateMessage,
 };
 
 use super::sync::Event;
 
-/// A message the system queued for this thread.
+/// A message the system queued for this thread, taken off the queue: not
+/// `Clone`, so it is dispatched at most once.
 pub struct Queued(MSG);
 
 impl Queued {
@@ -49,18 +55,26 @@ pub fn get(filter: HWND) -> Got {
     }
 }
 
-/// The next message in `min..=max` (0, 0: any) of `filter`'s windows, taken
-/// off the queue as `remove` says (PM_REMOVE, PM_NOREMOVE…), without
-/// waiting.
-pub fn peek(
-    filter: HWND,
-    (min, max): (u32, u32),
-    remove: PEEK_MESSAGE_REMOVE_TYPE,
-) -> Option<Queued> {
+/// Takes the next message in `min..=max` (0, 0: any) of `filter`'s windows
+/// off the queue (PeekMessageW with PM_REMOVE), without waiting.
+pub fn take(filter: HWND, (min, max): (u32, u32)) -> Option<Queued> {
     let mut msg = MSG::default();
     // SAFETY: an out-struct.
-    let got = unsafe { PeekMessageW(&mut msg, filter, min, max, remove) };
+    let got = unsafe { PeekMessageW(&mut msg, filter, min, max, PM_REMOVE) };
     (got != 0).then_some(Queued(msg))
+}
+
+/// A copy of the next message in `min..=max` (0, 0: any) of `filter`'s
+/// windows, left in the queue (PeekMessageW with PM_* `flags`, PM_REMOVE
+/// taken off: PM_NOYIELD, PM_QS_SENDMESSAGE…), without waiting. Sent
+/// messages that wait are delivered meanwhile, as by any peek. The copy
+/// is no [`Queued`]: what stays in the queue is dispatched once, after
+/// it is taken.
+pub fn peek(filter: HWND, (min, max): (u32, u32), flags: PEEK_MESSAGE_REMOVE_TYPE) -> Option<MSG> {
+    let mut msg = MSG::default();
+    // SAFETY: an out-struct.
+    let got = unsafe { PeekMessageW(&mut msg, filter, min, max, flags & !PM_REMOVE) };
+    (got != 0).then_some(msg)
 }
 
 /// Makes sure this thread has a message queue (a peek makes one).
@@ -74,18 +88,22 @@ pub fn translate(q: &Queued) {
     unsafe { TranslateMessage(&q.0) };
 }
 
-/// Hands the message to its window's procedure.
-pub fn dispatch(q: &Queued) -> LRESULT {
-    // SAFETY: a message the queue gave, dispatched as it came.
+/// Hands the message to its window's procedure, once: it is used up.
+pub fn dispatch(q: Queued) -> LRESULT {
+    // SAFETY: a message the queue gave, taken off it, dispatched as it
+    // came, and only this once (`Queued` is moved in).
     unsafe { DispatchMessageW(&q.0) }
 }
 
-/// Runs the accelerator table `table` for window `hwnd` on the message;
-/// whether it was one of its keys.
-pub fn translate_accelerator(hwnd: HWND, table: HACCEL, q: &Queued) -> bool {
+/// Runs the accelerator table `table` for window `hwnd` on the message:
+/// `None` when it was one of the table's keys, whose command went to
+/// `hwnd` (the message is used up, as TranslateAcceleratorW has it: it is
+/// not to be translated or dispatched); the message back otherwise.
+pub fn translate_accelerator(hwnd: HWND, table: HACCEL, q: Queued) -> Option<Queued> {
     // SAFETY: a message the queue gave; the table is a handle the system
     // checks.
-    unsafe { TranslateAcceleratorW(hwnd, table, &q.0) != 0 }
+    let used = unsafe { TranslateAcceleratorW(hwnd, table, &q.0) != 0 };
+    (!used).then_some(q)
 }
 
 /// Whether mouse or keyboard input waits in this thread's queue.

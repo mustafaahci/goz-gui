@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DS_SETFONT, HWND_MESSAGE, PM_REMOVE, WM_APP, WM_INITDIALOG, WM_NCDESTROY, WS_CHILD, WS_POPUP,
+    DS_SETFONT, HWND_MESSAGE, WM_APP, WM_INITDIALOG, WM_NCDESTROY, WS_CHILD, WS_POPUP,
 };
 
 use super::class::{self, Class, Create};
@@ -48,8 +48,8 @@ fn window(handler: impl Fn(&Msg) -> isize + 'static) -> HWND {
 
 /// Dispatches what waits in `hwnd`'s queue.
 fn pump(hwnd: HWND) {
-    while let Some(q) = queue::peek(hwnd, (0, 0), PM_REMOVE) {
-        queue::dispatch(&q);
+    while let Some(q) = queue::take(hwnd, (0, 0)) {
+        queue::dispatch(q);
     }
 }
 
@@ -403,4 +403,51 @@ fn only_a_class_registered_here_gets_a_handler() {
     };
     assert!(plain("mdiclient").is_null());
     assert!(plain("#32770").is_null());
+}
+
+#[test]
+fn a_queued_message_is_taken_and_dispatched_once() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F5;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        ACCEL, FVIRTKEY, PM_REMOVE, WM_COMMAND, WM_KEYDOWN,
+    };
+    // Not Clone: the call would be ambiguous if it were.
+    trait Ambiguous<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> Ambiguous<()> for T {}
+    impl<T: Clone> Ambiguous<u8> for T {}
+    <queue::Queued as Ambiguous<_>>::check();
+
+    let got = Rc::new(RefCell::new(Vec::new()));
+    let g = Rc::clone(&got);
+    let hwnd = window(move |m| {
+        if m.id == WM_APP + 4 || m.id == WM_COMMAND {
+            g.borrow_mut().push((m.id, m.w));
+            return 0;
+        }
+        m.def()
+    });
+    assert!(super::post_app(hwnd, WM_APP + 4, 0, 0));
+    // A peek leaves it there, PM_REMOVE or not, as a plain copy.
+    let seen = queue::peek(hwnd, (0, 0), PM_REMOVE).expect("a message");
+    assert_eq!(seen.message, WM_APP + 4);
+    let q = queue::take(hwnd, (0, 0)).expect("still there");
+    assert!(queue::take(hwnd, (0, 0)).is_none(), "taken once");
+    // Not one of the table's keys: given back, to dispatch.
+    let table = queue::AccelTable::new(&[ACCEL {
+        fVirt: FVIRTKEY,
+        key: VK_F5,
+        cmd: 9,
+    }])
+    .unwrap();
+    let q = queue::translate_accelerator(hwnd, table.handle(), q).expect("not a key");
+    queue::dispatch(q);
+    assert_eq!(*got.borrow(), vec![(WM_APP + 4, 0)]);
+    // One of its keys: used up, its command sent.
+    assert!(super::post_plain(hwnd, WM_KEYDOWN, usize::from(VK_F5), 0));
+    let q = queue::take(hwnd, (0, 0)).expect("the key");
+    assert!(queue::translate_accelerator(hwnd, table.handle(), q).is_none());
+    assert_eq!(got.borrow().last(), Some(&(WM_COMMAND, 0x1_0009)));
+    super::destroy(hwnd);
 }
