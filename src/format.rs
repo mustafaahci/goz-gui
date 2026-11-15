@@ -1,25 +1,20 @@
 //! Sizes and dates as the user's locale writes them.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::Globalization::{
-    DATE_SHORTDATE, GetDateFormatEx, GetLocaleInfoEx, GetTimeFormatEx, LOCALE_SDECIMAL,
-    LOCALE_STHOUSAND, TIME_NOSECONDS,
+    DATE_SHORTDATE, LOCALE_SDECIMAL, LOCALE_STHOUSAND, TIME_NOSECONDS,
 };
-use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
 use crate::ui_options::SizeFormat;
+use crate::win::ext::b8;
 
 /// One of the user's locale strings, such as a separator, or `default`.
 fn locale_text(kind: u32, default: &str) -> String {
     let mut buf = [0u16; 8];
-    // SAFETY: a null locale name is LOCALE_NAME_USER_DEFAULT; the buffer
-    // length passed is the buffer's.
-    let n = unsafe { GetLocaleInfoEx(core::ptr::null(), kind, buf.as_mut_ptr(), buf.len() as i32) };
+    let n = b8::user_locale_info(kind, &mut buf);
     if n > 1 {
         String::from_utf16_lossy(&buf[..n as usize - 1])
     } else {
@@ -142,41 +137,20 @@ pub fn date(ft: i64, out: &mut Vec<u16>) {
         dwLowDateTime: ft as u32,
         dwHighDateTime: (ft >> 32) as u32,
     };
-    // SAFETY: plain out-structs; the buffers' lengths are passed with them,
-    // and a null locale name is the user default.
-    unsafe {
-        let mut utc: SYSTEMTIME = core::mem::zeroed();
-        let mut local: SYSTEMTIME = core::mem::zeroed();
-        if FileTimeToSystemTime(&ft, &mut utc) == 0
-            || SystemTimeToTzSpecificLocalTime(core::ptr::null(), &utc, &mut local) == 0
-        {
-            return;
-        }
-        let mut buf = [0u16; 64];
-        let n = GetDateFormatEx(
-            core::ptr::null(),
-            DATE_SHORTDATE,
-            &local,
-            core::ptr::null(),
-            buf.as_mut_ptr(),
-            buf.len() as i32,
-            core::ptr::null(),
-        );
-        if n > 1 {
-            out.extend_from_slice(&buf[..n as usize - 1]);
-            out.push(u16::from(b' '));
-        }
-        let n = GetTimeFormatEx(
-            core::ptr::null(),
-            TIME_NOSECONDS,
-            &local,
-            core::ptr::null(),
-            buf.as_mut_ptr(),
-            buf.len() as i32,
-        );
-        if n > 1 {
-            out.extend_from_slice(&buf[..n as usize - 1]);
-        }
+    // In the user's locale (and its default formats).
+    let Some(local) = b8::file_time_to_system_time(&ft).and_then(|utc| b8::to_local_time(&utc))
+    else {
+        return;
+    };
+    let mut buf = [0u16; 64];
+    let n = b8::date_format(DATE_SHORTDATE, &local, &mut buf);
+    if n > 1 {
+        out.extend_from_slice(&buf[..n as usize - 1]);
+        out.push(u16::from(b' '));
+    }
+    let n = b8::time_format(TIME_NOSECONDS, &local, &mut buf);
+    if n > 1 {
+        out.extend_from_slice(&buf[..n as usize - 1]);
     }
 }
 
@@ -240,17 +214,7 @@ mod tests {
 
     /// Explorer's own formatter, in the same user locale.
     fn explorer(n: u64) -> String {
-        let mut buf = [0u16; 64];
-        // SAFETY: the buffer and its length.
-        unsafe {
-            windows_sys::Win32::UI::Shell::StrFormatByteSizeW(
-                n as i64,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-            )
-        };
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
-        String::from_utf16_lossy(&buf[..len])
+        b8::format_byte_size(n as i64)
     }
 
     #[test]

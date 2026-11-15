@@ -8,8 +8,6 @@
 //! a tmp file beside it and renamed into place once complete; a stopped or
 //! failed export deletes the tmp file and leaves whatever was there.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -18,7 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::client::{self, Failure, Row, Search, Stop, Streamed};
 use crate::columns::{COL_DATE, COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE, TITLES};
@@ -148,7 +145,8 @@ pub fn csv_columns(order: &[usize]) -> Vec<usize> {
 /// WM_EXPORT's wParam: more rows were written (the counts are in
 /// [`Running::progress`]).
 pub const PROGRESS: usize = 0;
-/// WM_EXPORT's wParam: the export ended; lParam is a `Box<Ended>`.
+/// WM_EXPORT's wParam: the export ended; an [`Ended`] comes with it as a
+/// parcel (`win::parcel::take`).
 pub const ENDED: usize = 1;
 
 /// How an export ended.
@@ -213,20 +211,11 @@ pub fn start(hwnd: HWND, msg: u32, job: Job) -> Running {
         .name("goz-export".into())
         .spawn(move || {
             // The Type column asks the shell for type names, which wants COM
-            // on the thread.
-            // SAFETY: initializes COM for this new thread only.
-            unsafe {
-                windows_sys::Win32::System::Com::CoInitializeEx(
-                    core::ptr::null(),
-                    windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32,
-                )
-            };
+            // on the thread (this new thread's, for its life).
+            crate::win::ext::b8::sta_with_ole1dde();
             let ended = run(&job, &t_stop, &t_done, &t_total, hwnd, msg);
-            let raw = Box::into_raw(Box::new(ended));
-            if !post(hwnd, msg, ENDED, raw as isize) {
-                // SAFETY: not posted (the window is gone), so still ours.
-                drop(unsafe { Box::from_raw(raw) });
-            }
+            // Dropped if not posted (the window is gone).
+            crate::win::parcel::post(hwnd as HWND, msg, ENDED, ended);
         })
         .ok();
     Running {
@@ -238,9 +227,7 @@ pub fn start(hwnd: HWND, msg: u32, job: Job) -> Running {
 }
 
 fn post(hwnd: usize, msg: u32, w: usize, l: isize) -> bool {
-    // SAFETY: posts to the window; the caller takes back a box in `l` when
-    // this fails.
-    unsafe { PostMessageW(hwnd as HWND, msg, w, l) != 0 }
+    crate::win::post_app(hwnd as HWND, msg, w, l)
 }
 
 fn run(
