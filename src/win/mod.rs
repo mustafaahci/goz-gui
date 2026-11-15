@@ -19,14 +19,26 @@
 //!     A list is an [`imagelist::ImageList`] (owned, destroyed with its last
 //!     clone) or an [`imagelist::SystemList`] (the shell's, kept for the
 //!     process); no safe function takes a raw one or destroys one, and a
-//!     control given one keeps it alive as long as it shows it.
+//!     control given one keeps it alive as long as it shows it. Which list
+//!     a control shows, takes or gives back is asked of its class's own
+//!     procedure (see below).
 //!   - A tree view's item (`HTREEITEM`) is the address of the item's memory
 //!     in its tree, which comctl32 checks only by a signature there, never
 //!     against the tree it is sent to. Items are [`tv::Item`]s, made only
 //!     from the tree's own answers and notifications and naming their tree,
-//!     and taken only while the tree has them: a subclass of the tree sees
-//!     every item inserted and deleted and the tree's end, and an item is
-//!     refused from the moment its deletion starts. A stale item names, at
+//!     and taken only while the tree has them, for a tree kept track of
+//!     from its birth (made by [`class::create_plain`] or from a
+//!     [`dlg::Template`]). [`tv`]'s messages that name an item go to the
+//!     tree's class's own procedure, so no subclass runs between the check
+//!     that the item is in the tree and the tree's reading it; an item is
+//!     noted as [`tv::insert`] puts it in, by the tree's own answer; each
+//!     deletion (TVM_DELETEITEM of an item, of an item above it or of every
+//!     item, a collapse that resets an item above it, the tree's end) takes
+//!     its items out of the record before the tree sees it, [`tv`]'s own
+//!     and, by a subclass put in as the tree is made, another's code's
+//!     through the window; so an item is refused from the moment its
+//!     deletion starts, and while one is under way the tree takes no
+//!     insert, deletion or reset of goz-gui's. A stale item names, at
 //!     worst, a new item the same tree put at its address: wrong, not
 //!     unsound.
 //! - **A message's parameters mean what its documentation says.** A message
@@ -38,18 +50,33 @@
 //!   are sent only to an Edit ([`edit`] lists the others it checked). A
 //!   message from `WM_USER` up is defined by its control class (`LVM_FIRST`
 //!   and `DTM_FIRST` are both `0x1000`), so the wrappers for those check the
-//!   window's class first and do nothing for a window of another class. A
-//!   reply that sizes a buffer for the next message is never taken from
-//!   whatever may answer it (a subclass): LB_GETTEXTLEN goes, with
-//!   LB_GETTEXT, to the list box's class's own procedure ([`listbox`]).
+//!   window's class first and do nothing for a window of another class.
+//! - **A reply the layer's soundness depends on is asked of the control
+//!   class's own procedure, never through the subclass chain.** Any safe
+//!   [`subclass::set`] closure can answer any message sent to a window, so
+//!   such a reply is had by calling the class's procedure directly
+//!   ([`system_class_proc`]: for a window of this thread whose class's
+//!   procedure is the system's, refused otherwise), with no subclass in
+//!   between: the length that sizes LB_GETTEXT's buffer ([`listbox`]), the
+//!   image list a list view shows or gives back (LVM_GETIMAGELIST,
+//!   LVM_SETIMAGELIST) and the one a tree takes (TVM_SETIMAGELIST), a
+//!   tree's new items and every walk of its items (TVM_INSERTITEMW,
+//!   TVM_GETNEXTITEM). So does a message whose item a subclass could
+//!   delete before passing it on (every [`tv`] message naming an item).
+//!   Any other answer that comes back through the chain is taken as a
+//!   value that may be wrong, never followed.
 //! - **What the system delivers is what it documents.** A procedure's
 //!   `lParam` for `WM_NOTIFY`, `WM_DRAWITEM` and the like points at the
 //!   structure the message defines. Only a [`Msg`] the system delivered
 //!   hands those out, as a [`View`]: read-only, but for the structures with
 //!   no pointer field ([`msg::Writable`]); what a notification asks its
 //!   procedure to write goes in through a setter that checks the
-//!   notification and writes through the pointers the system gave. A
-//!   message made by goz-gui's own code hands out nothing.
+//!   notification and writes through the pointers the system gave. Which
+//!   structure a `WM_NOTIFY` comes with is told by its header as delivered:
+//!   copied once per message before any view is lent, and put back before
+//!   the message goes on and as its procedure returns, as a custom draw
+//!   structure is lent writable whole. A message made by goz-gui's own code
+//!   hands out nothing.
 //! - **Another process of the user is as trusted as goz-gui.** A process of
 //!   the same user and integrity can send or post goz-gui's windows any
 //!   message with any parameters, and the system marshals few of them:

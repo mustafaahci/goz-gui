@@ -553,8 +553,8 @@ pub fn set_item_text(lv: HWND, item: i32, sub: i32, text: &str) -> bool {
         ..Default::default()
     };
     // SAFETY: LVM_SETITEMTEXTW's lParam is an LVITEMW whose text is read
-    // during the call; the structure is mutable, as the list writes its
-    // mask and item.
+    // during the call; the structure is mutable, as the list may write it
+    // (LVM_GETITEMTEXTW writes its mask and item).
     unsafe {
         send(
             lv,
