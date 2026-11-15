@@ -166,6 +166,15 @@ pub fn class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..usize::try_from(n).unwrap_or(0).min(buf.len())])
 }
 
+/// Whether `a` and `b` name the same window class: equal ignoring case
+/// as the system's atoms compare names (its own upper-case table,
+/// CompareStringOrdinal's), not only ASCII's.
+pub(crate) fn same_class_name(a: &str, b: &str) -> bool {
+    let a: Vec<u16> = a.encode_utf16().collect();
+    let b: Vec<u16> = b.encode_utf16().collect();
+    locale::compare_ordinal(&a, &b, true) == windows_sys::Win32::Globalization::CSTR_EQUAL
+}
+
 fn fold(unit: u16) -> u16 {
     if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
         unit + 32

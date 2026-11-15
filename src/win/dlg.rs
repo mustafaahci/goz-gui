@@ -39,6 +39,11 @@ impl Template {
     /// A dialog of `cx` × `cy` dialog units, styles `style` (which should
     /// include DS_SETFONT, as the font follows) and `ex_style`, titled
     /// `title`, in the font `face` at `points`.
+    ///
+    /// # Panics
+    /// If `style`'s high word is 0xFFFF: the dialog functions would read
+    /// the template as a DLGTEMPLATEEX (whose first words are 1, 0xFFFF),
+    /// laid out otherwise. No combination of WS_* styles is that.
     pub fn with_styles(
         title: &str,
         style: u32,
@@ -47,6 +52,10 @@ impl Template {
         points: u16,
         face: &[u16],
     ) -> Template {
+        assert!(
+            style >> 16 != 0xffff,
+            "a dialog style whose high word is 0xFFFF marks a DLGTEMPLATEEX"
+        );
         let mut t = Template { words: Vec::new() };
         t.dword(style);
         t.dword(ex_style);
@@ -59,8 +68,7 @@ impl Template {
         t.string(title);
         if style & windows_sys::Win32::UI::WindowsAndMessaging::DS_SETFONT as u32 != 0 {
             t.words.push(points);
-            t.words.extend(super::until_nul(face));
-            t.words.push(0);
+            t.units(super::until_nul(face).iter().copied());
         }
         t
     }
@@ -70,7 +78,20 @@ impl Template {
     }
 
     fn string(&mut self, s: &str) {
-        self.words.extend(s.encode_utf16().filter(|&c| c != 0));
+        self.units(s.encode_utf16());
+    }
+
+    /// A string field: `units` without their NULs, NUL-terminated. A
+    /// string field that starts with 0xFFFF is read as an ordinal (0xFFFF
+    /// and a number, a class's atom or a resource's id) and the template
+    /// then misread from there on, so a leading U+FFFF is written as U+FFFD,
+    /// the replacement character.
+    fn units(&mut self, units: impl Iterator<Item = u16>) {
+        let start = self.words.len();
+        self.words.extend(units.filter(|&c| c != 0));
+        if self.words.get(start) == Some(&0xffff) {
+            self.words[start] = 0xfffd;
+        }
         self.words.push(0);
     }
 
@@ -245,10 +266,21 @@ pub fn end(dlg: HWND, code: isize) {
 
 /// The answer of the dialog's current message, for the ones whose answer
 /// goes in DWLP_MSGRESULT (WM_NOTIFY's): the handler then returns 1.
+/// Nothing for a window that is not a dialog (`#32770`): DWLP_MSGRESULT
+/// is offset 0 of the window's extra bytes, which in another class's
+/// window are that class's own (a common control keeps its object's
+/// address there).
 pub fn set_result(dlg: HWND, answer: isize) {
-    // SAFETY: an integer; DWLP_MSGRESULT is not a pointer.
+    if !super::class_is(dlg, DIALOG) {
+        return;
+    }
+    // SAFETY: an integer into a dialog's DWLP_MSGRESULT, which the dialog
+    // manager keeps for the answer and never follows as a pointer.
     unsafe { SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, answer) };
 }
+
+/// The standard dialog class, which every [`Template`] makes.
+const DIALOG: &str = "#32770";
 
 /// `rc`, in the dialog's units, in its pixels.
 pub fn map_rect(dlg: HWND, rc: RECT) -> RECT {
@@ -260,7 +292,7 @@ pub fn map_rect(dlg: HWND, rc: RECT) -> RECT {
 
 /// The dialog's default push button becomes `id` (DM_SETDEFID).
 pub fn set_def_id(dlg: HWND, id: u16) {
-    let dlg = super::of_class(dlg, "#32770");
+    let dlg = super::of_class(dlg, DIALOG);
     // SAFETY: DM_SETDEFID's parameter is an id; a dialog's class checked.
     unsafe { super::send_raw(dlg, DM_SETDEFID, usize::from(id), 0) };
 }
@@ -373,6 +405,36 @@ mod tests {
         assert_eq!(second % 2, 0);
         // As u32s for the dialog functions, every word in.
         assert_eq!(t.aligned().len(), t.words.len().div_ceil(2));
+    }
+
+    #[test]
+    fn no_string_of_a_template_reads_as_an_ordinal() {
+        let face: Vec<u16> = "\u{ffff}Face".encode_utf16().collect();
+        let style = WS_POPUP | DS_SETFONT as u32;
+        let mut t = Template::with_styles("\u{ffff}T", style, 0, (1, 1), 9, &face);
+        let header = t.words.len();
+        t.control(
+            Class::Named("\u{ffff}\u{80}"),
+            "\u{ffff}\u{1}",
+            7,
+            0,
+            0,
+            (0, 0, 1, 1),
+        );
+        assert!(!t.words.contains(&0xffff), "{:x?}", t.words);
+        let at = header + header % 2;
+        // The class, then the text, each led by U+FFFD instead.
+        assert_eq!(&t.words[at + 9..at + 15], &[0xfffd, 0x80, 0, 0xfffd, 1, 0]);
+        // A U+FFFF further on is a character like any other.
+        let mut t = Template::with_styles("", WS_POPUP, 0, (1, 1), 9, &[]);
+        t.control(Class::Named("a\u{ffff}"), "", 1, 0, 0, (0, 0, 1, 1));
+        assert!(t.words.contains(&0xffff));
+    }
+
+    #[test]
+    #[should_panic(expected = "DLGTEMPLATEEX")]
+    fn a_style_that_marks_an_extended_template_is_refused() {
+        let _ = Template::with_styles("", 0xffff_0001, 0, (1, 1), 9, &[]);
     }
 
     #[test]

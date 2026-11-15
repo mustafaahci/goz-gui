@@ -308,3 +308,99 @@ fn a_drop_is_read_while_it_is_delivered_and_finished_once_after() {
     assert!(made.dropped_files().is_none());
     super::destroy(hwnd);
 }
+
+/// A hidden control of `class` (WS_CHILD and `style`), child of a hidden
+/// top-level window of the test class: (the control, its parent).
+pub(super) fn hidden_control(class: &str, style: u32) -> (HWND, HWND) {
+    use windows_sys::Win32::UI::Controls::{ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES};
+    super::sys::init_common_controls(ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES);
+    let _ = Class::new(CLASS).register();
+    let parent = class::create(
+        &Create {
+            ex_style: 0,
+            class: CLASS,
+            title: "",
+            style: WS_POPUP,
+            rect: (0, 0, 200, 200),
+            parent: core::ptr::null_mut(),
+            menu: core::ptr::null_mut(),
+        },
+        |m| m.def(),
+    );
+    assert!(!parent.is_null());
+    let control = class::create_plain(&Create {
+        ex_style: 0,
+        class,
+        title: "",
+        style: WS_CHILD | style,
+        rect: (0, 0, 200, 200),
+        parent,
+        menu: class::id_menu(1),
+    });
+    assert!(!control.is_null(), "a {class}");
+    (control, parent)
+}
+
+#[test]
+fn a_dialog_s_answer_goes_only_to_a_dialog() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DWLP_MSGRESULT, GetWindowLongPtrW};
+    // An integer of the window's extra bytes, at DWLP_MSGRESULT's offset.
+    let result = |hwnd: HWND| {
+        // SAFETY: reads an integer, no pointers.
+        unsafe { GetWindowLongPtrW(hwnd, DWLP_MSGRESULT as i32) }
+    };
+    // A list view keeps its object's address at offset 0, DWLP_MSGRESULT's.
+    let (list, parent) = hidden_control(super::lv::CLASS, 0);
+    let before = result(list);
+    dlg::set_result(list, 0x1234);
+    assert_eq!(result(list), before);
+    assert_eq!(super::lv::item_count(list), 0, "the list still answers");
+    // A dialog's goes in.
+    let page = template(WS_CHILD).create_child(parent, |_| 0);
+    assert!(!page.is_null());
+    dlg::set_result(page, 0x1234);
+    assert_eq!(result(page), 0x1234);
+    super::destroy(parent);
+}
+
+#[test]
+fn only_a_class_registered_here_gets_a_handler() {
+    let made = |class: &str| {
+        class::create(
+            &Create {
+                ex_style: 0,
+                class,
+                title: "",
+                style: 0,
+                rect: (0, 0, 0, 0),
+                parent: HWND_MESSAGE,
+                menu: core::ptr::null_mut(),
+            },
+            |m| m.def(),
+        )
+    };
+    // A system class, whose procedure would take the handler's address
+    // for creation data of its own: not made.
+    assert!(made("Static").is_null());
+    assert!(made("MDIClient").is_null());
+    // The test class, registered here (whatever the case of its name).
+    let _ = Class::new(CLASS).register();
+    let hwnd = made(&CLASS.to_uppercase());
+    assert!(!hwnd.is_null());
+    super::destroy(hwnd);
+    // No class goes by its atom; no MDI client is made plain.
+    assert!(!Class::new("#32770").register());
+    let plain = |class: &str| {
+        class::create_plain(&Create {
+            ex_style: 0,
+            class,
+            title: "",
+            style: 0,
+            rect: (0, 0, 0, 0),
+            parent: HWND_MESSAGE,
+            menu: core::ptr::null_mut(),
+        })
+    };
+    assert!(plain("mdiclient").is_null());
+    assert!(plain("#32770").is_null());
+}

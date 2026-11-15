@@ -2,7 +2,9 @@
 //! them, each made with the closure that handles its messages.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::HBRUSH;
@@ -10,6 +12,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetWindowLongPtrW, HCURSOR,
     HICON, HMENU, RegisterClassExW, SetWindowLongPtrW, WM_NCCREATE, WM_NCDESTROY, WNDCLASSEXW,
+    WS_EX_MDICHILD,
 };
 
 use super::msg::{Msg, Via};
@@ -49,8 +52,13 @@ impl<'a> Class<'a> {
     }
 
     /// Registers the class for this module; false if it could not (one of
-    /// that name is there already, say).
+    /// that name is there already, say), or if its name starts with `#`
+    /// (which names a class by its atom). Only a class registered here can
+    /// have windows made with [`create`].
     pub fn register(&self) -> bool {
+        if self.name.starts_with('#') {
+            return false;
+        }
         let name = super::wz(self.name);
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -68,8 +76,36 @@ impl<'a> Class<'a> {
         };
         // SAFETY: a complete class whose name outlives the call (the system
         // copies it); its procedure is the trampoline below.
-        unsafe { RegisterClassExW(&wc) != 0 }
+        let ok = unsafe { RegisterClassExW(&wc) != 0 };
+        if ok {
+            REGISTERED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(HashSet::new)
+                .insert(folded(self.name));
+        }
+        ok
     }
+}
+
+/// The names of the classes [`Class::register`] registered (their
+/// procedure the trampoline), as [`folded`] names them.
+static REGISTERED: Mutex<Option<HashSet<Vec<u16>>>> = Mutex::new(None);
+
+/// `name` as the classes compare it, its ASCII letters in lower case. The
+/// system compares class names ignoring case (all of it, not only
+/// ASCII's): two names equal here are the same class to it.
+fn folded(name: &str) -> Vec<u16> {
+    name.encode_utf16().map(super::fold).collect()
+}
+
+/// Whether `name` is a class [`Class::register`] registered.
+fn registered_here(name: &str) -> bool {
+    REGISTERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&folded(name)))
 }
 
 /// Whether this module has registered a window class `name`
@@ -118,8 +154,17 @@ pub fn id_menu(id: usize) -> HMENU {
 
 /// Makes a window of any class (a control, say) with no handler of
 /// goz-gui's: its own class's procedure handles it. Null if it could not be
-/// made.
+/// made, and for an MDI client or child, which read their creation data
+/// (none is passed) as a structure of their own, or a class named by its
+/// atom (`#n`, which may be the MDI client's).
 pub fn create_plain(c: &Create) -> HWND {
+    // A name "#n" is the class whose atom is n, which may be any class.
+    if c.class.starts_with('#')
+        || super::same_class_name(c.class, "MDIClient")
+        || c.ex_style & WS_EX_MDICHILD != 0
+    {
+        return core::ptr::null_mut();
+    }
     let class = super::wz(c.class);
     let title = super::wz(c.title);
     let (x, y, w, h) = c.rect;
@@ -152,8 +197,14 @@ struct Pending {
 /// Makes a window of a class registered with [`Class::register`], whose
 /// messages go to `handler` from WM_NCCREATE through WM_NCDESTROY (the
 /// default, [`Msg::def`], for the few that come before). Null if it could
-/// not be made, and then `handler` is dropped.
+/// not be made, and then `handler` is dropped: for a class not registered
+/// there (whose procedure would read the handler's address as its own
+/// creation data), and for an MDI child (WS_EX_MDICHILD, whose creation
+/// data the system wraps in an MDICREATESTRUCT).
 pub fn create(c: &Create, handler: impl Fn(&Msg) -> LRESULT + 'static) -> HWND {
+    if !registered_here(c.class) || c.ex_style & WS_EX_MDICHILD != 0 {
+        return core::ptr::null_mut();
+    }
     let class = super::wz(c.class);
     let title = super::wz(c.title);
     let pending = Pending {
@@ -162,7 +213,9 @@ pub fn create(c: &Create, handler: impl Fn(&Msg) -> LRESULT + 'static) -> HWND {
     let (x, y, w, h) = c.rect;
     // SAFETY: NUL-terminated names that outlive the call; `pending` outlives
     // it too, and only the trampoline reads it (at WM_NCCREATE, during the
-    // call).
+    // call): the class is one `Class::register` registered for this module,
+    // which CreateWindowExW finds first for this module's instance, so its
+    // procedure is the trampoline.
     unsafe {
         CreateWindowExW(
             c.ex_style,
@@ -190,11 +243,14 @@ pub fn create(c: &Create, handler: impl Fn(&Msg) -> LRESULT + 'static) -> HWND {
 /// GWLP_USERDATA (the safe API has no way to).
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE && l != 0 {
-        // SAFETY: WM_NCCREATE's lParam is a CREATESTRUCTW; a window of these
-        // classes is made only by `create`, whose lpCreateParams is its
-        // `Pending` (alive during CreateWindowExW), or by a dialog template,
-        // which passes null for a control without creation data, which
-        // goz-gui's templates never have.
+        // SAFETY: WM_NCCREATE's lParam is a CREATESTRUCTW. goz-gui makes a
+        // window of these classes three ways, and its lpCreateParams is
+        // null or a `Pending`: `create` passes its `Pending` (alive during
+        // CreateWindowExW; never for an MDI child, whose lpCreateParams
+        // would be an MDICREATESTRUCT); `create_plain` passes null; and a
+        // dialog's control of the class gets null, as every control of a
+        // `dlg::Template` has no creation data and no field of the template
+        // can be misread as one (`Template::units`, `Template::with_styles`).
         unsafe {
             let cs = &*(l as *const CREATESTRUCTW);
             let pending = cs.lpCreateParams as *const Pending;
