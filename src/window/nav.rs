@@ -11,16 +11,13 @@
 //! and sort) a navigation entry. Going back, forward or to an entry restores
 //! that state without adding one.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use goz_core::types::{SortDir, SortSpec};
-use windows_sys::Win32::UI::Controls::EM_SETSEL;
-use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
 
-use super::{App, Options, send};
+use super::{App, Options};
 use crate::bookmarks::{one_line, sort_name};
 use crate::session::Search;
-use crate::wide::{window_text, wz};
+use crate::wide::window_text;
+use crate::win::{self, edit};
 use crate::{dropdown, menu, searchbox};
 
 /// How long a search must stay as it is to become a navigation entry.
@@ -228,12 +225,11 @@ impl App {
         if window_text(self.edit) == text {
             self.start_search(false);
         } else {
-            // SAFETY: a NUL-terminated string for this thread's search box;
-            // the change searches through EN_CHANGE.
-            unsafe { SetWindowTextW(self.edit, wz(&text).as_ptr()) };
+            // The change searches through EN_CHANGE.
+            win::set_text(self.edit, &text);
         }
         let end = text.encode_utf16().count();
-        send(self.edit, EM_SETSEL, end, end as isize);
+        edit::set_sel(self.edit, end as i32, end as i32);
     }
 }
 

@@ -9,27 +9,21 @@
 //! button is pressed. It is a tracking tooltip that lets the mouse through
 //! (TTF_TRANSPARENT), so the list goes on getting its moves and clicks.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::Cell;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromPoint,
-};
+use windows_sys::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST;
 use windows_sys::Win32::UI::Controls::{
-    LVIR_BOUNDS, LVM_GETITEMRECT, TOOLTIPS_CLASSW, TTDT_INITIAL, TTF_ABSOLUTE, TTF_TRACK,
-    TTF_TRANSPARENT, TTM_ADDTOOLW, TTM_ADJUSTRECT, TTM_GETDELAYTIME, TTM_SETMAXTIPWIDTH,
-    TTM_TRACKACTIVATE, TTM_TRACKPOSITION, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX,
-    TTTOOLINFOW,
+    LVIR_BOUNDS, TTDT_INITIAL, TTF_ABSOLUTE, TTF_TRACK, TTF_TRANSPARENT, TTS_ALWAYSTIP,
+    TTS_NOPREFIX, TTTOOLINFOW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, KillTimer, SendMessageW, SetTimer, WM_SETFONT, WS_EX_TOPMOST,
-    WS_POPUP,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{CW_USEDEFAULT, WS_EX_TOPMOST, WS_POPUP};
 
 use crate::paint;
 use crate::theme;
+use crate::win::class::{self, Create};
+use crate::win::ext::b1;
+use crate::win::{self, lv, sys, tip};
 use crate::window::App;
 
 /// The main window's timer that shows the tip once the mouse has rested.
@@ -56,49 +50,34 @@ impl Default for CellTip {
     }
 }
 
-fn tool(app: &App, text: *mut u16) -> TTTOOLINFOW {
+/// The tip's one tool (its text goes in by the `tip` functions).
+fn tool(app: &App) -> TTTOOLINFOW {
     TTTOOLINFOW {
         cbSize: size_of::<TTTOOLINFOW>() as u32,
         uFlags: TTF_TRACK | TTF_ABSOLUTE | TTF_TRANSPARENT,
         hwnd: app.hwnd,
         uId: TOOL,
-        lpszText: text,
-        // SAFETY: the rest of TTTOOLINFOW is plain data.
-        ..unsafe { core::mem::zeroed() }
+        ..Default::default()
     }
-}
-
-fn send(tip: HWND, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: a message to this thread's tooltip; any pointer in `l` is the
-    // caller's and lives across the synchronous call.
-    unsafe { SendMessageW(tip, msg, w, l) }
 }
 
 /// Makes the tooltip, owned by the main window, with its one tool.
 pub fn create(app: &App) {
-    // SAFETY: creates a tooltip control owned by this thread's window.
-    let tip = unsafe {
-        CreateWindowExW(
-            WS_EX_TOPMOST,
-            TOOLTIPS_CLASSW,
-            core::ptr::null(),
-            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            app.hwnd,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            core::ptr::null(),
-        )
-    };
+    // A tooltip control owned by this thread's window.
+    let tip = class::create_plain(&Create {
+        ex_style: WS_EX_TOPMOST,
+        class: tip::CLASS,
+        title: "",
+        style: WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        rect: (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
+        parent: app.hwnd,
+        menu: core::ptr::null_mut(),
+    });
     if tip.is_null() {
         return;
     }
-    let mut empty = [0u16];
-    let info = tool(app, empty.as_mut_ptr());
-    send(tip, TTM_ADDTOOLW, 0, (&raw const info) as isize);
+    let info = tool(app);
+    tip::add_tool(tip, &info, tip::Text::Str(""));
     app.cell_tip.hwnd.set(tip);
 }
 
@@ -107,7 +86,7 @@ pub fn set_font(app: &App) {
     let tip = app.cell_tip.hwnd.get();
     if !tip.is_null() {
         let font = app.fonts.borrow().normal;
-        send(tip, WM_SETFONT, font as usize, 0);
+        win::set_font(tip, font, false);
     }
 }
 
@@ -131,12 +110,7 @@ pub fn set_theme(app: &App, dark: bool) {
 /// The cell at `pt` (the list's client coordinates) on `row`: its column
 /// id and rectangle.
 fn cell_at(app: &App, row: usize, pt: POINT) -> Option<(usize, RECT, RECT)> {
-    let mut bounds = RECT {
-        left: LVIR_BOUNDS as i32,
-        ..RECT::default()
-    };
-    // SAFETY: the rectangle lives across the synchronous call.
-    unsafe { SendMessageW(app.list, LVM_GETITEMRECT, row, (&raw mut bounds) as isize) };
+    let bounds = lv::item_rect(app.list, row as i32, LVIR_BOUNDS as i32).unwrap_or_default();
     let cells = app.column_rects(&bounds);
     cells
         .iter()
@@ -158,9 +132,9 @@ pub fn moved(app: &App, row: Option<usize>, pt: POINT) {
     if cell.is_none() || tip.is_null() {
         return;
     }
-    let delay = send(tip, TTM_GETDELAYTIME, TTDT_INITIAL as usize, 0).clamp(1, 5000);
-    // SAFETY: a timer of this thread's window; setting it again restarts it.
-    unsafe { SetTimer(app.hwnd, TIMER, delay as u32, None) };
+    let delay = tip::delay_time(tip, TTDT_INITIAL).clamp(1, 5000);
+    // A timer of this thread's window; setting it again restarts it.
+    win::set_timer(app.hwnd, TIMER, delay as u32);
 }
 
 /// The rows moved under the mouse (a scroll, a jump): the tip goes, and
@@ -182,16 +156,11 @@ pub fn left(app: &App) {
 /// Takes the tip away (a key, a click), and stops one about to show. It
 /// shows again only on another cell.
 pub fn hide(app: &App) {
-    // SAFETY: a timer of this thread's window.
-    unsafe { KillTimer(app.hwnd, TIMER) };
+    // A timer of this thread's window.
+    win::kill_timer(app.hwnd, TIMER);
     if app.cell_tip.shown.replace(false) {
-        let info = tool(app, core::ptr::null_mut());
-        send(
-            app.cell_tip.hwnd.get(),
-            TTM_TRACKACTIVATE,
-            0,
-            (&raw const info) as isize,
-        );
+        let info = tool(app);
+        tip::track_activate(app.cell_tip.hwnd.get(), false, &info);
     }
 }
 
@@ -206,12 +175,7 @@ pub fn timer(app: &App) {
         return;
     }
     // The cell's place, from the column wherever it was dragged to.
-    let mut bounds = RECT {
-        left: LVIR_BOUNDS as i32,
-        ..RECT::default()
-    };
-    // SAFETY: the rectangle lives across the synchronous call.
-    unsafe { SendMessageW(app.list, LVM_GETITEMRECT, row, (&raw mut bounds) as isize) };
+    let bounds = lv::item_rect(app.list, row as i32, LVIR_BOUNDS as i32).unwrap_or_default();
     let Some(&(_, cell)) = app.column_rects(&bounds).iter().find(|(c, _)| *c == id) else {
         return;
     };
@@ -222,52 +186,34 @@ pub fn timer(app: &App) {
         m.peek(row)
             .map(|r| paint::cell_text(app, &m, r, id, &bounds, cell.left))
     };
-    let Some(mut ct) = measured else {
+    let Some(ct) = measured else {
         return;
     };
     if !needs_tip(ct.need, cell.right - cell.left) {
         return;
     }
     let height = app.fonts.borrow().height;
-    let mut rc = [
-        POINT { x: ct.x, y: ct.y },
-        POINT {
-            x: ct.x + ct.width,
-            y: ct.y + height,
-        },
-    ];
-    // SAFETY: maps two points from the list's client area to the screen.
-    unsafe { MapWindowPoints(app.list, core::ptr::null_mut(), rc.as_mut_ptr(), 2) };
-    let mut window = RECT {
-        left: rc[0].x,
-        top: rc[0].y,
-        right: rc[1].x,
-        bottom: rc[1].y,
+    // The text's two corners, from the list's client area to the screen.
+    let text_rc = RECT {
+        left: ct.x,
+        top: ct.y,
+        right: ct.x + ct.width,
+        bottom: ct.y + height,
     };
+    let window = win::map_rect(app.list, core::ptr::null_mut(), text_rc);
     // The tip's window round that text: its border and margins outside.
-    send(tip, TTM_ADJUSTRECT, 1, (&raw mut window) as isize);
+    let window = tip::adjust_rect(tip, true, window);
     let work = work_area(POINT {
         x: window.left,
         y: window.top,
     });
     // As wide as the screen at most (a longer text wraps), and on it.
-    send(
-        tip,
-        TTM_SETMAXTIPWIDTH,
-        0,
-        (work.right - work.left).max(1) as isize,
-    );
+    tip::set_max_width(tip, (work.right - work.left).max(1));
     let (x, y) = clamp(&window, &work);
-    ct.text.push(0);
-    let info = tool(app, ct.text.as_mut_ptr());
-    send(tip, TTM_UPDATETIPTEXTW, 0, (&raw const info) as isize);
-    send(
-        tip,
-        TTM_TRACKPOSITION,
-        0,
-        ((x as u16 as u32) | ((y as u16 as u32) << 16)) as isize,
-    );
-    send(tip, TTM_TRACKACTIVATE, 1, (&raw const info) as isize);
+    let info = tool(app);
+    b1::tip_update_text_wide(tip, &info, &ct.text);
+    tip::track_position(tip, x, y);
+    tip::track_activate(tip, true, &info);
     app.cell_tip.shown.set(true);
 }
 
@@ -288,13 +234,9 @@ fn clamp(window: &RECT, work: &RECT) -> (i32, i32) {
 
 /// The work area of the monitor nearest `pt` (screen).
 fn work_area(pt: POINT) -> RECT {
-    let mut info = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..MONITORINFO::default()
-    };
-    // SAFETY: fills a plain out-struct for a monitor handle just found.
-    unsafe { GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut info) };
-    info.rcWork
+    sys::monitor_info(sys::monitor_from_point(pt, MONITOR_DEFAULTTONEAREST))
+        .map(|info| info.rcWork)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

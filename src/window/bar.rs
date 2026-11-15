@@ -1,17 +1,14 @@
 //! View > Filter Bar, View > Zoom, and Search > Next and Previous Filter
 //! (Ctrl+] and Ctrl+[).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use windows_sys::Win32::Foundation::{POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, MapWindowPoints};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyMenu, GetWindowRect, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER,
-    WHEEL_DELTA, WINDOWPOS, WM_SETFONT, WM_WINDOWPOSCHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, WHEEL_DELTA, WINDOWPOS,
 };
 
-use super::{App, send};
+use super::App;
 use crate::filter::Filter;
+use crate::win::{self, ext::b1};
 use crate::{menu, zoom};
 
 /// Everything's `filters_wide`: the filter bar's width at 100 %.
@@ -39,8 +36,8 @@ impl App {
     pub(super) fn invalidate_filter_bar(&self) {
         let rc = self.filter_rc.get();
         if rc.right > rc.left {
-            // SAFETY: repaints part of this thread's window.
-            unsafe { InvalidateRect(self.hwnd, &rc, 0) };
+            // Repaints part of this thread's window.
+            win::invalidate(self.hwnd, Some(&rc), false);
         }
     }
 
@@ -49,17 +46,19 @@ impl App {
     pub(super) fn filter_bar_click(&self) {
         let rc = self.filter_rc.get();
         let popup = menu::filter_menu(self.opts.get().filter);
-        let mut pt = POINT {
-            x: rc.left,
-            y: rc.bottom,
-        };
-        // SAFETY: converts a point of this thread's window.
-        unsafe { ClientToScreen(self.hwnd, &mut pt) };
+        // A point of this thread's window, on the screen.
+        let pt = win::client_to_screen(
+            self.hwnd,
+            POINT {
+                x: rc.left,
+                y: rc.bottom,
+            },
+        );
         self.filter_open.set(true);
         self.invalidate_filter_bar();
         let cmd = crate::popup::track(popup, self.hwnd, pt, "filter bar", &|_| None);
-        // SAFETY: the menu this function made.
-        unsafe { DestroyMenu(popup) };
+        // The menu this function made.
+        b1::destroy_menu(popup);
         self.filter_open.set(false);
         self.invalidate_filter_bar();
         if let Some(filter) = u16::try_from(cmd).ok().and_then(Filter::from_menu_id) {
@@ -109,7 +108,7 @@ impl App {
             // where they have their own.
             let old = self.remake_zoomed_fonts();
             let font = self.fonts.borrow().normal;
-            send(self.list, WM_SETFONT, font as usize, 0);
+            win::set_font(self.list, font, false);
             crate::celltip::set_font(self);
             // The list and its tip no longer draw with the old fonts.
             drop(old);
@@ -123,29 +122,23 @@ impl App {
     /// Has the list ask its rows' height again (WM_MEASUREITEM), which an
     /// owner-drawn list does when told it moved, and lay out its header.
     pub(super) fn remeasure_rows(&self) {
-        let mut rc = RECT::default();
-        // SAFETY: reads the list's place in this thread's window; the
-        // WINDOWPOS lives across the synchronous send.
-        unsafe {
-            GetWindowRect(self.list, &mut rc);
-            MapWindowPoints(
-                core::ptr::null_mut(),
-                self.hwnd,
-                (&raw mut rc).cast::<POINT>(),
-                2,
-            );
-            let wp = WINDOWPOS {
-                hwnd: self.list,
-                hwndInsertAfter: core::ptr::null_mut(),
-                x: rc.left,
-                y: rc.top,
-                cx: rc.right - rc.left,
-                cy: rc.bottom - rc.top,
-                flags: SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER,
-            };
-            send(self.list, WM_WINDOWPOSCHANGED, 0, (&raw const wp) as isize);
-            InvalidateRect(self.list, core::ptr::null(), 1);
-            InvalidateRect(self.header, core::ptr::null(), 1);
-        }
+        // The list's place in this thread's window.
+        let rc: RECT = win::map_rect(
+            core::ptr::null_mut(),
+            self.hwnd,
+            win::window_rect(self.list),
+        );
+        let wp = WINDOWPOS {
+            hwnd: self.list,
+            hwndInsertAfter: core::ptr::null_mut(),
+            x: rc.left,
+            y: rc.top,
+            cx: rc.right - rc.left,
+            cy: rc.bottom - rc.top,
+            flags: SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER,
+        };
+        b1::send_window_pos_changed(self.list, &wp);
+        win::invalidate(self.list, None, true);
+        win::invalidate(self.header, None, true);
     }
 }
