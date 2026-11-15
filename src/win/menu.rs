@@ -380,10 +380,18 @@ pub fn set_text(menu: HMENU, by: By, text: &str) -> bool {
 /// Shows `menu` at `pt` (on the screen) for `owner`, which gets its
 /// messages, until it closes (TrackPopupMenuEx with TPM_* `flags`).
 /// With TPM_RETURNCMD, the command chosen (0 for none); otherwise
-/// nonzero if it was shown.
+/// nonzero if it was shown. 0, and nothing shown, if `owner` is not one
+/// of goz-gui's own windows: the menu loop sends the owner WM_MEASUREITEM
+/// and WM_DRAWITEM with the values of the items it draws (a shell
+/// handler's among them), which another window's procedure may read as
+/// addresses of its own (as for [`measure_item`]).
 pub fn track(menu: HMENU, flags: TRACK_POPUP_MENU_FLAGS, pt: POINT, owner: HWND) -> i32 {
-    // SAFETY: no pointers (no TPMPARAMS). The menu loop sends `owner`
-    // the menu's messages, as the system defines them.
+    if !super::is_goz_window(owner) {
+        return 0;
+    }
+    // SAFETY: no pointers (no TPMPARAMS). The menu loop sends `owner`, one
+    // of goz-gui's own windows, the menu's messages, as the system defines
+    // them.
     unsafe { TrackPopupMenuEx(menu, flags, pt.x, pt.y, owner, core::ptr::null()) }
 }
 
