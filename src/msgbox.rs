@@ -507,9 +507,7 @@ fn proc(s: &MsgBox, m: &Msg) -> isize {
         // The first activation puts the keyboard on the default button, not
         // the dialog's first: a box shown in the background (`Quiet`) is
         // first active when it is clicked.
-        WM_ACTIVATE
-            if u32::from(win::loword(m.w)) != WA_INACTIVE && !s.activated.replace(true) =>
-        {
+        WM_ACTIVATE if u32::from(win::loword(m.w)) != WA_INACTIVE && !s.activated.replace(true) => {
             s.focus_default(dlg);
             1
         }

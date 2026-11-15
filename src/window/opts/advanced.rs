@@ -11,19 +11,15 @@
 //! the sort, the columns, the panes, the dialogs' places) is shown but
 //! changed only where it is changed: the window, the View menu.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::{
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
-    LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED,
+    LVCF_WIDTH, LVCOLUMNW, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVN_ITEMCHANGED,
     LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NM_DBLCLK, NMHDR, NMLISTVIEW,
+    LVS_SINGLESEL, NM_DBLCLK, NMLISTVIEW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_GROUPBOX, EN_CHANGE, ES_AUTOHSCROLL, WM_COMMAND, WM_NOTIFY, WS_BORDER,
@@ -32,11 +28,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::dialog::Class;
 use crate::options::{
-    Invalid, LABEL, Page, Rows, checked, enable, item, order, send, set_check, set_text, text,
+    Invalid, LABEL, Page, Rows, checked, enable, item, order, set_check, set_text, text,
 };
 use crate::settings::Settings;
 use crate::store::ini::Ini;
-use crate::wide::wz;
+use crate::win::{self, Msg, lv};
 use crate::window::App;
 
 /// Everything's control ids.
@@ -256,17 +252,14 @@ impl Advanced {
             .get()
             .and_then(|c| shown.iter().position(|&i| i == c));
         self.quietly(|| {
-            send(page, LIST, LVM_DELETEALLITEMS, 0, 0);
+            lv::delete_all_items(list);
             for (at, &i) in shown.iter().enumerate() {
                 let r = &rows[i];
-                let mut key = wz(&r.key);
-                let mut lv = LVITEMW {
-                    mask: LVIF_TEXT,
+                let row = LVITEMW {
                     iItem: at as i32,
-                    pszText: key.as_mut_ptr(),
                     ..Default::default()
                 };
-                send(page, LIST, LVM_INSERTITEMW, 0, (&raw mut lv) as isize);
+                lv::insert_item(list, row, Some(&r.key));
                 set_cell(list, at, &r.value);
             }
         });
@@ -289,14 +282,9 @@ impl Advanced {
 
     fn select_at(&self, page: HWND, at: usize) {
         let state = LVIS_SELECTED | LVIS_FOCUSED;
-        let mut lv = LVITEMW {
-            mask: LVIF_STATE,
-            state,
-            stateMask: state,
-            ..Default::default()
-        };
-        send(page, LIST, LVM_SETITEMSTATE, at, (&raw mut lv) as isize);
-        send(page, LIST, LVM_ENSUREVISIBLE, at, 0);
+        let list = item(page, LIST);
+        lv::set_item_state(list, at as i32, state, state);
+        lv::ensure_visible(list, at as i32, false);
     }
 
     /// The chosen setting's value, in the box below the list.
@@ -358,21 +346,7 @@ impl Advanced {
 }
 
 fn set_cell(list: HWND, at: usize, value: &str) {
-    let mut v = wz(value);
-    let mut lv = LVITEMW {
-        iSubItem: 1,
-        pszText: v.as_mut_ptr(),
-        ..Default::default()
-    };
-    // SAFETY: a message to this thread's list; the text outlives it.
-    unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
-            list,
-            LVM_SETITEMTEXTW,
-            at,
-            (&raw mut lv) as isize,
-        )
-    };
+    lv::set_item_text(list, at as i32, 1, value);
 }
 
 impl Page for Advanced {
@@ -458,20 +432,11 @@ impl Page for Advanced {
     fn fill(&self, app: &App, page: HWND) {
         *self.rows.borrow_mut() = rows_of(&app.current_settings());
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
-        send(
-            page,
-            LIST,
-            LVM_SETEXTENDEDLISTVIEWSTYLE,
-            ex as usize,
-            ex as isize,
-        );
+        let list = item(page, LIST);
+        lv::set_extended_style(list, ex, ex);
         // The name three fifths of the list, the value the rest (less a
         // scroll bar's room).
-        let mut rc = windows_sys::Win32::Foundation::RECT::default();
-        // SAFETY: reads the size of this page's list.
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(item(page, LIST), &mut rc)
-        };
+        let rc = win::client_rect(list);
         let dpi = crate::custom::window_dpi(page) as i32;
         let room = (rc.right - rc.left - 20 * dpi / 96).max(100);
         let name_w = room * 3 / 5;
@@ -479,14 +444,12 @@ impl Page for Advanced {
             .into_iter()
             .enumerate()
         {
-            let mut t = wz(name);
             let col = LVCOLUMNW {
-                mask: LVCF_TEXT | LVCF_WIDTH,
+                mask: LVCF_WIDTH,
                 cx: width,
-                pszText: t.as_mut_ptr(),
                 ..Default::default()
             };
-            send(page, LIST, LVM_INSERTCOLUMNW, i, (&raw const col) as isize);
+            lv::insert_column(list, i as i32, col, Some(name));
         }
         set_check(page, MODIFIED, false);
         self.list_rows(page);
@@ -520,25 +483,28 @@ impl Page for Advanced {
         }
     }
 
-    fn message(&self, _app: &App, page: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<isize> {
-        if msg == WM_NOTIFY {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR, an NMLISTVIEW for the
-            // list's item changes.
-            let hdr = unsafe { &*(l as *const NMHDR) };
-            if hdr.idFrom != usize::from(LIST) {
+    fn message_msg(&self, _app: &App, page: HWND, m: &Msg) -> Option<isize> {
+        if m.id == WM_NOTIFY {
+            let n = m.notify()?;
+            if n.id() != usize::from(LIST) {
                 return None;
             }
-            if hdr.code == LVN_ITEMCHANGED && !self.busy.get() {
-                // SAFETY: as above.
-                let nm = unsafe { &*(l as *const NMLISTVIEW) };
-                if nm.uNewState & LVIS_SELECTED != 0 && nm.uOldState & LVIS_SELECTED == 0 {
-                    let i = self.shown.borrow().get(nm.iItem.max(0) as usize).copied();
+            if n.code() == LVN_ITEMCHANGED && !self.busy.get() {
+                // Copied out: what follows sends messages.
+                let nm = n
+                    .get::<NMLISTVIEW>()
+                    .map(|nm| (nm.uNewState, nm.uOldState, nm.iItem));
+                if let Some((new, old, at)) = nm
+                    && new & LVIS_SELECTED != 0
+                    && old & LVIS_SELECTED == 0
+                {
+                    let i = self.shown.borrow().get(at.max(0) as usize).copied();
                     self.current.set(i);
                     self.show_value(page);
                 }
                 return Some(0);
             }
-            if hdr.code == NM_DBLCLK {
+            if n.code() == NM_DBLCLK {
                 let Some(i) = self.current.get() else {
                     return Some(0);
                 };
@@ -555,10 +521,10 @@ impl Page for Advanced {
             }
             return None;
         }
-        if msg != WM_COMMAND {
+        if m.id != WM_COMMAND {
             return None;
         }
-        let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+        let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
         if self.busy.get() {
             return Some(0);
         }

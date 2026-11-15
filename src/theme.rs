@@ -273,7 +273,11 @@ pub fn system_dark() -> bool {
 /// accent of Default in Options > Fonts and Colors; Windows' default blue
 /// if it cannot be read.
 pub fn system_accent() -> u32 {
-    match ext::reg_dword(Hive::CurrentUser, r"Software\Microsoft\Windows\DWM", "AccentColor") {
+    match ext::reg_dword(
+        Hive::CurrentUser,
+        r"Software\Microsoft\Windows\DWM",
+        "AccentColor",
+    ) {
         // 0xAABBGGRR: the low three bytes are a COLORREF.
         Some(data) => data & 0x00ff_ffff,
         None => rgb(0x00, 0x78, 0xd4),

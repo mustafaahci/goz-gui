@@ -59,10 +59,14 @@ pub fn reg_dword(hive: Hive, key: &str, value: &str) -> Option<u32> {
 /// The string `value` of key `key` (a path under `hive`), if it is there,
 /// is a REG_SZ and fits in `cap` UTF-16 units with its NUL.
 pub fn reg_string(hive: Hive, key: &str, value: &str, cap: usize) -> Option<String> {
+    // No room for even the NUL (and no buffer to point at).
+    if cap == 0 {
+        return None;
+    }
     let key = wz(key);
     let value = wz(value);
     let mut buf = vec![0u16; cap];
-    let mut size = u32::try_from(buf.len() * 2).unwrap_or(u32::MAX & !1);
+    let mut size = u32::try_from(buf.len() * 2).unwrap_or(u32::MAX - 1);
     // SAFETY: a predefined key; NUL-terminated names read during the call;
     // the buffer, whose size in bytes is passed (at most its own), written
     // during the call.
@@ -392,4 +396,111 @@ pub fn set_pixel(
 ) -> bool {
     // SAFETY: no pointers; GDI checks the DC.
     unsafe { windows_sys::Win32::Graphics::Gdi::SetPixelV(hdc, x, y, c) != 0 }
+}
+
+/// EnableThemeDialogTexture: whether a dialog draws the tab's face behind
+/// its controls (ETDT_*).
+pub fn enable_theme_dialog_texture(hwnd: HWND, flags: u32) -> bool {
+    // SAFETY: no pointers.
+    unsafe { windows_sys::Win32::UI::Controls::EnableThemeDialogTexture(hwnd, flags) >= 0 }
+}
+
+/// TBM_SETRANGE: a trackbar's range as one message (16-bit ends), to a
+/// trackbar only.
+pub fn trackbar_set_range16(t: HWND, min: u16, max: u16, redraw: bool) {
+    use windows_sys::Win32::UI::Controls::TBM_SETRANGE;
+    let t = crate::win::of_class(t, crate::win::trackbar::CLASS);
+    let l = crate::win::make_lparam(min, max);
+    // SAFETY: TBM_SETRANGE's parameters are a flag and two packed integers;
+    // to a trackbar (or to null).
+    unsafe { crate::win::send_raw(t, TBM_SETRANGE, usize::from(redraw), l) };
+}
+
+/// The font faces the screen has, as EnumFontFamiliesExW gives them for a
+/// LOGFONTW of `charset` and no face (DEFAULT_CHARSET: each face once per
+/// charset it has), in its order.
+pub fn font_faces(charset: u8) -> Vec<String> {
+    use windows_sys::Win32::Foundation::LPARAM;
+    use windows_sys::Win32::Graphics::Gdi::{EnumFontFamiliesExW, LOGFONTW, TEXTMETRICW};
+
+    /// Adds each face to the vector `l` points at.
+    unsafe extern "system" fn each(
+        lf: *const LOGFONTW,
+        _tm: *const TEXTMETRICW,
+        _kind: u32,
+        l: LPARAM,
+    ) -> i32 {
+        // SAFETY: `l` is `font_faces`' vector, alive and borrowed by nothing
+        // else for the enumeration; `lf` the face Windows enumerates, read
+        // during the call (its name copied out).
+        unsafe {
+            let out = &mut *(l as *mut Vec<String>);
+            let face = &(*lf).lfFaceName;
+            out.push(String::from_utf16_lossy(crate::win::until_nul(face)));
+        }
+        1
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let dc = crate::win::gdi::WindowDc::get(core::ptr::null_mut());
+    let lf = LOGFONTW {
+        lfCharSet: charset,
+        ..Default::default()
+    };
+    // SAFETY: the screen's DC (released when `dc` drops); the callback
+    // above with `out`, which outlives the call and is not touched during
+    // it but through the callback.
+    unsafe { EnumFontFamiliesExW(dc.hdc(), &lf, Some(each), (&raw mut out) as LPARAM, 0) };
+    out
+}
+
+/// CB_SELECTSTRING: selects the first item after `after` (-1: from the
+/// start) whose text starts with `text` (ignoring case); its index, CB_ERR
+/// if none.
+pub fn combo_select_string(c: HWND, after: i32, text: &str) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::CB_SELECTSTRING;
+    let z = wz(text);
+    // SAFETY: CB_SELECTSTRING (below WM_USER: the same for every window)
+    // takes an index and a NUL-terminated string, read during the call.
+    unsafe {
+        crate::win::send_raw(
+            c,
+            CB_SELECTSTRING,
+            after as isize as usize,
+            z.as_ptr() as isize,
+        ) as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_registry_gives_dwords_and_strings() {
+        let key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+        assert!(reg_dword(Hive::LocalMachine, key, "CurrentMajorVersionNumber").is_some());
+        let build = reg_string(Hive::LocalMachine, key, "CurrentBuild", 256);
+        assert!(build.is_some_and(|b| !b.is_empty() && !b.contains('\0')));
+        // A DWORD is not a string, and no buffer holds nothing.
+        assert_eq!(
+            reg_string(Hive::LocalMachine, key, "CurrentMajorVersionNumber", 256),
+            None
+        );
+        assert_eq!(reg_string(Hive::LocalMachine, key, "CurrentBuild", 0), None);
+        assert_eq!(
+            reg_dword(Hive::CurrentUser, r"Software\goz-gui-no-such-key", "x"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_icon_is_asked_for_by_number() {
+        assert!(Icon::system(0x10000, 32, 32).is_none());
+    }
+
+    #[test]
+    fn a_class_never_registered_is_not() {
+        assert!(!class_registered("goz-gui-no-such-class"));
+    }
 }

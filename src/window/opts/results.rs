@@ -7,10 +7,7 @@
 //! "Automatically scroll view" and "Underline icon titles" are the list
 //! control's own doing, which goz-gui leaves as Windows has it: not here.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::KillTimer;
 
 use crate::options::{
     Invalid, Page, Rows, checked, combo_value, enable, fill_combo, order, select_combo, set_check,
@@ -174,8 +171,7 @@ impl App {
             return;
         }
         if ms == 0 {
-            // SAFETY: a timer of this window.
-            unsafe { KillTimer(self.hwnd, super::super::TIMER_LIVE) };
+            crate::win::kill_timer(self.hwnd, super::super::TIMER_LIVE);
         } else {
             self.arm_live();
         }

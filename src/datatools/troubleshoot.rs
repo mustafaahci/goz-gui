@@ -17,8 +17,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::dialog::{
-    self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner,
-    common_msg,
+    self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner, common_msg,
 };
 use crate::store::location::Source;
 use crate::win::ext::b4::{self as ext, Hive};
