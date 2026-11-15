@@ -499,3 +499,103 @@ fn a_control_keeps_the_image_lists_it_shows_alive() {
     assert!(!tv::set_image_list(view, TVSIL_NORMAL, None), "gone");
     super::destroy(parent);
 }
+
+/// A hidden tree view, child of a hidden top-level window of the test
+/// class whose messages go to `parent`: (the tree, its parent).
+fn hidden_tree(parent: impl Fn(&Msg) -> isize + 'static) -> (HWND, HWND) {
+    use windows_sys::Win32::UI::Controls::ICC_TREEVIEW_CLASSES;
+    super::sys::init_common_controls(ICC_TREEVIEW_CLASSES);
+    let _ = Class::new(CLASS).register();
+    let host = class::create(
+        &Create {
+            ex_style: 0,
+            class: CLASS,
+            title: "",
+            style: WS_POPUP,
+            rect: (0, 0, 200, 200),
+            parent: core::ptr::null_mut(),
+            menu: core::ptr::null_mut(),
+        },
+        parent,
+    );
+    assert!(!host.is_null());
+    let tree = class::create_plain(&Create {
+        ex_style: 0,
+        class: super::tv::CLASS,
+        title: "",
+        style: WS_CHILD,
+        rect: (0, 0, 200, 200),
+        parent: host,
+        menu: class::id_menu(1),
+    });
+    assert!(!tree.is_null());
+    (tree, host)
+}
+
+#[test]
+fn a_tree_item_acts_on_its_own_tree_and_only_while_it_is_there() {
+    use super::tv::{self, After, Item, Select};
+    use windows_sys::Win32::UI::Controls::{
+        TVIF_EXPANDEDIMAGE, TVIF_INTEGRAL, TVIF_PARAM, TVIF_STATEEX, TVITEMEXW, TVITEMW,
+        TVN_DELETEITEMW,
+    };
+    let item = |param: isize| TVITEMEXW {
+        mask: TVIF_PARAM,
+        lParam: param,
+        ..Default::default()
+    };
+    // What the parent of tree A can do with A's first item while A deletes
+    // its items, one by one.
+    let watched: Rc<Cell<Option<Item>>> = Rc::new(Cell::new(None));
+    let during = Rc::new(RefCell::new(Vec::new()));
+    let (w, d) = (Rc::clone(&watched), Rc::clone(&during));
+    let (a, host_a) = hidden_tree(move |m| {
+        if let Some(n) = m.notify()
+            && n.code() == TVN_DELETEITEMW
+            && let Some(item) = w.get()
+        {
+            d.borrow_mut().push(tv::item_param(item));
+        }
+        m.def()
+    });
+    let (b, host_b) = hidden_tree(|m| m.def());
+    let a1 = tv::insert(a, None, After::Last, item(1), Some("a1")).expect("a1");
+    let a2 = tv::insert(a, Some(a1), After::Last, item(2), Some("a2")).expect("a2");
+    let b1 = tv::insert(b, None, After::Last, item(10), Some("b1")).expect("b1");
+    assert_eq!((a1.tree(), b1.tree()), (a, b));
+    // Each item acts on its own tree.
+    assert_eq!(tv::item_param(a2), Some(2));
+    assert_eq!(tv::item_param(b1), Some(10));
+    assert_eq!(tv::child(a1), Some(a2));
+    // An item of A goes into nothing of B's.
+    assert!(!tv::select(b, Select::Caret, Some(a1)));
+    assert!(tv::insert(b, Some(a1), After::Last, item(3), Some("x")).is_none());
+    assert!(tv::insert(b, None, After::Item(a1), item(3), Some("x")).is_none());
+    // Nor after an item of another parent.
+    assert!(tv::insert(a, None, After::Item(a2), item(3), Some("x")).is_none());
+    assert!(tv::select(a, Select::Caret, Some(a2)));
+    assert_eq!(tv::selection(a), Some(a2));
+    // TVITEMEXW's own fields are never asked of a TVITEMW.
+    let fields = TVITEMW {
+        mask: TVIF_PARAM | TVIF_INTEGRAL | TVIF_STATEEX | TVIF_EXPANDEDIMAGE,
+        ..Default::default()
+    };
+    let (got, _) = tv::get_item(a2, fields, 0).expect("read");
+    assert_eq!(got.mask, TVIF_PARAM);
+    assert_eq!(got.lParam, 2);
+    assert!(tv::set_item(a2, fields, Some("a2 again")));
+    // Deleted: refused from the moment it starts to go.
+    watched.set(Some(a2));
+    assert!(tv::delete_item(a1));
+    assert_eq!(*during.borrow(), vec![None, None]);
+    assert_eq!(tv::item_param(a1), None);
+    assert!(!tv::delete_item(a2));
+    assert_eq!(tv::child(a1), None);
+    // B's goes on.
+    assert_eq!(tv::item_param(b1), Some(10));
+    // A tree destroyed takes its items with it.
+    super::destroy(host_b);
+    assert_eq!(tv::item_param(b1), None);
+    assert!(!tv::delete_item(b1));
+    super::destroy(host_a);
+}

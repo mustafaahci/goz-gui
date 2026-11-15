@@ -25,7 +25,7 @@ pub use organize::organize;
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::UI::Controls::{
-    HTREEITEM, TVE_EXPAND, TVGN_CARET, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE, TVITEMEXW,
+    TVE_EXPAND, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE, TVITEMEXW,
 };
 use windows_sys::Win32::UI::Shell::{SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -122,15 +122,10 @@ const TOP_NAME: &str = "Bookmarks";
 /// Fills a tree view with the folders of `tree`, all open: the top as
 /// "Bookmarks", each item's lParam its node. The folders `skip` (and what
 /// is in them) are left out. Returns each node's item.
-fn fill_tree(
-    view: HWND,
-    tree: &Tree,
-    skip: &[FolderPath],
-    icons: Icons,
-) -> Vec<(usize, HTREEITEM)> {
-    tv::delete_item(view, tv::ROOT);
+fn fill_tree(view: HWND, tree: &Tree, skip: &[FolderPath], icons: Icons) -> Vec<(usize, tv::Item)> {
+    tv::delete_all(view);
     let mut made = Vec::new();
-    let insert = |parent: HTREEITEM, text: &str, node: usize| -> HTREEITEM {
+    let insert = |parent: Option<tv::Item>, text: &str, node: usize| -> Option<tv::Item> {
         let item = TVITEMEXW {
             mask: TVIF_PARAM | TVIF_IMAGE | TVIF_SELECTEDIMAGE,
             iImage: icons.folder,
@@ -138,9 +133,11 @@ fn fill_tree(
             lParam: node as LPARAM,
             ..Default::default()
         };
-        tv::insert(view, parent, tv::LAST, item, Some(text))
+        tv::insert(view, parent, tv::After::Last, item, Some(text))
     };
-    let top = insert(tv::ROOT, TOP_NAME, TOP);
+    let Some(top) = insert(None, TOP_NAME, TOP) else {
+        return made;
+    };
     made.push((TOP, top));
     // Each folder after its parent, depth first: a parent is made first.
     for (f, _) in tree.folders_below(TOP) {
@@ -153,31 +150,29 @@ fn fill_tree(
         let Some(&(_, at)) = made.iter().find(|(n, _)| *n == parent) else {
             continue;
         };
-        let h = insert(at, tree.nodes[f].name(), f);
-        made.push((f, h));
+        if let Some(h) = insert(Some(at), tree.nodes[f].name(), f) {
+            made.push((f, h));
+        }
     }
     for &(_, h) in &made {
-        tv::expand(view, h, TVE_EXPAND);
+        tv::expand(h, TVE_EXPAND);
     }
     made
 }
 
 /// Selects `node`'s item in a tree view `fill_tree` filled.
-fn tree_select(view: HWND, made: &[(usize, HTREEITEM)], node: usize) {
+fn tree_select(made: &[(usize, tv::Item)], node: usize) {
     if let Some(&(_, h)) = made.iter().find(|(n, _)| *n == node) {
-        tv::select_item(view, TVGN_CARET, h);
-        tv::ensure_visible(view, h);
+        tv::select(h.tree(), tv::Select::Caret, Some(h));
+        tv::ensure_visible(h);
     }
 }
 
 /// The node of the tree view's selected item.
 fn tree_selected(view: HWND) -> Option<usize> {
-    let h = tv::next_item(view, 0, TVGN_CARET);
-    if h == 0 {
-        return None;
-    }
+    let h = tv::selection(view)?;
     // An item the tree would not read reads as 0, the top.
-    let param = tv::item_param(view, h).unwrap_or(0);
+    let param = tv::item_param(h).unwrap_or(0);
     usize::try_from(param).ok()
 }
 

@@ -33,11 +33,11 @@ use std::sync::Arc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::UI::Controls::{
-    HTREEITEM, NM_CLICK, NM_CUSTOMDRAW, NM_DBLCLK, NM_SETFOCUS, NMTREEVIEWW, NMTVCUSTOMDRAW,
-    NMTVGETINFOTIPW, TVE_COLLAPSE, TVE_EXPAND, TVHT_ONITEM, TVHT_ONITEMINDENT, TVHT_ONITEMRIGHT,
-    TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW, TVS_EX_AUTOHSCROLL, TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT,
-    TVS_HASBUTTONS, TVS_INFOTIP, TVS_LINESATROOT, TVS_NOHSCROLL, TVS_NONEVENHEIGHT,
-    TVS_SHOWSELALWAYS, TVS_TRACKSELECT, WM_MOUSELEAVE,
+    NM_CLICK, NM_CUSTOMDRAW, NM_DBLCLK, NM_SETFOCUS, NMTREEVIEWW, NMTVCUSTOMDRAW, NMTVGETINFOTIPW,
+    TVE_COLLAPSE, TVE_EXPAND, TVHT_ONITEM, TVHT_ONITEMINDENT, TVHT_ONITEMRIGHT, TVN_GETINFOTIPW,
+    TVN_ITEMEXPANDEDW, TVS_EX_AUTOHSCROLL, TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS,
+    TVS_INFOTIP, TVS_LINESATROOT, TVS_NOHSCROLL, TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS,
+    TVS_TRACKSELECT, WM_MOUSELEAVE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F2, VK_RETURN, VK_SHIFT, VK_UP,
@@ -58,8 +58,9 @@ use crate::menu::{self, Item as MenuItem};
 use crate::paint::fill;
 use crate::pane::PaneContent;
 use crate::sidebars::{self, Shown};
-use crate::treeview::{self, Images, NONE, New, Source};
+use crate::treeview::{self, Images, New, Source, TreeItem};
 use crate::win::class::{self, Create};
+use crate::win::tv::After;
 use crate::win::{self, Msg, edit, subclass, sys, tv};
 use crate::{searchbox, theme};
 
@@ -194,8 +195,8 @@ impl BookmarksPane {
     }
 
     /// The entry of a tree item.
-    fn entry(&self, item: HTREEITEM) -> Option<Entry> {
-        let i = usize::try_from(treeview::param(self.tree.get(), item)?).ok()?;
+    fn entry(&self, item: Option<TreeItem>) -> Option<Entry> {
+        let i = usize::try_from(treeview::param(item?)?).ok()?;
         self.entries.borrow().get(i).cloned()
     }
 
@@ -215,16 +216,16 @@ impl BookmarksPane {
 
     /// The tree item, and its entry, that stands for `keep` now; `None`
     /// when it is not shown any more.
-    fn find(&self, keep: &Keep) -> Option<(HTREEITEM, Entry)> {
+    fn find(&self, keep: &Keep) -> Option<(TreeItem, Entry)> {
         let tree = self.tree.get();
-        let mut todo = treeview::children(tree, NONE);
+        let mut todo = treeview::children(tree, None);
         while let Some(item) = todo.pop() {
-            if let Some(entry) = self.entry(item)
+            if let Some(entry) = self.entry(Some(item))
                 && self.keep_of(&entry) == *keep
             {
                 return Some((item, entry));
             }
-            todo.extend(treeview::children(tree, item));
+            todo.extend(treeview::children(tree, Some(item)));
         }
         None
     }
@@ -254,21 +255,21 @@ impl BookmarksPane {
         };
         let tree = self.tree.get();
         let was = self.filling.replace(true);
-        treeview::delete(tree, NONE);
+        treeview::delete_all(tree);
         self.entries.borrow_mut().clear();
         let mut again = None;
-        let mut first = NONE;
+        let mut first = None;
         self.insert(
             &shown,
-            NONE,
+            None,
             (folder_image, mark_image),
             &list,
             keep.as_ref(),
             &mut again,
             &mut first,
         );
-        if let Some(item) = again.or((first != NONE && !filter.is_empty()).then_some(first)) {
-            treeview::select(tree, item);
+        if let Some(item) = again.or(first.filter(|_| !filter.is_empty())) {
+            treeview::select(tree, Some(item));
         }
         self.filling.set(was);
         *self.list.borrow_mut() = list;
@@ -281,12 +282,12 @@ impl BookmarksPane {
     fn insert(
         &self,
         shown: &[Shown],
-        parent: HTREEITEM,
+        parent: Option<TreeItem>,
         images: (i32, i32),
         list: &Bookmarks,
         keep: Option<&Keep>,
-        found: &mut Option<HTREEITEM>,
-        first: &mut HTREEITEM,
+        found: &mut Option<TreeItem>,
+        first: &mut Option<TreeItem>,
     ) {
         let tree = self.tree.get();
         for s in shown {
@@ -316,20 +317,19 @@ impl BookmarksPane {
                 entries.len() as isize - 1
             };
             let text: Vec<u16> = text.encode_utf16().collect();
-            let item = treeview::insert(
+            let Some(item) = treeview::insert(
                 tree,
                 &New {
                     parent,
-                    after: None,
+                    after: After::Last,
                     text: &text,
                     image,
                     children,
                     param,
                 },
-            );
-            if item == NONE {
+            ) else {
                 continue;
-            }
+            };
             let key = match &entry {
                 Entry::Folder { place, .. } => Keep::Folder(place.join("/")),
                 Entry::Mark { row } => Keep::Mark(Id::of(list, *row)),
@@ -339,12 +339,12 @@ impl BookmarksPane {
             }
             match s {
                 Shown::Folder { items, open, .. } => {
-                    self.insert(items, item, images, list, keep, found, first);
+                    self.insert(items, Some(item), images, list, keep, found, first);
                     if *open {
-                        treeview::expand(tree, item, true);
+                        treeview::expand(item, true);
                     }
                 }
-                Shown::Mark { .. } if *first == NONE => *first = item,
+                Shown::Mark { .. } if first.is_none() => *first = Some(item),
                 Shown::Mark { .. } => {}
             }
         }
@@ -430,32 +430,31 @@ impl BookmarksPane {
 
     /// What Enter (or the menu's first item) does to `item`: opens a
     /// bookmark, opens or closes a folder.
-    fn activate(&self, app: &App, item: HTREEITEM) {
-        match self.entry(item) {
-            Some(Entry::Mark { row }) => self.open(app, row),
-            Some(Entry::Folder { .. }) => {
-                let tree = self.tree.get();
-                treeview::expand(tree, item, !treeview::is_expanded(tree, item));
+    fn activate(&self, app: &App, item: Option<TreeItem>) {
+        match (self.entry(item), item) {
+            (Some(Entry::Mark { row }), _) => self.open(app, row),
+            (Some(Entry::Folder { .. }), Some(item)) => {
+                treeview::expand(item, !treeview::is_expanded(item));
             }
-            None => {}
+            _ => {}
         }
     }
 
     /// A folder opened or closed by the user: the open ones are kept, while
     /// the box filters nothing (filtered, they all show open).
-    fn expanded(&self, app: &App, nm: &NMTREEVIEWW) {
+    fn expanded(&self, app: &App, item: Option<TreeItem>, action: u32) {
         if self.filling.get() || !self.filter().is_empty() {
             return;
         }
-        let Some(Entry::Folder { place, .. }) = self.entry(nm.itemNew.hItem) else {
+        let Some(Entry::Folder { place, .. }) = self.entry(item) else {
             return;
         };
         let place = place.join("/");
         let mut open = app.sidebar_settings().bookmarks_expanded;
         open.retain(|p| !p.eq_ignore_ascii_case(&place));
-        if nm.action == TVE_EXPAND {
+        if action == TVE_EXPAND {
             open.push(place);
-        } else if nm.action != TVE_COLLAPSE {
+        } else if action != TVE_COLLAPSE {
             return;
         }
         app.set_bookmarks_expanded(open);
@@ -471,7 +470,7 @@ impl BookmarksPane {
         self.sync(app);
         let (item, pt) = if l == -1 {
             let item = treeview::selected(tree);
-            let rc = treeview::item_rect(tree, item, true);
+            let rc = item.map_or_else(RECT::default, |i| treeview::item_rect(i, true));
             let pt = win::client_to_screen(
                 tree,
                 POINT {
@@ -495,7 +494,7 @@ impl BookmarksPane {
                 Some(MARK_OPEN)
             }
             Some(Entry::Folder { .. }) => {
-                let label = if treeview::is_expanded(tree, item) {
+                let label = if item.is_some_and(treeview::is_expanded) {
                     "Collap&se"
                 } else {
                     "Exp&and"
@@ -528,7 +527,7 @@ impl BookmarksPane {
         }
         let id = app.track_with_shell(popup, pt, "bookmarks menu", None);
         if marked {
-            treeview::drop_highlight(tree, NONE);
+            treeview::drop_highlight(tree, None);
         }
         // The menu made above.
         win::menu::destroy(popup);
@@ -539,7 +538,7 @@ impl BookmarksPane {
         let now = keep.as_ref().and_then(|k| self.find(k));
         match (id as u16, now) {
             (0, _) => {}
-            (MARK_OPEN | MARK_EXPAND, Some((item, _))) => self.activate(app, item),
+            (MARK_OPEN | MARK_EXPAND, Some((item, _))) => self.activate(app, Some(item)),
             (MARK_EDIT, Some((_, e))) => self.edit_entry(app, &e),
             (MARK_DELETE, Some((_, e))) => self.delete_entry(app, &e),
             (MARK_OPEN | MARK_EXPAND | MARK_EDIT | MARK_DELETE, None) => {}
@@ -597,8 +596,10 @@ impl BookmarksPane {
             }
             TVN_ITEMEXPANDEDW => {
                 // Copied out: nothing of the message is held meanwhile.
-                if let Some(nm) = n.get::<NMTREEVIEWW>().map(|v| *v) {
-                    self.expanded(app, &nm);
+                if let Some((item, action)) =
+                    n.get::<NMTREEVIEWW>().map(|v| (v.item_new(), v.action))
+                {
+                    self.expanded(app, item, action);
                 }
                 Some(0)
             }
@@ -606,7 +607,7 @@ impl BookmarksPane {
                 let Some(mut tip) = n.get::<NMTVGETINFOTIPW>() else {
                     return Some(0);
                 };
-                if let Some(Entry::Mark { row }) = self.entry(tip.hItem) {
+                if let Some(Entry::Mark { row }) = self.entry(tip.item()) {
                     let text = {
                         let list = self.list.borrow();
                         list.rows().get(row).map(|r| {
@@ -828,11 +829,10 @@ impl PaneContent for BookmarksPane {
             return match msg.message {
                 WM_KEYDOWN => match vk {
                     VK_DOWN => {
-                        let tree_item = treeview::selected(tree);
-                        if tree_item == NONE
-                            && let Some(&first) = treeview::children(tree, NONE).first()
+                        if treeview::selected(tree).is_none()
+                            && let Some(&first) = treeview::children(tree, None).first()
                         {
-                            treeview::select(tree, first);
+                            treeview::select(tree, Some(first));
                         }
                         win::set_focus(tree);
                         true

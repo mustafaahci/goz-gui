@@ -54,10 +54,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, PS_SOLID, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
-    HTREEITEM, NM_CUSTOMDRAW, NMTREEVIEWW, NMTVCUSTOMDRAW, TTF_SUBCLASS, TTS_ALWAYSTIP,
-    TTS_NOPREFIX, TTTOOLINFOW, TVC_BYMOUSE, TVE_EXPAND, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW,
-    TVS_EX_AUTOHSCROLL, TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_LINESATROOT,
-    TVS_NOHSCROLL, TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT,
+    NM_CUSTOMDRAW, NMTREEVIEWW, NMTVCUSTOMDRAW, TTF_SUBCLASS, TTS_ALWAYSTIP, TTS_NOPREFIX,
+    TTTOOLINFOW, TVC_BYMOUSE, TVE_EXPAND, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW, TVS_EX_AUTOHSCROLL,
+    TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_LINESATROOT, TVS_NOHSCROLL,
+    TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_F5, VK_RETURN, VK_SHIFT, VK_UP,
@@ -79,10 +79,11 @@ use crate::paint::fill;
 use crate::shell;
 use crate::store::location;
 use crate::theme;
-use crate::treeview::{self, Images, NONE, New, Source};
+use crate::treeview::{self, Images, New, Source, TreeItem};
 use crate::win::class::{self, Create};
 use crate::win::gdi::{self, Owned, Selected, WindowDc};
 use crate::win::tip::Text;
+use crate::win::tv::After;
 use crate::win::{self, Msg, parcel, subclass, sys, tv};
 
 /// A thread's listing (a `foldertree::Reply`, as a parcel).
@@ -164,7 +165,7 @@ struct Node {
     /// A folder's name; a drive's root (`C:\`); nothing for the top item.
     name: Vec<u16>,
     parent: Option<u32>,
-    item: HTREEITEM,
+    item: TreeItem,
     /// Its subfolders' nodes, in the tree's order.
     children: Vec<u32>,
     load: Load,
@@ -341,8 +342,9 @@ impl FoldersPane {
     }
 
     /// The node of a tree item.
-    fn node_of(&self, item: HTREEITEM) -> Option<u32> {
-        let n = u32::try_from(treeview::param(self.tree.get(), item)?).ok()?;
+    fn node_of(&self, item: Option<TreeItem>) -> Option<u32> {
+        let item = item?;
+        let n = u32::try_from(treeview::param(item)?).ok()?;
         let nodes = self.nodes.borrow();
         nodes
             .get(n as usize)
@@ -350,12 +352,12 @@ impl FoldersPane {
             .map(|_| n)
     }
 
-    /// Puts a node in the tree under `parent` (`None`: the top level) after
-    /// `after` (`Some(NONE)`: first; `None`: last); its index.
+    /// Puts a node in the tree under `parent` (`None`: the top level),
+    /// placed as `after` says; its index.
     fn add(
         &self,
         parent: Option<u32>,
-        after: Option<HTREEITEM>,
+        after: After,
         name: Vec<u16>,
         text: &[u16],
         image: i32,
@@ -363,10 +365,7 @@ impl FoldersPane {
     ) -> Option<u32> {
         let (parent_item, at) = {
             let nodes = self.nodes.borrow();
-            (
-                parent.map_or(NONE, |p| nodes[p as usize].item),
-                nodes.len() as u32,
-            )
+            (parent.map(|p| nodes[p as usize].item), nodes.len() as u32)
         };
         let item = treeview::insert(
             self.tree.get(),
@@ -378,10 +377,7 @@ impl FoldersPane {
                 children,
                 param: at as isize,
             },
-        );
-        if item == NONE {
-            return None;
-        }
+        )?;
         let mut nodes = self.nodes.borrow_mut();
         // Inserting sends this pane nothing, so the index still holds.
         debug_assert_eq!(nodes.len() as u32, at);
@@ -442,7 +438,7 @@ impl FoldersPane {
             let image = self.image(root.icon);
             self.add(
                 None,
-                None,
+                After::Last,
                 root.path,
                 &root.label,
                 image,
@@ -503,7 +499,7 @@ impl FoldersPane {
                     nodes[node as usize].open_when_listed = false;
                 }
                 self.sync_more(node);
-                treeview::set_children(self.tree.get(), item, false);
+                treeview::set_children(item, false);
                 self.continue_reveal(app);
                 return;
             }
@@ -580,9 +576,14 @@ impl FoldersPane {
             for f in part {
                 let image = self.image(f.icon);
                 let children = f.has_folders != Some(false);
-                if let Some(id) =
-                    self.add(Some(node), None, f.name.clone(), &f.name, image, children)
-                {
+                if let Some(id) = self.add(
+                    Some(node),
+                    After::Last,
+                    f.name.clone(),
+                    &f.name,
+                    image,
+                    children,
+                ) {
                     added.push(id);
                 }
             }
@@ -607,11 +608,11 @@ impl FoldersPane {
             (done.then_some((n.item, n.children.is_empty())), open)
         };
         if let Some(item) = open {
-            self.quietly(|| treeview::expand(self.tree.get(), item, true));
+            self.quietly(|| treeview::expand(item, true));
         }
         if let Some((item, empty)) = done {
             if empty {
-                treeview::set_children(self.tree.get(), item, false);
+                treeview::set_children(item, false);
             }
             // After the last of them: how many more there are.
             self.sync_more(node);
@@ -632,7 +633,6 @@ impl FoldersPane {
             }
             (node.hidden, node.more)
         };
-        let tree = self.tree.get();
         match (hidden, more) {
             (0, None) => {}
             (0, Some(m)) => {
@@ -642,16 +642,24 @@ impl FoldersPane {
                     Self::forget(&mut nodes, m);
                     nodes[m as usize].item
                 };
-                self.quietly(|| treeview::delete(tree, item));
+                self.quietly(|| treeview::delete(item));
             }
             (h, Some(m)) => {
                 let item = self.nodes.borrow()[m as usize].item;
-                treeview::set_text(tree, item, &more_label(h));
+                treeview::set_text(item, &more_label(h));
             }
             (h, None) => {
                 let image = self.image(None);
-                let id = self
-                    .quietly(|| self.add(Some(n), None, Vec::new(), &more_label(h), image, false));
+                let id = self.quietly(|| {
+                    self.add(
+                        Some(n),
+                        After::Last,
+                        Vec::new(),
+                        &more_label(h),
+                        image,
+                        false,
+                    )
+                });
                 if let Some(id) = id {
                     let mut nodes = self.nodes.borrow_mut();
                     nodes[id as usize].is_more = true;
@@ -694,7 +702,6 @@ impl FoldersPane {
         let old: Vec<&[u16]> = old_names.iter().map(Vec::as_slice).collect();
         let new: Vec<&[u16]> = found.iter().map(|f| f.name.as_slice()).collect();
         let (steps, gone) = foldertree::merge(&old, &new);
-        let tree = self.tree.get();
         self.quietly(|| {
             for &g in &gone {
                 let item = {
@@ -703,9 +710,9 @@ impl FoldersPane {
                     Self::forget(&mut nodes, old_ids[g]);
                     item
                 };
-                treeview::delete(tree, item);
+                treeview::delete(item);
             }
-            let mut prev = NONE;
+            let mut prev = After::First;
             let mut order = Vec::with_capacity(steps.len());
             // A step for each new folder, in their order.
             for (j, step) in steps.into_iter().enumerate() {
@@ -720,28 +727,23 @@ impl FoldersPane {
                         };
                         if name != f.name {
                             // Renamed in case only.
-                            treeview::set_text(tree, item, &f.name);
+                            treeview::set_text(item, &f.name);
                             self.nodes.borrow_mut()[id as usize].name = f.name.clone();
                         }
                         if load == Load::Unlisted {
-                            treeview::set_children(tree, item, f.has_folders != Some(false));
+                            treeview::set_children(item, f.has_folders != Some(false));
                         }
-                        prev = item;
+                        prev = After::Item(item);
                         order.push(id);
                     }
                     Step::Insert(new) => {
                         let f = &found[new];
                         let image = self.image(f.icon);
                         let children = f.has_folders != Some(false);
-                        if let Some(id) = self.add(
-                            Some(n),
-                            Some(prev),
-                            f.name.clone(),
-                            &f.name,
-                            image,
-                            children,
-                        ) {
-                            prev = self.nodes.borrow()[id as usize].item;
+                        if let Some(id) =
+                            self.add(Some(n), prev, f.name.clone(), &f.name, image, children)
+                        {
+                            prev = After::Item(self.nodes.borrow()[id as usize].item);
                             order.push(id);
                         }
                     }
@@ -754,7 +756,7 @@ impl FoldersPane {
                 empty.then_some(nodes[n as usize].item)
             };
             if let Some(item) = item {
-                treeview::set_children(tree, item, false);
+                treeview::set_children(item, false);
             }
         });
     }
@@ -767,7 +769,7 @@ impl FoldersPane {
         match app.folder_selection() {
             None => {
                 *self.reveal.borrow_mut() = None;
-                let top = self.nodes.borrow().first().map_or(NONE, |n| n.item);
+                let top = self.nodes.borrow().first().map(|n| n.item);
                 if treeview::selected(self.tree.get()) != top {
                     self.quietly(|| treeview::select(self.tree.get(), top));
                 }
@@ -788,7 +790,7 @@ impl FoldersPane {
         let tree = self.tree.get();
         let give_up = || {
             *self.reveal.borrow_mut() = None;
-            self.quietly(|| treeview::select(tree, NONE));
+            self.quietly(|| treeview::select(tree, None));
         };
         // `X:\` and the names after it.
         if target.len() < 3 || target[1] != utf16(b':') || target[2] != utf16(b'\\') {
@@ -827,8 +829,8 @@ impl FoldersPane {
             match load {
                 Load::Listed => match child {
                     Some(c) => {
-                        if !treeview::is_expanded(tree, item) {
-                            self.quietly(|| treeview::expand(tree, item, true));
+                        if !treeview::is_expanded(item) {
+                            self.quietly(|| treeview::expand(item, true));
                         }
                         at = c;
                     }
@@ -871,8 +873,8 @@ impl FoldersPane {
         };
         let selected = treeview::selected(tree);
         // Chosen through its "more folders" item, which stays chosen.
-        if selected != item && Some(selected) != more {
-            self.quietly(|| treeview::select(tree, item));
+        if selected != Some(item) && (more.is_none() || selected != more) {
+            self.quietly(|| treeview::select(tree, Some(item)));
         }
     }
 
@@ -911,6 +913,7 @@ impl FoldersPane {
                 let Some(nm) = n.get::<NMTREEVIEWW>().map(|v| *v) else {
                     return Some(0);
                 };
+                // The item's param, the node, as the tree notified it.
                 if nm.action == TVE_EXPAND
                     && let Ok(n) = u32::try_from(nm.itemNew.lParam)
                 {
@@ -966,7 +969,7 @@ impl FoldersPane {
         let tree = self.tree.get();
         let (item, pt) = if l == -1 {
             let item = treeview::selected(tree);
-            let rc = treeview::item_rect(tree, item, true);
+            let rc = item.map_or_else(RECT::default, |i| treeview::item_rect(i, true));
             let pt = win::client_to_screen(
                 tree,
                 POINT {
@@ -980,7 +983,7 @@ impl FoldersPane {
             let at = win::screen_to_client(tree, pt);
             (treeview::hit(tree, at).0, pt)
         };
-        let Some(n) = self.node_of(item) else {
+        let (Some(n), Some(item)) = (self.node_of(item), item) else {
             return;
         };
         if self.nodes.borrow()[n as usize].is_more {
@@ -991,9 +994,9 @@ impl FoldersPane {
             return;
         };
         // Expand while it shows a button (or holds folders).
-        let can_expand = treeview::has_children(tree, item)
-            || !self.nodes.borrow()[n as usize].children.is_empty();
-        let expanded = treeview::is_expanded(tree, item);
+        let can_expand =
+            treeview::has_children(item) || !self.nodes.borrow()[n as usize].children.is_empty();
+        let expanded = treeview::is_expanded(item);
         let mut items = Vec::new();
         if can_expand {
             items.push(Item::Cmd(
@@ -1023,13 +1026,13 @@ impl FoldersPane {
             },
         );
         super::context::tidy_separators(popup);
-        let marked = item != treeview::selected(tree);
+        let marked = Some(item) != treeview::selected(tree);
         if marked {
-            treeview::drop_highlight(tree, item);
+            treeview::drop_highlight(tree, Some(item));
         }
         let id = app.track_with_shell(popup, pt, "folder menu", shell.as_ref());
         if marked {
-            treeview::drop_highlight(tree, NONE);
+            treeview::drop_highlight(tree, None);
         }
         match (id, &shell) {
             (0, _) => {}
@@ -1044,17 +1047,16 @@ impl FoldersPane {
     }
 
     /// One of the folder menu's own items, for node `n` (`item`) at `path`.
-    fn command(&self, app: &App, id: u16, n: u32, item: HTREEITEM, path: Vec<u16>) {
+    fn command(&self, app: &App, id: u16, n: u32, item: TreeItem, path: Vec<u16>) {
         match id {
             FOLDER_EXPAND => {
-                let tree = self.tree.get();
-                if treeview::is_expanded(tree, item) {
-                    treeview::expand(tree, item, false);
+                if treeview::is_expanded(item) {
+                    treeview::expand(item, false);
                 } else {
                     if self.nodes.borrow()[n as usize].load != Load::Listed {
                         self.open_when_listed(n);
                     }
-                    treeview::expand(tree, item, true);
+                    treeview::expand(item, true);
                 }
             }
             FOLDER_OPEN => actions::open(app.hwnd, vec![Target { path, is_dir: true }]),
@@ -1240,7 +1242,7 @@ impl FoldersPane {
 /// A closed pane's tree still to empty, and its items still in it.
 struct Parked {
     tree: HWND,
-    items: Vec<HTREEITEM>,
+    items: Vec<TreeItem>,
 }
 
 thread_local! {
@@ -1253,7 +1255,7 @@ thread_local! {
 /// for tens of thousands). As the window ends (`ending`) it stays so until
 /// the process ends, which frees it at once; otherwise it is emptied a
 /// slice at a time from a timer of its own ([`empty_parked`]).
-fn park(tree: HWND, items: Vec<HTREEITEM>, ending: bool) {
+fn park(tree: HWND, items: Vec<TreeItem>, ending: bool) {
     // Hides this thread's tree and makes it a message-only window of this
     // thread, no longer a child of the pane.
     win::show(tree, SW_HIDE);
@@ -1295,7 +1297,7 @@ fn empty_parked(tree: HWND, id: usize) {
         // goes but here, nothing is borrowed meanwhile).
         match next {
             Some(Some(item)) => {
-                tv::delete_item(tree, item);
+                tv::delete_item(item);
             }
             Some(None) | None => {
                 win::kill_timer(tree, id);
@@ -1321,11 +1323,11 @@ fn tree_proc(syncing: &Cell<bool>, m: &Msg) -> LRESULT {
         return m.def();
     }
     let hwnd = m.hwnd;
-    let none = treeview::selected(hwnd) == NONE;
+    let none = treeview::selected(hwnd).is_none();
     let was = syncing.replace(true);
     let r = m.def();
-    if none && treeview::selected(hwnd) != NONE {
-        treeview::select(hwnd, NONE);
+    if none && treeview::selected(hwnd).is_some() {
+        treeview::select(hwnd, None);
     }
     syncing.set(was);
     r
@@ -1429,8 +1431,9 @@ impl crate::pane::PaneContent for FoldersPane {
         };
         let goz: Vec<u16> = "goz".encode_utf16().collect();
         self.quietly(|| {
-            self.add(None, None, Vec::new(), &goz, top, false);
-            treeview::select(tree, self.nodes.borrow()[TOP as usize].item);
+            self.add(None, After::Last, Vec::new(), &goz, top, false);
+            let top = self.nodes.borrow().get(TOP as usize).map(|n| n.item);
+            treeview::select(tree, top);
         });
         let labels = app.sidebar_settings().labels;
         foldertree::spawn(
@@ -1483,11 +1486,11 @@ impl crate::pane::PaneContent for FoldersPane {
         self.images.borrow_mut().take();
         // Its items in the order they were made: a folder's subfolders
         // after it, so the last first can be taken out one at a time.
-        let items: Vec<HTREEITEM> = self
+        let items: Vec<TreeItem> = self
             .nodes
             .borrow()
             .iter()
-            .filter(|n| !n.gone && n.item != NONE)
+            .filter(|n| !n.gone)
             .map(|n| n.item)
             .collect();
         park(tree, items, app.window_ending());

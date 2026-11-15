@@ -6,8 +6,8 @@ use std::cell::{Cell, RefCell};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::{
-    HTREEITEM, NM_DBLCLK, TVN_SELCHANGEDW, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT,
-    TVS_SHOWSELALWAYS, TVSIL_NORMAL,
+    NM_DBLCLK, TVN_SELCHANGEDW, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
+    TVSIL_NORMAL,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, EN_CHANGE, ES_AUTOHSCROLL, IDCANCEL, IDOK, WM_COMMAND, WM_INITDIALOG,
@@ -126,7 +126,7 @@ struct Pick<'a> {
     select: usize,
     icons: Icons,
     look: Cell<Look>,
-    made: RefCell<Vec<(usize, HTREEITEM)>>,
+    made: RefCell<Vec<(usize, tv::Item)>>,
     result: RefCell<Option<FolderPath>>,
 }
 
@@ -208,7 +208,7 @@ fn pick_proc(s: &Pick<'_>, m: &Msg) -> isize {
                 tv::set_system_image_list(view, TVSIL_NORMAL, icons);
             }
             let made = fill_tree(view, s.tree, s.skip, s.icons);
-            tree_select(view, &made, s.select);
+            tree_select(&made, s.select);
             *s.made.borrow_mut() = made;
             apply_theme(dlg, s.look.get().dark);
             center_on_owner(dlg);

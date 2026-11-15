@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Controls::{
-    HTREEITEM, I_IMAGENONE, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVIS_FOCUSED,
+    I_IMAGENONE, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVIS_FOCUSED,
     LVIS_SELECTED, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW,
     LVN_ODSTATECHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
     LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS, LVSIL_SMALL, NM_CUSTOMDRAW,
@@ -188,7 +188,7 @@ struct Organize<'a> {
     list: RefCell<Arc<Bookmarks>>,
     tree: RefCell<Tree>,
     /// The tree view's items, by node.
-    made: RefCell<Vec<(usize, HTREEITEM)>>,
+    made: RefCell<Vec<(usize, tv::Item)>>,
     /// The folder shown.
     folder: RefCell<FolderPath>,
     /// The list's rows.
@@ -396,7 +396,7 @@ impl Organize<'_> {
         let view = Organize::tree_view(dlg);
         self.filling.set(true);
         let made = fill_tree(view, &tree, &[], self.icons);
-        tree_select(view, &made, node);
+        tree_select(&made, node);
         self.filling.set(false);
         *self.made.borrow_mut() = made;
     }
@@ -553,9 +553,8 @@ impl Organize<'_> {
         if !dlg::item_text(dlg, ID_FILTER).is_empty() {
             win::set_text(dlg::item(dlg, ID_FILTER), "");
         }
-        let view = Organize::tree_view(dlg);
         self.filling.set(true);
-        tree_select(view, &self.made.borrow(), node);
+        tree_select(&self.made.borrow(), node);
         self.filling.set(false);
         self.reshow(dlg, Keep::At(Some(0)));
     }

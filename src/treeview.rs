@@ -13,10 +13,9 @@ use windows_sys::Win32::Graphics::Gdi::HFONT;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_HOT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NEWFONT,
-    CDRF_NOTIFYITEMDRAW, HTREEITEM, ILC_COLOR32, ILC_MASK, ILD_NORMAL, NMTVCUSTOMDRAW,
-    TVE_COLLAPSE, TVE_EXPAND, TVGN_CARET, TVGN_CHILD, TVGN_DROPHILITE, TVGN_NEXT, TVGN_ROOT,
-    TVI_FIRST, TVI_LAST, TVI_ROOT, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE,
-    TVIF_STATE, TVIS_EXPANDED, TVITEMW, TVSIL_NORMAL,
+    CDRF_NOTIFYITEMDRAW, ILC_COLOR32, ILC_MASK, ILD_NORMAL, NMTVCUSTOMDRAW, TVE_COLLAPSE,
+    TVE_EXPAND, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE, TVIF_STATE,
+    TVIS_EXPANDED, TVITEMW, TVSIL_NORMAL,
 };
 use windows_sys::Win32::UI::Shell::{
     SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SIID_FIND,
@@ -26,31 +25,24 @@ use crate::colors::{Item, State};
 use crate::theme::{self, Palette};
 use crate::win::icon::Icon;
 use crate::win::imagelist::{ImageList, SystemList};
+pub use crate::win::tv::Item as TreeItem;
+use crate::win::tv::{After, Select};
 use crate::win::{self, gdi, imagelist, tv};
 
-/// No item: the tree's root (as a parent), or nothing (as an answer).
-pub const NONE: HTREEITEM = 0;
-
-/// A new item: under `parent` (`NONE` for the top level), after `after`
-/// (`NONE` for first, `last` for the end), with `text`, `image` and a
-/// `param` of the caller's; `children` shows an expand button before any
-/// child is in.
+/// A new item: under `parent` (`None` for the top level), placed as
+/// `after` says, with `text`, `image` and a `param` of the caller's;
+/// `children` shows an expand button before any child is in.
 pub struct New<'a> {
-    pub parent: HTREEITEM,
-    pub after: Option<HTREEITEM>,
+    pub parent: Option<TreeItem>,
+    pub after: After,
     pub text: &'a [u16],
     pub image: i32,
     pub children: bool,
     pub param: isize,
 }
 
-/// Puts `item` in `tree`; the new item, or `NONE` if it failed.
-pub fn insert(tree: HWND, item: &New<'_>) -> HTREEITEM {
-    let after = match item.after {
-        None => TVI_LAST,
-        Some(NONE) => TVI_FIRST,
-        Some(h) => h,
-    };
+/// Puts `item` in `tree`; the new item, `None` if it failed.
+pub fn insert(tree: HWND, item: &New<'_>) -> Option<TreeItem> {
     // The text goes in as it is, UTF-16 (a file's name need not be valid
     // Unicode); TVIF_TEXT is added with it.
     let it = TVITEMW {
@@ -61,24 +53,20 @@ pub fn insert(tree: HWND, item: &New<'_>) -> HTREEITEM {
         lParam: item.param,
         ..Default::default()
     };
-    win::tv::insert_units(tree, item.parent, after, it, item.text)
+    win::tv::insert_units(tree, item.parent, item.after, it, item.text)
 }
 
-/// `item`'s param; `None` for no item.
-pub fn param(tree: HWND, item: HTREEITEM) -> Option<isize> {
-    if item == NONE {
-        return None;
-    }
-    tv::item_param(tree, item)
+/// `item`'s param; `None` for an item no longer there.
+pub fn param(item: TreeItem) -> Option<isize> {
+    tv::item_param(item)
 }
 
 /// Shows an expand button on `item`, or not.
-pub fn set_children(tree: HWND, item: HTREEITEM, children: bool) {
+pub fn set_children(item: TreeItem, children: bool) {
     tv::set_item(
-        tree,
+        item,
         TVITEMW {
             mask: TVIF_CHILDREN,
-            hItem: item,
             cChildren: i32::from(children),
             ..Default::default()
         },
@@ -87,87 +75,87 @@ pub fn set_children(tree: HWND, item: HTREEITEM, children: bool) {
 }
 
 /// `item`'s text.
-pub fn set_text(tree: HWND, item: HTREEITEM, text: &[u16]) {
-    win::tv::set_text_units(tree, item, text);
+pub fn set_text(item: TreeItem, text: &[u16]) {
+    win::tv::set_text_units(item, text);
 }
 
 /// Whether `item` shows an expand button.
-pub fn has_children(tree: HWND, item: HTREEITEM) -> bool {
+pub fn has_children(item: TreeItem) -> bool {
     let it = TVITEMW {
         mask: TVIF_CHILDREN,
-        hItem: item,
         ..Default::default()
     };
-    tv::get_item(tree, it, 0).is_some_and(|(it, _)| it.cChildren != 0)
+    tv::get_item(item, it, 0).is_some_and(|(it, _)| it.cChildren != 0)
 }
 
 /// Whether `item` shows open.
-pub fn is_expanded(tree: HWND, item: HTREEITEM) -> bool {
+pub fn is_expanded(item: TreeItem) -> bool {
     let it = TVITEMW {
         mask: TVIF_STATE,
-        hItem: item,
         stateMask: TVIS_EXPANDED,
         ..Default::default()
     };
-    tv::get_item(tree, it, 0).is_some_and(|(it, _)| it.state & TVIS_EXPANDED != 0)
+    tv::get_item(item, it, 0).is_some_and(|(it, _)| it.state & TVIS_EXPANDED != 0)
 }
 
 /// Opens (`open`) or closes `item`.
-pub fn expand(tree: HWND, item: HTREEITEM, open: bool) {
+pub fn expand(item: TreeItem, open: bool) {
     let code = if open { TVE_EXPAND } else { TVE_COLLAPSE };
-    tv::expand(tree, item, code);
+    tv::expand(item, code);
 }
 
-/// Selects `item` (`NONE`: nothing) and scrolls it into view.
-pub fn select(tree: HWND, item: HTREEITEM) {
-    tv::select_item(tree, TVGN_CARET, item);
-    if item != NONE {
-        tv::ensure_visible(tree, item);
+/// Selects `item` (`None`: nothing) and scrolls it into view.
+pub fn select(tree: HWND, item: Option<TreeItem>) {
+    tv::select(tree, Select::Caret, item);
+    if let Some(item) = item {
+        tv::ensure_visible(item);
     }
 }
 
 /// The selected item.
-pub fn selected(tree: HWND) -> HTREEITEM {
-    tv::next_item(tree, NONE, TVGN_CARET)
+pub fn selected(tree: HWND) -> Option<TreeItem> {
+    tv::selection(tree)
 }
 
-/// Marks `item` as the one a context menu is for (`NONE`: none), as
+/// Marks `item` as the one a context menu is for (`None`: none), as
 /// Explorer's tree does while its menu is up.
-pub fn drop_highlight(tree: HWND, item: HTREEITEM) {
-    tv::select_item(tree, TVGN_DROPHILITE, item);
+pub fn drop_highlight(tree: HWND, item: Option<TreeItem>) {
+    tv::select(tree, Select::DropHighlight, item);
 }
 
-/// Takes `item` (and what is under it) out; `NONE` empties the tree.
-pub fn delete(tree: HWND, item: HTREEITEM) {
-    let item = if item == NONE { TVI_ROOT } else { item };
-    tv::delete_item(tree, item);
+/// Takes `item` (and what is under it) out.
+pub fn delete(item: TreeItem) {
+    tv::delete_item(item);
 }
 
-/// The items directly under `parent` (`NONE`: the top level), in order.
-pub fn children(tree: HWND, parent: HTREEITEM) -> Vec<HTREEITEM> {
+/// Empties the tree.
+pub fn delete_all(tree: HWND) {
+    tv::delete_all(tree);
+}
+
+/// The items directly under `parent` (`None`: the top level), in order.
+pub fn children(tree: HWND, parent: Option<TreeItem>) -> Vec<TreeItem> {
     let mut out = Vec::new();
-    let mut at = if parent == NONE {
-        tv::next_item(tree, NONE, TVGN_ROOT)
-    } else {
-        tv::next_item(tree, parent, TVGN_CHILD)
+    let mut at = match parent {
+        None => tv::root(tree),
+        Some(parent) => tv::child(parent),
     };
-    while at != NONE {
-        out.push(at);
-        at = tv::next_item(tree, at, TVGN_NEXT);
+    while let Some(item) = at {
+        out.push(item);
+        at = tv::next_sibling(item);
     }
     out
 }
 
 /// The item at `pt` (the tree's client coordinates) and where on it
 /// (`TVHT_*`).
-pub fn hit(tree: HWND, pt: POINT) -> (HTREEITEM, u32) {
-    let info = tv::hit_test(tree, pt);
-    (info.hItem, info.flags)
+pub fn hit(tree: HWND, pt: POINT) -> (Option<TreeItem>, u32) {
+    tv::hit_test(tree, pt)
 }
 
 /// `item`'s row, or its text only (`text`), in the tree's coordinates.
-pub fn item_rect(tree: HWND, item: HTREEITEM, text: bool) -> RECT {
-    tv::item_rect(tree, item, text).unwrap_or_default()
+pub fn item_rect(item: TreeItem, text: bool) -> RECT {
+    tv::item_rect(item, text).unwrap_or_default()
 }
 
 /// The tree in `item`'s colours (Options > Fonts and Colors' sidebar: its

@@ -26,9 +26,9 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::{
-    ETDT_DISABLE, ETDT_ENABLE, ETDT_USETABTEXTURE, HTREEITEM, NMTREEVIEWW, TCITEMW, TVE_EXPAND,
-    TVGN_CARET, TVIF_PARAM, TVITEMEXW, TVN_SELCHANGEDW, TVS_EX_DOUBLEBUFFER, TVS_HASLINES,
-    TVS_LINESATROOT, TVS_SHOWSELALWAYS,
+    ETDT_DISABLE, ETDT_ENABLE, ETDT_USETABTEXTURE, NMTREEVIEWW, TCITEMW, TVE_EXPAND, TVIF_PARAM,
+    TVITEMEXW, TVN_SELCHANGEDW, TVS_EX_DOUBLEBUFFER, TVS_HASLINES, TVS_LINESATROOT,
+    TVS_SHOWSELALWAYS,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX, CBN_SELCHANGE, CBS_DROPDOWNLIST,
@@ -463,7 +463,7 @@ struct Held {
     hwnd: Cell<HWND>,
     /// Changed since it was filled or last applied.
     dirty: Cell<bool>,
-    item: Cell<HTREEITEM>,
+    item: Cell<Option<tv::Item>>,
 }
 
 /// The dialog, which the frame's procedure, each page's window and the
@@ -504,7 +504,7 @@ pub fn show(app: &App, pages: Vec<Box<dyn Page>>, first: &str) -> String {
                 page,
                 hwnd: Cell::new(core::ptr::null_mut()),
                 dirty: Cell::new(false),
-                item: Cell::new(0),
+                item: Cell::new(None),
             })
             .collect()
     };
@@ -590,7 +590,7 @@ impl Dialog {
         self.frame.set(dlg);
         let tree = ctrl(dlg, TREE);
         tv::set_extended_style(tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
-        let mut parent: HTREEITEM = tv::ROOT;
+        let mut parent: Option<tv::Item> = None;
         let mut tops = Vec::new();
         for (i, held) in self.pages.iter().enumerate() {
             let under = nested.get(i).copied().unwrap_or(false);
@@ -601,20 +601,20 @@ impl Dialog {
             };
             let h = tv::insert(
                 tree,
-                if under { parent } else { tv::ROOT },
-                tv::LAST,
+                if under { parent } else { None },
+                tv::After::Last,
                 item,
                 Some(held.page.name()),
             );
             held.item.set(h);
             if !under {
                 parent = h;
-                tops.push(h);
+                tops.extend(h);
             }
         }
         // Everything shows every page's place open.
         for h in tops {
-            tv::expand(tree, h, TVE_EXPAND);
+            tv::expand(h, TVE_EXPAND);
         }
         // The tab that names the page.
         tab::insert(ctrl(dlg, TAB), 0, TCITEMW::default(), "");
@@ -637,8 +637,10 @@ impl Dialog {
             return;
         };
         let tree = ctrl(self.frame.get(), TREE);
-        tv::select_item(tree, TVGN_CARET, held.item.get());
-        tv::ensure_visible(tree, held.item.get());
+        tv::select(tree, tv::Select::Caret, held.item.get());
+        if let Some(h) = held.item.get() {
+            tv::ensure_visible(h);
+        }
         // Selecting the item already selected notifies nothing.
         if self.current.get() != Some(i) {
             self.show_page(i);
