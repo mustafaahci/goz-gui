@@ -13,6 +13,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::msg::{Msg, Via};
+use super::tv::Births;
 
 /// A control's window class in a [`Template`].
 pub enum Class {
@@ -144,10 +145,14 @@ impl Template {
     /// Shows the dialog, owned by `owner`, until it ends, its messages going
     /// to `handler` (from WM_INITDIALOG on); returns what [`end`] was given
     /// (-1 if it could not be made). `handler` answers as a dialog procedure
-    /// does: nonzero for a message it handled.
+    /// does: nonzero for a message it handled. Its tree views are kept
+    /// track of from their birth ([`super::tv`]).
     pub fn modal(&self, owner: HWND, handler: &dyn Fn(&Msg) -> isize) -> isize {
         let aligned = self.aligned();
-        let slot: &dyn Fn(&Msg) -> isize = handler;
+        let slot = Modal {
+            handler,
+            births: Cell::new(Some(Births::watch())),
+        };
         // SAFETY: a complete template that outlives the modal call; `slot`
         // outlives it too, and the dialog with it (DialogBoxIndirectParamW
         // destroys the dialog before it returns), so `modal_proc` may read
@@ -165,11 +170,13 @@ impl Template {
 
     /// Makes the dialog as a child of `parent` (hidden unless its style has
     /// WS_VISIBLE), its messages going to `handler` until it is destroyed;
-    /// null if it could not be made (and then `handler` is dropped).
+    /// null if it could not be made (and then `handler` is dropped). Its
+    /// tree views are kept track of from their birth ([`super::tv`]).
     pub fn create_child(&self, parent: HWND, handler: impl Fn(&Msg) -> isize + 'static) -> HWND {
         let aligned = self.aligned();
         let pending = Pending {
             handler: Cell::new(Some(Rc::new(handler))),
+            births: Cell::new(Some(Births::watch())),
         };
         // SAFETY: a complete template (the system copies what it needs
         // before returning); `pending` outlives the call, and only
@@ -190,12 +197,22 @@ impl Template {
 
 type ChildHandler = Rc<dyn Fn(&Msg) -> isize>;
 
-/// Waits at WM_INITDIALOG for `child_proc` to take the handler.
+/// Waits at WM_INITDIALOG for `child_proc` to take the handler; watches
+/// the births of the dialog's trees until then.
 struct Pending {
     handler: Cell<Option<ChildHandler>>,
+    births: Cell<Option<Births>>,
 }
 
-/// The procedure of a modal dialog: GWLP_USERDATA is the `&dyn Fn` slot
+/// What `modal` keeps on its stack for its dialog: the handler, and the
+/// watch on the births of the dialog's trees, ended at WM_INITDIALOG (its
+/// controls are made by then).
+struct Modal<'a> {
+    handler: &'a dyn Fn(&Msg) -> isize,
+    births: Cell<Option<Births>>,
+}
+
+/// The procedure of a modal dialog: GWLP_USERDATA is the `Modal` slot
 /// `modal` keeps on its stack, from WM_INITDIALOG on.
 unsafe extern "system" fn modal_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
     if msg == WM_INITDIALOG {
@@ -205,11 +222,16 @@ unsafe extern "system" fn modal_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
     }
     // SAFETY: null, or `modal`'s slot (above), which outlives the dialog.
-    let slot = unsafe { GetWindowLongPtrW(dlg, GWLP_USERDATA) } as *const &dyn Fn(&Msg) -> isize;
+    let slot = unsafe { GetWindowLongPtrW(dlg, GWLP_USERDATA) } as *const Modal<'_>;
     // SAFETY: as above.
-    let Some(&handler) = (unsafe { slot.as_ref() }) else {
+    let Some(slot) = (unsafe { slot.as_ref() }) else {
         return 0;
     };
+    if msg == WM_INITDIALOG {
+        // Its controls are made: no tree of it is born after.
+        drop(slot.births.take());
+    }
+    let handler = slot.handler;
     let _drop = super::dropfiles::Delivery::enter(msg, w);
     // SAFETY: the parameters the system delivered, for this call.
     handler(&unsafe { Msg::delivered(dlg, msg, w, l, Via::Dialog) })
@@ -222,6 +244,8 @@ unsafe extern "system" fn child_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         // SAFETY: WM_INITDIALOG's lParam is the `Pending` `create_child`
         // passed, alive during the call that sends this message.
         let pending = unsafe { (l as *const Pending).as_ref() };
+        // Its controls are made: no tree of it is born after.
+        drop(pending.and_then(|p| p.births.take()));
         if let Some(handler) = pending.and_then(|p| p.handler.take()) {
             let slot = Box::into_raw(Box::new(handler));
             // SAFETY: a dialog's GWLP_USERDATA is its procedure's to use,

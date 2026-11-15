@@ -156,7 +156,8 @@ pub fn id_menu(id: usize) -> HMENU {
 /// goz-gui's: its own class's procedure handles it. Null if it could not be
 /// made, and for an MDI client or child, which read their creation data
 /// (none is passed) as a structure of their own, or a class named by its
-/// atom (`#n`, which may be the MDI client's).
+/// atom (`#n`, which may be the MDI client's). A tree view made so is kept
+/// track of from now on ([`super::tv`]).
 pub fn create_plain(c: &Create) -> HWND {
     // A name "#n" is the class whose atom is n, which may be any class.
     if c.class.starts_with('#')
@@ -171,7 +172,7 @@ pub fn create_plain(c: &Create) -> HWND {
     // SAFETY: NUL-terminated names that outlive the call; no creation
     // parameter (a window of a class registered here then has no handler,
     // see `window_proc`).
-    unsafe {
+    let hwnd = unsafe {
         CreateWindowExW(
             c.ex_style,
             class.as_ptr(),
@@ -186,7 +187,10 @@ pub fn create_plain(c: &Create) -> HWND {
             module(),
             core::ptr::null(),
         )
-    }
+    };
+    // SAFETY: made just now: no deletion of a tree's items is under way.
+    unsafe { super::tv::adopt_made(hwnd) };
+    hwnd
 }
 
 /// Waits at WM_NCCREATE for the trampoline to take the handler.

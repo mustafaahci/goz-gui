@@ -527,7 +527,7 @@ fn a_control_keeps_the_image_lists_it_shows_alive() {
 
 /// A hidden tree view, child of a hidden top-level window of the test
 /// class whose messages go to `parent`: (the tree, its parent).
-fn hidden_tree(parent: impl Fn(&Msg) -> isize + 'static) -> (HWND, HWND) {
+pub(super) fn hidden_tree(parent: impl Fn(&Msg) -> isize + 'static) -> (HWND, HWND) {
     use windows_sys::Win32::UI::Controls::ICC_TREEVIEW_CLASSES;
     super::sys::init_common_controls(ICC_TREEVIEW_CLASSES);
     let _ = Class::new(CLASS).register();
@@ -912,5 +912,55 @@ fn a_control_s_image_lists_are_judged_by_its_own_answers() {
     assert!(tv::set_image_list(tree, TVSIL_NORMAL, None));
     // The list let go of is no longer shown: the tree took the change.
     assert_eq!(shown(tree, tv::CLASS, TVM_GETIMAGELIST), 0);
+    super::destroy(parent);
+}
+
+#[test]
+fn a_tree_is_taken_only_kept_track_of_from_its_birth() {
+    use super::tv::{self, After};
+    use windows_sys::Win32::UI::Controls::{ICC_TREEVIEW_CLASSES, TVITEMEXW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::CreateWindowExW;
+    super::sys::init_common_controls(ICC_TREEVIEW_CLASSES);
+    let (_, parent) = hidden_control("Static", 0);
+    // A tree made outside the layer: what goes on in it is not known (a
+    // deletion may be under way), so none of its items is taken.
+    let class = super::wz(tv::CLASS);
+    // SAFETY: NUL-terminated names that outlive the call; no creation
+    // data.
+    let other = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            [0u16].as_ptr(),
+            WS_CHILD,
+            0,
+            0,
+            50,
+            50,
+            parent,
+            core::ptr::null_mut(),
+            class::module(),
+            core::ptr::null(),
+        )
+    };
+    assert!(!other.is_null());
+    let item = TVITEMEXW::default();
+    assert!(tv::insert(other, None, After::Last, item, Some("x")).is_none());
+    assert_eq!(tv::root(other), None);
+    // A dialog template's tree is seen as it is made.
+    let mut t = template(WS_CHILD);
+    t.control(
+        dlg::Class::Named("SysTreeView32"),
+        "",
+        5,
+        0,
+        0,
+        (0, 0, 20, 20),
+    );
+    let page = t.create_child(parent, |_| 0);
+    assert!(!page.is_null());
+    let tree = dlg::item(page, 5);
+    let made = tv::insert(tree, None, After::Last, item, Some("y")).expect("an item");
+    assert_eq!(tv::root(tree), Some(made));
     super::destroy(parent);
 }
