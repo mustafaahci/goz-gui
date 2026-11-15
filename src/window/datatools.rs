@@ -24,8 +24,6 @@
 //!
 //! No `RefCell` of the window is borrowed while a dialog runs.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,8 +32,7 @@ use goz_core::types::SortDir;
 
 use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, HMENU, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
-    MB_YESNO,
+    HMENU, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
 };
 
 use super::App;
@@ -48,6 +45,7 @@ use crate::filelist::{FileList, Notify};
 use crate::menu::{self, Item};
 use crate::msgbox;
 use crate::store::location;
+use crate::win::{self, ext::b3::ProcessWait};
 
 /// A file list finished reading: wParam 1 when every row was read, 0 when
 /// reading stopped on an error; lParam the list's id (the shown tab's list
@@ -96,18 +94,10 @@ pub(super) fn before_window(l: &crate::cmdline::Launch) -> Option<i32> {
 
 /// Waits for process `pid` to end, at most `ms`.
 fn wait_for_process(pid: u32, ms: u32) {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-    };
-    // SAFETY: opens the process for waiting only, waits, and closes the
-    // handle; a process gone already gives no handle.
-    unsafe {
-        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-        if !h.is_null() {
-            WaitForSingleObject(h, ms);
-            CloseHandle(h);
-        }
+    // Opened for waiting only, closed after; a process gone already gives
+    // nothing to wait for.
+    if let Some(process) = ProcessWait::open(pid) {
+        process.wait(ms);
     }
 }
 
@@ -1012,19 +1002,13 @@ impl App {
     /// there are none, else when a thread that waits for them (at most
     /// [`OTHERS_WAIT_MS`]) says so. The window answers meanwhile.
     fn after_other_windows(&self, replace: Replace) {
-        use windows_sys::Win32::Foundation::{CloseHandle, HWND};
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-        };
-        use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+        use windows_sys::Win32::Foundation::HWND;
         let pids = self.exit_other_windows_unsaved();
-        // Opened now, so a process id used again later is not waited for.
-        // SAFETY: opens each process for waiting only; a process gone
-        // already gives no handle.
-        let handles: Vec<usize> = pids
+        // Opened now, so a process id used again later is not waited for;
+        // each for waiting only, and a process gone already gives nothing.
+        let handles: Vec<ProcessWait> = pids
             .iter()
-            .map(|&pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) } as usize)
-            .filter(|&h| h != 0)
+            .filter_map(|&pid| ProcessWait::open(pid))
             .collect();
         if handles.is_empty() {
             self.replace_settings(replace);
@@ -1036,25 +1020,20 @@ impl App {
         let wait = move || {
             let end = std::time::Instant::now()
                 + std::time::Duration::from_millis(u64::from(OTHERS_WAIT_MS));
-            for &h in &handles {
+            for process in handles {
                 let left = end.saturating_duration_since(std::time::Instant::now());
-                // SAFETY: waits on and closes the handles opened above,
-                // each once.
-                unsafe {
-                    WaitForSingleObject(h as _, left.as_millis() as u32);
-                    CloseHandle(h as _);
-                }
+                // Waited on, then closed as it drops.
+                process.wait(left.as_millis() as u32);
             }
-            // SAFETY: posts a message with no pointers; a window gone
-            // meanwhile is reported and ignored.
-            unsafe { PostMessageW(hwnd as HWND, WM_OTHERS_ENDED, 0, 0) };
+            // A window gone meanwhile is reported and ignored.
+            win::post_app(hwnd as HWND, WM_OTHERS_ENDED, 0, 0);
         };
         if let Err(e) = std::thread::Builder::new()
             .name("goz-wait-windows".into())
             .spawn(wait)
         {
-            // No thread (the handles stay open until the restart ends
-            // this process): replace now.
+            // No thread (the processes are not waited for): replace
+            // now.
             self.show_note(format!("Could not wait for the other windows: {e}"));
             let replace = self.data_tools.replacing.take();
             if let Some(replace) = replace {
@@ -1107,8 +1086,8 @@ impl App {
             let _ = command.spawn();
         }
         self.exit_other_windows_unsaved();
-        // SAFETY: destroys this thread's window; the process ends with it.
-        unsafe { DestroyWindow(self.hwnd) };
+        // The process ends with the window.
+        win::destroy(self.hwnd);
     }
 }
 

@@ -2,15 +2,13 @@
 //! file, on a thread of its own (`crate::export`). The status bar follows
 //! it; Esc or File > Export... again stops it.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, MB_ICONWARNING, MB_OK};
+use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK};
 
 use super::{App, TIMER_NOTE, WM_EXPORT};
 use crate::client::Search;
 use crate::export::{self, Ended, Format, Job};
 use crate::store::location;
+use crate::win::{self, sys};
 use crate::{filedlg, format, msgbox};
 
 impl App {
@@ -104,8 +102,8 @@ impl App {
         let Some((done, total)) = self.export.borrow().as_ref().map(|r| r.progress()) else {
             return;
         };
-        // SAFETY: a timer of this window: no timer takes the note away.
-        unsafe { KillTimer(self.hwnd, TIMER_NOTE) };
+        // No timer takes the note away.
+        win::kill_timer(self.hwnd, TIMER_NOTE);
         *self.note.borrow_mut() = Some(if total == 0 {
             "Exporting...".to_owned()
         } else {
@@ -134,8 +132,7 @@ impl App {
             ),
             Ended::Stopped => "Export cancelled".to_owned(),
             Ended::Failed(why) => {
-                // SAFETY: plays a system sound.
-                unsafe { MessageBeep(MB_ICONWARNING) };
+                sys::beep(MB_ICONWARNING);
                 format!("Export failed: {why}")
             }
         };

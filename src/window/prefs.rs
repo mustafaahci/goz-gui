@@ -8,14 +8,11 @@
 //! keep each other's settings; a key Home holds fixed is never written
 //! (see `crate::settings`).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SetTimer};
 
 use super::{App, TIMER_SETTINGS, TIMER_STORE_RETRY, WM_STORE};
 use crate::bookmarks::one_line;
@@ -26,6 +23,7 @@ use crate::store::ini::Ini;
 use crate::store::location::{self, SETTINGS_FILE};
 use crate::store::{IniWrites, writer::Writer};
 use crate::wide::window_text;
+use crate::win::{self, parcel};
 use crate::{places, syntax};
 
 /// How long after the last change the settings are written.
@@ -44,18 +42,12 @@ pub(super) const STORE_FAILED: usize = 0;
 /// WM_STORE's wParam: written, with something to tell the user.
 pub(super) const STORE_NOTE: usize = 1;
 
-/// Tells the window (from the store thread) what a write came to: `text`,
-/// and whether the write `failed` (it is tried again). The text is freed
-/// again if the window is gone.
+/// Tells the window (from the store thread) what a write came to: `text`
+/// (a parcel, `win::parcel`), and whether the write `failed` (it is tried
+/// again). The text is freed again if the window is gone.
 pub(super) fn report(hwnd: usize, text: String, failed: bool) {
-    let raw = Box::into_raw(Box::new(text));
     let kind = if failed { STORE_FAILED } else { STORE_NOTE };
-    // SAFETY: posts to the window; if that fails the box is taken back.
-    unsafe {
-        if PostMessageW(hwnd as HWND, WM_STORE, kind, raw as isize) == 0 {
-            drop(Box::from_raw(raw));
-        }
-    }
+    parcel::post(hwnd as HWND, WM_STORE, kind, text);
 }
 
 /// [`report`] for a write's result: nothing when it went through quietly.
@@ -173,8 +165,8 @@ impl App {
 
     /// A setting changed: the file is written once they stop changing.
     pub(super) fn settings_changed(&self) {
-        // SAFETY: a timer of this window; setting it again restarts it.
-        unsafe { SetTimer(self.hwnd, TIMER_SETTINGS, SAVE_DELAY_MS, None) };
+        // Setting the timer again restarts it.
+        win::set_timer(self.hwnd, TIMER_SETTINGS, SAVE_DELAY_MS);
     }
 
     /// The window's normal rectangle (screen pixels, with the DPI there),
@@ -301,8 +293,7 @@ impl App {
             prefs.retry_armed = true;
             prefs.retry_ms
         };
-        // SAFETY: a timer of this window.
-        unsafe { SetTimer(self.hwnd, TIMER_STORE_RETRY, delay, None) };
+        win::set_timer(self.hwnd, TIMER_STORE_RETRY, delay);
     }
 
     /// The retry timer: everything still staged is written again.

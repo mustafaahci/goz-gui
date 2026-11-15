@@ -6,29 +6,27 @@
 //! Its WM_APP messages are `WM_APP + 420..430`, its timers `420..430`, its
 //! commands `5150..5200` (the header menu's columns and Organize Columns).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows_sys::Win32::UI::Controls::LVM_REDRAWITEMS;
-use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, WM_APP};
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_APP;
 
-use super::{App, send};
+use super::App;
 use crate::client::Search;
 use crate::columns::{self, COL_ACCESSED, COL_ATTRIB, COL_CREATED, COL_RECENT};
 use crate::content::plan::{Plan, Planned};
 use crate::content::{Key, Run};
 use crate::props;
+use crate::win::{self, Msg, lv, parcel};
 use goz_core::types::SortKey;
 
 /// The disk reader's answers are waiting (`props::Reader::take`).
 pub(super) const WM_PROPS: u32 = WM_APP + 420;
 /// The content search running found more, or ended.
 pub(super) const WM_CONTENT: u32 = WM_APP + 421;
-/// Options > Indexes' change was answered: `lParam` is a `Box<String>`
-/// for the status bar.
+/// Options > Indexes' change was answered: a `String` for the status bar
+/// comes with it as a parcel (`win::parcel`).
 pub const WM_INDEX_SET: u32 = WM_APP + 422;
 pub(super) const MSG_FIRST: u32 = WM_APP + 420;
 pub(super) const MSG_END: u32 = WM_APP + 430;
@@ -93,10 +91,10 @@ impl App {
             super::w9b::WM_WATCH => self.watch_news(w),
             super::w9b::WM_REFETCH => self.refetch(),
             WM_INDEX_SET => {
-                // SAFETY: the box the Indexes page's thread posted; owned
-                // here once the message came.
-                let text = unsafe { Box::from_raw(l as *mut String) };
-                self.show_note(*text);
+                // The text the Indexes page's thread posted.
+                if let Some(text) = parcel::take::<String>(&Msg::new(self.hwnd, msg, w, l)) {
+                    self.show_note(text);
+                }
             }
             _ => {}
         }
@@ -172,7 +170,7 @@ impl App {
             }
         }
         if low <= high {
-            send(self.list, LVM_REDRAWITEMS, low, high as isize);
+            lv::redraw_items(self.list, low as i32, high as i32);
         }
     }
 
@@ -261,8 +259,7 @@ impl App {
         if let Some(run) = self.w9.content.take() {
             run.stop();
         }
-        // SAFETY: a timer of this window.
-        unsafe { KillTimer(self.hwnd, TIMER_CONTENT) };
+        win::kill_timer(self.hwnd, TIMER_CONTENT);
         self.w9.refresh_due.set(false);
     }
 
@@ -297,8 +294,7 @@ impl App {
         let total = self.model.borrow().total;
         let changed = run.matches() as u64 != total || !run.running();
         if changed && !self.w9.refresh_due.replace(true) {
-            // SAFETY: a timer of this window.
-            unsafe { SetTimer(self.hwnd, TIMER_CONTENT, CONTENT_REFRESH_MS, None) };
+            win::set_timer(self.hwnd, TIMER_CONTENT, CONTENT_REFRESH_MS);
         }
     }
 }

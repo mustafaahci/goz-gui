@@ -16,21 +16,18 @@
 //!
 //! No `RefCell` of the window is borrowed while a dialog runs.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, IsWindowVisible, PostMessageW, WM_CLOSE,
-};
+use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
+use windows_sys::Win32::UI::WindowsAndMessaging::MB_OK;
 
 use super::App;
 use super::results::{Act, Then};
 use crate::filelist::slots::{self, Func, Slots, Term, cmd};
 use crate::places::{self, Which};
 use crate::slotedit;
+use crate::win::{self, Msg, parcel, sys};
 
 use crate::filelist::slots::SAVE_MAX;
 
@@ -52,8 +49,7 @@ fn slots_text(saves: &[usize]) -> String {
 }
 
 fn beep() {
-    // SAFETY: plays a system sound.
-    unsafe { windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(0) };
+    sys::beep(MB_OK);
 }
 
 impl App {
@@ -136,10 +132,10 @@ impl App {
                 }
             }
             slotedit::WM_SLOT_SAVED if l != 0 => {
-                // SAFETY: the box the save thread posted, ours once
-                // delivered.
-                let saved = unsafe { Box::from_raw(l as *mut Saved) };
-                self.slots_saved(*saved);
+                // What the save thread posted.
+                if let Some(saved) = parcel::take::<Saved>(&Msg::new(self.hwnd, msg, w, l)) {
+                    self.slots_saved(saved);
+                }
             }
             _ => {}
         }
@@ -324,18 +320,13 @@ impl App {
                         crate::client::Failure::Refused(m) | crate::client::Failure::Other(m) => m,
                     }),
                 };
-                let raw = Box::into_raw(Box::new(Saved {
+                let saved = Saved {
                     query: search.query.clone(),
                     slots: saves,
                     names,
-                }));
-                // SAFETY: posts to the window, which takes the box; if it is
-                // gone the box is taken back.
-                unsafe {
-                    if PostMessageW(hwnd as _, slotedit::WM_SLOT_SAVED, 0, raw as isize) == 0 {
-                        drop(Box::from_raw(raw));
-                    }
-                }
+                };
+                // The window takes it; if it is gone it is freed again.
+                parcel::post(hwnd as _, slotedit::WM_SLOT_SAVED, 0, saved);
             });
         if spawned.is_err() {
             self.data_tools.saving.borrow_mut().take();
@@ -421,9 +412,7 @@ impl App {
     /// `-filelist-editor`: the editor, where it was last, in the window's
     /// look; one open comes to the front (and opens `file`).
     pub(super) fn open_list_editor(&self, file: Option<&str>) {
-        let mut near = RECT::default();
-        // SAFETY: reads this thread's window's place.
-        unsafe { GetWindowRect(self.hwnd, &mut near) };
+        let near = win::window_rect(self.hwnd);
         let (export_type, export_selection) = {
             let p = self.prefs.borrow();
             let f = &p.base.file_lists;
@@ -446,12 +435,11 @@ impl App {
     /// for it alone, whose window was never shown, ends with it.
     fn editor_closed(&self) {
         self.take_editor_kept();
-        // SAFETY: reads whether this thread's window shows.
-        let shown = unsafe { IsWindowVisible(self.hwnd) } != 0;
+        let shown = win::is_visible(self.hwnd);
         if self.data_tools.editor_alone.get() && !shown && !crate::listedit::ui::is_open() {
-            // SAFETY: posts to this thread's window; with "run in the
-            // background" WM_CLOSE keeps goz-gui running, as -startup does.
-            unsafe { PostMessageW(self.hwnd, WM_CLOSE, 0, 0) };
+            // With "run in the background" WM_CLOSE keeps goz-gui running,
+            // as -startup does.
+            win::post_close(self.hwnd);
         }
     }
 
