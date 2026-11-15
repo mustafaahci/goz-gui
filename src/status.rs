@@ -151,8 +151,8 @@ fn round_fill(hdc: HDC, rc: &RECT, colour: u32, radius: i32) {
     // own are put back.
     gdi::set_dc_brush_color(hdc, colour);
     win::gdi::set_dc_pen_color(hdc, colour);
-    let old_brush = gdi::Selected::new(hdc, gdi::stock_object(DC_BRUSH));
-    let old_pen = gdi::Selected::new(hdc, gdi::stock_object(DC_PEN));
+    let old_brush = gdi::Selected::of(hdc, gdi::stock_object(DC_BRUSH));
+    let old_pen = gdi::Selected::of(hdc, gdi::stock_object(DC_PEN));
     win::gdi::round_rect(hdc, rc, radius, radius);
     drop(old_pen);
     drop(old_brush);
@@ -407,7 +407,7 @@ pub fn paint(app: &App, hdc: HDC) {
     // Draws into the paint buffer; the old font is put back.
     {
         let bold = pal.is_bold(Item::StatusBar, State::Normal);
-        let old = gdi::Selected::new(hdc, if bold { fonts.bold } else { fonts.normal });
+        let old = gdi::Selected::of(hdc, if bold { fonts.bold } else { fonts.normal });
         gdi::set_bk_mode(hdc, TRANSPARENT as i32);
         let y = rc.top + 1 + (rc.bottom - rc.top - 1 - fonts.height) / 2;
         let sep = |x: i32| {

@@ -11,8 +11,7 @@ use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
     DT_CALCRECT, DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
-    HBRUSH, HDC, MONITOR_DEFAULTTONULL, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
-    TRANSPARENT,
+    HDC, MONITOR_DEFAULTTONULL, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
     BP_CHECKBOX, BP_RADIOBUTTON, BST_CHECKED, BST_INDETERMINATE, CDDS_ITEMPREPAINT, CDDS_POSTPAINT,
@@ -404,7 +403,7 @@ fn paint_dark_group(hwnd: HWND) {
     let paint = gdi::Paint::begin(hwnd);
     let hdc = paint.hdc();
     let rc = win::client_rect(hwnd);
-    let _font = gdi::Selected::new(hdc, win::font(hwnd));
+    let _font = gdi::Selected::of(hdc, win::font(hwnd));
     let text: Vec<u16> = win::text_wide(hwnd);
     let size = gdi::text_extent(hdc, &text);
     let dpi = crate::custom::window_dpi(hwnd) as i32;
@@ -509,7 +508,7 @@ fn paint_dark_hotkey(hwnd: HWND) {
         let rc = win::client_rect(hwnd);
         let enabled = win::is_enabled(hwnd);
         fill(hdc, &rc, if enabled { pal.bg } else { pal.chrome });
-        let _font = gdi::Selected::new(hdc, win::font(hwnd));
+        let _font = gdi::Selected::of(hdc, win::font(hwnd));
         let text: Vec<u16> = hotkey_text(win::hotkey::get(hwnd)).encode_utf16().collect();
         let size = gdi::text_extent(hdc, &text);
         gdi::set_bk_mode(hdc, TRANSPARENT as i32);
@@ -850,8 +849,15 @@ const LABEL_INSET: i32 = 2;
 const CELL_INSET: i32 = 6;
 
 thread_local! {
-    /// The dark face and text box brushes, made once.
-    static BRUSHES: Cell<Option<(HBRUSH, HBRUSH)>> = const { Cell::new(None) };
+    /// The dark face and text box brushes, made once and kept for the life
+    /// of the thread.
+    static BRUSHES: (Option<gdi::Owned>, Option<gdi::Owned>) = {
+        let pal = Palette::new(true);
+        (
+            gdi::create_solid_brush(pal.chrome),
+            gdi::create_solid_brush(pal.bg),
+        )
+    };
 }
 
 /// The answer to a dialog's `WM_CTLCOLOR*` message `msg` for the DC `hdc`:
@@ -862,15 +868,8 @@ pub fn ctl_color(msg: u32, hdc: HDC, dark: bool) -> Option<isize> {
         return None;
     }
     let pal = Palette::new(true);
-    let (face, field) = BRUSHES.get().unwrap_or_else(|| {
-        // Two brushes kept for the life of the thread.
-        let made = (
-            gdi::create_solid_brush(pal.chrome),
-            gdi::create_solid_brush(pal.bg),
-        );
-        BRUSHES.set(Some(made));
-        made
-    });
+    let handle = |b: &Option<gdi::Owned>| b.as_ref().map_or(core::ptr::null_mut(), gdi::Owned::get);
+    let (face, field) = BRUSHES.with(|(face, field)| (handle(face), handle(field)));
     let (bg, brush) = if msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX {
         (pal.bg, field)
     } else {
@@ -1052,7 +1051,7 @@ pub fn paint_check(button: HWND, cd: &NMCUSTOMDRAW, kind: Check, ink: CheckInk) 
         theme.draw_background(hdc, part, part_state, &glyph, None);
     }
     drop(theme);
-    let _font = gdi::Selected::new(hdc, win::font(button));
+    let _font = gdi::Selected::of(hdc, win::font(button));
     let text = win::text_wide(button);
     let cues = win::send_plain(button, WM_QUERYUISTATE, 0, 0) as u32;
     let mut format = DT_SINGLELINE | DT_VCENTER;
@@ -1140,7 +1139,7 @@ fn fit_list_items(list: HWND) {
     }
     let tm = {
         let dc = gdi::WindowDc::get(list);
-        let _font = gdi::Selected::new(dc.hdc(), win::font(list));
+        let _font = gdi::Selected::of(dc.hdc(), win::font(list));
         gdi::text_metrics(dc.hdc())
     };
     if tm.tmHeight > 0 {

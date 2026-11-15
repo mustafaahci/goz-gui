@@ -9,13 +9,13 @@
 //! not read the new syntax yet (`client::boolean_syntax`) gets lines
 //! saying what its searches of the index refuse.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use goz_core::escompat::{HelpScreen, help};
 use windows_sys::Win32::Foundation::{HWND, LRESULT};
 use windows_sys::Win32::Graphics::Gdi::{
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DC_BRUSH, DEFAULT_CHARSET, FF_MODERN, FIXED_PITCH,
-    FW_NORMAL, HDC, HFONT, LOGFONTW, OUT_DEFAULT_PRECIS,
+    FW_NORMAL, HDC, LOGFONTW, OUT_DEFAULT_PRECIS,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_ESCAPE};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -37,7 +37,7 @@ static TEXT_KEYS: subclass::Key = subclass::Key::new("search syntax text box key
 thread_local! {
     /// The window while it is open; one at a time.
     static OPEN: Cell<HWND> = const { Cell::new(core::ptr::null_mut()) };
-    static FONT: Cell<HFONT> = const { Cell::new(core::ptr::null_mut()) };
+    static FONT: RefCell<Option<gdi::Owned>> = const { RefCell::new(None) };
     static DARK: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -414,16 +414,18 @@ fn apply_fonts(hwnd: HWND) {
     for (to, from) in lf.lfFaceName.iter_mut().zip("Consolas".encode_utf16()) {
         *to = from;
     }
-    // A font owned here; the old one is deleted once the text box has the
-    // new one.
+    // A font owned here; the old one is deleted (as it drops) once the
+    // text box has the new one.
     let font = gdi::create_font(&lf);
-    win::set_font(text, font, true);
+    win::set_font(
+        text,
+        font.as_ref().map_or(core::ptr::null_mut(), gdi::Owned::get),
+        true,
+    );
     let margin = scale(hwnd, 6) as u16;
     edit::set_margins(text, EC_LEFTMARGIN | EC_RIGHTMARGIN, margin, margin);
     let old = FONT.replace(font);
-    if !old.is_null() {
-        gdi::delete_object(old);
-    }
+    drop(old);
 }
 
 fn layout(hwnd: HWND) {
@@ -481,10 +483,9 @@ fn wndproc(m: &Msg) -> LRESULT {
         WM_DESTROY => {
             places::keep(hwnd, Which::SearchSyntax, core::ptr::null_mut());
             OPEN.set(core::ptr::null_mut());
-            let font = FONT.replace(core::ptr::null_mut());
-            if !font.is_null() {
-                gdi::delete_object(font);
-            }
+            // Deleted as it drops, the text box gone with the window.
+            let font = FONT.take();
+            drop(font);
             0
         }
         _ => m.def(),

@@ -458,7 +458,7 @@ impl Strip for TabStrip {
             self.paint_tab(app, hdc, &c, &m, (i, l, r), title, i == current);
         }
         // The font selected above goes back.
-        gdi::select(hdc, old);
+        old.restore(hdc);
         let button = |(l, r): (i32, i32)| RECT {
             left: l,
             top: m.top,

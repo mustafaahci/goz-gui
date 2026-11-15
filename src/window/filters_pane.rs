@@ -208,7 +208,7 @@ impl FiltersPane {
             ColorItem::FiltersSidebar,
             pal.is_bold(ColorItem::FiltersSidebar, state),
         );
-        let _font = Selected::new(hdc, font);
+        let _font = Selected::of(hdc, font);
         gdi::set_bk_mode(hdc, TRANSPARENT as i32);
         gdi::set_text_color(hdc, ink.fg);
         gdi::draw_text(

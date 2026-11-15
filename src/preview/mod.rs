@@ -35,8 +35,8 @@ use windows_sys::Win32::Foundation::{HWND, LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLORONCOLOR,
     DEFAULT_CHARSET, DT_CALCRECT, DT_CENTER, DT_EDITCONTROL, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_WORDBREAK, FF_MODERN, FIXED_PITCH, FW_NORMAL, HALFTONE, HBITMAP, HDC, HFONT, LOGFONTW,
-    OUT_DEFAULT_PRECIS, SRCCOPY, TRANSPARENT,
+    DT_WORDBREAK, FF_MODERN, FIXED_PITCH, FW_NORMAL, HALFTONE, HDC, LOGFONTW, OUT_DEFAULT_PRECIS,
+    SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::LVIS_SELECTED;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU};
@@ -279,15 +279,9 @@ struct Scaled {
     height: i32,
     bg: u32,
     smooth: bool,
-    handle: HBITMAP,
-}
-
-impl Drop for Scaled {
-    fn drop(&mut self) {
-        // The bitmap is owned here and selected into no DC (each draw
-        // selects it out again).
-        gdi::delete_object(self.handle);
-    }
+    /// The bitmap, owned here and selected into no DC (each draw selects
+    /// it out again), deleted as this drops.
+    bitmap: gdi::Owned,
 }
 
 /// What the pane shows.
@@ -376,7 +370,7 @@ fn on_screen(app: &App) -> bool {
 
 /// The text view's font at the window's DPI: Consolas at 13 px (100 %),
 /// or in Fonts and Colors' Preview face and size where it has its own.
-fn mono_font(app: &App) -> HFONT {
+fn mono_font(app: &App) -> Option<gdi::Owned> {
     let own = app.font_spec(crate::colors::Item::Preview);
     let height = if own.size > 0 {
         // Points at the DPI.
@@ -429,7 +423,7 @@ pub struct PreviewPane {
     /// The content's place in the pane window.
     rc: Cell<RECT>,
     text_box: Cell<HWND>,
-    mono: Cell<HFONT>,
+    mono: RefCell<Option<gdi::Owned>>,
     /// The background the host windows paint, shared with their handlers.
     host_bg: Rc<Cell<u32>>,
     worker: RefCell<Option<Worker>>,
@@ -452,7 +446,7 @@ impl PreviewPane {
             pane: Cell::new(core::ptr::null_mut()),
             rc: Cell::new(RECT::default()),
             text_box: Cell::new(core::ptr::null_mut()),
-            mono: Cell::new(core::ptr::null_mut()),
+            mono: RefCell::new(None),
             host_bg: Rc::new(Cell::new(0)),
             worker: RefCell::new(None),
             generation: Cell::new(0),
@@ -873,7 +867,7 @@ fn draw_image(
     let mem = MemDc::compatible(hdc);
     if (w, h) == (src.width, src.height) {
         // Its own size: blended straight onto the background.
-        let _picture = Selected::new(mem.hdc(), src.handle());
+        let _picture = Selected::of(mem.hdc(), src.handle());
         gdi::alpha_blend(
             hdc,
             (at.left, at.top, w, h),
@@ -896,7 +890,7 @@ fn draw_image(
         *cache.borrow_mut() = scale(hdc, image, w, h, bg, smooth);
     }
     if let Some(s) = cache.borrow().as_ref() {
-        let _scaled = Selected::new(mem.hdc(), s.handle);
+        let _scaled = Selected::new(mem.hdc(), &s.bitmap);
         gdi::bit_blt(hdc, (at.left, at.top, w, h), mem.hdc(), (0, 0), SRCCOPY);
     }
 }
@@ -918,19 +912,22 @@ fn scale(hdc: HDC, image: &Decoded, w: i32, h: i32, bg: u32, smooth: bool) -> Op
     let (sw, sh) = (src.width, src.height);
     // Bitmaps and DCs made here; each is selected out before it is
     // deleted, and the one returned is owned by `Scaled`.
-    let out = gdi::create_compatible_bitmap(hdc, w, h);
-    if out.is_null() {
-        return None;
-    }
+    let out = gdi::create_compatible_bitmap(hdc, w, h)?;
     let dst = MemDc::compatible(hdc);
     let src_dc = MemDc::compatible(hdc);
-    let old_dst = Selected::new(dst.hdc(), out);
-    let mut flat: HBITMAP = core::ptr::null_mut();
-    let old_src = if image.opaque {
-        Selected::new(src_dc.hdc(), src.handle())
+    let old_dst = Selected::new(dst.hdc(), &out);
+    let flat = if image.opaque {
+        None
     } else {
-        flat = gdi::create_compatible_bitmap(hdc, sw, sh);
-        let old = Selected::new(src_dc.hdc(), flat);
+        gdi::create_compatible_bitmap(hdc, sw, sh)
+    };
+    let old_src = if image.opaque {
+        Selected::of(src_dc.hdc(), src.handle())
+    } else {
+        let old = Selected::of(
+            src_dc.hdc(),
+            flat.as_ref().map_or(core::ptr::null_mut(), gdi::Owned::get),
+        );
         let whole = RECT {
             left: 0,
             top: 0,
@@ -939,7 +936,7 @@ fn scale(hdc: HDC, image: &Decoded, w: i32, h: i32, bg: u32, smooth: bool) -> Op
         };
         fill(src_dc.hdc(), &whole, bg);
         let pixels = MemDc::compatible(hdc);
-        let old_px = Selected::new(pixels.hdc(), src.handle());
+        let old_px = Selected::of(pixels.hdc(), src.handle());
         gdi::alpha_blend(
             src_dc.hdc(),
             (0, 0, sw, sh),
@@ -964,15 +961,13 @@ fn scale(hdc: HDC, image: &Decoded, w: i32, h: i32, bg: u32, smooth: bool) -> Op
     drop(old_dst);
     drop(src_dc);
     drop(dst);
-    if !flat.is_null() {
-        gdi::delete_object(flat);
-    }
+    drop(flat);
     Some(Scaled {
         width: w,
         height: h,
         bg,
         smooth,
-        handle: out,
+        bitmap: out,
     })
 }
 
@@ -1012,7 +1007,7 @@ fn caption(
     // In Fonts and Colors' Preview font.
     let line = app.part_height(crate::colors::Item::Preview);
     // Draws into the paint buffer; the old font is put back as this goes.
-    let _font = Selected::new(hdc, app.part_font(crate::colors::Item::Preview, false));
+    let _font = Selected::of(hdc, app.part_font(crate::colors::Item::Preview, false));
     gdi::set_bk_mode(hdc, TRANSPARENT as i32);
     let shown = image.map(|(i, _, _)| fit(i.natural, (w, (height(rc) / 2).max(1)), false));
     let heights: Vec<i32> = lines
@@ -1068,7 +1063,8 @@ impl PaneContent for PreviewPane {
     fn create(&self, app: &App, pane: HWND) {
         self.pane.set(pane);
         let font = mono_font(app);
-        self.mono.set(font);
+        let handle = font.as_ref().map_or(core::ptr::null_mut(), gdi::Owned::get);
+        *self.mono.borrow_mut() = font;
         let style = WS_CHILD
             | WS_VSCROLL
             | WS_HSCROLL
@@ -1084,7 +1080,7 @@ impl PaneContent for PreviewPane {
             parent: pane,
             menu: class::id_menu(ID_TEXT),
         });
-        win::set_font(edit, font, false);
+        win::set_font(edit, handle, false);
         edit::set_limit(edit, 0);
         self.text_box.set(edit);
         self.theme_text_box(app.pal.get().dark);
@@ -1117,14 +1113,12 @@ impl PaneContent for PreviewPane {
         }
         self.release();
         let edit = self.text_box.replace(core::ptr::null_mut());
-        let font = self.mono.replace(core::ptr::null_mut());
-        // The text box goes before the font it uses.
+        let font = self.mono.take();
+        // The text box goes before the font it uses (deleted as it drops).
         if !edit.is_null() {
             win::destroy(edit);
         }
-        if !font.is_null() {
-            gdi::delete_object(font);
-        }
+        drop(font);
     }
 
     fn focus(&self) -> Option<HWND> {
@@ -1279,12 +1273,12 @@ impl PaneContent for PreviewPane {
 
     fn dpi(&self, app: &App, _dpi: u32) {
         let font = mono_font(app);
+        let handle = font.as_ref().map_or(core::ptr::null_mut(), gdi::Owned::get);
         let old = self.mono.replace(font);
-        // The text box takes the new font before the old one goes.
-        win::set_font(self.text_box.get(), font, true);
-        if !old.is_null() {
-            gdi::delete_object(old);
-        }
+        // The text box takes the new font before the old one goes (deleted
+        // as it drops).
+        win::set_font(self.text_box.get(), handle, true);
+        drop(old);
         // The icon is made at the window's DPI.
         if matches!(*self.view.borrow(), View::Icon { .. }) {
             self.reload(app);

@@ -86,7 +86,7 @@ fn centred(app: &App, hdc: HDC, rc: &RECT, text: &str, colour: u32) {
     let mut r = *rc;
     // Drawn into the buffer handed over; the old font goes back as this
     // drops.
-    let _font = Selected::new(hdc, app.ui_font());
+    let _font = Selected::of(hdc, app.ui_font());
     gdi::set_bk_mode(hdc, TRANSPARENT as i32);
     gdi::set_text_color(hdc, colour);
     gdi::draw_text(

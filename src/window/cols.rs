@@ -224,7 +224,7 @@ impl App {
         // font is put back first.
         let title_w = {
             let dc = gdi::WindowDc::get(self.list);
-            let old = gdi::Selected::new(dc.hdc(), font);
+            let old = gdi::Selected::of(dc.hdc(), font);
             let w = paint::width(dc.hdc(), &title);
             drop(old);
             drop(dc);

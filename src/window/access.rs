@@ -61,8 +61,10 @@ impl App {
         {
             let dc = gdi::WindowDc::get(self.hwnd);
             let mem = gdi::MemDc::compatible(dc.hdc());
-            let bmp = gdi::Owned::new(gdi::create_compatible_bitmap(dc.hdc(), w, h));
-            let old = gdi::Selected::new(mem.hdc(), bmp.get());
+            let Some(bmp) = gdi::create_compatible_bitmap(dc.hdc(), w, h) else {
+                return Vec::new();
+            };
+            let old = gdi::Selected::new(mem.hdc(), &bmp);
             gdi::set_viewport_org(mem.hdc(), -rc.left, -rc.top);
             crate::status::paint(self, mem.hdc());
             drop(old);

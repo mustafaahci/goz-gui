@@ -1387,7 +1387,7 @@ fn paint_status(s: &Dlg, dis: &DRAWITEMSTRUCT) {
     let mut rc = dis.rcItem;
     rc.top = centred_top(rc.top, rc.bottom, measured.bottom - measured.top);
     gdi::draw_text(hdc, &text, &mut rc, format);
-    gdi::select(hdc, old);
+    old.restore(hdc);
 }
 
 /// The top of `height` centred between `top` and `bottom` (at `top` when

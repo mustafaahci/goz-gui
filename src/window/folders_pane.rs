@@ -81,7 +81,7 @@ use crate::store::location;
 use crate::theme;
 use crate::treeview::{self, Images, New, Source, TreeItem};
 use crate::win::class::{self, Create};
-use crate::win::gdi::{self, Owned, Selected, WindowDc};
+use crate::win::gdi::{self, Selected, WindowDc};
 use crate::win::tip::Text;
 use crate::win::tv::After;
 use crate::win::{self, Msg, parcel, subclass, sys, tv};
@@ -288,7 +288,7 @@ impl FoldersPane {
         // its old one (the guards drop in turn).
         let w = {
             let dc = WindowDc::get(core::ptr::null_mut());
-            let _font = Selected::new(dc.hdc(), font);
+            let _font = Selected::of(dc.hdc(), font);
             crate::paint::width(dc.hdc(), &label)
         };
         // The label starts past the box (`paint_bar`).
@@ -1167,8 +1167,8 @@ impl FoldersPane {
         // A pen made and deleted here, selected out again before (the
         // guards drop in turn).
         if ticked {
-            let pen = Owned::new(gdi::create_pen(PS_SOLID, s(2).max(1), colour));
-            let _pen_in = Selected::new(hdc, pen.get());
+            let pen = gdi::create_pen(PS_SOLID, s(2).max(1), colour);
+            let _pen_in = pen.as_ref().map(|p| Selected::new(hdc, p));
             gdi::move_to(hdc, left + s(3), top + s(6));
             gdi::line_to(hdc, left + s(5), top + s(9));
             gdi::line_to(hdc, left + s(10), top + s(3));
@@ -1182,7 +1182,7 @@ impl FoldersPane {
         };
         // Drawn into the paint buffer; the old font goes back as this
         // drops.
-        let _font = Selected::new(
+        let _font = Selected::of(
             hdc,
             app.part_font(crate::colors::Item::FoldersSidebar, false),
         );

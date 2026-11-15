@@ -660,7 +660,7 @@ fn draw_bitmap(hdc: HDC, bitmap: &Bitmap, square: &RECT) {
     // A memory DC made and deleted here holds the bitmap, which the cache
     // keeps alive across the call and selects nowhere else.
     let mem = gdi::MemDc::compatible(hdc);
-    let selected = gdi::Selected::new(mem.hdc(), bitmap.handle());
+    let selected = gdi::Selected::of(mem.hdc(), bitmap.handle());
     gdi::alpha_blend(
         hdc,
         (

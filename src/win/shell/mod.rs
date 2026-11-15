@@ -162,11 +162,14 @@ impl ImageFactory {
     }
 
     /// Its image, at most `side` pixels square, as SIIGBF_* `flags` ask
-    /// (GetImage): a bitmap now the caller's.
+    /// (GetImage): a bitmap now the caller's, deleted when it drops.
     pub fn image(&self, side: i32, flags: SIIGBF) -> Result<gdi::Owned> {
         // SAFETY: no pointers in; the bitmap comes back the caller's.
         let made = unsafe { self.0.GetImage(SIZE { cx: side, cy: side }, flags) }?;
-        Ok(gdi::Owned::new(made.0))
+        // SAFETY: GetImage's bitmap, made for the caller and owned by
+        // nothing else.
+        unsafe { gdi::Owned::take(made.0) }
+            .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
     }
 }
 

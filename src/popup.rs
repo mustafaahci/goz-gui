@@ -238,12 +238,12 @@ fn draw(owner: HWND, menu: HMENU, pos: u32, width: u32, height: u32) -> u32 {
     // order of these, as they drop).
     let screen = gdi::WindowDc::get(core::ptr::null_mut());
     let dc = gdi::MemDc::compatible(screen.hdc());
-    let bitmap = gdi::Owned::new(gdi::create_compatible_bitmap(screen.hdc(), w, h));
+    let bitmap = gdi::create_compatible_bitmap(screen.hdc(), w, h);
     drop(screen);
-    if dc.hdc().is_null() || bitmap.get().is_null() {
+    let Some(bitmap) = bitmap.filter(|_| !dc.hdc().is_null()) else {
         return 0;
-    }
-    let _selected = gdi::Selected::new(dc.hdc(), bitmap.get());
+    };
+    let _selected = gdi::Selected::new(dc.hdc(), &bitmap);
     let rc = RECT {
         left: 0,
         top: 0,

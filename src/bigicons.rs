@@ -380,8 +380,8 @@ fn load_thread(shared: &Shared) {
     // ends with the process's, as the icon thread's does): drawing an icon
     // there is what makes the list load it.
     let dc = gdi::MemDc::compatible(core::ptr::null_mut());
-    let bitmap = gdi::Owned::new(gdi::create_bitmap(1, 1, 1, 32));
-    let _selected = gdi::Selected::new(dc.hdc(), bitmap.get());
+    let bitmap = gdi::create_bitmap(1, 1, 1, 32);
+    let _selected = bitmap.as_ref().map(|b| gdi::Selected::new(dc.hdc(), b));
     let mut last_told = Instant::now();
     loop {
         match next_job(shared) {

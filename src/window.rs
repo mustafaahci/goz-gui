@@ -213,10 +213,15 @@ struct Options {
 }
 
 pub struct Fonts {
+    /// The fonts to draw with, `_owned`'s (null for one GDI could not
+    /// make).
     pub normal: HFONT,
     pub bold: HFONT,
     /// Text height in pixels.
     pub height: i32,
+    /// The fonts themselves, deleted as this drops, once replaced (no
+    /// longer selected anywhere).
+    _owned: [Option<gdi::Owned>; 2],
 }
 
 impl Fonts {
@@ -238,26 +243,21 @@ impl Fonts {
         let normal = gdi::create_font(&lf);
         lf.lfWeight = 700;
         let bold = gdi::create_font(&lf);
+        let handle =
+            |f: &Option<gdi::Owned>| f.as_ref().map_or(core::ptr::null_mut(), gdi::Owned::get);
         // The screen's DC, measured in and given back; the old font is put
         // back first.
         let dc = gdi::WindowDc::get(core::ptr::null_mut());
-        let old = gdi::Selected::new(dc.hdc(), normal);
+        let old = gdi::Selected::of(dc.hdc(), handle(&normal));
         let tm = gdi::text_metrics(dc.hdc());
         drop(old);
         drop(dc);
         Fonts {
-            normal,
-            bold,
+            normal: handle(&normal),
+            bold: handle(&bold),
             height: tm.tmHeight,
+            _owned: [normal, bold],
         }
-    }
-}
-
-impl Drop for Fonts {
-    fn drop(&mut self) {
-        // Owned GDI objects, no longer selected anywhere once replaced.
-        gdi::delete_object(self.normal);
-        gdi::delete_object(self.bold);
     }
 }
 

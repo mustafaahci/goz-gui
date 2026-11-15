@@ -703,7 +703,7 @@ pub fn paint_filter_bar(app: &App, hdc: HDC, rc: RECT, name: &str, open: bool) {
         &mut room,
         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
-    gdi::select(hdc, old);
+    old.restore(hdc);
 }
 
 /// A button's glyph and background colours on a field of `bg`, lit (under

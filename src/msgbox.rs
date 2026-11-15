@@ -364,7 +364,7 @@ impl MsgBox {
         // these drop.
         let dc = WindowDc::get(dlg);
         let hdc = dc.hdc();
-        let _font = Selected::new(hdc, font);
+        let _font = Selected::of(hdc, font);
         let mut rc = rect(0, 0, most, 0).to_win();
         gdi::draw_text(
             hdc,

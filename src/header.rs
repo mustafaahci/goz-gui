@@ -206,7 +206,7 @@ fn item(app: &App, cd: &NMCUSTOMDRAW) {
     // Fonts and Colors' Header font.
     let font = app.part_font(Item::Header, pal.is_bold(Item::Header, state));
     // Draws into the header's DC; the old font is put back.
-    let old = gdi::Selected::new(hdc, font);
+    let old = gdi::Selected::of(hdc, font);
     gdi::set_bk_mode(hdc, TRANSPARENT as i32);
     gdi::set_text_color(hdc, pal.ink(Item::Header, state).fg);
     gdi::draw_text(

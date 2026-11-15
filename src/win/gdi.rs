@@ -1,6 +1,14 @@
 //! GDI: device contexts and the objects drawn with them. GDI checks every
 //! handle it is given, so handles are plain values here; what a call reads
 //! or writes through a pointer is a Rust reference or slice.
+//!
+//! What GDI makes for goz-gui is owned: a DC ([`MemDc`], [`WindowDc`]) or
+//! an object ([`Owned`]: a font, brush, pen or bitmap) is a type that lets
+//! it go when it drops, and no function here deletes or releases a raw
+//! handle (which could be another part of the process's, a DIB section
+//! whose bits it still uses, say). Selecting an object into a DC
+//! ([`Selected`]) borrows it; the object a selection replaced comes back
+//! as a [`Previous`], only to be selected again.
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -9,7 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     DT_MODIFYSTRING, DeleteDC, DeleteObject, DrawFocusRect, DrawTextW, ETO_OPTIONS, EndPaint,
     ExtTextOutW, FillRect, GET_STOCK_OBJECT_FLAGS, GetDC, GetObjectW, GetStockObject, GetSysColor,
     GetSysColorBrush, GetTextExtentPoint32W, GetTextMetricsW, GetWindowDC, HBITMAP, HBRUSH, HDC,
-    HFONT, HGDIOBJ, HPEN, LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PEN_STYLE, ROP_CODE, ReleaseDC,
+    HFONT, HGDIOBJ, LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PEN_STYLE, ROP_CODE, ReleaseDC,
     SYS_COLOR_INDEX, SelectObject, SetBkColor, SetBkMode, SetDCBrushColor, SetTextColor,
     SetViewportOrgEx, StretchBlt, TEXTMETRICW,
 };
@@ -52,7 +60,7 @@ impl Drop for Paint {
     }
 }
 
-/// A window's client-area DC (GetDC), released when this drops.
+/// A window's DC (GetDC, GetWindowDC), released when this drops.
 pub struct WindowDc {
     hwnd: HWND,
     hdc: HDC,
@@ -91,9 +99,11 @@ impl Drop for WindowDc {
 pub struct MemDc(HDC);
 
 impl MemDc {
-    /// A memory DC compatible with `hdc` (null: the screen).
+    /// A memory DC compatible with `hdc` (null: the screen); its DC null if
+    /// it could not be made.
     pub fn compatible(hdc: HDC) -> MemDc {
-        MemDc(create_compatible_dc(hdc))
+        // SAFETY: no pointers.
+        MemDc(unsafe { CreateCompatibleDC(hdc) })
     }
 
     /// The DC, to draw with (it stays this one's).
@@ -104,17 +114,29 @@ impl MemDc {
 
 impl Drop for MemDc {
     fn drop(&mut self) {
-        delete_dc(self.0);
+        // SAFETY: no pointers; the DC this made, deleted once.
+        unsafe { DeleteDC(self.0) };
     }
 }
 
-/// A GDI object (font, brush, pen, bitmap) deleted when this drops.
+/// A GDI object goz-gui made (a font, brush, pen or bitmap: only the
+/// functions here that make one give one), deleted when this drops.
 pub struct Owned(HGDIOBJ);
 
 impl Owned {
-    /// Takes `obj`, a GDI object made for the caller, to delete when this drops.
-    pub fn new(obj: HGDIOBJ) -> Owned {
-        Owned(obj)
+    /// `obj`, made for the caller (not null), to delete when this drops.
+    fn own(obj: HGDIOBJ) -> Option<Owned> {
+        (!obj.is_null()).then_some(Owned(obj))
+    }
+
+    /// Takes `obj`, a GDI object made for the caller by a call of this
+    /// layer's (a shell image's bitmap, say), to delete when this drops;
+    /// `None` for null.
+    ///
+    /// # Safety
+    /// `obj` is the caller's own, which nothing else deletes.
+    pub(crate) unsafe fn take(obj: HGDIOBJ) -> Option<Owned> {
+        Owned::own(obj)
     }
 
     /// The object, to draw with (it stays this one's).
@@ -125,81 +147,93 @@ impl Owned {
 
 impl Drop for Owned {
     fn drop(&mut self) {
-        delete_object(self.0);
+        // SAFETY: no pointers; the object this owns, deleted once (GDI
+        // refuses a bitmap still selected into a DC, and deletes a pen, a
+        // brush or a font once it is no longer selected).
+        unsafe { DeleteObject(self.0) };
     }
 }
 
 /// An object selected into a DC until this drops, when the one it replaced
-/// goes back.
-pub struct Selected {
+/// goes back. One goz-gui owns is borrowed meanwhile.
+pub struct Selected<'a> {
     hdc: HDC,
     old: HGDIOBJ,
+    _object: core::marker::PhantomData<&'a Owned>,
 }
 
-impl Selected {
-    /// Selects `obj` into `hdc` until this drops.
-    pub fn new(hdc: HDC, obj: HGDIOBJ) -> Selected {
+impl<'a> Selected<'a> {
+    /// Selects `obj` into `hdc` until this drops, borrowing it.
+    pub fn new(hdc: HDC, obj: &'a Owned) -> Selected<'a> {
+        Selected::of(hdc, obj.get())
+    }
+
+    /// Selects `obj`, an object goz-gui does not own here (a stock object,
+    /// a window's font, a section's bitmap), into `hdc` until this drops.
+    pub fn of(hdc: HDC, obj: HGDIOBJ) -> Selected<'a> {
         Selected {
             hdc,
-            old: select(hdc, obj),
+            // SAFETY: no pointers.
+            old: unsafe { SelectObject(hdc, obj) },
+            _object: core::marker::PhantomData,
         }
     }
 }
 
-impl Drop for Selected {
+impl Drop for Selected<'_> {
     fn drop(&mut self) {
         if !self.old.is_null() {
-            select(self.hdc, self.old);
+            // SAFETY: no pointers.
+            unsafe { SelectObject(self.hdc, self.old) };
+        }
+    }
+}
+
+/// The object a selection replaced in a DC: it is only selected again
+/// ([`Previous::restore`]), never deleted (it is not goz-gui's).
+pub struct Previous(HGDIOBJ);
+
+impl Previous {
+    /// Selects the object back into `hdc`.
+    pub fn restore(self, hdc: HDC) {
+        if !self.0.is_null() {
+            // SAFETY: no pointers.
+            unsafe { SelectObject(hdc, self.0) };
         }
     }
 }
 
 /// The window's client-area DC (GetDC), to give back with [`release_dc`].
-pub fn get_dc(hwnd: HWND) -> HDC {
+fn get_dc(hwnd: HWND) -> HDC {
     // SAFETY: no pointers.
     unsafe { GetDC(hwnd) }
 }
 
 /// The whole window's DC (GetWindowDC), to give back with [`release_dc`].
-pub fn window_dc(hwnd: HWND) -> HDC {
+fn window_dc(hwnd: HWND) -> HDC {
     // SAFETY: no pointers.
     unsafe { GetWindowDC(hwnd) }
 }
 
 /// Gives back a DC [`get_dc`] or [`window_dc`] gave.
-pub fn release_dc(hwnd: HWND, hdc: HDC) {
+fn release_dc(hwnd: HWND, hdc: HDC) {
     // SAFETY: no pointers.
     unsafe { ReleaseDC(hwnd, hdc) };
 }
 
-/// A memory DC compatible with `hdc` (null: the screen), to delete with [`delete_dc`].
-pub fn create_compatible_dc(hdc: HDC) -> HDC {
+/// A `cx` × `cy` bitmap of `hdc`'s format, deleted when it drops; `None` if
+/// it could not be made.
+pub fn create_compatible_bitmap(hdc: HDC, cx: i32, cy: i32) -> Option<Owned> {
     // SAFETY: no pointers.
-    unsafe { CreateCompatibleDC(hdc) }
+    Owned::own(unsafe { CreateCompatibleBitmap(hdc, cx, cy) })
 }
 
-/// Deletes a memory DC.
-pub fn delete_dc(hdc: HDC) {
+/// Selects `obj` into `hdc` (an object goz-gui owns stays its owner's: the
+/// caller selects the previous one back before it goes); the object it
+/// replaced, to select back.
+pub fn select(hdc: HDC, obj: HGDIOBJ) -> Previous {
     // SAFETY: no pointers.
-    unsafe { DeleteDC(hdc) };
-}
-
-/// A `cx` × `cy` bitmap of `hdc`'s format (null if it could not be made).
-pub fn create_compatible_bitmap(hdc: HDC, cx: i32, cy: i32) -> HBITMAP {
-    // SAFETY: no pointers.
-    unsafe { CreateCompatibleBitmap(hdc, cx, cy) }
-}
-
-/// Selects `obj` into `hdc`; the object it replaced.
-pub fn select(hdc: HDC, obj: HGDIOBJ) -> HGDIOBJ {
-    // SAFETY: no pointers.
-    unsafe { SelectObject(hdc, obj) }
-}
-
-/// Deletes a GDI object (GDI refuses one still selected into a DC).
-pub fn delete_object(obj: HGDIOBJ) -> bool {
-    // SAFETY: no pointers.
-    unsafe { DeleteObject(obj) != 0 }
+    Previous(unsafe { SelectObject(hdc, obj) })
 }
 
 /// One of the stock objects (DC_BRUSH, DEFAULT_GUI_FONT…), never deleted.
@@ -381,10 +415,10 @@ pub fn round_rect(hdc: HDC, rc: &RECT, cx: i32, cy: i32) {
 }
 
 /// A new `cx` × `cy` bitmap of `planes` planes of `bits_per_pixel`, its
-/// pixels not set (null if it could not be made). The caller deletes it.
-pub fn create_bitmap(cx: i32, cy: i32, planes: u32, bits_per_pixel: u32) -> HBITMAP {
+/// pixels not set, deleted when it drops; `None` if it could not be made.
+pub fn create_bitmap(cx: i32, cy: i32, planes: u32, bits_per_pixel: u32) -> Option<Owned> {
     // SAFETY: no initial pixels (null).
-    unsafe { CreateBitmap(cx, cy, planes, bits_per_pixel, core::ptr::null()) }
+    Owned::own(unsafe { CreateBitmap(cx, cy, planes, bits_per_pixel, core::ptr::null()) })
 }
 
 /// The font faces the screen has, as EnumFontFamiliesExW gives them for a
@@ -500,16 +534,17 @@ pub fn line_to(hdc: HDC, x: i32, y: i32) {
     unsafe { LineTo(hdc, x, y) };
 }
 
-/// A font as `lf` describes it, to delete (null if it could not be made).
-/// Its face name is read up to its last unit, which is made a NUL.
-pub fn create_font(lf: &LOGFONTW) -> HFONT {
+/// A font as `lf` describes it, deleted when it drops; `None` if it could
+/// not be made. Its face name is read up to its last unit, which is made a
+/// NUL.
+pub fn create_font(lf: &LOGFONTW) -> Option<Owned> {
     let lf = LOGFONTW {
         lfFaceName: face_name_ended(lf.lfFaceName),
         ..*lf
     };
     // SAFETY: an in-struct whose face name ends with a NUL within its
     // array.
-    unsafe { CreateFontIndirectW(&lf) }
+    Owned::own(unsafe { CreateFontIndirectW(&lf) })
 }
 
 /// A LOGFONTW's face name with its last unit a NUL, so a call reading it as
@@ -520,16 +555,18 @@ pub(crate) fn face_name_ended(face: [u16; 32]) -> [u16; 32] {
     face
 }
 
-/// A brush of colour `c`, to delete.
-pub fn create_solid_brush(c: COLORREF) -> HBRUSH {
+/// A brush of colour `c`, deleted when it drops; `None` if it could not be
+/// made.
+pub fn create_solid_brush(c: COLORREF) -> Option<Owned> {
     // SAFETY: no pointers.
-    unsafe { CreateSolidBrush(c) }
+    Owned::own(unsafe { CreateSolidBrush(c) })
 }
 
-/// A pen of `style`, `width` and colour `c`, to delete.
-pub fn create_pen(style: PEN_STYLE, width: i32, c: COLORREF) -> HPEN {
+/// A pen of `style`, `width` and colour `c`, deleted when it drops; `None`
+/// if it could not be made.
+pub fn create_pen(style: PEN_STYLE, width: i32, c: COLORREF) -> Option<Owned> {
     // SAFETY: no pointers.
-    unsafe { CreatePen(style, width, c) }
+    Owned::own(unsafe { CreatePen(style, width, c) })
 }
 
 /// A font's LOGFONTW.

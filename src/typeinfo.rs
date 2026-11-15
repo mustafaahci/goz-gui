@@ -262,9 +262,10 @@ fn lookup_thread(shared: &Shared, first: Vec<i32>) {
     // ends with the process's, as the icon threads' do): drawing an icon
     // there is what makes the list load it (as `bigicons.rs` does for the
     // big lists).
-    let dc = gdi::create_compatible_dc(core::ptr::null_mut());
-    let bitmap = crate::win::gdi::create_bitmap(1, 1, 1, 32);
-    gdi::select(dc, bitmap);
+    let dc = gdi::MemDc::compatible(core::ptr::null_mut());
+    let bitmap = gdi::create_bitmap(1, 1, 1, 32);
+    let _selected = bitmap.as_ref().map(|b| gdi::Selected::new(dc.hdc(), b));
+    let dc = dc.hdc();
     // The icons drawn (so loaded) here: many types share one.
     let mut loaded = HashSet::new();
     let mut load = |icon: i32| {

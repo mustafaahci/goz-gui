@@ -374,7 +374,7 @@ impl FontsColors {
                     );
                     x += size.cx;
                 }
-                gdi::select(hdc, old);
+                old.restore(hdc);
             }
             _ => {}
         }

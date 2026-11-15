@@ -1037,7 +1037,7 @@ fn paint_dark_tab(hwnd: HWND, d: &Dialog) {
         .map(|i| d.pages[i].page.name())
         .unwrap_or_default();
     let text: Vec<u16> = name.encode_utf16().collect();
-    let _font = Selected::new(hdc, win::font(hwnd));
+    let _font = Selected::of(hdc, win::font(hwnd));
     gdi::set_bk_mode(hdc, TRANSPARENT as i32);
     gdi::set_text_color(hdc, pal.fg);
     let mut tr = t;

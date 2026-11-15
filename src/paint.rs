@@ -226,7 +226,7 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
     // which keeps its own).
     let filtered = app.color_filter_colour(row);
     // Draws into the list's DC; the old font is put back at the end.
-    let old_font = gdi::Selected::new(hdc, fonts.normal);
+    let old_font = gdi::Selected::of(hdc, fonts.normal);
     gdi::set_bk_mode(hdc, TRANSPARENT as i32);
     for &(col, cell) in cols.iter() {
         if cell.right - cell.left <= 2 * pad {
@@ -406,7 +406,7 @@ pub fn cell_text(
     let w = {
         let dc = gdi::WindowDc::get(app.list);
         let hdc = dc.hdc();
-        let old = gdi::Selected::new(hdc, fonts.normal);
+        let old = gdi::Selected::of(hdc, fonts.normal);
         let w = parts(&text, spans, &fonts)
             .iter()
             .map(|&(s, e, f, _)| {
@@ -603,8 +603,10 @@ pub fn window(app: &App) {
     }
     let mem_dc = gdi::MemDc::compatible(hdc);
     let mem = mem_dc.hdc();
-    let bmp = gdi::Owned::new(gdi::create_compatible_bitmap(hdc, w, h));
-    let old_bmp = gdi::Selected::new(mem, bmp.get());
+    let Some(bmp) = gdi::create_compatible_bitmap(hdc, w, h) else {
+        return;
+    };
+    let old_bmp = gdi::Selected::new(mem, &bmp);
     gdi::set_viewport_org(mem, -dirty.left, -dirty.top);
 
     let pal = app.pal.get();
@@ -699,7 +701,7 @@ pub fn empty_list(app: &App) {
     rc.right -= app.scale(24);
     let dc = gdi::WindowDc::get(app.list);
     let hdc = dc.hdc();
-    let old = gdi::Selected::new(hdc, fonts.normal);
+    let old = gdi::Selected::of(hdc, fonts.normal);
     gdi::set_bk_mode(hdc, TRANSPARENT as i32);
     gdi::set_text_color(hdc, app.pal.get().dim);
     gdi::draw_text(hdc, &t, &mut rc, DT_CENTER | DT_WORDBREAK);

@@ -42,7 +42,7 @@ use crate::paint::fill;
 use crate::searchbox;
 use crate::theme::Ink;
 use crate::win::class::{self, Class, Create};
-use crate::win::gdi::{self, MemDc, Owned, Paint, Selected};
+use crate::win::gdi::{self, MemDc, Paint, Selected};
 use crate::win::{self, Msg, sys};
 use crate::window::App;
 
@@ -362,8 +362,10 @@ fn paint(app: &App, hwnd: HWND, p: &PaneWindow) {
         return;
     }
     let mem = MemDc::compatible(hdc);
-    let bmp = Owned::new(gdi::create_compatible_bitmap(hdc, w, h));
-    let _bmp_in = Selected::new(mem.hdc(), bmp.get());
+    let Some(bmp) = gdi::create_compatible_bitmap(hdc, w, h) else {
+        return;
+    };
+    let _bmp_in = Selected::new(mem.hdc(), &bmp);
     gdi::set_viewport_org(mem.hdc(), -dirty.left, -dirty.top);
 
     let rc = client(hwnd);
@@ -450,7 +452,7 @@ fn paint_title(app: &App, hwnd: HWND, p: &PaneWindow, hdc: HDC, rc: &RECT) {
         // Drawn into the paint buffer; the old font goes back as this
         // drops.
         let font = app.part_font(Item::Pane, pal.is_bold(Item::Pane, State::Normal));
-        let _font = Selected::new(hdc, font);
+        let _font = Selected::of(hdc, font);
         gdi::set_bk_mode(hdc, TRANSPARENT as i32);
         gdi::set_text_color(hdc, ink.fg);
         gdi::draw_text(

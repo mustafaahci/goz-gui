@@ -222,7 +222,7 @@ impl FindBar {
         // old font (the guards drop in turn).
         let w = {
             let dc = WindowDc::get(app.hwnd);
-            let _font = Selected::new(dc.hdc(), app.part_font(ColorItem::FindBar, false));
+            let _font = Selected::of(dc.hdc(), app.part_font(ColorItem::FindBar, false));
             crate::paint::width(dc.hdc(), &text)
         };
         let check = sys::metric_for_dpi(SM_CXMENUCHECK, app.dpi.get());
@@ -562,7 +562,7 @@ impl Strip for FindBar {
             let mut r = g.status;
             // Drawn into the paint buffer; the old font goes back as this
             // drops.
-            let _font = Selected::new(hdc, app.part_font(ColorItem::FindBar, false));
+            let _font = Selected::of(hdc, app.part_font(ColorItem::FindBar, false));
             gdi::set_bk_mode(hdc, TRANSPARENT as i32);
             gdi::set_text_color(hdc, pal.dim);
             gdi::draw_text(

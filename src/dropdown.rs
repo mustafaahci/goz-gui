@@ -483,10 +483,12 @@ fn paint(app: &App, hwnd: HWND) {
     let (w, h) = (client.right.max(1), client.bottom.max(1));
     let mem_dc = gdi::MemDc::compatible(hdc);
     let mem = mem_dc.hdc();
-    let bmp = gdi::Owned::new(gdi::create_compatible_bitmap(hdc, w, h));
-    let _bmp_in = gdi::Selected::new(mem, bmp.get());
+    let Some(bmp) = gdi::create_compatible_bitmap(hdc, w, h) else {
+        return;
+    };
+    let _bmp_in = gdi::Selected::new(mem, &bmp);
     fill(mem, &client, pal.popup_bg);
-    let font_in = gdi::Selected::new(mem, app.ui_font());
+    let font_in = gdi::Selected::of(mem, app.ui_font());
     gdi::set_bk_mode(mem, TRANSPARENT as i32);
     gdi::set_text_color(mem, pal.fg);
     let top = app.dropdown.top.get();

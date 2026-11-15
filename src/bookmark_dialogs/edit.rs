@@ -382,7 +382,7 @@ impl Edit {
         // the DC of its WM_PAINT, put back when `_font` drops (before the
         // style closes).
         let theme = Theme::open_for_window(model, "Combobox");
-        let _font = gdi::Selected::new(hdc, win::font(dlg));
+        let _font = gdi::Selected::of(hdc, win::font(dlg));
         gdi::set_bk_mode(hdc, TRANSPARENT as i32);
         let anchors = |id: u16| ANCHORS.iter().find(|a| a.0 == id).map_or(0, |a| a.2);
         for (id, units, text, enabled) in self.last_row_look() {
