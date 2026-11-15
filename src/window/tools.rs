@@ -4,43 +4,29 @@
 //! menu). The find bar is `findbar.rs`, the user's filters
 //! `custom_filters.rs`.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO,
-    MonitorFromRect, MonitorFromWindow, ScreenToClient,
-};
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::UI::Controls::{
-    EM_CANUNDO, EM_CHARFROMPOS, EM_GETSEL, EM_REPLACESEL, EM_SETSEL, EM_UNDO, LVIS_SELECTED,
-    LVM_GETCOLUMNWIDTH, LVM_GETITEMCOUNT, LVM_GETITEMSTATE, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT,
-    LVNI_FOCUSED, LVNI_SELECTED,
-};
-use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetFocus};
+use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL};
+use windows_sys::Win32::UI::Controls::{LVIS_SELECTED, LVNI_FOCUSED, LVNI_SELECTED};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CheckMenuItem, DestroyMenu, EnableMenuItem, GWL_STYLE, GetCaretPos, GetClientRect,
-    GetMenuItemCount, GetMenuItemID, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
-    GetWindowTextLengthW, HMENU, IsIconic, IsZoomed, MB_OK, MF_BYCOMMAND, MF_BYPOSITION,
-    MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_UNCHECKED, PostMessageW, SM_CXVSCROLL, SW_RESTORE,
-    SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetMenu, SetWindowLongPtrW,
-    SetWindowPlacement, SetWindowPos, ShowWindow, WINDOWPLACEMENT, WM_CLEAR, WM_CONTEXTMENU,
-    WM_COPY, WM_CUT, WM_PASTE, WS_CAPTION, WS_THICKFRAME,
+    HMENU, MB_OK, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_UNCHECKED,
+    MFT_SEPARATOR, MIIM_FTYPE, SM_CXVSCROLL, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE,
+    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, WINDOWPLACEMENT, WM_CLEAR, WM_CONTEXTMENU, WM_COPY, WM_CUT, WM_PASTE, WS_CAPTION,
+    WS_THICKFRAME,
 };
 
 use super::findbar::{FindBar, Finding, Report, TIMER_TYPED, WM_FIND};
 use super::selecting::Step;
-use super::{App, send, slots};
+use super::{App, slots};
 use crate::menu::{self, Item};
 use crate::searchtools::{self as st, Insert};
 use crate::settings::WindowPos;
 use crate::strip::StripSlot;
 use crate::wide::window_text;
+use crate::win::{self, Msg, edit, ext::b3, lv, parcel, sys};
 use crate::{advsearch, clipboard, goto, placement};
 
 /// Enters fullscreen once the window has shown, as it was left
@@ -58,7 +44,7 @@ struct Full {
     /// exactly only while it still is, else the placement alone puts the
     /// window on one (a monitor unplugged while fullscreen).
     rect_on_monitor: bool,
-    style: isize,
+    style: u32,
     /// The menu bar was taken away (`fullscreen_menu=0`).
     menu_hidden: bool,
 }
@@ -81,35 +67,27 @@ impl Tools {
 }
 
 fn enable(menu: HMENU, id: u16, on: bool) {
-    // SAFETY: an item of a menu of this window, by command; a missing one
-    // is reported and ignored.
-    unsafe {
-        EnableMenuItem(
-            menu,
-            u32::from(id),
-            MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED },
-        )
-    };
+    // By command; a missing one is reported and ignored.
+    b3::enable_menu_item(
+        menu,
+        u32::from(id),
+        MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED },
+    );
 }
 
 fn check(menu: HMENU, id: u16, on: bool) {
-    // SAFETY: as in `enable`.
-    unsafe {
-        CheckMenuItem(
-            menu,
-            u32::from(id),
-            MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED },
-        )
-    };
+    // As in `enable`.
+    b3::check_menu_item(
+        menu,
+        u32::from(id),
+        MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED },
+    );
 }
 
 /// The position of the item that runs `cmd` in `menu`.
 fn position_of(menu: HMENU, cmd: u16) -> Option<u32> {
-    // SAFETY: reads the items of a menu of this thread.
-    unsafe {
-        let n = GetMenuItemCount(menu).max(0) as u32;
-        (0..n).find(|&i| GetMenuItemID(menu, i as i32) == u32::from(cmd))
-    }
+    let n = b3::menu_item_count(menu).max(0) as u32;
+    (0..n).find(|&i| b3::menu_item_id(menu, i as i32) == u32::from(cmd))
 }
 
 impl App {
@@ -146,20 +124,12 @@ impl App {
         // The separator that came after Details now follows Window Size:
         // it goes, so Window Size and Zoom are one group, as Everything's.
         if let Some(at) = position_of(m.view, menu::VIEW_DETAILS) {
-            // SAFETY: deletes one item of this window's View menu by
-            // position, the separator two after Window Size's own.
-            unsafe {
-                use windows_sys::Win32::UI::WindowsAndMessaging::{
-                    DeleteMenu, GetMenuItemInfoW, MENUITEMINFOW, MFT_SEPARATOR, MIIM_FTYPE,
-                };
-                let mut mii: MENUITEMINFOW = core::mem::zeroed();
-                mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
-                mii.fMask = MIIM_FTYPE;
-                if GetMenuItemInfoW(m.view, at + 3, 1, &mut mii) != 0
-                    && mii.fType & MFT_SEPARATOR != 0
-                {
-                    DeleteMenu(m.view, at + 3, MF_BYPOSITION);
-                }
+            // One item of this window's View menu, by position: the
+            // separator two after Window Size's own.
+            if b3::menu_item_info(m.view, at + 3, true, MIIM_FTYPE, 0)
+                .is_some_and(|(mii, _)| mii.fType & MFT_SEPARATOR != 0)
+            {
+                b3::delete_menu(m.view, at + 3, MF_BYPOSITION);
             }
         }
         menu::add_items(
@@ -179,8 +149,8 @@ impl App {
         }
         self.restore_find();
         if self.prefs.borrow().base.search_tools.fullscreen {
-            // SAFETY: posts to this thread's window: after it has shown.
-            unsafe { PostMessageW(self.hwnd, WM_FULLSCREEN_AT_START, 0, 0) };
+            // After the window has shown.
+            win::post_app(self.hwnd, WM_FULLSCREEN_AT_START, 0, 0);
         }
     }
 
@@ -193,7 +163,7 @@ impl App {
     /// them; the user's filters are read again if another program changed
     /// them.
     pub(super) fn tools_menu_popup(&self, popup: HMENU) {
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0);
+        let count = lv::item_count(self.list);
         if popup == self.menus.edit {
             enable(popup, st::INVERT_SELECTION, count > 0);
             enable(popup, st::GO_TO, count > 0);
@@ -231,12 +201,13 @@ impl App {
     }
 
     /// F4's WM_APP messages.
-    pub(super) fn tools_message(&self, msg: u32, _w: WPARAM, l: LPARAM) -> Option<LRESULT> {
+    pub(super) fn tools_message(&self, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         match msg {
             WM_FIND => {
-                // SAFETY: a find's thread posted this box and gave it up.
-                let report = unsafe { Box::from_raw(l as *mut Report) };
-                self.find_report(*report);
+                // What a find's thread posted.
+                if let Some(report) = parcel::take::<Report>(&Msg::new(self.hwnd, msg, w, l)) {
+                    self.find_report(report);
+                }
                 Some(0)
             }
             WM_FULLSCREEN_AT_START => {
@@ -270,11 +241,11 @@ impl App {
     fn invert_selection(&self) {
         // The selection as it is to be, rows still being set included.
         self.finish_selecting();
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
+        let count = lv::item_count(self.list);
         if count == 0 {
             return;
         }
-        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize;
+        let selected = lv::selected_count(self.list);
         // All rows selected first (and the ones selected now deselected
         // after), or none (and the ones not selected now selected after).
         let (all, rows) = match self.kept_selection(count, selected) {
@@ -312,7 +283,7 @@ impl App {
             (sel.samples(64), sel.clone())
         };
         let agrees = samples.into_iter().all(|(row, on)| {
-            let bits = send(self.list, LVM_GETITEMSTATE, row, LVIS_SELECTED as isize) as u32;
+            let bits = lv::item_state(self.list, row as i32, LVIS_SELECTED);
             (bits & LVIS_SELECTED != 0) == on
         });
         agrees.then_some(sel)
@@ -322,14 +293,14 @@ impl App {
     /// when the kept selection does not agree with it.
     fn selected_scanned(&self) -> Vec<core::ops::Range<usize>> {
         let mut out = Vec::new();
-        let mut at = usize::MAX;
+        let mut at = -1;
         loop {
-            let next = send(self.list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize);
+            let next = lv::next_item(self.list, at, LVNI_SELECTED);
             if next < 0 {
                 break;
             }
             out.push(next as usize..next as usize + 1);
-            at = next as usize;
+            at = next;
         }
         out
     }
@@ -339,34 +310,26 @@ impl App {
     /// Asks for a result number and selects that result alone, the
     /// keyboard in the results.
     fn go_to(&self) {
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as u64;
+        let count = lv::item_count(self.list) as u64;
         if count == 0 {
-            // SAFETY: plays a system sound.
-            unsafe { MessageBeep(MB_OK) };
+            sys::beep(MB_OK);
             return;
         }
-        let focused = usize::try_from(send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        ))
-        .map_or(1, |i| i as u64 + 1);
+        let focused =
+            usize::try_from(lv::next_item(self.list, -1, LVNI_FOCUSED)).map_or(1, |i| i as u64 + 1);
         let chosen = {
             let _quiet = crate::dialog::Quiet::begin();
             goto::ask(self.hwnd, count, focused, self.dialog_look())
         };
         let Some(n) = chosen else { return };
         // The rows may have gone meanwhile (a live update).
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as u64;
+        let count = lv::item_count(self.list) as u64;
         if n == 0 || n > count {
             return;
         }
         self.select_row((n - 1) as usize);
-        // SAFETY: reads which window is active.
-        if unsafe { GetActiveWindow() } == self.hwnd {
-            // SAFETY: focuses a child of this thread's window.
-            unsafe { SetFocus(self.list) };
+        if win::active() == self.hwnd {
+            win::set_focus(self.list);
         } else {
             self.last_focus.set(self.list);
         }
@@ -376,17 +339,9 @@ impl App {
 
     /// The work area of the window's monitor.
     fn work_area(&self) -> RECT {
-        // SAFETY: plain out-structs; MonitorFromWindow never fails with
-        // DEFAULTTONEAREST.
-        unsafe {
-            let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
-            let mut mi = MONITORINFO {
-                cbSize: size_of::<MONITORINFO>() as u32,
-                ..core::mem::zeroed()
-            };
-            GetMonitorInfoW(mon, &mut mi);
-            mi.rcWork
-        }
+        // MonitorFromWindow never fails with DEFAULTTONEAREST.
+        let mon = sys::monitor_from_window(self.hwnd, MONITOR_DEFAULTTONEAREST);
+        sys::monitor_info(mon).map_or_else(RECT::default, |mi| mi.rcWork)
     }
 
     /// Puts the window back to its normal size first: from fullscreen,
@@ -395,38 +350,27 @@ impl App {
         if self.tools.full.borrow().is_some() {
             self.leave_fullscreen();
         }
-        // SAFETY: reads and restores this thread's window.
-        unsafe {
-            if IsZoomed(self.hwnd) != 0 {
-                ShowWindow(self.hwnd, SW_RESTORE);
-            }
+        if win::is_zoomed(self.hwnd) {
+            win::show(self.hwnd, SW_RESTORE);
         }
     }
 
     /// Sizes the window as `size` (pixels), its top left corner where it
     /// is, kept on its monitor.
     fn resize_window(&self, size: (i32, i32)) {
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's window.
-        unsafe { GetWindowRect(self.hwnd, &mut rc) };
+        let rc = win::window_rect(self.hwnd);
         let work = self.work_area();
         let (l, t, r, b) = st::sized_within(
             (rc.left, rc.top, rc.right, rc.bottom),
             size,
             (work.left, work.top, work.right, work.bottom),
         );
-        // SAFETY: moves and sizes this thread's window.
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                core::ptr::null_mut(),
-                l,
-                t,
-                r - l,
-                b - t,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
+        win::set_pos(
+            self.hwnd,
+            core::ptr::null_mut(),
+            (l, t, r - l, b - t),
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 
     /// View > Window Size > Small, Medium or Large (`which` 0, 1, 2):
@@ -449,15 +393,11 @@ impl App {
         self.size_all_columns_to_fit();
         let shown = self.list_cols.get().ids().len();
         let columns: i32 = (0..shown)
-            .map(|i| send(self.list, LVM_GETCOLUMNWIDTH, i, 0) as i32)
+            .map(|i| lv::column_width(self.list, i as i32))
             .sum();
-        let (mut window, mut list) = (RECT::default(), RECT::default());
-        // SAFETY: reads this thread's windows and a metric.
-        let scroll = unsafe {
-            GetWindowRect(self.hwnd, &mut window);
-            GetClientRect(self.list, &mut list);
-            GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi.get())
-        };
+        let window = win::window_rect(self.hwnd);
+        let list = win::client_rect(self.list);
+        let scroll = sys::metric_for_dpi(SM_CXVSCROLL, self.dpi.get());
         let chrome = (
             (window.right - window.left) - (list.right - list.left) + scroll + self.scale(2),
             (window.bottom - window.top) - (list.bottom - list.top) + self.header_height(),
@@ -487,29 +427,12 @@ impl App {
     /// The window covers its monitor, without its frame (and without its
     /// menu bar, unless `fullscreen_menu=1`).
     fn enter_fullscreen(&self) {
-        let mut placement = WINDOWPLACEMENT {
-            length: size_of::<WINDOWPLACEMENT>() as u32,
-            // SAFETY: the rest of WINDOWPLACEMENT is plain data.
-            ..unsafe { core::mem::zeroed() }
-        };
-        // SAFETY: reads this thread's window.
-        let (style, ok) = unsafe {
-            (
-                GetWindowLongPtrW(self.hwnd, GWL_STYLE),
-                GetWindowPlacement(self.hwnd, &mut placement) != 0,
-            )
-        };
-        if !ok {
+        let style = win::style(self.hwnd);
+        let Some(placement) = win::placement(self.hwnd) else {
             return;
-        }
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's window's state and rectangle.
-        let rect = unsafe {
-            (IsZoomed(self.hwnd) == 0
-                && IsIconic(self.hwnd) == 0
-                && GetWindowRect(self.hwnd, &mut rc) != 0)
-                .then_some(rc)
         };
+        let rect = (!win::is_zoomed(self.hwnd) && !win::is_iconic(self.hwnd))
+            .then(|| win::window_rect(self.hwnd));
         let keep_menu = self.prefs.borrow().base.search_tools.fullscreen_menu;
         *self.tools.full.borrow_mut() = Some(Full {
             placement,
@@ -518,35 +441,27 @@ impl App {
             style,
             menu_hidden: !keep_menu,
         });
-        // SAFETY: plain out-structs; MonitorFromWindow never fails with
-        // DEFAULTTONEAREST.
-        let monitor = unsafe {
-            let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
-            let mut mi = MONITORINFO {
-                cbSize: size_of::<MONITORINFO>() as u32,
-                ..core::mem::zeroed()
-            };
-            GetMonitorInfoW(mon, &mut mi);
-            mi.rcMonitor
-        };
-        // SAFETY: changes this thread's window: its menu, its frame, then
-        // its place, which sends WM_SIZE (no borrow is held).
-        unsafe {
-            if !keep_menu {
-                SetMenu(self.hwnd, core::ptr::null_mut());
-            }
-            let frame = (WS_CAPTION | WS_THICKFRAME) as isize;
-            SetWindowLongPtrW(self.hwnd, GWL_STYLE, style & !frame);
-            SetWindowPos(
-                self.hwnd,
-                core::ptr::null_mut(),
+        // MonitorFromWindow never fails with DEFAULTTONEAREST.
+        let mon = sys::monitor_from_window(self.hwnd, MONITOR_DEFAULTTONEAREST);
+        let monitor = sys::monitor_info(mon).map_or_else(RECT::default, |mi| mi.rcMonitor);
+        // The window's menu, its frame, then its place, which sends WM_SIZE
+        // (no borrow is held).
+        if !keep_menu {
+            b3::set_menu(self.hwnd, core::ptr::null_mut());
+        }
+        let frame = WS_CAPTION | WS_THICKFRAME;
+        win::set_style(self.hwnd, style & !frame);
+        win::set_pos(
+            self.hwnd,
+            core::ptr::null_mut(),
+            (
                 monitor.left,
                 monitor.top,
                 monitor.right - monitor.left,
                 monitor.bottom - monitor.top,
-                SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
-            );
-        }
+            ),
+            SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
+        );
         self.set_fullscreen_setting(true);
     }
 
@@ -563,43 +478,35 @@ impl App {
         if placement.showCmd == SW_SHOWNORMAL as u32 {
             placement.showCmd = SW_SHOWNOACTIVATE as u32;
         }
-        // SAFETY: changes this thread's window back as it was read.
-        unsafe {
-            SetWindowLongPtrW(self.hwnd, GWL_STYLE, full.style);
-            if full.menu_hidden {
-                SetMenu(self.hwnd, self.menus.bar);
-            }
-            SetWindowPlacement(self.hwnd, &placement);
-            let flags = SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE;
-            match full
-                .rect
-                .filter(|rc| exactly_back(full.rect_on_monitor, on_a_monitor(rc)))
-            {
-                // Exactly where it was, on a monitor or not (the placement
-                // alone brings one that was off every monitor onto one);
-                // not where no monitor is any more.
-                Some(rc) => SetWindowPos(
-                    self.hwnd,
-                    core::ptr::null_mut(),
-                    rc.left,
-                    rc.top,
-                    rc.right - rc.left,
-                    rc.bottom - rc.top,
-                    flags,
-                ),
-                None => SetWindowPos(
-                    self.hwnd,
-                    core::ptr::null_mut(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | flags,
-                ),
-            };
-            if placement.showCmd == SW_SHOWMAXIMIZED as u32 && GetActiveWindow() != self.hwnd {
-                self.maximize_deferred.set(true);
-            }
+        // The window goes back as it was read.
+        win::set_style(self.hwnd, full.style);
+        if full.menu_hidden {
+            b3::set_menu(self.hwnd, self.menus.bar);
+        }
+        win::set_placement(self.hwnd, &placement);
+        let flags = SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE;
+        match full
+            .rect
+            .filter(|rc| exactly_back(full.rect_on_monitor, on_a_monitor(rc)))
+        {
+            // Exactly where it was, on a monitor or not (the placement
+            // alone brings one that was off every monitor onto one);
+            // not where no monitor is any more.
+            Some(rc) => win::set_pos(
+                self.hwnd,
+                core::ptr::null_mut(),
+                (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top),
+                flags,
+            ),
+            None => win::set_pos(
+                self.hwnd,
+                core::ptr::null_mut(),
+                (0, 0, 0, 0),
+                SWP_NOMOVE | SWP_NOSIZE | flags,
+            ),
+        };
+        if placement.showCmd == SW_SHOWMAXIMIZED as u32 && win::active() != self.hwnd {
+            self.maximize_deferred.set(true);
         }
         self.set_fullscreen_setting(false);
     }
@@ -640,16 +547,9 @@ impl App {
     /// put in at the caret, and Advanced Search...
     fn search_box_menu(&self, l: LPARAM) {
         let edit = self.edit;
-        let (mut start, mut end) = (0u32, 0u32);
-        send(
-            edit,
-            EM_GETSEL,
-            (&raw mut start) as usize,
-            (&raw mut end) as isize,
-        );
+        let (start, end) = edit::sel(edit);
         let selection = start != end;
-        // SAFETY: reads this thread's search box.
-        let has_text = unsafe { GetWindowTextLengthW(edit) } > 0;
+        let has_text = win::text_len(edit) > 0;
         // OR, NOT and Group with a gozd that reads them.
         let operator = if crate::client::boolean_syntax() {
             menu::submenu(&[
@@ -687,14 +587,12 @@ impl App {
         let at = if l == -1 {
             Some(start as usize)
         } else {
-            let mut p = POINT {
+            let p = POINT {
                 x: (l & 0xffff) as i16 as i32,
                 y: ((l >> 16) & 0xffff) as i16 as i32,
             };
-            // SAFETY: maps a screen point into this thread's search box.
-            unsafe { ScreenToClient(edit, &mut p) };
-            let packed = ((p.y as u32 & 0xffff) << 16) | (p.x as u32 & 0xffff);
-            let r = send(edit, EM_CHARFROMPOS, 0, packed as isize);
+            let p = win::screen_to_client(edit, p);
+            let r = b3::edit_char_from_pos(edit, p);
             (r != -1).then_some((r as usize) & 0xffff)
         };
         // W8: not on `filelist-filename:` (nothing to edit), nor on a term
@@ -727,7 +625,7 @@ impl App {
             Item::Cmd(st::ADVANCED_SEARCH, "Advanced Search..."),
         ]);
         let popup = menu::submenu(&items);
-        enable(popup, st::BOX_UNDO, send(edit, EM_CANUNDO, 0, 0) != 0);
+        enable(popup, st::BOX_UNDO, edit::can_undo(edit));
         enable(popup, st::BOX_CUT, selection);
         enable(popup, st::BOX_COPY, selection);
         enable(popup, st::BOX_DELETE, selection);
@@ -735,16 +633,11 @@ impl App {
         enable(popup, st::BOX_SELECT_ALL, has_text);
         let pt = if l == -1 {
             // From the keyboard: under the caret.
-            let mut p = POINT::default();
-            // SAFETY: reads the caret of this thread and maps it to the
-            // screen from the box.
-            unsafe {
-                GetCaretPos(&mut p);
-                let h = self.search_font_height();
-                p.y += h;
-                ClientToScreen(edit, &mut p);
-            }
-            p
+            // This thread's caret, mapped to the screen from the box.
+            let mut p = b3::caret_pos();
+            let h = self.search_font_height();
+            p.y += h;
+            win::client_to_screen(edit, p)
         } else {
             POINT {
                 x: (l & 0xffff) as i16 as i32,
@@ -752,27 +645,27 @@ impl App {
             }
         };
         let id = crate::popup::track(popup, self.hwnd, pt, "search box menu", &|_| None);
-        // SAFETY: the menu this function made, its submenus with it.
-        unsafe { DestroyMenu(popup) };
+        // The menu this function made, its submenus with it.
+        b3::destroy_menu(popup);
         let id = id as u16;
         match id {
             st::BOX_UNDO => {
-                send(edit, EM_UNDO, 0, 0);
+                edit::undo(edit);
             }
             st::BOX_CUT => {
-                send(edit, WM_CUT, 0, 0);
+                win::send_plain(edit, WM_CUT, 0, 0);
             }
             st::BOX_COPY => {
-                send(edit, WM_COPY, 0, 0);
+                win::send_plain(edit, WM_COPY, 0, 0);
             }
             st::BOX_PASTE => {
-                send(edit, WM_PASTE, 0, 0);
+                win::send_plain(edit, WM_PASTE, 0, 0);
             }
             st::BOX_DELETE => {
-                send(edit, WM_CLEAR, 0, 0);
+                win::send_plain(edit, WM_CLEAR, 0, 0);
             }
             st::BOX_SELECT_ALL => {
-                send(edit, EM_SETSEL, 0, -1);
+                edit::set_sel(edit, 0, -1);
             }
             st::BOX_LOCATED_IN => {
                 if let Some(folder) = self.pick_folder() {
@@ -797,13 +690,7 @@ impl App {
     /// typing would (it can be undone), the keyboard there.
     fn put_in_search(&self, piece: &str, how: Insert) {
         let edit = self.edit;
-        let (mut start, mut end) = (0u32, 0u32);
-        send(
-            edit,
-            EM_GETSEL,
-            (&raw mut start) as usize,
-            (&raw mut end) as isize,
-        );
+        let (start, end) = edit::sel(edit);
         let text: Vec<u16> = window_text(edit).encode_utf16().collect();
         let (start, end) = (start as usize, end as usize);
         let (out, (caret, _)) = st::insert(&text, (start, end), piece, how);
@@ -814,10 +701,10 @@ impl App {
         let tail = text.len() - hi;
         let mut middle: Vec<u16> = out[lo..out.len() - tail].to_vec();
         middle.push(0);
-        send(edit, EM_SETSEL, lo, hi as isize);
+        edit::set_sel(edit, lo as i32, hi as i32);
         // The box's EN_CHANGE searches again.
-        send(edit, EM_REPLACESEL, 1, middle.as_ptr() as isize);
-        send(edit, EM_SETSEL, caret, caret as isize);
+        b3::edit_replace_sel_wide(edit, &middle, true);
+        edit::set_sel(edit, caret as i32, caret as i32);
         self.focus_box();
     }
 
@@ -885,8 +772,8 @@ impl App {
 
 /// Whether any of `rc` is on a monitor.
 fn on_a_monitor(rc: &RECT) -> bool {
-    // SAFETY: reads a plain rectangle; DEFAULTTONULL gives null for none.
-    !unsafe { MonitorFromRect(rc, MONITOR_DEFAULTTONULL) }.is_null()
+    // DEFAULTTONULL gives null for none.
+    !sys::monitor_from_rect(rc, MONITOR_DEFAULTTONULL).is_null()
 }
 
 /// Whether leaving fullscreen puts the window back at its exact old

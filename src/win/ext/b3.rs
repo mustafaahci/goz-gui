@@ -3,21 +3,31 @@
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT, SIZE, WAIT_OBJECT_0};
+use windows_sys::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, GetTextExtentExPointW,
+    HBITMAP, HDC, HGDIOBJ,
+};
+use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Memory::{HeapOptimizeResources, HeapSetInformation};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, OpenProcess, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE,
     STARTF_USESHOWWINDOW, STARTUPINFOW, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::Controls::{
+    EM_CHARFROMPOS, EM_REPLACESEL, EM_SETSEL, HIMAGELIST, IMAGELIST_CREATION_FLAGS,
+    IMAGELISTDRAWPARAMS, ImageList_Create, ImageList_Destroy, ImageList_DrawIndirect,
+    LVHITTESTINFO, LVM_HITTEST, LVM_SETICONSPACING, LVM_SUBITEMHITTEST,
+};
 use windows_sys::Win32::UI::Shell::{
-    SHELLFLAGSTATE, SHGetKnownFolderPath, SHGetSettings, SSF_MASK,
+    SHELLFLAGSTATE, SHGetImageList, SHGetKnownFolderPath, SHGetSettings, SSF_MASK,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, AppendMenuW, CheckMenuItem, CreatePopupMenu, DeleteMenu, DestroyMenu,
-    EnableMenuItem, GetMenuDefaultItem, GetMenuItemCount, GetMenuItemID, GetMenuItemInfoW,
-    GetMenuState, GetMenuStringW, HMENU, MENU_ITEM_FLAGS, MENU_ITEM_MASK, MENUITEMINFOW,
-    MIIM_FTYPE, MIIM_STRING, MIIM_TYPE, SetMenu, SetMenuItemInfoW,
+    EnableMenuItem, GetCaretPos, GetMenuDefaultItem, GetMenuItemCount, GetMenuItemID,
+    GetMenuItemInfoW, GetMenuState, GetMenuStringW, HMENU, MENU_ITEM_FLAGS, MENU_ITEM_MASK,
+    MENUITEMINFOW, MIIM_FTYPE, MIIM_STRING, MIIM_TYPE, PostMessageW, SetMenu, SetMenuItemInfoW,
 };
 use windows_sys::core::GUID;
 
@@ -318,9 +328,9 @@ pub fn known_folder_path(id: &GUID) -> Option<Vec<u16>> {
     // SAFETY: the folder's id read during the call; no token; the shell
     // allocates the path into `p` (null on failure).
     let hr = unsafe { SHGetKnownFolderPath(id, 0, core::ptr::null_mut(), &mut p) };
-    // SAFETY: the shell's NUL-terminated path, copied out before it is
-    // freed below.
     let path = if hr >= 0 {
+        // SAFETY: the shell's NUL-terminated path (or null), copied out
+        // before it is freed below.
         unsafe { crate::win::msg::read_nul(p) }
     } else {
         None
@@ -329,4 +339,271 @@ pub fn known_folder_path(id: &GUID) -> Option<Vec<u16>> {
     // allowed).
     unsafe { CoTaskMemFree(p.cast()) };
     path
+}
+
+// ---- List views. ----
+
+/// LVM_HITTEST (or LVM_SUBITEMHITTEST with `subitem`) of `info` (its
+/// point; the fields the list fills come back), with wParam 0: the list's
+/// answer (the item hit, -1 for none) and the filled structure.
+pub fn lv_hit_test(lv: HWND, info: LVHITTESTINFO, subitem: bool) -> (isize, LVHITTESTINFO) {
+    let mut ht = info;
+    let msg = if subitem {
+        LVM_SUBITEMHITTEST
+    } else {
+        LVM_HITTEST
+    };
+    // SAFETY: both messages' lParam is an LVHITTESTINFO, in and out, with
+    // no pointers; sent only to a list view.
+    let answer = unsafe {
+        crate::win::send_raw(
+            crate::win::of_class(lv, crate::win::lv::CLASS),
+            msg,
+            0,
+            (&raw mut ht) as isize,
+        )
+    };
+    (answer, ht)
+}
+
+/// LVM_SETICONSPACING: the spacing of icons in icon view, `cx` × `cy`
+/// (-1 for the default); the spacing before, as (cx, cy).
+pub fn lv_set_icon_spacing(lv: HWND, cx: i32, cy: i32) -> (i32, i32) {
+    let l = (cx as u16 as isize) | ((cy as u16 as isize) << 16);
+    // SAFETY: LVM_SETICONSPACING's lParam is a packed size; sent only to a
+    // list view.
+    let v = unsafe {
+        crate::win::send_raw(
+            crate::win::of_class(lv, crate::win::lv::CLASS),
+            LVM_SETICONSPACING,
+            0,
+            l,
+        )
+    } as usize;
+    (
+        i32::from(crate::win::loword(v)),
+        i32::from(crate::win::hiword(v)),
+    )
+}
+
+// ---- Edit boxes. ----
+
+/// Posts EM_SETSEL to `e` (characters `start` up to `end`), to be done
+/// once what runs now has returned. Its parameters are integers, and below
+/// WM_USER it means the same to every window.
+pub fn post_edit_sel(e: HWND, start: i32, end: i32) -> bool {
+    // SAFETY: EM_SETSEL's parameters are integers.
+    unsafe { PostMessageW(e, EM_SETSEL, start as isize as usize, end as isize) != 0 }
+}
+
+// ---- Files. ----
+
+/// The file system's attributes of `path` (UTF-16, a NUL added if it has
+/// none); `None` when it is not there.
+pub fn file_attributes(path: &[u16]) -> Option<u32> {
+    let z = if path.last() == Some(&0) {
+        path.to_vec()
+    } else {
+        crate::win::wz_units(path)
+    };
+    // SAFETY: a NUL-terminated path read during the call.
+    let attrs = unsafe { GetFileAttributesW(z.as_ptr()) };
+    (attrs != INVALID_FILE_ATTRIBUTES).then_some(attrs)
+}
+
+// ---- Image lists (comctl32 checks the handles it is given). ----
+
+/// ImageList_Create: an empty image list of `cx` × `cy` images (ILC_*
+/// `flags`); null if none could be made.
+pub fn imagelist_create(
+    cx: i32,
+    cy: i32,
+    flags: IMAGELIST_CREATION_FLAGS,
+    initial: i32,
+    grow: i32,
+) -> HIMAGELIST {
+    // SAFETY: no pointers.
+    unsafe { ImageList_Create(cx, cy, flags, initial, grow) }
+}
+
+/// ImageList_Destroy; false if `il` is not an image list.
+pub fn imagelist_destroy(il: HIMAGELIST) -> bool {
+    // SAFETY: no pointers.
+    unsafe { ImageList_Destroy(il) != 0 }
+}
+
+/// `IID_IImageList`, which `SHGetImageList` hands the system lists out as.
+const IID_IMAGE_LIST: GUID = GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0950);
+
+/// The shell's system image list `which` (SHIL_*), which lives as long as
+/// the process: the reference handed out is kept, never released. `None`
+/// if the shell has no such list.
+pub fn system_image_list(which: i32) -> Option<HIMAGELIST> {
+    let mut ppv: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: an out-pointer for the interface the IID names; the list it
+    // gives is an IImageList, which is an HIMAGELIST.
+    let hr = unsafe { SHGetImageList(which, &IID_IMAGE_LIST, &mut ppv) };
+    (hr >= 0 && !ppv.is_null()).then_some(ppv as HIMAGELIST)
+}
+
+// ---- Drawing. ----
+
+/// GetTextExtentExPointW of `text` in the DC's font: how many of its units
+/// fit in `max` pixels, and the size of all of it.
+pub fn text_fit(hdc: HDC, text: &[u16], max: i32) -> (i32, SIZE) {
+    let mut fit = 0;
+    let mut size = SIZE::default();
+    let len = i32::try_from(text.len()).unwrap_or(i32::MAX);
+    // SAFETY: `len` units of `text`, read; two out-values; no array of
+    // partial extents.
+    unsafe {
+        GetTextExtentExPointW(
+            hdc,
+            text.as_ptr(),
+            len,
+            max,
+            &mut fit,
+            core::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    (fit, size)
+}
+
+/// A 32-bit top-down DIB section of `cx` × `cy` pixels in a memory DC of
+/// its own, both deleted when this drops, to draw an image list's image
+/// into and read back. Neither the DC nor the bitmap is handed out, so
+/// nothing else can deselect or delete the bitmap whose pixels this reads.
+pub struct DibCanvas {
+    dc: HDC,
+    dib: HBITMAP,
+    old: HGDIOBJ,
+    bits: *mut u32,
+    cx: i32,
+    count: usize,
+}
+
+impl DibCanvas {
+    /// `None` for an empty size, or if GDI could not make it.
+    pub fn new(cx: i32, cy: i32) -> Option<DibCanvas> {
+        if cx <= 0 || cy <= 0 {
+            return None;
+        }
+        let count = usize::try_from(cx)
+            .ok()?
+            .checked_mul(usize::try_from(cy).ok()?)?;
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: cx,
+                // Top-down.
+                biHeight: -cy,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: a complete BITMAPINFO for a 32-bit DIB, read; an out
+        // pointer for its pixels; no file mapping.
+        let dib = unsafe {
+            CreateDIBSection(
+                core::ptr::null_mut(),
+                &bi,
+                DIB_RGB_COLORS,
+                &mut bits,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if dib.is_null() || bits.is_null() {
+            if !dib.is_null() {
+                crate::win::gdi::delete_object(dib);
+            }
+            return None;
+        }
+        let dc = crate::win::gdi::create_compatible_dc(core::ptr::null_mut());
+        let old = crate::win::gdi::select(dc, dib);
+        Some(DibCanvas {
+            dc,
+            dib,
+            old,
+            bits: bits.cast(),
+            cx,
+            count,
+        })
+    }
+
+    /// Sets every pixel to `value` (0x00RRGGBB, alpha in the top byte).
+    pub fn fill(&mut self, value: u32) {
+        crate::win::gdi::flush();
+        // SAFETY: the DIB section's `count` pixels, which this owns and
+        // nothing else reaches (its DC and bitmap are not handed out); GDI's
+        // drawing into them is done (flushed above).
+        unsafe { core::slice::from_raw_parts_mut(self.bits, self.count) }.fill(value);
+    }
+
+    /// ImageList_DrawIndirect of `params` into the canvas (its `hdcDst` is
+    /// the canvas's own, set here); false if the list did not draw.
+    pub fn draw_image(&mut self, params: &IMAGELISTDRAWPARAMS) -> bool {
+        let mut p = *params;
+        p.cbSize = size_of::<IMAGELISTDRAWPARAMS>() as u32;
+        p.hdcDst = self.dc;
+        // SAFETY: an in-struct with its size and no pointers (handles and
+        // values only).
+        unsafe { ImageList_DrawIndirect(&p) != 0 }
+    }
+
+    /// The pixels, `cx` to a row from the top, lent to `f` once what was
+    /// drawn is in them.
+    pub fn with_pixels<R>(&self, f: impl FnOnce(&[u32]) -> R) -> R {
+        crate::win::gdi::flush();
+        // SAFETY: as in `fill`; the slice is borrowed from `self` for the
+        // call, so the canvas outlives it, and nothing draws into the
+        // canvas meanwhile (only `&mut self` methods do).
+        f(unsafe { core::slice::from_raw_parts(self.bits, self.count) })
+    }
+
+    /// The width in pixels.
+    pub fn width(&self) -> i32 {
+        self.cx
+    }
+}
+
+impl Drop for DibCanvas {
+    fn drop(&mut self) {
+        crate::win::gdi::select(self.dc, self.old);
+        crate::win::gdi::delete_dc(self.dc);
+        crate::win::gdi::delete_object(self.dib);
+    }
+}
+
+/// EM_CHARFROMPOS at `pt` (client coordinates) as the box answers it: the
+/// character index in the low word and the line in the high word, -1 for
+/// a point outside it.
+pub fn edit_char_from_pos(e: HWND, pt: POINT) -> isize {
+    let packed = ((pt.y as u32 & 0xffff) << 16) | (pt.x as u32 & 0xffff);
+    // SAFETY: EM_CHARFROMPOS's lParam is a packed point.
+    unsafe { crate::win::send_raw(e, EM_CHARFROMPOS, 0, packed as isize) }
+}
+
+/// Replaces the selection with `text` (UTF-16; a NUL is added if missing).
+pub fn edit_replace_sel_wide(e: HWND, text: &[u16], can_undo: bool) {
+    let z = if text.last() == Some(&0) {
+        text.to_vec()
+    } else {
+        crate::win::wz_units(text)
+    };
+    // SAFETY: a NUL-terminated string read during the call.
+    unsafe { crate::win::send_raw(e, EM_REPLACESEL, usize::from(can_undo), z.as_ptr() as isize) };
+}
+
+/// Where this thread's caret is, in its window's client coordinates.
+pub fn caret_pos() -> POINT {
+    let mut p = POINT::default();
+    // SAFETY: an out-struct.
+    unsafe { GetCaretPos(&mut p) };
+    p
 }
