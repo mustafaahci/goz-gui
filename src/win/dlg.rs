@@ -98,6 +98,12 @@ impl Template {
 
     /// Adds a control at `x, y` of `cx` × `cy` dialog units, visible
     /// (WS_CHILD | WS_VISIBLE and `style`). Controls come in tab order.
+    ///
+    /// # Panics
+    /// If `class` names the MDI client, or a class by its atom (`#n`,
+    /// which may be the MDI client's), as [`super::class::create_plain`]
+    /// refuses them: a template's control has no creation data, which the
+    /// MDI client reads as a CLIENTCREATESTRUCT of its own.
     pub fn control(
         &mut self,
         class: Class,
@@ -123,7 +129,19 @@ impl Template {
             Class::Button => self.words.extend([0xffff, 0x0080]),
             Class::Edit => self.words.extend([0xffff, 0x0081]),
             Class::Static => self.words.extend([0xffff, 0x0082]),
-            Class::Named(name) => self.string(name),
+            Class::Named(name) => {
+                // The name as the template holds it (without NULs), compared
+                // as `create_plain` compares it.
+                let held: Vec<u16> = name.encode_utf16().filter(|&c| c != 0).collect();
+                let mdi: Vec<u16> = "MDIClient".encode_utf16().collect();
+                assert!(
+                    held.first() != Some(&u16::from(b'#'))
+                        && super::locale::compare_ordinal(&held, &mdi, true)
+                            != windows_sys::Win32::Globalization::CSTR_EQUAL,
+                    "a dialog's control is no MDI client, nor a class named by its atom"
+                );
+                self.string(name)
+            }
         }
         self.string(text);
         // No creation data.
@@ -474,6 +492,28 @@ mod tests {
     #[should_panic(expected = "DLGTEMPLATEEX")]
     fn a_style_that_marks_an_extended_template_is_refused() {
         let _ = Template::with_styles("", 0xffff_0001, 0, (1, 1), 9, &[]);
+    }
+
+    #[test]
+    fn a_template_makes_no_mdi_client() {
+        // A control of the class named so: whether the template refused it.
+        let refused = |name: &'static str| {
+            std::panic::catch_unwind(|| {
+                let mut t = Template::with_styles("", WS_POPUP, 0, (1, 1), 9, &[]);
+                t.control(Class::Named(name), "", 1, 0, 0, (0, 0, 1, 1));
+            })
+            .is_err()
+        };
+        // The MDI client, however its name is cased or cut (the template
+        // holds no NUL), and any class by its atom (the MDI client's is
+        // 32772): the client would read the control's missing creation
+        // data as its own structure.
+        assert!(refused("MDIClient"));
+        assert!(refused("mdiclient"));
+        assert!(refused("MDI Client"));
+        assert!(refused("#32772"));
+        assert!(!refused("SysTreeView32"));
+        assert!(!refused("MDIClient2"));
     }
 
     #[test]
