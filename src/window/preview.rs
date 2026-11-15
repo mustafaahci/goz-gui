@@ -3,14 +3,15 @@
 //! passes back, and Everything's layout menu that a right-click on the
 //! preview opens.
 
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
-use windows_sys::Win32::UI::WindowsAndMessaging::{MF_CHECKED, MF_STRING, MF_UNCHECKED};
+use windows_sys::Win32::Foundation::{LRESULT, POINT};
+use windows_sys::Win32::UI::WindowsAndMessaging::{MFS_CHECKED, MFS_UNCHECKED};
 
 use super::App;
 use crate::dock::PaneId;
 use crate::menu;
 use crate::preview::{self, TAB_BACK_OUT, TAB_OUT, WM_REPLIES, WM_RETIRE};
-use crate::win::ext::b2;
+use crate::win::menu::NewItem;
+use crate::win::{self, Msg};
 
 impl App {
     /// A command of the preview's range (`menu::F1_FIRST`..): true when it
@@ -31,9 +32,9 @@ impl App {
     }
 
     /// A message of the preview's range (`slots::F1_MSG`..).
-    pub(super) fn preview_message(&self, msg: u32, w: WPARAM, _l: LPARAM) -> Option<LRESULT> {
-        match msg {
-            WM_RETIRE => preview::retired(w),
+    pub(super) fn preview_message(&self, m: &Msg) -> Option<LRESULT> {
+        match m.id {
+            WM_RETIRE => preview::retired(m.w),
             WM_REPLIES => preview::replies_ready(self),
             _ => return None,
         }
@@ -71,23 +72,24 @@ impl App {
             }
         }
         // A popup menu made here and destroyed after it closes.
-        let popup = b2::create_popup_menu();
+        let popup = win::menu::create_popup();
         if popup.is_null() {
             return;
         }
         for (i, (cmd, label, checked)) in items.iter().enumerate() {
-            let check = if *checked { MF_CHECKED } else { MF_UNCHECKED };
+            let check = if *checked { MFS_CHECKED } else { MFS_UNCHECKED };
             // The menu copies the label.
             if i == first_pane {
-                b2::append_separator(popup);
+                win::menu::append(popup, &NewItem::separator());
             }
-            b2::append_menu(popup, MF_STRING | check, usize::from(*cmd), label);
+            let item = NewItem::command(u32::from(*cmd), label).state(check);
+            win::menu::append(popup, &item);
         }
         // Shown (or, in a test's dump, written out) while no state of the
         // window is borrowed.
         let cmd = crate::popup::track(popup, self.hwnd, POINT { x, y }, "layout menu", &|_| None);
         // The menu made above, closed now.
-        b2::destroy_menu(popup);
+        win::menu::destroy(popup);
         if cmd > 0 {
             self.command(cmd as u16);
         }

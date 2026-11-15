@@ -10,7 +10,8 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_MOVE};
 use windows_sys::Win32::UI::Shell::DROPFILES;
 
-use crate::win::ext::b8::{self, Clipboard};
+use crate::win;
+use crate::win::clipboard::Clipboard;
 
 /// What a paste of the files does with them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,7 +84,7 @@ fn open_as_is(hwnd: HWND) -> Option<Clipboard> {
             return Some(clipboard);
         }
         if attempt + 1 < OPEN_TRIES {
-            b8::sleep(OPEN_RETRY_MS);
+            win::process::sleep(OPEN_RETRY_MS);
         }
     }
     None
@@ -92,12 +93,12 @@ fn open_as_is(hwnd: HWND) -> Option<Clipboard> {
 /// The clipboard holds files (CF_HDROP): Paste has something to paste.
 pub fn has_files() -> bool {
     // A standard format; the clipboard need not be open.
-    b8::clipboard_has(u32::from(CF_HDROP))
+    win::clipboard::has(u32::from(CF_HDROP))
 }
 
 /// The clipboard holds text, for the search box's Paste.
 pub fn has_text() -> bool {
-    b8::clipboard_has(u32::from(CF_UNICODETEXT))
+    win::clipboard::has(u32::from(CF_UNICODETEXT))
 }
 
 /// Files on the clipboard, as a paste takes them.
@@ -121,7 +122,7 @@ fn is_move(effect: Option<u32>) -> bool {
 /// The files on the clipboard (CF_HDROP) and whether they were cut;
 /// `None` when it holds none or cannot be opened.
 pub fn files(hwnd: HWND) -> Option<Clip> {
-    let preferred = b8::register_clipboard_format(PREFERRED_DROP_EFFECT);
+    let preferred = win::clipboard::register_format(PREFERRED_DROP_EFFECT);
     let clipboard = open_as_is(hwnd)?;
     // Copies of what it holds, read while it is open.
     let paths = clipboard.files();
@@ -134,7 +135,7 @@ pub fn files(hwnd: HWND) -> Option<Clip> {
     };
     // While it is still open, and after the formats were rendered for the
     // reads above: nothing put on it since can be taken for these.
-    let sequence = b8::clipboard_sequence();
+    let sequence = win::clipboard::sequence();
     drop(clipboard);
     if paths.is_empty() {
         return None;
@@ -169,7 +170,7 @@ pub fn text(hwnd: HWND) -> Option<String> {
 /// clipboard is emptied, as after a cut and paste in Explorer (the paths
 /// on it are gone), unless something else was put on it since.
 pub fn clear_after_move(hwnd: HWND, sequence: u32) {
-    if b8::clipboard_sequence() != sequence {
+    if win::clipboard::sequence() != sequence {
         return;
     }
     // Emptied as it opens, closed as it drops.
@@ -203,7 +204,7 @@ pub fn put_files(hwnd: HWND, files: &Files, effect: Effect) -> bool {
         Effect::Move => DROPEFFECT_MOVE,
     }
     .to_le_bytes();
-    let preferred = b8::register_clipboard_format(PREFERRED_DROP_EFFECT);
+    let preferred = win::clipboard::register_format(PREFERRED_DROP_EFFECT);
     let Some(clipboard) = open(hwnd) else {
         return false;
     };

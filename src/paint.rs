@@ -10,20 +10,16 @@ use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, ILD_TRANSPARENT, LVIR_BOUNDS, ODS_DISABLED, ODS_FOCUS, ODS_GRAYED,
     ODS_HOTLIGHT, ODS_INACTIVE, ODS_NOACCEL, ODS_SELECTED,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON;
+use windows_sys::Win32::UI::WindowsAndMessaging::{OBJID_MENU, SM_CXSMICON};
 
 use crate::format;
 use crate::highlight::Span;
 use crate::icons::{PENDING, UNSET};
 use crate::theme::Palette;
-use crate::win::ext::b1;
+use crate::win::menubar::{UahDrawMenuItem, UahMenu};
 use crate::win::{self, gdi, imagelist, lv, sys};
 use crate::window::{App, COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE, Fonts};
 use crate::{copytext, filetype, searchbox, status};
-
-// The menu bar's undocumented messages and their structs live in
-// `win::ext::b1`, with the accessors that read them from a message.
-pub use crate::win::ext::b1::{UahDrawMenuItem, UahMenu, WM_UAHDRAWMENU, WM_UAHDRAWMENUITEM};
 
 /// The space inside a cell before and after its text, at 96 DPI.
 const CELL_PAD: i32 = 6;
@@ -512,7 +508,7 @@ pub fn runs_hl(
         .collect();
     // A match in a colour of its own, on a background of its own: the
     // DC's colour is the cell's, put back after each match.
-    let normal_fg = b1::text_color(hdc);
+    let normal_fg = win::gdi::text_color(hdc);
     let mark = |x: i32, w: i32, matched: bool| {
         if !matched {
             return;
@@ -562,7 +558,7 @@ pub fn runs_hl(
             }
             let room = limit - x;
             if room > 0 {
-                let fit = b1::text_fit(hdc, &text[s..e], room);
+                let (fit, _) = gdi::text_fit(hdc, &text[s..e], room);
                 let fit = &text[s..s + fit.max(0) as usize];
                 let fw = width(hdc, fit);
                 mark(x, fw, matched);
@@ -721,7 +717,7 @@ fn offset(rc: RECT, dx: i32, dy: i32) -> RECT {
 
 /// The menu bar's rectangle in window coordinates.
 fn menubar_rect(hwnd: HWND) -> RECT {
-    let bar = b1::menu_bar_info(hwnd)
+    let bar = win::menu::bar_info(hwnd, OBJID_MENU, 0)
         .map(|mbi| mbi.rcBar)
         .unwrap_or_default();
     let wr = win::window_rect(hwnd);
@@ -774,9 +770,9 @@ pub fn menubar_text(ink: crate::theme::Ink, dim: bool) -> u32 {
 
 /// Paints one item of a menu bar in `pal`'s colours.
 pub fn menubar_item_of(pal: &Palette, item: &UahDrawMenuItem) {
-    // The item's text (up to 255 units); then paints into the DC Windows
-    // handed over.
-    let text = b1::menu_item_text(item.um.hmenu, item.umi.position as u32, true);
+    // The item's text; then paints into the DC Windows handed over.
+    let by = win::menu::By::Position(item.umi.position as u32);
+    let text = win::menu::text_units(item.um.hmenu, by);
     let state = item.dis.itemState;
     let hot = state & (ODS_HOTLIGHT | ODS_SELECTED) != 0;
     let mut rc = item.dis.rcItem;

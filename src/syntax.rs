@@ -24,7 +24,6 @@ use crate::paint::fill;
 use crate::places::{self, Which};
 use crate::theme::{self, Palette};
 use crate::win::class::{self, Create, create_plain, id_menu};
-use crate::win::ext::b4 as ext;
 use crate::win::gdi::{self, Paint};
 use crate::win::{self, Msg, edit, subclass, sys};
 use crate::window::app_icon;
@@ -271,7 +270,7 @@ pub fn show(owner: HWND, dark: bool) {
     // The class stays registered once the window closes, and its icons
     // with it; loading new ones for a registration that would fail leaks
     // them, two icons per opening.
-    if !ext::class_registered(CLASS) {
+    if !win::class::is_registered(CLASS) {
         let c = class::Class {
             cursor: sys::system_cursor(IDC_ARROW),
             icon: app_icon(sys::metric(SM_CXICON)),

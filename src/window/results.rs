@@ -43,7 +43,6 @@ use crate::client::{BLOCK_ROWS, Job};
 use crate::clipboard::{self, Effect, Files};
 use crate::copytext::{self, Field};
 use crate::store::location;
-use crate::win::ext::b1;
 use crate::win::{self, Notify, lv, sys};
 use crate::{format, msgbox};
 
@@ -139,7 +138,7 @@ impl Fetching {
             blocks,
             waiting,
             then,
-            clipboard: b1::clipboard_sequence(),
+            clipboard: win::clipboard::sequence(),
             moved: 0,
         }
     }
@@ -423,7 +422,7 @@ impl App {
             Then::RowMenu { .. } => location::menu_dump(),
             Then::Copy(_) | Then::Files(_) | Then::RunCount => false,
         };
-        let copied = b1::clipboard_sequence() != fetching.clipboard;
+        let copied = win::clipboard::sequence() != fetching.clipboard;
         held_back(fetching.then, front, quiet, copied).map_or(Ok(()), Err)
     }
 
@@ -519,7 +518,7 @@ impl App {
         }
         // The cursor's place; a window of this thread (checked) is asked for
         // its cursor there, as a mouse move would.
-        let Some(pt): Option<POINT> = b1::cursor_pos() else {
+        let Some(pt): Option<POINT> = win::sys::cursor_pos() else {
             return;
         };
         let under = win::from_point(pt);
@@ -528,7 +527,7 @@ impl App {
         }
         let at = (pt.x as u16 as u32 | ((pt.y as u16 as u32) << 16)) as isize;
         let hit = win::send_plain(under, WM_NCHITTEST, 0, at) as u32 & 0xffff;
-        b1::send_set_cursor(under, under, hit as u16, WM_MOUSEMOVE as u16);
+        win::send_set_cursor(under, under, hit as u16, WM_MOUSEMOVE as u16);
     }
 
     /// WM_SETCURSOR on the client area while busy: the busy cursor; false

@@ -10,7 +10,6 @@ use windows_sys::Win32::UI::Shell::SSF_DOUBLECLICKINWEBVIEW;
 use super::{App, slots};
 use crate::highlight::Highlight;
 use crate::ui_options::UiOptions;
-use crate::wide::window_text;
 use crate::win::{self, lv};
 
 /// The search delay's timer (`search_delay`): the text typed is searched
@@ -24,7 +23,7 @@ pub(super) const WM_FOCUS_SEARCH: u32 = slots::F6_MSG;
 /// Explorer's "Single-click to open an item (point to select)" (Folder
 /// Options), which Everything's "Use system settings" follows.
 fn explorer_single_click() -> bool {
-    let state = win::ext::b3::shell_settings(SSF_DOUBLECLICKINWEBVIEW);
+    let state = win::shell::settings(SSF_DOUBLECLICKINWEBVIEW);
     // fDoubleClickInWebView is the sixth bit of the flags (after
     // fShowAllObjects, fShowExtensions, fNoConfirmRecycle, fShowSysFiles
     // and fShowCompColor): set for double-click, Windows' default.
@@ -97,7 +96,7 @@ impl App {
         if self.search_dirty.get() {
             return;
         }
-        let text = window_text(self.edit);
+        let text = win::text(self.edit);
         let o = self.opts.get();
         let mut m = self.model.borrow_mut();
         if let Some(p) = m.pending.as_mut() {

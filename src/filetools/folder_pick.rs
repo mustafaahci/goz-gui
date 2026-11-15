@@ -12,7 +12,7 @@ use windows::Win32::UI::Shell::{
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::store::location;
-use crate::win::ext::b6::{self, OpenDialog};
+use crate::win::shell::FileDialog;
 
 /// Asks for a folder, over `owner`, titled `title` with `ok` on its button,
 /// opening in `start` when it is a folder; the folder chosen, `None` when
@@ -29,23 +29,19 @@ pub fn pick(owner: HWND, title: &str, ok: &str, start: Option<&[u16]>) -> Option
     }
     // COM is initialised on this (the UI) thread; the dialog runs its own
     // loop while the caller holds no borrow.
-    let dialog = OpenDialog::new()?;
+    let dialog = FileDialog::open()?;
     let options = dialog.options()?;
-    if !dialog.set_options(
-        options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR,
-    ) {
+    let folders = FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR;
+    if !dialog.set_options(options | folders.0) {
         return None;
     }
     dialog.set_title(title);
     dialog.set_ok_label(ok);
-    if let Some(start) = start.filter(|s| super::attributes(s).is_some())
-        && let Some(folder) = b6::shell_item(start)
-    {
-        dialog.set_folder(&folder);
+    if let Some(start) = start.filter(|s| super::attributes(s).is_some()) {
+        dialog.set_folder(start);
     }
     if !dialog.show(owner) {
         return None;
     }
-    let item = dialog.result()?;
-    b6::shell_item_path(&item)
+    dialog.result()?.file_system_path()
 }

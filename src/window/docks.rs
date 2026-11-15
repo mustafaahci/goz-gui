@@ -7,11 +7,6 @@
 //! `crate::strip` for the strips. FRAMEWORK.md (in the wave's notes) says
 //! how a feature uses it.
 
-// Left: `strip_message` takes the main window's message by its parts (from
-// window.rs) and reads the control a notification came from out of its
-// lParam, until it takes a `win::Msg`.
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
@@ -24,8 +19,7 @@ use crate::dock::{self, DockSettings, PaneId, PaneLayout, Side};
 use crate::layout::{self, Regions};
 use crate::pane::{self, PaneContent, PaneEvent, PaneSpec};
 use crate::strip::{Strip, StripSlot};
-use crate::win::ext::b2;
-use crate::win::{self, edit, sys};
+use crate::win::{self, Msg, edit, sys};
 use crate::{columns, menu};
 
 /// A registered pane.
@@ -482,27 +476,23 @@ impl App {
     /// A message from a strip's own control (`WM_COMMAND`, `WM_NOTIFY`,
     /// `WM_CTLCOLOR*`, `WM_DRAWITEM`), for that strip: its answer, or
     /// `None` when no strip owns the control or the strip leaves it.
-    pub(super) fn strip_message(&self, msg: u32, w: usize, l: isize) -> Option<isize> {
-        use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, NMHDR};
+    pub(super) fn strip_message(&self, m: &Msg) -> Option<isize> {
         use windows_sys::Win32::UI::WindowsAndMessaging::{WM_DRAWITEM, WM_NOTIFY};
-        if self.strips.borrow().iter().all(Option::is_none) || l == 0 {
+        if self.strips.borrow().iter().all(Option::is_none) || m.l == 0 {
             return None;
         }
-        // SAFETY: the main window's procedure hands on the parameters it was
-        // delivered: each message's lParam as it defines it, a control's
-        // window, an NMHDR from a control, a DRAWITEMSTRUCT.
-        let from = unsafe {
-            match msg {
-                WM_NOTIFY => (*(l as *const NMHDR)).hwndFrom,
-                WM_DRAWITEM => (*(l as *const DRAWITEMSTRUCT)).hwndItem,
-                _ => l as HWND,
-            }
+        // The control it came from: a notification's sender, the item
+        // drawn, or (WM_COMMAND, WM_CTLCOLOR*) the control lParam names.
+        let from = match m.id {
+            WM_NOTIFY => m.notify()?.from(),
+            WM_DRAWITEM => m.draw_item()?.hwndItem,
+            _ => m.l as HWND,
         };
         [StripSlot::Tabs, StripSlot::FindBar]
             .into_iter()
             .filter_map(|slot| self.strip(slot))
             .find(|s| s.contains(from))
-            .and_then(|s| s.message(self, msg, w, l))
+            .and_then(|s| s.message(self, m))
     }
 
     /// Lays the window out again: a strip's height or a pane's content
@@ -535,14 +525,15 @@ impl App {
     }
 
     /// A mouse message of the main window for the strips: the one holding
-    /// the mouse gets them all, else the one under `pt`; moves and leaves
-    /// go to each. True when a strip took a button message.
-    pub(super) fn strip_mouse(&self, msg: u32, w: usize, pt: POINT) -> bool {
+    /// the mouse gets them all, else the one under its point; moves and
+    /// leaves go to each. True when a strip took a button message.
+    pub(super) fn strip_mouse(&self, m: &Msg) -> bool {
         use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
         use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CAPTURECHANGED, WM_MOUSEMOVE};
         if self.strips.borrow().iter().all(Option::is_none) {
             return false;
         }
+        let (msg, w, pt) = (m.id, m.w, m.point());
         let captured = self.strip_capture.get();
         if msg == WM_CAPTURECHANGED {
             self.strip_capture.set(None);
@@ -730,7 +721,7 @@ impl App {
     pub(super) fn divider_cursor(&self) -> bool {
         let dragging = self.docks.borrow().drag.as_ref().map(|d| d.divider);
         let divider = dragging.or_else(|| {
-            let pt = win::screen_to_client(self.hwnd, sys::cursor_pos());
+            let pt = win::screen_to_client(self.hwnd, sys::cursor_pos().unwrap_or_default());
             self.divider_at(pt)
         });
         let Some(divider) = divider else {
@@ -1145,12 +1136,12 @@ impl Defer {
                 (rc.bottom - rc.top).max(0),
             )
         };
-        let moves: Vec<b2::Move> = self
+        let moves: Vec<win::WindowMove> = self
             .moves
             .iter()
             .map(|(hwnd, rc)| (*hwnd, size(rc)))
             .collect();
-        if !b2::defer_window_pos(&moves, SWP_NOZORDER | SWP_NOACTIVATE) {
+        if !win::defer_pos(&moves, SWP_NOZORDER | SWP_NOACTIVATE) {
             for &(hwnd, (x, y, cx, cy)) in &moves {
                 win::move_window(hwnd, x, y, cx, cy, true);
             }

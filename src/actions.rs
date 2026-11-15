@@ -18,7 +18,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL, WM_APP
 use crate::store::location::dry_run_instead;
 use crate::win;
 use crate::win::com::Apartment;
-use crate::win::ext::b8::{self, DataObject, Execute, Pidl};
+use crate::win::shell::{DataObject, Execute, Pidl};
 
 /// In a test's dry run (`GOZ_GUI_DRY_RUN`), notes the action in the data
 /// folder's `dry-run.log` instead of running it, and returns true.
@@ -72,7 +72,7 @@ pub fn open(hwnd: HWND, targets: Vec<Target>) {
             let dir = parent_folder(&target.path);
             let opened = execute(owner, None, &target.path, None, dir, SW_SHOWNORMAL, None);
             if opened && !target.is_dir {
-                b8::add_to_recent_docs(&target.path);
+                win::shell::add_to_recent_docs(&target.path);
             }
         }
     });
@@ -131,12 +131,12 @@ fn reveal_in(folder: Option<&[u16]>, items: &[&[u16]]) {
     match parent {
         None => {
             for pidl in &pidls {
-                b8::open_folder_and_select(pidl, &[]);
+                win::shell::open_folder_and_select(pidl, &[]);
             }
         }
         Some(parent) => {
             let children: Vec<&Pidl> = pidls.iter().collect();
-            b8::open_folder_and_select(&parent, &children);
+            win::shell::open_folder_and_select(&parent, &children);
         }
     }
 }
@@ -210,7 +210,7 @@ fn spawn_sheet_thread() -> Option<Arc<SheetQueue>> {
             }
         })
         .ok()?;
-    let thread = b8::thread_id_of(&handle);
+    let thread = win::process::thread_id_of(&handle);
     let queue = Arc::new(SheetQueue {
         jobs: Mutex::new(VecDeque::new()),
         thread,
@@ -240,7 +240,7 @@ fn sheet_thread(queue: &SheetQueue) {
             let Some((owner, paths)) = job else { break };
             properties_now(owner as HWND, &paths);
         }
-        let Some(q) = win::queue::get(core::ptr::null_mut()) else {
+        let win::queue::Got::Message(q) = win::queue::get(core::ptr::null_mut()) else {
             return;
         };
         let msg = q.msg();
@@ -257,7 +257,7 @@ fn properties_now(hwnd: HWND, paths: &[Vec<u16>]) {
     match paths {
         [] => {}
         [one] => {
-            b8::object_properties(hwnd, one);
+            win::shell::object_properties(hwnd, one);
         }
         many => {
             // SHCreateDataObject copies what it keeps, so every PIDL is
@@ -346,7 +346,7 @@ fn execute(
 ) -> bool {
     // The thread may end right after: the shell finishes any asynchronous
     // part first (`shell_execute`'s SEE_MASK_NOASYNC).
-    let ran = b8::shell_execute(&Execute {
+    let ran = win::shell::execute(&Execute {
         owner: owner as HWND,
         verb,
         file,
@@ -420,7 +420,7 @@ impl Service {
 
 /// The system folder, such as `C:\Windows\system32`.
 fn system_dir() -> String {
-    b8::system_dir().unwrap_or_else(|| r"C:\Windows\System32".into())
+    win::sys::system_dir().unwrap_or_else(|| r"C:\Windows\System32".into())
 }
 
 /// Starts, stops or restarts the goz service, elevated (Windows asks the

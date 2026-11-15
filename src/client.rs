@@ -28,8 +28,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Threading::INFINITE;
 
-use crate::win::ext::b8::{self, InFlight, OverlappedFile};
+use crate::win;
 use crate::win::parcel;
+use crate::win::process::{InFlight, OverlappedFile};
 use crate::win::sync::Event;
 
 mod w9;
@@ -1222,7 +1223,7 @@ impl Pipe {
                 // it for a moment.
                 Some(ERROR_PIPE_BUSY) if tries < 8 => {
                     tries += 1;
-                    b8::wait_named_pipe(PIPE_NAME, 250);
+                    win::process::wait_named_pipe(PIPE_NAME, 250);
                 }
                 _ => {
                     return Err(Failure::Other(format!("cannot open {PIPE_NAME}: {e}")));

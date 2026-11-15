@@ -1,5 +1,5 @@
 //! The system: the keyboard and mouse state, metrics and DPI, monitors,
-//! sounds, the last error.
+//! sounds, the last error, its folder and environment.
 
 use windows_sys::Win32::Foundation::{GetLastError, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -67,12 +67,20 @@ pub fn beep(kind: MESSAGEBOX_STYLE) {
     unsafe { MessageBeep(kind) };
 }
 
-/// The mouse pointer on the screen.
-pub fn cursor_pos() -> POINT {
+/// The mouse pointer on the screen; `None` if it could not be read (a
+/// secure desktop, say).
+pub fn cursor_pos() -> Option<POINT> {
     let mut pt = POINT::default();
     // SAFETY: an out-struct.
-    unsafe { GetCursorPos(&mut pt) };
-    pt
+    (unsafe { GetCursorPos(&mut pt) } != 0).then_some(pt)
+}
+
+/// Where this thread's caret is, in its window's client coordinates.
+pub fn caret_pos() -> POINT {
+    let mut p = POINT::default();
+    // SAFETY: an out-struct.
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCaretPos(&mut p) };
+    p
 }
 
 /// Where the pointer was at the current message.
@@ -103,11 +111,13 @@ pub fn set_cursor(c: HCURSOR) -> HCURSOR {
     unsafe { SetCursor(c) }
 }
 
+/// A system metric (SM_*) at the system's DPI.
 pub fn metric(index: SYSTEM_METRICS_INDEX) -> i32 {
     // SAFETY: no pointers.
     unsafe { GetSystemMetrics(index) }
 }
 
+/// A system metric (SM_*) at `dpi`.
 pub fn metric_for_dpi(index: SYSTEM_METRICS_INDEX, dpi: u32) -> i32 {
     // SAFETY: no pointers.
     unsafe { GetSystemMetricsForDpi(index, dpi) }
@@ -122,31 +132,37 @@ pub fn dpi_for_window(hwnd: HWND) -> u32 {
     }
 }
 
+/// The system's DPI (96 at 100 %).
 pub fn system_dpi() -> u32 {
     // SAFETY: no pointers.
     unsafe { GetDpiForSystem() }
 }
 
+/// The most time between the clicks of a double-click, in ms.
 pub fn double_click_ms() -> u32 {
     // SAFETY: no pointers.
     unsafe { GetDoubleClickTime() }
 }
 
+/// The ms since the system started.
 pub fn tick_ms() -> u64 {
     // SAFETY: no pointers.
     unsafe { GetTickCount64() }
 }
 
+/// This thread's last error (GetLastError).
 pub fn last_error() -> u32 {
     // SAFETY: no pointers.
     unsafe { GetLastError() }
 }
 
+/// This process's id.
 pub fn process_id() -> u32 {
     // SAFETY: no pointers.
     unsafe { GetCurrentProcessId() }
 }
 
+/// This thread's id.
 pub fn thread_id() -> u32 {
     // SAFETY: no pointers.
     unsafe { GetCurrentThreadId() }
@@ -187,11 +203,13 @@ pub fn monitor_from_rect(rc: &RECT, flags: MONITOR_FROM_FLAGS) -> HMONITOR {
     unsafe { MonitorFromRect(rc, flags) }
 }
 
+/// The monitor a screen point is on (as `flags` say for none).
 pub fn monitor_from_point(pt: POINT, flags: MONITOR_FROM_FLAGS) -> HMONITOR {
     // SAFETY: no pointers.
     unsafe { MonitorFromPoint(pt, flags) }
 }
 
+/// The monitor a window is mostly on (as `flags` say for none).
 pub fn monitor_from_window(hwnd: HWND, flags: MONITOR_FROM_FLAGS) -> HMONITOR {
     // SAFETY: no pointers.
     unsafe { MonitorFromWindow(hwnd, flags) }
@@ -205,4 +223,91 @@ pub fn monitor_info(mon: HMONITOR) -> Option<MONITORINFO> {
     };
     // SAFETY: an out-struct with its size.
     (unsafe { GetMonitorInfoW(mon, &mut mi) } != 0).then_some(mi)
+}
+
+/// The display monitors as Windows has them now (EnumDisplayMonitors).
+pub fn display_monitors() -> Vec<HMONITOR> {
+    use windows_sys::Win32::Foundation::LPARAM;
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC};
+    use windows_sys::core::BOOL;
+
+    unsafe extern "system" fn each(mon: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
+        // SAFETY: `data` is the Vec of `display_monitors`, alive across the
+        // enumeration and not otherwise borrowed meanwhile.
+        let out = unsafe { &mut *(data as *mut Vec<HMONITOR>) };
+        out.push(mon);
+        1
+    }
+    let mut out: Vec<HMONITOR> = Vec::new();
+    // SAFETY: every monitor (no DC, no clip); the callback above, which only
+    // pushes to `out`.
+    unsafe {
+        EnumDisplayMonitors(
+            core::ptr::null_mut(),
+            core::ptr::null(),
+            Some(each),
+            (&raw mut out) as LPARAM,
+        )
+    };
+    out
+}
+
+/// A monitor's effective DPI (horizontal); `None` if the system would not
+/// say.
+pub fn monitor_dpi(mon: HMONITOR) -> Option<u32> {
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    let (mut dx, mut dy) = (96u32, 96u32);
+    // SAFETY: two out-values.
+    let hr = unsafe { GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) };
+    (hr >= 0).then_some(dx)
+}
+
+/// The system folder, such as `C:\Windows\system32`; `None` if it does not
+/// fit 260 units.
+pub fn system_dir() -> Option<String> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    // SAFETY: the buffer and its length.
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..n]))
+}
+
+/// `text` with its environment variables (`%SystemRoot%`) expanded;
+/// `None` if it could not be.
+pub fn expand_environment(text: &[u16]) -> Option<Vec<u16>> {
+    use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
+    let source = super::nul_ended(text);
+    let mut out = vec![0u16; 1024];
+    for _ in 0..2 {
+        let cap = u32::try_from(out.len()).ok()?;
+        // SAFETY: a NUL-terminated source; the buffer with its length.
+        let n = unsafe { ExpandEnvironmentStringsW(source.as_ptr(), out.as_mut_ptr(), cap) };
+        match n as usize {
+            0 => return None,
+            // The count includes the NUL.
+            n if n <= out.len() => {
+                out.truncate(n - 1);
+                return Some(out);
+            }
+            n => out = vec![0u16; n],
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_system_is_described() {
+        assert!(!display_monitors().is_empty());
+        assert!(system_dir().is_some_and(|d| d.to_lowercase().ends_with("system32")));
+        let root: Vec<u16> = "%SystemRoot%".encode_utf16().collect();
+        let expanded = expand_environment(&root).map(|p| String::from_utf16_lossy(&p));
+        assert!(expanded.is_some_and(|p| !p.contains('%')));
+    }
 }

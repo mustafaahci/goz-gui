@@ -7,14 +7,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL};
 use windows_sys::Win32::UI::Controls::{LVIS_SELECTED, LVNI_FOCUSED, LVNI_SELECTED};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    HMENU, MB_OK, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_UNCHECKED,
-    MFT_SEPARATOR, MIIM_FTYPE, SM_CXVSCROLL, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE,
-    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER, WINDOWPLACEMENT, WM_CLEAR, WM_CONTEXTMENU, WM_COPY, WM_CUT, WM_PASTE, WS_CAPTION,
+    HMENU, MB_OK, SM_CXVSCROLL, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    WINDOWPLACEMENT, WM_CLEAR, WM_CONTEXTMENU, WM_COPY, WM_CUT, WM_PASTE, WS_CAPTION,
     WS_THICKFRAME,
 };
 
@@ -25,8 +24,8 @@ use crate::menu::{self, Item};
 use crate::searchtools::{self as st, Insert};
 use crate::settings::WindowPos;
 use crate::strip::StripSlot;
-use crate::wide::window_text;
-use crate::win::{self, Msg, edit, ext::b3, lv, parcel, sys};
+use crate::win::menu::By;
+use crate::win::{self, Msg, edit, lv, parcel, sys};
 use crate::{advsearch, clipboard, goto, placement};
 
 /// Enters fullscreen once the window has shown, as it was left
@@ -68,26 +67,18 @@ impl Tools {
 
 fn enable(menu: HMENU, id: u16, on: bool) {
     // By command; a missing one is reported and ignored.
-    b3::enable_menu_item(
-        menu,
-        u32::from(id),
-        MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED },
-    );
+    win::menu::enable(menu, By::Command(u32::from(id)), on);
 }
 
 fn check(menu: HMENU, id: u16, on: bool) {
     // As in `enable`.
-    b3::check_menu_item(
-        menu,
-        u32::from(id),
-        MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED },
-    );
+    win::menu::check(menu, By::Command(u32::from(id)), on);
 }
 
 /// The position of the item that runs `cmd` in `menu`.
 fn position_of(menu: HMENU, cmd: u16) -> Option<u32> {
-    let n = b3::menu_item_count(menu).max(0) as u32;
-    (0..n).find(|&i| b3::menu_item_id(menu, i as i32) == u32::from(cmd))
+    let n = win::menu::count(menu).max(0) as u32;
+    (0..n).find(|&i| win::menu::item_id(menu, i as i32) == u32::from(cmd))
 }
 
 impl App {
@@ -126,10 +117,8 @@ impl App {
         if let Some(at) = position_of(m.view, menu::VIEW_DETAILS) {
             // One item of this window's View menu, by position: the
             // separator two after Window Size's own.
-            if b3::menu_item_info(m.view, at + 3, true, MIIM_FTYPE, 0)
-                .is_some_and(|(mii, _)| mii.fType & MFT_SEPARATOR != 0)
-            {
-                b3::delete_menu(m.view, at + 3, MF_BYPOSITION);
+            if win::menu::is_separator(m.view, By::Position(at + 3)) {
+                win::menu::delete(m.view, By::Position(at + 3));
             }
         }
         menu::add_items(
@@ -201,11 +190,11 @@ impl App {
     }
 
     /// F4's WM_APP messages.
-    pub(super) fn tools_message(&self, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
-        match msg {
+    pub(super) fn tools_message(&self, m: &Msg) -> Option<LRESULT> {
+        match m.id {
             WM_FIND => {
                 // What a find's thread posted.
-                if let Some(report) = parcel::take::<Report>(&Msg::new(self.hwnd, msg, w, l)) {
+                if let Some(report) = parcel::take::<Report>(m) {
                     self.find_report(report);
                 }
                 Some(0)
@@ -447,7 +436,7 @@ impl App {
         // The window's menu, its frame, then its place, which sends WM_SIZE
         // (no borrow is held).
         if !keep_menu {
-            b3::set_menu(self.hwnd, core::ptr::null_mut());
+            win::menu::set_for_window(self.hwnd, core::ptr::null_mut());
         }
         let frame = WS_CAPTION | WS_THICKFRAME;
         win::set_style(self.hwnd, style & !frame);
@@ -481,7 +470,7 @@ impl App {
         // The window goes back as it was read.
         win::set_style(self.hwnd, full.style);
         if full.menu_hidden {
-            b3::set_menu(self.hwnd, self.menus.bar);
+            win::menu::set_for_window(self.hwnd, self.menus.bar);
         }
         win::set_placement(self.hwnd, &placement);
         let flags = SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE;
@@ -532,10 +521,10 @@ impl App {
     /// The search box's messages F4 takes: its context menu. (F2, Advanced
     /// Search... there, is one of the box's keys in `keys::SEARCH_BOX_KEYS`,
     /// which Options > Keyboard can rebind.)
-    pub(super) fn search_box_message(&self, msg: u32, _w: WPARAM, l: LPARAM) -> Option<LRESULT> {
-        match msg {
+    pub(super) fn search_box_message(&self, m: &Msg) -> Option<LRESULT> {
+        match m.id {
             WM_CONTEXTMENU => {
-                self.search_box_menu(l);
+                self.search_box_menu(m.l);
                 Some(0)
             }
             _ => None,
@@ -592,14 +581,15 @@ impl App {
                 y: ((l >> 16) & 0xffff) as i16 as i32,
             };
             let p = win::screen_to_client(edit, p);
-            let r = b3::edit_char_from_pos(edit, p);
-            (r != -1).then_some((r as usize) & 0xffff)
+            // -1 (both words all ones) for a point outside the box.
+            let (ch, line) = edit::char_from_pos(edit, p);
+            ((ch, line) != (u16::MAX, u16::MAX)).then_some(usize::from(ch))
         };
         // W8: not on `filelist-filename:` (nothing to edit), nor on a term
         // whose file Ctrl+click and F2 pick (`include-file-list:`,
         // `open-filelist:`: no label of Everything's is known for a menu).
         let term = at
-            .and_then(|u| crate::filelist::slots::term_at(&window_text(edit), u))
+            .and_then(|u| crate::filelist::slots::term_at(&win::text(edit), u))
             .filter(|t| t.func.editable() && !t.func.picks_file());
         let mut items = Vec::with_capacity(16);
         if let Some(t) = &term {
@@ -634,7 +624,7 @@ impl App {
         let pt = if l == -1 {
             // From the keyboard: under the caret.
             // This thread's caret, mapped to the screen from the box.
-            let mut p = b3::caret_pos();
+            let mut p = win::sys::caret_pos();
             let h = self.search_font_height();
             p.y += h;
             win::client_to_screen(edit, p)
@@ -646,7 +636,7 @@ impl App {
         };
         let id = crate::popup::track(popup, self.hwnd, pt, "search box menu", &|_| None);
         // The menu this function made, its submenus with it.
-        b3::destroy_menu(popup);
+        win::menu::destroy(popup);
         let id = id as u16;
         match id {
             st::BOX_UNDO => {
@@ -691,7 +681,7 @@ impl App {
     fn put_in_search(&self, piece: &str, how: Insert) {
         let edit = self.edit;
         let (start, end) = edit::sel(edit);
-        let text: Vec<u16> = window_text(edit).encode_utf16().collect();
+        let text: Vec<u16> = win::text(edit).encode_utf16().collect();
         let (start, end) = (start as usize, end as usize);
         let (out, (caret, _)) = st::insert(&text, (start, end), piece, how);
         let (lo, hi) = (
@@ -703,7 +693,7 @@ impl App {
         middle.push(0);
         edit::set_sel(edit, lo as i32, hi as i32);
         // The box's EN_CHANGE searches again.
-        b3::edit_replace_sel_wide(edit, &middle, true);
+        win::edit::replace_sel_wide(edit, &middle, true);
         edit::set_sel(edit, caret as i32, caret as i32);
         self.focus_box();
     }

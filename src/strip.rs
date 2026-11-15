@@ -9,11 +9,12 @@
 
 use std::any::Any;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::UI::WindowsAndMessaging::MSG;
 
 use crate::paint::fill;
+use crate::win::Msg;
 use crate::window::App;
 
 /// Which row.
@@ -70,14 +71,16 @@ pub trait Strip: Any {
     }
 
     /// A message one of its own controls sent the main window (their
-    /// parent): `WM_COMMAND`, `WM_NOTIFY`, `WM_CTLCOLOR*`, `WM_DRAWITEM`.
-    /// `Some` is the answer; `None` leaves it to the window.
-    fn message(&self, _app: &App, _msg: u32, _w: WPARAM, _l: LPARAM) -> Option<LRESULT> {
+    /// parent): `WM_COMMAND`, `WM_NOTIFY`, `WM_CTLCOLOR*`, `WM_DRAWITEM`,
+    /// as the window was delivered it. `Some` is the answer; `None` leaves
+    /// it to the window.
+    fn message(&self, _app: &App, _m: &Msg) -> Option<LRESULT> {
         None
     }
 
     /// A key message for one of its windows before the window's shortcuts
-    /// and Tab: true when the strip took it (`PaneContent::key`).
+    /// and Tab: true when the strip took it, having done what the key
+    /// means itself; it then goes no further (`PaneContent::key`).
     fn key(&self, _app: &App, _msg: &MSG) -> bool {
         false
     }

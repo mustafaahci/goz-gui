@@ -35,8 +35,8 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::PM_REMOVE;
 
 use crate::win::com::Apartment;
-use crate::win::ext::b2::{self, FindDirs};
-use crate::win::{Msg, parcel, queue};
+use crate::win::file::{Find, Search};
+use crate::win::{self, Msg, parcel, queue};
 
 const BACKSLASH: u16 = b'\\' as u16;
 
@@ -61,7 +61,7 @@ pub struct Shown {
 impl Shown {
     /// Explorer's setting now.
     pub fn now() -> Shown {
-        let state = b2::shell_state(SSF_SHOWALLOBJECTS | SSF_SHOWSUPERHIDDEN);
+        let state = win::shell::state(SSF_SHOWALLOBJECTS | SSF_SHOWSUPERHIDDEN);
         // `fShowAllObjects` is the bit field's first bit, `fShowSuperHidden`
         // its sixteenth (shlobj_core.h's SHELLSTATE).
         Shown {
@@ -158,12 +158,11 @@ fn each_folder(
     let pattern = join(folder, &[b'*' as u16]);
     // A long listing reads in large fetches; a probe wants its first few.
     // The find is closed on every path out, as it drops.
-    let mut find = FindDirs::first(&pattern, limit == usize::MAX)?;
+    let (mut find, mut data) = Find::first(&pattern, Search::Folders, limit == usize::MAX)?;
     let mut read = 0usize;
     let complete = loop {
-        let data = find.data();
         let attributes = data.dwFileAttributes;
-        let name = name_of(data);
+        let name = name_of(&data);
         // The search's "directories only" is a hint a file system may
         // ignore (NTFS does): the attribute decides.
         if attributes & FILE_ATTRIBUTE_DIRECTORY != 0
@@ -177,8 +176,9 @@ fn each_folder(
         if read >= limit {
             break false;
         }
-        if !find.next() {
-            break true;
+        match find.next() {
+            Some(next) => data = next,
+            None => break true,
         }
     };
     Ok(complete)
@@ -217,7 +217,7 @@ fn has_folders(folder: &[u16], shown: Shown) -> Option<bool> {
 
 /// Sorts names as Explorer does: `2` before `10`, case aside.
 pub fn sort_names<T>(items: &mut [T], name: impl Fn(&T) -> &[u16]) {
-    items.sort_by(|a, b| b2::cmp_logical(name(a), name(b)).cmp(&0));
+    items.sort_by(|a, b| win::locale::cmp_logical(name(a), name(b)).cmp(&0));
 }
 
 /// The icon of the item at `path` in the system's small image list.
@@ -226,7 +226,7 @@ fn icon_of(path: &[u16], display_name: bool) -> (Option<i32>, Option<Vec<u16>>) 
     if display_name {
         flags |= SHGFI_DISPLAYNAME;
     }
-    let (list, info) = b2::file_info(path, 0, flags);
+    let (list, info) = win::shell::file_info(path, 0, flags);
     if list == 0 {
         return (None, None);
     }
@@ -281,21 +281,21 @@ fn searchable_drive(kind: u32) -> bool {
 /// The drives at the top of the tree, `labels` naming them as Explorer
 /// does. A removable drive with no disk in is left out.
 pub fn roots(labels: bool, shown: Shown) -> Vec<Root> {
-    let mask = b2::logical_drives();
+    let mask = win::file::logical_drives();
     let mut out = Vec::new();
     for i in 0..26u16 {
         if mask & (1 << i) == 0 {
             continue;
         }
         let path: Vec<u16> = vec![b'A' as u16 + i, b':' as u16, BACKSLASH];
-        let kind = b2::drive_type(&path);
+        let kind = win::file::drive_type(&path);
         if !searchable_drive(kind) {
             continue;
         }
         if kind == DRIVE_REMOVABLE {
             // Fails when no disk is in (without a dialog: the thread's
             // error mode).
-            let ready = b2::volume_ready(&path);
+            let ready = win::file::volume_ready(&path);
             if !ready {
                 continue;
             }
@@ -472,7 +472,7 @@ pub fn spawn(job: Job, hwnd: HWND, msg: u32, alive: Alive) {
         .spawn(move || {
             // No dialog for a drive without a disk on this thread; COM for
             // the shell's icons and names, released below.
-            b2::set_thread_error_mode(SEM_FAILCRITICALERRORS);
+            win::process::set_thread_error_mode(SEM_FAILCRITICALERRORS);
             let com = Apartment::sta();
             let shown = Shown::now();
             let reply = match job {

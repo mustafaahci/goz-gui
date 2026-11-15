@@ -46,10 +46,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
-    INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 
-use crate::win::ext::b8::{self, NamedMutex, OwnedMutex};
+use crate::win;
+use crate::win::process::{NamedMutex, OwnedMutex};
 
 /// How long a write waits for another goz-gui writing the same file. A
 /// write is milliseconds; one held longer is a goz-gui hung or suspended.
@@ -152,10 +153,9 @@ fn retrying<T>(
 /// Whether `path` is a folder or a read-only file: "Access is denied" for
 /// a rename onto it is no passing hold, and is not tried again.
 fn refuses_for_good(path: &[u16]) -> bool {
-    // A missing file gives INVALID_FILE_ATTRIBUTES.
-    let attributes = b8::file_attributes(path);
-    attributes != INVALID_FILE_ATTRIBUTES
-        && attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY) != 0
+    // A missing file has none.
+    win::file::attributes(path)
+        .is_some_and(|a| a & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY) != 0)
 }
 
 /// Renames `from` over `to` in one step, through to the disk; tried again
@@ -170,7 +170,7 @@ fn replace_after(from: &Path, to: &Path, waits: &[u64]) -> io::Result<()> {
     retrying(
         waits,
         || {
-            b8::move_file(
+            win::file::move_file(
                 &from,
                 &to,
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
@@ -212,7 +212,7 @@ fn put(path: &Path, bytes: &[u8], force: bool) -> io::Result<()> {
         // A rename over a read-only file is refused; hidden is cleared too,
         // so the file never keeps an attribute the user did not give it.
         // A file not there just fails.
-        b8::set_file_attributes(&wide(path), FILE_ATTRIBUTE_NORMAL);
+        win::file::set_attributes(&wide(path), FILE_ATTRIBUTE_NORMAL);
     }
     let result = replace(&tmp, path);
     if result.is_err() {
@@ -401,7 +401,7 @@ fn move_aside(path: &Path) -> io::Result<PathBuf> {
         // the file (a scan of the file just found damaged).
         let moved = retrying(
             &RETRY_WAITS_MS,
-            || b8::move_file(&from, &dest, MOVEFILE_WRITE_THROUGH),
+            || win::file::move_file(&from, &dest, MOVEFILE_WRITE_THROUGH),
             || to.exists() || refuses_for_good(&from),
         );
         let e = match moved {
@@ -533,11 +533,12 @@ pub mod tests {
     }
 
     fn attributes(path: &Path) -> u32 {
-        b8::file_attributes(&wide(path))
+        // INVALID_FILE_ATTRIBUTES for none.
+        win::file::attributes(&wide(path)).unwrap_or(u32::MAX)
     }
 
     fn set_attributes(path: &Path, attributes: u32) {
-        assert!(b8::set_file_attributes(&wide(path), attributes));
+        assert!(win::file::set_attributes(&wide(path), attributes));
     }
 
     #[test]
@@ -804,7 +805,7 @@ pub mod tests {
         let tmp = dir.join("other.tmp");
         fs::write(&tmp, b"x").expect("tmp");
         let (from, to) = (wide(&tmp), wide(&path));
-        let once = b8::move_file(
+        let once = win::file::move_file(
             &from,
             &to,
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,

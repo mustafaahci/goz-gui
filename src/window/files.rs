@@ -30,8 +30,7 @@ use super::{
 };
 use crate::dialog::Quiet;
 use crate::fileops::{self, Done, Job, Outcome};
-use crate::wide::{window_text, wz};
-use crate::win::{self, Msg, edit, ext::b3, lv, subclass, sys};
+use crate::win::{self, Msg, edit, lv, subclass, sys};
 use crate::{clipboard, filename, msgbox, paint, shell, theme};
 
 const BACKSLASH: u16 = b'\\' as u16;
@@ -173,7 +172,7 @@ fn all_gone(paths: &[Vec<u16>]) -> bool {
 
 /// The file system's attributes of `path`; `None` when it is gone.
 fn attributes(path: &[u16]) -> Option<u32> {
-    b3::file_attributes(path)
+    win::file::attributes(path)
 }
 
 fn is_dir(path: &[u16]) -> bool {
@@ -595,7 +594,7 @@ impl App {
         } else {
             name.len()
         };
-        b3::post_edit_sel(edit, 0, selected as i32);
+        win::edit::post_set_sel(edit, 0, selected as i32);
         false
     }
 
@@ -762,12 +761,12 @@ impl App {
         let any = paths.len() > 1 && crate::client::boolean_syntax();
         let text = if any {
             let items: Vec<(String, bool)> = paths.iter().map(target_of).collect();
-            drop_search_any(&window_text(self.edit), &items, append)
+            drop_search_any(&win::text(self.edit), &items, append)
         } else {
             let (target, dir) = target_of(first);
-            drop_search(&window_text(self.edit), &target, dir, append)
+            drop_search(&win::text(self.edit), &target, dir, append)
         };
-        let z = wz(&text);
+        let z = win::wz(&text);
         // EN_CHANGE searches.
         win::set_text_wide(self.edit, &z);
         let end = z.len() - 1;

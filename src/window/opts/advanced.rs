@@ -483,7 +483,7 @@ impl Page for Advanced {
         }
     }
 
-    fn message_msg(&self, _app: &App, page: HWND, m: &Msg) -> Option<isize> {
+    fn message(&self, _app: &App, page: HWND, m: &Msg) -> Option<isize> {
         if m.id == WM_NOTIFY {
             let n = m.notify()?;
             if n.id() != usize::from(LIST) {

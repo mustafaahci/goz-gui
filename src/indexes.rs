@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::win;
 use goz_core::proto::{ConfigChange, feature};
 
 /// The settings, as Everything's keys name them, in the page's order.
@@ -281,7 +282,7 @@ fn goz_exe() -> Option<PathBuf> {
 
 /// The goz service's program, from its configuration.
 fn service_binary() -> Option<PathBuf> {
-    use crate::win::ext::b8::ServiceHandle;
+    use crate::win::process::ServiceHandle;
     use windows_sys::Win32::System::Services::{SC_MANAGER_CONNECT, SERVICE_QUERY_CONFIG};
     // Each handle is closed as it drops: the service's, then the manager's.
     let scm = ServiceHandle::manager(SC_MANAGER_CONNECT)?;
@@ -306,7 +307,7 @@ fn program_of(command: &str) -> &str {
 /// waits for it: an error when the prompt was refused or it failed.
 fn run_elevated(exe: &Path, args: &str) -> Result<(), String> {
     use crate::win::com::Apartment;
-    use crate::win::ext::b8::{self, Execute};
+    use crate::win::shell::Execute;
     use windows_sys::Win32::Foundation::ERROR_CANCELLED;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
     let shown = format!("{} {args}", exe.display());
@@ -316,7 +317,7 @@ fn run_elevated(exe: &Path, args: &str) -> Result<(), String> {
     let file: Vec<u16> = exe.to_string_lossy().encode_utf16().collect();
     // COM for this thread (the page's own), undone right after.
     let com = Apartment::sta();
-    let ran = b8::shell_execute(&Execute {
+    let ran = win::shell::execute(&Execute {
         owner: core::ptr::null_mut(),
         verb: Some("runas"),
         file: &file,

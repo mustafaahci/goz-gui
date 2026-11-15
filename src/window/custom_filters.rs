@@ -8,7 +8,7 @@ use super::prefs::report_result;
 use crate::filter::Filter;
 use crate::filters::{self, FilterDef};
 use crate::store::file;
-use crate::wide::window_text;
+use crate::win;
 use crate::{dialog, filter_dialogs, menu};
 
 impl App {
@@ -72,7 +72,7 @@ impl App {
     pub(super) fn add_to_filters(&self) {
         self.refresh_filters();
         let o = self.opts.get();
-        let search = window_text(self.edit);
+        let search = win::text(self.edit);
         let def = FilterDef::new("", &search, o.match_case, o.match_path);
         let mut list = filters::list();
         let made = {

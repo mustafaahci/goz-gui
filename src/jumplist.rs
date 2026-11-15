@@ -16,7 +16,7 @@ use windows::Win32::Foundation::{E_FAIL, PROPERTYKEY};
 use windows::core::GUID;
 
 use crate::win::com::Apartment;
-use crate::win::ext::b9::shell::{self, JumpList, ObjectCollection, PropertyStore, ShellLink};
+use crate::win::shell::{self, JumpList, ObjectCollection, PropertyStore, ShellLink};
 
 /// The most searches, and bookmarks, the jump list shows.
 pub const MAX_ITEMS: usize = 10;

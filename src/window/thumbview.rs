@@ -31,7 +31,9 @@ use crate::paint::{self, RowState};
 use crate::status::ViewButton;
 use crate::thumbs::{Bitmap, Picture, ThumbReply};
 use crate::view::{self, View};
-use crate::win::{self, ext::b3, gdi, imagelist, lv};
+use crate::win::dib::Canvas;
+use crate::win::imagelist::ImageList;
+use crate::win::{self, gdi, imagelist, lv};
 use crate::window::Fonts;
 
 /// `SHIL_LARGE` (32 px), `SHIL_SMALL` (16 px), `SHIL_EXTRALARGE` (48 px)
@@ -128,12 +130,16 @@ impl App {
             let (cx, cy) = view::spacing(v.size, dpi, line);
             // An empty image list the list owns from here on; the one it
             // gives back was made here before and is not used.
-            let images = b3::imagelist_create(side, side, ILC_COLOR32, 0, 1);
-            let old = lv::set_image_list(self.list, LVSIL_NORMAL, images);
+            let images = ImageList::create(side, side, ILC_COLOR32, 0, 1);
+            let old = lv::set_image_list(
+                self.list,
+                LVSIL_NORMAL,
+                images.map_or(0, ImageList::into_raw),
+            );
             if old != 0 {
-                b3::imagelist_destroy(old);
+                imagelist::destroy(old);
             }
-            b3::lv_set_icon_spacing(self.list, cx, cy);
+            win::lv::set_icon_spacing(self.list, cx, cy);
             // Icon view, its items in rows in order (auto-arranged), and not
             // owner-drawn: owner draw is Details' only, and left on it
             // keeps the list from drawing (or placing) its icons.
@@ -586,7 +592,7 @@ impl App {
         if lists[slot] == 0 {
             // The shell hands out its own image list, which lives as long
             // as the process; it is kept, never released.
-            if let Some(list) = b3::system_image_list(which) {
+            if let Some(list) = win::imagelist::system(which) {
                 lists[slot] = list as usize;
                 self.big_icons.set(lists);
             }
@@ -742,18 +748,18 @@ enum Extent {
 /// if it is loaded (`ILD_ASYNC`).
 fn drawn_extent(list: HIMAGELIST, icon: i32) -> Extent {
     // A DIB section and a memory DC made, used and deleted here
-    // (`DibCanvas`): its pixels are read between the draws, once what was
-    // drawn is in them.
+    // (`dib::Canvas`): its pixels are copied out between the draws, once
+    // what was drawn is in them.
     let (cx, cy) = imagelist::icon_size(list).unwrap_or((0, 0));
     if cx <= 0 || cy <= 0 {
         return Extent::Unknown;
     }
-    let Some(mut canvas) = b3::DibCanvas::new(cx, cy) else {
+    let Some(canvas) = Canvas::new(cx, cy) else {
         return Extent::Unknown;
     };
     let params = IMAGELISTDRAWPARAMS {
-        cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
         himl: list,
+        hdcDst: canvas.hdc(),
         i: icon,
         rgbBk: CLR_NONE as u32,
         rgbFg: CLR_DEFAULT as u32,
@@ -763,20 +769,21 @@ fn drawn_extent(list: HIMAGELIST, icon: i32) -> Extent {
     let (mut right, mut bottom) = (0, 0);
     let mut loaded = true;
     for back in [0u32, 0x00ff_ffff] {
-        canvas.fill(back);
-        if !canvas.draw_image(&params) {
+        canvas.fill(back.to_le_bytes());
+        if !imagelist::draw_indirect(&params) {
             loaded = false;
             break;
         }
-        canvas.with_pixels(|pixels| {
-            for (i, p) in pixels.iter().enumerate() {
-                if p & 0x00ff_ffff != back {
-                    let (x, y) = (i as i32 % cx, i as i32 / cx);
-                    right = right.max(x + 1);
-                    bottom = bottom.max(y + 1);
-                }
+        let Some(pixels) = canvas.pixels() else {
+            return Extent::Unknown;
+        };
+        for (i, p) in pixels.iter().enumerate() {
+            if u32::from_le_bytes(*p) & 0x00ff_ffff != back {
+                let (x, y) = (i as i32 % cx, i as i32 / cx);
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
             }
-        });
+        }
     }
     drop(canvas);
     if !loaded {
@@ -829,7 +836,7 @@ fn name_lines(hdc: HDC, rc: &RECT, name: &[u16], spans: &[Span], fonts: &Fonts, 
             fonts.bold
         },
     );
-    let (fit, _) = b3::text_fit(hdc, name, avail);
+    let (fit, _) = win::gdi::text_fit(hdc, name, avail);
     let cut = view::line_break(name, fit.max(0) as usize);
     let line = |from: usize, to: usize, top: i32| {
         if from >= to {

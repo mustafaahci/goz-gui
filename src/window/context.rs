@@ -21,11 +21,10 @@
 use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{LPARAM, POINT};
-use windows_sys::Win32::UI::Controls::{LVHITTESTINFO, LVIR_BOUNDS, LVNI_FOCUSED, ODT_MENU};
+use windows_sys::Win32::UI::Controls::{LVIR_BOUNDS, LVNI_FOCUSED, ODT_MENU};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    HMENU, MB_ICONWARNING, MF_BYCOMMAND, MF_BYPOSITION, MFT_SEPARATOR, MIIM_FTYPE, WM_DRAWITEM,
-    WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
+    HMENU, MB_ICONWARNING, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
 };
 
 use super::files::renamable;
@@ -34,13 +33,13 @@ use super::{App, COL_PATH, key_down, point};
 use crate::dialog::Quiet;
 use crate::shell::{self, ContextMenu};
 use crate::store::location;
-use crate::win::{self, Msg, ext::b3, lv, sys};
+use crate::win::menu::By;
+use crate::win::{self, Msg, lv, sys};
 use crate::{menu, popup, run_count};
 
 /// Whether item `pos` of `menu` is a separator.
 fn is_separator(menu: HMENU, pos: u32) -> bool {
-    b3::menu_item_info(menu, pos, true, MIIM_FTYPE, 0)
-        .is_some_and(|(mii, _)| mii.fType & MFT_SEPARATOR != 0)
+    win::menu::is_separator(menu, By::Position(pos))
 }
 
 /// No separator first, last, or after another: what taking items out of
@@ -48,18 +47,18 @@ fn is_separator(menu: HMENU, pos: u32) -> bool {
 pub(super) fn tidy_separators(menu: HMENU) {
     let mut pos = 0u32;
     let mut after_separator = true;
-    while (pos as i32) < b3::menu_item_count(menu) {
+    while (pos as i32) < win::menu::count(menu) {
         let sep = is_separator(menu, pos);
         if sep && after_separator {
-            b3::delete_menu(menu, pos, MF_BYPOSITION);
+            win::menu::delete(menu, By::Position(pos));
             continue;
         }
         after_separator = sep;
         pos += 1;
     }
-    let n = b3::menu_item_count(menu);
+    let n = win::menu::count(menu);
     if n > 0 && is_separator(menu, n as u32 - 1) {
-        b3::delete_menu(menu, n as u32 - 1, MF_BYPOSITION);
+        win::menu::delete(menu, By::Position(n as u32 - 1));
     }
 }
 
@@ -93,17 +92,13 @@ impl App {
 
     /// The row and column under `pt` (the list's client coordinates).
     pub(super) fn hit_row(&self, pt: POINT) -> Option<(usize, i32)> {
-        let hit = LVHITTESTINFO {
-            pt,
-            flags: 0,
-            iItem: -1,
-            iSubItem: -1,
-            iGroup: 0,
-        };
         // Icon view has no columns: the item, as the name's column.
-        let subitem = !self.view().thumbnails;
-        let (item, hit) = b3::lv_hit_test(self.list, hit, subitem);
-        (item >= 0).then_some((item as usize, hit.iSubItem.max(0)))
+        let hit = if self.view().thumbnails {
+            lv::hit_test(self.list, pt)
+        } else {
+            lv::subitem_hit_test(self.list, pt)
+        };
+        (hit.iItem >= 0).then_some((hit.iItem as usize, hit.iSubItem.max(0)))
     }
 
     /// The row menu at the mouse (`Some`, screen) or, from the keyboard,
@@ -172,7 +167,7 @@ impl App {
         }
         // The menu this function made; the shell's handlers are done with
         // it once its command ran.
-        b3::destroy_menu(popup);
+        win::menu::destroy(popup);
     }
 
     /// Where the keyboard's row menu opens: under the focused row, a little
@@ -214,9 +209,10 @@ impl App {
         ) {
             return None;
         }
-        let default = b3::menu_default_item(popup, false, 0);
-        if cm.owns(default, u32::from(menu::SHELL_LAST)) {
-            b3::delete_menu(popup, default, MF_BYCOMMAND);
+        if let Some(default) = win::menu::default_item(popup, false, 0)
+            && cm.owns(default, u32::from(menu::SHELL_LAST))
+        {
+            win::menu::delete(popup, By::Command(default));
         }
         Some((Rc::new(cm), items.len()))
     }
@@ -286,7 +282,7 @@ impl App {
         self.add_background_items(popup);
         let id = self.track_with_shell(popup, pt, "background menu", None);
         // The menu this function made.
-        b3::destroy_menu(popup);
+        win::menu::destroy(popup);
         if id > 0 {
             self.command(id as u16);
         }

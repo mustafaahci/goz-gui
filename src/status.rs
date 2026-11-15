@@ -11,7 +11,6 @@ use windows_sys::Win32::Graphics::Gdi::{
 use crate::colors::{Item, State};
 use crate::format;
 use crate::paint::{fill, width};
-use crate::win::ext::b1;
 use crate::win::{self, gdi, lv};
 use crate::window::App;
 
@@ -151,10 +150,10 @@ fn round_fill(hdc: HDC, rc: &RECT, colour: u32, radius: i32) {
     // The stock DC brush and pen paint in the colours set here; the DC's
     // own are put back.
     gdi::set_dc_brush_color(hdc, colour);
-    b1::set_dc_pen_color(hdc, colour);
+    win::gdi::set_dc_pen_color(hdc, colour);
     let old_brush = gdi::Selected::new(hdc, gdi::stock_object(DC_BRUSH));
     let old_pen = gdi::Selected::new(hdc, gdi::stock_object(DC_PEN));
-    b1::round_rect(hdc, rc, radius, radius);
+    win::gdi::round_rect(hdc, rc, radius, radius);
     drop(old_pen);
     drop(old_brush);
 }
@@ -186,7 +185,7 @@ fn elide_path(hdc: HDC, text: &[u16], max: i32) -> Vec<u16> {
         right: max.max(1),
         bottom: 1,
     };
-    b1::draw_text_modified(
+    win::gdi::draw_text_modified(
         hdc,
         text,
         &mut rc,

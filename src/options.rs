@@ -20,7 +20,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
 };
@@ -44,7 +44,6 @@ use crate::dialog::{
 };
 use crate::places::{self, Which};
 use crate::theme::Palette;
-use crate::win::ext::b4 as ext;
 use crate::win::gdi::{self, Paint, Selected};
 use crate::win::{self, Msg, combo, dlg, subclass, tab, tv};
 use crate::window::App;
@@ -165,18 +164,12 @@ pub trait Page {
     /// or Apply like any change). (No change is noted meanwhile.)
     fn defaults(&self, page: HWND);
 
-    /// Any message to the page's window, first, by its numbers: a button of
-    /// its own (`Some` takes it, so it is no change), a timer, ... `Some`
-    /// is the dialog procedure's answer.
-    fn message(&self, _app: &App, _page: HWND, _msg: u32, _w: WPARAM, _l: LPARAM) -> Option<isize> {
-        None
-    }
-
     /// Any message to the page's window, first, as the system delivered
-    /// it: for a page that reads what its `lParam` points at (`WM_NOTIFY`,
-    /// `WM_DRAWITEM`). By default [`Page::message`] of its numbers.
-    fn message_msg(&self, app: &App, page: HWND, m: &Msg) -> Option<isize> {
-        self.message(app, page, m.id, m.w, m.l)
+    /// it: a button of its own (`Some` takes it, so it is no change), a
+    /// timer, a notification (what its `lParam` points at is read through
+    /// `m`'s accessors)... `Some` is the dialog procedure's answer.
+    fn message(&self, _app: &App, _page: HWND, _m: &Msg) -> Option<isize> {
+        None
     }
 }
 
@@ -737,7 +730,7 @@ impl Dialog {
         } else {
             ETDT_ENABLE | ETDT_USETABTEXTURE
         };
-        ext::enable_theme_dialog_texture(page, flags);
+        win::uxtheme::enable_dialog_texture(page, flags);
         apply_theme(page, dark);
     }
 
@@ -928,7 +921,7 @@ fn page_proc(d: &Dialog, index: usize, m: &Msg) -> isize {
         }
         _ => {}
     }
-    if let Some(answer) = held.page.message_msg(d.app, page, m) {
+    if let Some(answer) = held.page.message(d.app, page, m) {
         return answer;
     }
     if let Some(answer) = common(m, &d.look) {

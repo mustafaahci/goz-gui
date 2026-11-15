@@ -20,7 +20,7 @@ use crate::dialog::{
     self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner, common,
 };
 use crate::store::location::Source;
-use crate::win::ext::b4::{self as ext, Hive};
+use crate::win::reg::Hive;
 use crate::win::{self, Msg, dlg, edit};
 
 /// What the text tells, gathered by the window.
@@ -51,8 +51,8 @@ pub struct Facts {
 pub fn os_version() -> String {
     const KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
     // HKLM only.
-    let dword = |name: &str| ext::reg_dword(Hive::LocalMachine, KEY, name);
-    let string = |name: &str| ext::reg_string(Hive::LocalMachine, KEY, name, 256);
+    let dword = |name: &str| win::reg::get_dword(Hive::LocalMachine, KEY, name);
+    let string = |name: &str| win::reg::get_string(Hive::LocalMachine, KEY, Some(name));
     let major = dword("CurrentMajorVersionNumber").unwrap_or(10);
     let minor = dword("CurrentMinorVersionNumber").unwrap_or(0);
     let build = string("CurrentBuild").unwrap_or_default();
@@ -69,7 +69,7 @@ pub fn os_version() -> String {
 
 /// This process's private bytes and working set.
 pub fn memory() -> Option<(u64, u64)> {
-    ext::process_memory().map(|c| (c.PrivateUsage as u64, c.WorkingSetSize as u64))
+    win::process::memory().map(|c| (c.PrivateUsage as u64, c.WorkingSetSize as u64))
 }
 
 fn megabytes(bytes: u64) -> String {

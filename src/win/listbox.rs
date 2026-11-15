@@ -21,6 +21,7 @@ pub fn add(lb: HWND, text: &str) -> i32 {
     unsafe { super::send_raw(lb, LB_ADDSTRING, 0, z.as_ptr() as isize) as i32 }
 }
 
+/// Inserts `text` at `i` (-1: at the end); its index.
 pub fn insert(lb: HWND, i: i32, text: &str) -> i32 {
     let z = super::wz(text);
     // SAFETY: as in `add`.
@@ -34,22 +35,27 @@ pub fn insert(lb: HWND, i: i32, text: &str) -> i32 {
     }
 }
 
+/// Deletes item `i`; how many are left (LB_ERR if there was none).
 pub fn delete(lb: HWND, i: i32) -> i32 {
     send_int(lb, LB_DELETESTRING, i as isize as usize, 0) as i32
 }
 
+/// Empties the list.
 pub fn reset(lb: HWND) {
     send_int(lb, LB_RESETCONTENT, 0, 0);
 }
 
+/// How many items the list has.
 pub fn count(lb: HWND) -> i32 {
     send_int(lb, LB_GETCOUNT, 0, 0) as i32
 }
 
+/// The selected item of a single-selection list (LB_ERR -1 for none).
 pub fn cur_sel(lb: HWND) -> i32 {
     send_int(lb, LB_GETCURSEL, 0, 0) as i32
 }
 
+/// Selects item `i` of a single-selection list (-1: none).
 pub fn set_cur_sel(lb: HWND, i: i32) -> i32 {
     send_int(lb, LB_SETCURSEL, i as isize as usize, 0) as i32
 }
@@ -59,6 +65,7 @@ pub fn set_sel(lb: HWND, on: bool, i: i32) {
     send_int(lb, LB_SETSEL, usize::from(on), i as isize);
 }
 
+/// Whether item `i` is selected.
 pub fn is_selected(lb: HWND, i: i32) -> bool {
     send_int(lb, LB_GETSEL, i as isize as usize, 0) > 0
 }
@@ -99,6 +106,8 @@ pub fn text(lb: HWND, i: i32) -> String {
     String::from_utf16_lossy(&buf[..n])
 }
 
+/// The index of the item whose text is `text` (ignoring case), from after `after` (-1: from the
+/// start); -1 if none.
 pub fn find_exact(lb: HWND, after: i32, text: &str) -> i32 {
     let z = super::wz(text);
     // SAFETY: a NUL-terminated string read during the call.
@@ -112,22 +121,27 @@ pub fn find_exact(lb: HWND, after: i32, text: &str) -> i32 {
     }
 }
 
+/// The number item `i` keeps (LB_SETITEMDATA's).
 pub fn item_data(lb: HWND, i: i32) -> isize {
     send_int(lb, LB_GETITEMDATA, i as isize as usize, 0)
 }
 
+/// Keeps a number with item `i`.
 pub fn set_item_data(lb: HWND, i: i32, data: isize) {
     send_int(lb, LB_SETITEMDATA, i as isize as usize, data);
 }
 
+/// The height of item `i` (of every item, unless LBS_OWNERDRAWVARIABLE).
 pub fn item_height(lb: HWND, i: i32) -> i32 {
     send_int(lb, LB_GETITEMHEIGHT, i as isize as usize, 0) as i32
 }
 
+/// Sets the height of item `i` (of every item, unless LBS_OWNERDRAWVARIABLE).
 pub fn set_item_height(lb: HWND, i: i32, height: i32) {
     send_int(lb, LB_SETITEMHEIGHT, i as isize as usize, height as isize);
 }
 
+/// Item `i`'s rectangle, in the list's client coordinates.
 pub fn item_rect(lb: HWND, i: i32) -> Option<RECT> {
     let mut rc = RECT::default();
     // SAFETY: LB_GETITEMRECT's lParam is a RECT out.
@@ -142,10 +156,12 @@ pub fn item_rect(lb: HWND, i: i32) -> Option<RECT> {
     (r != -1).then_some(rc)
 }
 
+/// The first item shown.
 pub fn top_index(lb: HWND) -> i32 {
     send_int(lb, LB_GETTOPINDEX, 0, 0) as i32
 }
 
+/// Scrolls item `i` to the top.
 pub fn set_top_index(lb: HWND, i: i32) {
     send_int(lb, LB_SETTOPINDEX, i as isize as usize, 0);
 }

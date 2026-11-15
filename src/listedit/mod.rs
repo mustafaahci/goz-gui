@@ -532,7 +532,7 @@ impl Export {
 /// `text` in the system's ANSI code page; a character it has not got is
 /// its default character (`?`).
 fn ansi(text: &str) -> Vec<u8> {
-    use crate::win::ext::b6::wide_to_multi_byte;
+    use crate::win::locale::wide_to_multi_byte;
     use windows_sys::Win32::Globalization::CP_ACP;
     let wide: Vec<u16> = text.encode_utf16().collect();
     if wide.is_empty() {

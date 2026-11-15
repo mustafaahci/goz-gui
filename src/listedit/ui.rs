@@ -73,10 +73,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_DELETE, VK_
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_DROPFILES;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     HMENU, IDCANCEL, IDNO, IDOK, IDYES, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNOCANCEL,
-    MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, SIZE_MAXIMIZED, SIZE_RESTORED, SW_RESTORE, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
-    WM_INITDIALOG, WM_INITMENUPOPUP, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY, WM_SETTINGCHANGE,
-    WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
+    SIZE_MAXIMIZED, SIZE_RESTORED, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_INITDIALOG, WM_INITMENUPOPUP,
+    WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY, WM_SETTINGCHANGE, WM_SIZE, WS_EX_CLIENTEDGE,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
 };
 
 use super::scan::{Job, Saving, Source};
@@ -93,8 +93,7 @@ use crate::places::{self, Place, Which};
 use crate::store::location;
 use crate::theme::Palette;
 use crate::win::com::Apartment;
-use crate::win::ext::b1;
-use crate::win::ext::b6::{self, OpenDialog};
+use crate::win::shell::FileDialog;
 use crate::win::{self, Msg, View, dlg, header, lv, subclass, sys};
 
 const TITLE: &str = "File List Editor";
@@ -402,20 +401,16 @@ fn set_text(hwnd: HWND, text: &str) {
 fn menu_bar(menus: &[(&str, &[Item<'_>])]) -> HMENU {
     // A new menu, filled with popups this function makes; the window it is
     // set on destroys it.
-    let bar = b6::create_menu();
+    let bar = win::menu::create_bar();
     for &(title, items) in menus {
         let popup = menu::submenu(items);
-        b6::append_popup(bar, popup, title);
+        win::menu::append(bar, &win::menu::NewItem::submenu(title, popup));
     }
     bar
 }
 
 fn enable_item(m: HMENU, id: u16, on: bool) {
-    b6::enable_menu_item(
-        m,
-        u32::from(id),
-        MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED },
-    );
+    win::menu::enable(m, win::menu::By::Command(u32::from(id)), on);
 }
 
 impl Editor {
@@ -498,7 +493,7 @@ impl Editor {
             ),
         ]);
         // The dialog's menu bar; files may be dropped on it.
-        b6::set_menu(dlg, bar);
+        win::menu::set_for_window(dlg, bar);
         win::dropfiles::accept(dlg, true);
         let dark = self.look.get().dark;
         dialog::theme_new(dlg, dark);
@@ -579,7 +574,7 @@ impl Editor {
         // The dialog's frame subclass anew, and its menu bar and list
         // repainted.
         set_frame(dlg, look.dark);
-        b6::draw_menu_bar(dlg);
+        win::menu::draw_bar(dlg);
         win::invalidate(Editor::list(dlg), None, true);
     }
 
@@ -1594,15 +1589,14 @@ pub(crate) fn pick_files(owner: HWND) -> Vec<String> {
     let mut out = Vec::new();
     // COM is initialised on this (the editor's) thread; the dialog runs its
     // own loop while nothing of the editor is borrowed.
-    let Some(dialog) = OpenDialog::new() else {
+    let Some(dialog) = FileDialog::open() else {
         return out;
     };
     let Some(options) = dialog.options() else {
         return out;
     };
-    dialog.set_options(
-        options | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR,
-    );
+    let files = FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR;
+    dialog.set_options(options | files.0);
     dialog.set_title("Add Files");
     if !dialog.show(owner) {
         return out;
@@ -1615,7 +1609,10 @@ pub(crate) fn pick_files(owner: HWND) -> Vec<String> {
         let Some(item) = items.get(i) else {
             continue;
         };
-        if let Some(path) = b6::shell_item_path(&item).and_then(|p| String::from_utf16(&p).ok()) {
+        if let Some(path) = item
+            .file_system_path()
+            .and_then(|p| String::from_utf16(&p).ok())
+        {
             out.push(path);
         }
     }
@@ -1635,14 +1632,14 @@ fn frame_proc(m: &Msg, dark: bool) -> isize {
     if dark {
         let pal = Palette::new(true);
         match m.id {
-            paint::WM_UAHDRAWMENU => {
-                if let Some(um) = b1::uah_menu(m) {
+            win::menubar::WM_UAHDRAWMENU => {
+                if let Some(um) = win::menubar::draw_menu(m) {
                     paint::menubar_of(hwnd, &pal, &um);
                 }
                 return 1;
             }
-            paint::WM_UAHDRAWMENUITEM => {
-                if let Some(item) = b1::uah_draw_menu_item(m) {
+            win::menubar::WM_UAHDRAWMENUITEM => {
+                if let Some(item) = win::menubar::draw_menu_item(m) {
                     paint::menubar_item_of(&pal, &item);
                 }
                 return 1;
@@ -1672,7 +1669,7 @@ fn dialog_proc(s: &Editor, m: &Msg) -> isize {
             // repainted).
             let dark = s.look.get().dark;
             set_frame(dlg, dark);
-            b6::draw_menu_bar(dlg);
+            win::menu::draw_bar(dlg);
         }
         return answer;
     }

@@ -10,14 +10,14 @@ use windows_sys::Win32::UI::Controls::{
     LVM_ARRANGE, LVM_CANCELEDITLABEL, LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_DELETEITEM,
     LVM_EDITLABELW, LVM_ENSUREVISIBLE, LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNW, LVM_GETCOLUMNWIDTH,
     LVM_GETCOUNTPERPAGE, LVM_GETEDITCONTROL, LVM_GETEXTENDEDLISTVIEWSTYLE, LVM_GETHEADER,
-    LVM_GETIMAGELIST, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSPACING, LVM_GETITEMSTATE,
-    LVM_GETITEMW, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_GETSELECTIONMARK, LVM_GETSTRINGWIDTHW,
-    LVM_GETSUBITEMRECT, LVM_GETTOOLTIPS, LVM_GETTOPINDEX, LVM_GETVIEW, LVM_HITTEST,
-    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETBKCOLOR,
+    LVM_GETHOTITEM, LVM_GETIMAGELIST, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSPACING,
+    LVM_GETITEMSTATE, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_GETSELECTIONMARK,
+    LVM_GETSTRINGWIDTHW, LVM_GETSUBITEMRECT, LVM_GETTOOLTIPS, LVM_GETTOPINDEX, LVM_GETVIEW,
+    LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETBKCOLOR,
     LVM_SETCOLUMNORDERARRAY, LVM_SETCOLUMNW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SETITEMW,
-    LVM_SETSELECTIONMARK, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVM_SETVIEW, LVM_SUBITEMHITTEST,
-    LVM_UPDATE,
+    LVM_SETICONSPACING, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
+    LVM_SETITEMW, LVM_SETSELECTIONMARK, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVM_SETVIEW,
+    LVM_SUBITEMHITTEST, LVM_UPDATE,
 };
 
 /// The class these messages are for.
@@ -39,6 +39,7 @@ fn send_int(lv: HWND, msg: u32, w: usize, l: isize) -> isize {
     unsafe { send(lv, msg, w, l) }
 }
 
+/// How many items the list has.
 pub fn item_count(lv: HWND) -> usize {
     usize::try_from(send_int(lv, LVM_GETITEMCOUNT, 0, 0)).unwrap_or(0)
 }
@@ -48,6 +49,7 @@ pub fn set_item_count(lv: HWND, count: usize, flags: u32) {
     send_int(lv, LVM_SETITEMCOUNT, count, flags as isize);
 }
 
+/// How many items are selected.
 pub fn selected_count(lv: HWND) -> usize {
     usize::try_from(send_int(lv, LVM_GETSELECTEDCOUNT, 0, 0)).unwrap_or(0)
 }
@@ -58,6 +60,7 @@ pub fn next_item(lv: HWND, start: i32, flags: u32) -> i32 {
     send_int(lv, LVM_GETNEXTITEM, start as isize as usize, flags as isize) as i32
 }
 
+/// Scrolls `item` into view (`partial_ok`: part of it is enough).
 pub fn ensure_visible(lv: HWND, item: i32, partial_ok: bool) {
     send_int(
         lv,
@@ -67,6 +70,7 @@ pub fn ensure_visible(lv: HWND, item: i32, partial_ok: bool) {
     );
 }
 
+/// The selection mark: where a Shift+click selection starts (-1: none).
 pub fn selection_mark(lv: HWND) -> i32 {
     send_int(lv, LVM_GETSELECTIONMARK, 0, 0) as i32
 }
@@ -76,14 +80,17 @@ pub fn set_selection_mark(lv: HWND, item: i32) -> i32 {
     send_int(lv, LVM_SETSELECTIONMARK, 0, item as isize) as i32
 }
 
+/// The first item shown (list and details views).
 pub fn top_index(lv: HWND) -> i32 {
     send_int(lv, LVM_GETTOPINDEX, 0, 0) as i32
 }
 
+/// How many items fit in the list's view at once.
 pub fn count_per_page(lv: HWND) -> i32 {
     send_int(lv, LVM_GETCOUNTPERPAGE, 0, 0) as i32
 }
 
+/// The LVS_EX_* extended styles.
 pub fn extended_style(lv: HWND) -> u32 {
     send_int(lv, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as u32
 }
@@ -98,14 +105,17 @@ pub fn set_extended_style(lv: HWND, mask: u32, style: u32) {
     );
 }
 
+/// The list's header control.
 pub fn header(lv: HWND) -> HWND {
     send_int(lv, LVM_GETHEADER, 0, 0) as HWND
 }
 
+/// The list's tooltip control.
 pub fn tooltips(lv: HWND) -> HWND {
     send_int(lv, LVM_GETTOOLTIPS, 0, 0) as HWND
 }
 
+/// The edit box of a label being edited (null: none).
 pub fn edit_control(lv: HWND) -> HWND {
     send_int(lv, LVM_GETEDITCONTROL, 0, 0) as HWND
 }
@@ -115,6 +125,7 @@ pub fn edit_label(lv: HWND, item: i32) -> HWND {
     send_int(lv, LVM_EDITLABELW, item as isize as usize, 0) as HWND
 }
 
+/// Ends a label's editing without a change.
 pub fn cancel_edit_label(lv: HWND) {
     send_int(lv, LVM_CANCELEDITLABEL, 0, 0);
 }
@@ -124,6 +135,7 @@ pub fn redraw_items(lv: HWND, first: i32, last: i32) {
     send_int(lv, LVM_REDRAWITEMS, first as isize as usize, last as isize);
 }
 
+/// Arranges (with LVS_AUTOARRANGE) and redraws `item`.
 pub fn update(lv: HWND, item: i32) {
     send_int(lv, LVM_UPDATE, item as isize as usize, 0);
 }
@@ -134,22 +146,27 @@ pub fn scroll(lv: HWND, dx: i32, dy: i32) {
     send_int(lv, LVM_SCROLL, dx as isize as usize, dy as isize);
 }
 
+/// The items' text colour.
 pub fn set_text_color(lv: HWND, c: COLORREF) {
     send_int(lv, LVM_SETTEXTCOLOR, 0, c as isize);
 }
 
+/// The colour behind the items' text (CLR_NONE: none).
 pub fn set_text_bk_color(lv: HWND, c: COLORREF) {
     send_int(lv, LVM_SETTEXTBKCOLOR, 0, c as isize);
 }
 
+/// The list's background colour.
 pub fn set_bk_color(lv: HWND, c: COLORREF) {
     send_int(lv, LVM_SETBKCOLOR, 0, c as isize);
 }
 
+/// The list's LV_VIEW_* view.
 pub fn view(lv: HWND) -> u32 {
     send_int(lv, LVM_GETVIEW, 0, 0) as u32
 }
 
+/// Sets the list's LV_VIEW_* view.
 pub fn set_view(lv: HWND, view: u32) {
     send_int(lv, LVM_SETVIEW, view as usize, 0);
 }
@@ -165,6 +182,20 @@ pub fn item_spacing(lv: HWND, small: bool) -> (i32, i32) {
     ((v & 0xffff) as i32, (v >> 16) as i32)
 }
 
+/// LVM_SETICONSPACING: the spacing of icons in icon view, `cx` × `cy`
+/// (-1 for the default); the spacing before, as (cx, cy).
+pub fn set_icon_spacing(lv: HWND, cx: i32, cy: i32) -> (i32, i32) {
+    let l = super::make_lparam(cx as u16, cy as u16);
+    let v = send_int(lv, LVM_SETICONSPACING, 0, l) as usize;
+    (i32::from(super::loword(v)), i32::from(super::hiword(v)))
+}
+
+/// LVM_GETHOTITEM: the item under the mouse, -1 for none.
+pub fn hot_item(lv: HWND) -> i32 {
+    send_int(lv, LVM_GETHOTITEM, 0, 0) as i32
+}
+
+/// Image list `which` (LVSIL_*).
 pub fn image_list(lv: HWND, which: u32) -> HIMAGELIST {
     send_int(lv, LVM_GETIMAGELIST, which as usize, 0)
 }
@@ -174,18 +205,22 @@ pub fn set_image_list(lv: HWND, which: u32, il: HIMAGELIST) -> HIMAGELIST {
     send_int(lv, LVM_SETIMAGELIST, which as usize, il)
 }
 
+/// Deletes `item`; false if it could not.
 pub fn delete_item(lv: HWND, item: i32) -> bool {
     send_int(lv, LVM_DELETEITEM, item as isize as usize, 0) != 0
 }
 
+/// Deletes every item; false if it could not.
 pub fn delete_all_items(lv: HWND) -> bool {
     send_int(lv, LVM_DELETEALLITEMS, 0, 0) != 0
 }
 
+/// Deletes column `col`; false if it could not.
 pub fn delete_column(lv: HWND, col: i32) -> bool {
     send_int(lv, LVM_DELETECOLUMN, col as isize as usize, 0) != 0
 }
 
+/// Column `col`'s width, in pixels.
 pub fn column_width(lv: HWND, col: i32) -> i32 {
     send_int(lv, LVM_GETCOLUMNWIDTH, col as isize as usize, 0) as i32
 }
@@ -263,25 +298,31 @@ pub fn subitem_rect(lv: HWND, item: i32, sub: i32, code: i32) -> Option<RECT> {
     (ok != 0).then_some(rc)
 }
 
-/// LVM_HITTEST at `pt` (client coordinates): the filled LVHITTESTINFO.
+/// LVM_HITTEST at `pt` (client coordinates): the filled LVHITTESTINFO,
+/// its `iItem` the item hit (-1 for none). WParam 0, as goz-gui's lists
+/// have always asked: the item and where on it, not its group.
 pub fn hit_test(lv: HWND, pt: POINT) -> LVHITTESTINFO {
     let mut ht = LVHITTESTINFO {
         pt,
+        iItem: -1,
         ..Default::default()
     };
     // SAFETY: LVM_HITTEST's lParam is an LVHITTESTINFO, in and out.
-    unsafe { send(lv, LVM_HITTEST, usize::MAX, (&raw mut ht) as isize) };
+    unsafe { send(lv, LVM_HITTEST, 0, (&raw mut ht) as isize) };
     ht
 }
 
-/// LVM_SUBITEMHITTEST at `pt`: the filled LVHITTESTINFO.
+/// LVM_SUBITEMHITTEST at `pt`: the filled LVHITTESTINFO, its `iItem` and
+/// `iSubItem` the cell hit (-1 for none). WParam 0, as in [`hit_test`].
 pub fn subitem_hit_test(lv: HWND, pt: POINT) -> LVHITTESTINFO {
     let mut ht = LVHITTESTINFO {
         pt,
+        iItem: -1,
+        iSubItem: -1,
         ..Default::default()
     };
     // SAFETY: LVM_SUBITEMHITTEST's lParam is an LVHITTESTINFO, in and out.
-    unsafe { send(lv, LVM_SUBITEMHITTEST, usize::MAX, (&raw mut ht) as isize) };
+    unsafe { send(lv, LVM_SUBITEMHITTEST, 0, (&raw mut ht) as isize) };
     ht
 }
 

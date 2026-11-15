@@ -19,10 +19,9 @@
 
 use std::io::Read;
 
+use crate::win;
 use memchr::memmem::Finder;
 use windows_sys::Win32::Globalization::CP_ACP;
-
-use crate::win::ext::b8;
 
 /// How much of a file is read at a time.
 const PIECE: usize = 1 << 20;
@@ -111,7 +110,7 @@ fn is_word(u: u16) -> bool {
 
 /// The system's ANSI code page: whether it has two-byte characters.
 fn ansi_is_dbcs() -> bool {
-    b8::code_page_info(CP_ACP).is_some_and(|info| info.MaxCharSize > 1)
+    win::locale::code_page_info(CP_ACP).is_some_and(|info| info.MaxCharSize > 1)
 }
 
 /// Appends `bytes` decoded from the ANSI code page.
@@ -123,7 +122,7 @@ fn ansi_into(bytes: &[u8], out: &mut Vec<u16>) {
     // Room for as many UTF-16 units as there are bytes, which a code page
     // never exceeds.
     out.resize(at + bytes.len(), 0);
-    let n = b8::multi_byte_to_wide(CP_ACP, 0, bytes, &mut out[at..]);
+    let n = win::locale::multi_byte_to_wide(CP_ACP, 0, bytes, &mut out[at..]);
     out.truncate(at + n);
 }
 
@@ -164,7 +163,7 @@ impl Decoder {
                     // A lead byte at the very end waits for its trail.
                     let mut i = 0;
                     while i < b.len() {
-                        i += if b8::is_dbcs_lead_byte(CP_ACP, b[i]) {
+                        i += if win::locale::is_dbcs_lead_byte(CP_ACP, b[i]) {
                             2
                         } else {
                             1
@@ -271,7 +270,7 @@ struct Stream {
 
 /// The bytes of `units`, as memmem searches them.
 fn bytes_of(units: &[u16]) -> &[u8] {
-    b8::units_as_bytes(units)
+    win::units_as_bytes(units)
 }
 
 /// The needle's bytes, folded as `f` says, in native order.

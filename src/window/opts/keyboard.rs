@@ -10,7 +10,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT};
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT, VK_TAB};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -402,8 +402,9 @@ impl Page for Keyboard {
             || (id == ADD || id == REMOVE) && code == BN_CLICKED
     }
 
-    fn message(&self, _app: &App, page: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<isize> {
-        if msg != WM_COMMAND {
+    fn message(&self, _app: &App, page: HWND, m: &Msg) -> Option<isize> {
+        let (w, l) = (m.w, m.l);
+        if m.id != WM_COMMAND {
             return None;
         }
         let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);

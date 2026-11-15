@@ -58,7 +58,6 @@ use crate::dialog::{
 use crate::fileops::parent;
 use crate::places::{self, Which};
 use crate::theme::Palette;
-use crate::win::ext::b6;
 use crate::win::{self, Msg, View, combo, dlg, edit, gdi, lv, parcel, subclass, sys};
 use crate::{menu, msgbox, popup};
 
@@ -998,7 +997,7 @@ impl Dlg {
         };
         let id = popup::track(popup_menu, dlg, pt, "rename format menu", &|_| None);
         // The menu this function made.
-        b6::destroy_menu(popup_menu);
+        win::menu::destroy(popup_menu);
         let Some((text, wrap, _)) = usize::try_from(id)
             .ok()
             .and_then(|i| i.checked_sub(1))
@@ -1074,7 +1073,7 @@ impl Dlg {
         if list.is_empty() {
             menu::add_items(m, Some(u16::MAX), &[menu::Item::Greyed("&Delete Preset")]);
             // A menu this function made and put nowhere.
-            b6::destroy_menu(delete);
+            win::menu::destroy(delete);
         } else {
             menu::add_items(
                 m,
@@ -1089,7 +1088,7 @@ impl Dlg {
         };
         let id = popup::track(m, dlg, pt, "rename presets menu", &|_| None);
         // The menu this function made (its submenu goes with it).
-        b6::destroy_menu(m);
+        win::menu::destroy(m);
         match id {
             0 => {}
             SAVE => self.save_preset(dlg),

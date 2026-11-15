@@ -21,7 +21,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CONTEXTMENU, WM_MBUTTONUP, 
 
 use crate::colors::{Item, State};
 use crate::paint::fill;
-use crate::win::ext::b1;
 use crate::win::{self, Msg, gdi, subclass};
 use crate::window::App;
 
@@ -33,7 +32,7 @@ pub static SUBCLASS: subclass::Key = subclass::Key::new("results header");
 
 /// The item at `pt` (the header's client coordinates).
 fn item_at(app: &App, pt: POINT) -> Option<usize> {
-    usize::try_from(b1::header_item_at(app.header, pt)).ok()
+    usize::try_from(win::header::item_at(app.header, pt)).ok()
 }
 
 /// The item at `pt` (the screen).
@@ -54,7 +53,7 @@ pub fn subclass_proc(app: &App, m: &Msg) -> LRESULT {
             // Passes the message on, then adjusts the HDLAYOUT the list
             // passed.
             let r = m.def();
-            b1::header_layout(m, |pos, rest| {
+            win::header::on_layout(m, |pos, rest| {
                 let height = app.header_height();
                 let top = pos.y;
                 pos.cy = height;

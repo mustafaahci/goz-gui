@@ -32,10 +32,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, BS_PUSHBUTTON, DI_NORMAL, GW_OWNER, IDCANCEL, IDI_ERROR, IDI_INFORMATION,
     IDI_QUESTION, IDI_WARNING, IDNO, IDOK, IDYES, MB_DEFBUTTON2, MB_DEFBUTTON3, MB_DEFBUTTON4,
     MB_DEFMASK, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONMASK, MB_ICONQUESTION, MB_ICONWARNING,
-    MB_OK, MB_OKCANCEL, MB_TYPEMASK, MB_YESNO, MB_YESNOCANCEL, MF_BYCOMMAND, MF_GRAYED, SC_CLOSE,
-    SM_CXICON, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WA_INACTIVE, WM_ACTIVATE, WM_APP,
-    WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_INITDIALOG, WM_KEYDOWN, WM_SETTINGCHANGE, WS_GROUP, WS_TABSTOP,
+    MB_OK, MB_OKCANCEL, MB_TYPEMASK, MB_YESNO, MB_YESNOCANCEL, SC_CLOSE, SM_CXICON, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_COMMAND, WM_CTLCOLORBTN,
+    WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_KEYDOWN,
+    WM_SETTINGCHANGE, WS_GROUP, WS_TABSTOP,
 };
 
 use crate::clipboard;
@@ -43,7 +43,6 @@ use crate::dialog::{self, Class, Look, Quiet, Template, apply_theme, center_on_o
 use crate::paint::fill;
 use crate::placement::Rect;
 use crate::theme::Palette;
-use crate::win::ext::b4 as ext;
 use crate::win::gdi::{self, Selected, WindowDc};
 use crate::win::{self, Msg, dlg, subclass, sys, wz};
 
@@ -215,7 +214,7 @@ struct MsgBox {
 /// `IDYES`, `IDNO`).
 pub fn show(owner: HWND, text: &str, title: &str, style: u32) -> i32 {
     let Some(buttons) = buttons(style) else {
-        return ext::message_box(owner, text, title, style);
+        return win::dlg::message_box(owner, text, title, style);
     };
     let state = MsgBox {
         text: wz(text),
@@ -255,7 +254,7 @@ pub fn show(owner: HWND, text: &str, title: &str, style: u32) -> i32 {
     let _quiet = Quiet::begin();
     match t.show(owner, &|m| proc(&state, m)) {
         // The dialog could not be made: Windows' own box, unthemed.
-        -1 => ext::message_box(owner, text, title, style),
+        -1 => win::dlg::message_box(owner, text, title, style),
         // 0 when the owner was not a window (as `MessageBoxW` fails) or
         // the box went with it.
         answer => answer as i32,
@@ -310,7 +309,8 @@ impl MsgBox {
         center_on_owner(dlg);
         if self.buttons.cancel.is_none() {
             // Greys the close box.
-            ext::enable_menu_item(ext::system_menu(dlg), SC_CLOSE, MF_BYCOMMAND | MF_GRAYED);
+            let menu = win::menu::system_menu(dlg, false);
+            win::menu::enable(menu, win::menu::By::Command(SC_CLOSE), false);
         }
         for &(id, _) in self.buttons.set {
             // The subclass goes with the button.
@@ -342,7 +342,7 @@ impl MsgBox {
         };
         let style = win::style(dlg);
         let ex = win::ex_style(dlg);
-        let frame = ext::adjust_window_rect_for_dpi(
+        let frame = win::adjust_rect_for_dpi(
             RECT::default(),
             style,
             false,
@@ -440,7 +440,7 @@ impl MsgBox {
         }
         // A system icon at the control's size, drawn on the DC the control
         // gave, then destroyed (it is this call's own copy).
-        if let Some(icon) = ext::Icon::system(id, side, side) {
+        if let Some(icon) = win::icon::Icon::system(id, side, side) {
             gdi::draw_icon(
                 dis.hDC,
                 (r.left, r.top, side, side),

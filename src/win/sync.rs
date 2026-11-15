@@ -32,11 +32,13 @@ impl Event {
         (!h.is_null()).then_some(Event(h))
     }
 
+    /// Sets the event (signalled).
     pub fn set(&self) {
         // SAFETY: the handle this owns.
         unsafe { SetEvent(self.0) };
     }
 
+    /// Resets the event (not signalled).
     pub fn reset(&self) {
         // SAFETY: the handle this owns.
         unsafe { ResetEvent(self.0) };

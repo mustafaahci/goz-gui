@@ -2,21 +2,21 @@
 //! minimizing to the tray, the global hotkeys, and command lines handed over
 //! by a second start (`crate::instance`).
 
-use windows_sys::Win32::Foundation::{LPARAM, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{POINT, WPARAM};
 use windows_sys::Win32::UI::Controls::{HOTKEYF_ALT, HOTKEYF_CONTROL, HOTKEYF_SHIFT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::NIN_SELECT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MB_ICONWARNING, MB_OK, MF_STRING, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, TPM_RETURNCMD,
+    MB_ICONWARNING, MB_OK, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_NULL,
 };
 
 use super::{App, Options, WM_TRAY};
 use crate::cmdline::{self, Launch};
 use crate::settings::Background;
-use crate::win::{self, ext::b1};
+use crate::win::{self, Msg};
 use crate::{menu, msgbox, tray};
 
 /// The tray icon chosen with the keyboard (NIN_SELECT | NINF_KEY).
@@ -76,9 +76,9 @@ impl App {
         ] {
             // This window's own hotkey ids; unregistering one not
             // registered is harmless.
-            b1::unregister_hotkey(self.hwnd, id);
+            win::unregister_hotkey(self.hwnd, id);
             if let Some((mods, vk)) = hotkey_parts(word)
-                && !b1::register_hotkey(self.hwnd, id, mods, vk)
+                && !win::register_hotkey(self.hwnd, id, mods, vk)
             {
                 taken.push(name);
             }
@@ -154,8 +154,8 @@ impl App {
 
     /// A tray icon event (`NOTIFYICON_VERSION_4`: the event in lParam's low
     /// word, the anchor point in wParam).
-    pub(super) fn on_tray(&self, w: WPARAM, l: LPARAM) {
-        let event = (l as u32) & 0xffff;
+    pub(super) fn on_tray(&self, m: &Msg) {
+        let (w, event) = (m.w, (m.l as u32) & 0xffff);
         match event {
             WM_CONTEXTMENU => {
                 let pt = POINT {
@@ -191,17 +191,19 @@ impl App {
         // comes forward first so the menu closes when the user clicks
         // elsewhere (and WM_NULL after, the documented pairing).
         let cmd = {
-            let m = b1::create_popup_menu();
-            b1::append_menu_string(m, MF_STRING, usize::from(menu::TRAY_SHOW), "&Show Window");
-            b1::append_menu_separator(m);
-            b1::append_menu_string(m, MF_STRING, usize::from(menu::OPTIONS), "&Options...");
-            b1::append_menu_separator(m);
-            b1::append_menu_string(m, MF_STRING, usize::from(menu::EXIT), "E&xit");
-            b1::set_menu_default_item(m, u32::from(menu::TRAY_SHOW), false);
+            use win::menu::{By, NewItem};
+            let m = win::menu::create_popup();
+            let command = |id: u16, text| NewItem::command(u32::from(id), text);
+            win::menu::append(m, &command(menu::TRAY_SHOW, "&Show Window"));
+            win::menu::append(m, &NewItem::separator());
+            win::menu::append(m, &command(menu::OPTIONS, "&Options..."));
+            win::menu::append(m, &NewItem::separator());
+            win::menu::append(m, &command(menu::EXIT, "E&xit"));
+            win::menu::set_default(m, By::Command(u32::from(menu::TRAY_SHOW)));
             win::set_foreground(self.hwnd);
-            let cmd = b1::track_popup_menu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt, self.hwnd);
+            let cmd = win::menu::track(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt, self.hwnd);
             win::post_plain(self.hwnd, WM_NULL, 0, 0);
-            b1::destroy_menu(m);
+            win::menu::destroy(m);
             cmd
         };
         match cmd as u16 {
@@ -280,7 +282,7 @@ impl App {
         }
         let text = l
             .search_text()
-            .unwrap_or_else(|| crate::wide::window_text(self.edit));
+            .unwrap_or_else(|| crate::win::text(self.edit));
         if l.path.is_some() {
             // A folder of its own (Explorer's "Search goz..."): the Folders
             // pane's goes, or the search would be inside both (F2).

@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use windows::Win32::UI::Shell::{IFileOperationProgressSink, IShellItem};
 use windows::core::HRESULT;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Globalization::CSTR_EQUAL;
@@ -32,8 +31,8 @@ use crate::filetools::{self, Change, Sink, StepResult};
 use crate::shell::{self, FileOp};
 use crate::store::location;
 use crate::win::com::Apartment;
-use crate::win::ext::b8::{self, FileOperation};
 use crate::win::queue::Woke;
+use crate::win::shell::{FileOperation, ProgressSink, ShellItem};
 use crate::win::{self, parcel};
 
 /// A file operation, with what the window needs to know once it is done.
@@ -190,7 +189,7 @@ fn spawn(owner: usize, message: u32) -> Option<Worker> {
             }
         })
         .ok()?;
-    let thread = b8::thread_id_of(&handle);
+    let thread = win::process::thread_id_of(&handle);
     let queue = Arc::new(Queue {
         jobs: Mutex::new(VecDeque::new()),
         quit: AtomicBool::new(false),
@@ -268,7 +267,7 @@ fn thread(queue: &Queue, owner: usize, message: u32) {
 /// Gives what the process's heaps hold free back to Windows: the shell's
 /// state of a large operation, freed as the thread ends.
 fn give_back_memory() {
-    b8::optimize_heaps();
+    win::process::optimize_heaps();
 }
 
 /// HRESULT_FROM_WIN32(ERROR_CANCELLED), and the copy engine's own
@@ -299,17 +298,17 @@ fn same_folder(a: &[u16], b: &[u16]) -> bool {
         p
     }
     let (a, b) = (trim(a), trim(b));
-    b8::compare_ordinal(a, b, true) == CSTR_EQUAL
+    win::locale::compare_ordinal(a, b, true) == CSTR_EQUAL
 }
 
 /// The shell items at `paths`; those gone are left out.
-fn items(paths: &[Vec<u16>]) -> Vec<IShellItem> {
+fn items(paths: &[Vec<u16>]) -> Vec<ShellItem> {
     paths.iter().filter_map(|p| item(p)).collect()
 }
 
 /// The shell item at `path`; `None` when it is gone.
-fn item(path: &[u16]) -> Option<IShellItem> {
-    b8::shell_item(path)
+fn item(path: &[u16]) -> Option<ShellItem> {
+    ShellItem::from_parsing_name(path)
 }
 
 /// An operation of `kind`, owned by `owner` (its questions, progress and
@@ -320,9 +319,16 @@ fn operation(
     owner: HWND,
     kind: FileOp,
     silent: bool,
-    sink: &IFileOperationProgressSink,
+    sink: &ProgressSink,
 ) -> windows::core::Result<FileOperation> {
-    FileOperation::new(owner, shell::fileop_flags(kind, silent), sink)
+    let op = FileOperation::new()?;
+    if !owner.is_null() {
+        op.set_owner_window(owner)?;
+    }
+    op.set_operation_flags(shell::fileop_flags(kind, silent))?;
+    // The operation keeps the sink until it is released.
+    op.advise(sink)?;
+    Ok(op)
 }
 
 /// Runs `job` as [`perform`] does, and says what it did: the shell's report
@@ -402,12 +408,7 @@ pub fn perform(owner: HWND, job: &Job, silent: bool) -> Outcome {
 
 /// [`perform`] for a Delete, Paste or Rename, each operation telling
 /// `sink` what it does.
-fn perform_with(
-    owner: HWND,
-    job: &Job,
-    silent: bool,
-    sink: &IFileOperationProgressSink,
-) -> Outcome {
+fn perform_with(owner: HWND, job: &Job, silent: bool, sink: &ProgressSink) -> Outcome {
     let new_op = |owner: HWND, kind: FileOp, silent: bool| operation(owner, kind, silent, sink);
     let run = || -> windows::core::Result<Outcome> {
         // COM is initialised on this thread (an STA); each operation is
@@ -446,7 +447,7 @@ fn perform_with(
                     }
                     let op = new_op(owner, FileOp::Transfer, silent)?;
                     for item in &items {
-                        op.move_item(item, &target)?;
+                        op.move_item(item, &target, None)?;
                     }
                     return finish(&op, items.len());
                 }
@@ -458,7 +459,7 @@ fn perform_with(
                     }
                     let op = new_op(owner, kind, silent)?;
                     for item in &items {
-                        op.copy_item(item, &target)?;
+                        op.copy_item(item, &target, None)?;
                     }
                     let done = finish(&op, items.len())?;
                     // Stopped by the user: the rest is not started.
@@ -471,7 +472,7 @@ fn perform_with(
             }
             Job::Rename { path, name } => {
                 let op = new_op(owner, FileOp::Transfer, silent)?;
-                let items: Vec<IShellItem> = item(path).into_iter().collect();
+                let items: Vec<ShellItem> = item(path).into_iter().collect();
                 for item in &items {
                     op.rename_item(item, name)?;
                 }
@@ -514,7 +515,7 @@ mod tests {
     #[test]
     fn copy_move_rename_and_delete_for_good() {
         // COM for this test thread, which ends with the test.
-        b8::sta_with_ole1dde();
+        win::com::sta_with_ole1dde();
         let dir = scratch("ops");
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::create_dir_all(&a).unwrap();
@@ -584,7 +585,7 @@ mod tests {
     #[test]
     fn a_paste_into_the_items_own_folder() {
         // COM for this test thread, which ends with the test.
-        b8::sta_with_ole1dde();
+        win::com::sta_with_ole1dde();
         let dir = scratch("same");
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::create_dir_all(&a).unwrap();

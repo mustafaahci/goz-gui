@@ -31,7 +31,6 @@ use crate::pane::{PaneContent, PaneSpec};
 use crate::sidebars;
 use crate::status::{self, Indicator};
 use crate::win;
-use crate::win::ext::b2;
 
 // F2's commands (`menu::F2_FIRST`, 3100..=3199). The first two are
 // Everything's "Folders | Clear Selection" and "Folders | Up One Dir",
@@ -365,7 +364,7 @@ impl App {
         // The window readies the checks as it opens (WM_INITMENUPOPUP).
         let id = self.track_with_shell(popup, screen, "status bar menu", None);
         // The menu made above.
-        b2::destroy_menu(popup);
+        win::menu::destroy(popup);
         match id as u16 {
             0 => {}
             CLEAR_SELECTION => self.clear_folder(),

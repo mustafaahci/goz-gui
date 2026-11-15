@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_MESSAGE, WM_APP, WM_COPYDATA};
 
 use crate::win::class::{self, Class, Create};
-use crate::win::ext::b8::{self, NamedMutex};
+use crate::win::process::NamedMutex;
 use crate::win::{self, Msg, parcel};
 
 /// The message-only windows' class.
@@ -113,9 +113,9 @@ pub fn forward(key: &str, args: &[String]) -> bool {
         return false;
     };
     let data: Vec<u8> = encode(args).iter().flat_map(|u| u.to_ne_bytes()).collect();
-    b8::allow_set_foreground(win::process_of(hwnd));
+    win::process::allow_set_foreground(win::process_of(hwnd));
     // A hung instance is given up on after 5 s.
-    b8::send_copy_data(hwnd, core::ptr::null_mut(), MAGIC, &data, 5000) == Some(1)
+    win::send_copy_data(hwnd, core::ptr::null_mut(), MAGIC, &data, 5000) == Some(1)
 }
 
 /// The message-only window of class `class`, titled `key`, whose messages

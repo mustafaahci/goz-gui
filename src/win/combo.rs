@@ -1,12 +1,12 @@
 //! Combo-box messages (CB_* are below WM_USER: the same for every window).
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::Controls::{CB_SETMINVISIBLE, COMBOBOXINFO};
+use windows_sys::Win32::UI::Controls::{CB_SETMINVISIBLE, COMBOBOXINFO, GetComboBoxInfo};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CB_ADDSTRING, CB_DELETESTRING, CB_FINDSTRINGEXACT, CB_GETCOMBOBOXINFO, CB_GETCOUNT,
-    CB_GETCURSEL, CB_GETDROPPEDSTATE, CB_GETEDITSEL, CB_GETITEMDATA, CB_GETLBTEXT, CB_GETLBTEXTLEN,
-    CB_INSERTSTRING, CB_RESETCONTENT, CB_SETCURSEL, CB_SETDROPPEDWIDTH, CB_SETEDITSEL,
-    CB_SETITEMDATA, CB_SHOWDROPDOWN,
+    CB_ADDSTRING, CB_DELETESTRING, CB_FINDSTRINGEXACT, CB_GETCOUNT, CB_GETCURSEL,
+    CB_GETDROPPEDSTATE, CB_GETEDITSEL, CB_GETITEMDATA, CB_GETLBTEXT, CB_GETLBTEXTLEN,
+    CB_INSERTSTRING, CB_RESETCONTENT, CB_SELECTSTRING, CB_SETCURSEL, CB_SETDROPPEDWIDTH,
+    CB_SETEDITSEL, CB_SETITEMDATA, CB_SHOWDROPDOWN,
 };
 
 fn send_int(c: HWND, msg: u32, w: usize, l: isize) -> isize {
@@ -29,18 +29,22 @@ pub fn insert(c: HWND, i: i32, text: &str) -> i32 {
     unsafe { super::send_raw(c, CB_INSERTSTRING, i as isize as usize, z.as_ptr() as isize) as i32 }
 }
 
+/// Deletes item `i`; how many are left (CB_ERR if there was none).
 pub fn delete(c: HWND, i: i32) -> i32 {
     send_int(c, CB_DELETESTRING, i as isize as usize, 0) as i32
 }
 
+/// Empties the list.
 pub fn reset(c: HWND) {
     send_int(c, CB_RESETCONTENT, 0, 0);
 }
 
+/// How many items the list has.
 pub fn count(c: HWND) -> i32 {
     send_int(c, CB_GETCOUNT, 0, 0) as i32
 }
 
+/// The selected item (CB_ERR -1 for none).
 pub fn cur_sel(c: HWND) -> i32 {
     send_int(c, CB_GETCURSEL, 0, 0) as i32
 }
@@ -88,22 +92,42 @@ pub fn find_exact(c: HWND, after: i32, text: &str) -> i32 {
     }
 }
 
+/// Selects the first item after `after` (-1: from the start) whose text
+/// starts with `text` (ignoring case); its index, CB_ERR if none.
+pub fn select_string(c: HWND, after: i32, text: &str) -> i32 {
+    let z = super::wz(text);
+    // SAFETY: a NUL-terminated string read during the call.
+    unsafe {
+        super::send_raw(
+            c,
+            CB_SELECTSTRING,
+            after as isize as usize,
+            z.as_ptr() as isize,
+        ) as i32
+    }
+}
+
+/// The number item `i` keeps (CB_SETITEMDATA's).
 pub fn item_data(c: HWND, i: i32) -> isize {
     send_int(c, CB_GETITEMDATA, i as isize as usize, 0)
 }
 
+/// Keeps a number with item `i`.
 pub fn set_item_data(c: HWND, i: i32, data: isize) {
     send_int(c, CB_SETITEMDATA, i as isize as usize, data);
 }
 
+/// Drops the list down, or closes it.
 pub fn show_dropdown(c: HWND, show: bool) {
     send_int(c, CB_SHOWDROPDOWN, usize::from(show), 0);
 }
 
+/// Whether the list is dropped down.
 pub fn dropped(c: HWND) -> bool {
     send_int(c, CB_GETDROPPEDSTATE, 0, 0) != 0
 }
 
+/// The least width of the dropped-down list, in pixels.
 pub fn set_dropped_width(c: HWND, width: i32) {
     send_int(c, CB_SETDROPPEDWIDTH, width as isize as usize, 0);
 }
@@ -133,16 +157,17 @@ pub fn set_edit_sel(c: HWND, start: i16, end: i16) {
     );
 }
 
-/// The box's parts: its edit, its list.
+/// The box's parts (its button, item area, edit and list) as the system's
+/// GetComboBoxInfo answers them; `None` for a window that is no combo box.
+/// No message is sent, so no subclass of the box sees one
+/// (`dialog::fill_later`'s takes any CB_ message for a use of the list).
 pub fn info(c: HWND) -> Option<COMBOBOXINFO> {
     let mut ci = COMBOBOXINFO {
         cbSize: size_of::<COMBOBOXINFO>() as u32,
         ..Default::default()
     };
-    // SAFETY: CB_GETCOMBOBOXINFO's lParam is a COMBOBOXINFO out, its size
-    // set.
-    let ok = unsafe { super::send_raw(c, CB_GETCOMBOBOXINFO, 0, (&raw mut ci) as isize) } != 0;
-    ok.then_some(ci)
+    // SAFETY: an out-struct, its size set.
+    (unsafe { GetComboBoxInfo(c, &mut ci) } != 0).then_some(ci)
 }
 
 /// How many items the drop-down shows at most (CB_SETMINVISIBLE, the

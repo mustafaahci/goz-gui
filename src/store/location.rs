@@ -183,7 +183,11 @@ fn roaming_app_data() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(dir));
     }
-    crate::win::ext::b8::known_folder_path(&FOLDERID_RoamingAppData).map(PathBuf::from)
+    crate::win::shell::known_folder(&FOLDERID_RoamingAppData).map(|p| {
+        PathBuf::from(<OsString as std::os::windows::ffi::OsStringExt>::from_wide(
+            &p,
+        ))
+    })
 }
 
 /// Whether the variable asks for a dry run: set, and not empty or `0`.

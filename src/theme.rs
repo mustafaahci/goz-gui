@@ -9,7 +9,9 @@
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::colors::{Item, SLOTS, State, slot};
-use crate::win::ext::b4::{self as ext, AppMode, Hive};
+use crate::win;
+use crate::win::reg::Hive;
+use crate::win::uxtheme::AppMode;
 
 /// A part's text and background colours.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -266,14 +268,14 @@ impl Palette {
 /// Whether the user picked the dark app theme.
 pub fn system_dark() -> bool {
     let key = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
-    ext::reg_dword(Hive::CurrentUser, key, "AppsUseLightTheme") == Some(0)
+    win::reg::get_dword(Hive::CurrentUser, key, "AppsUseLightTheme") == Some(0)
 }
 
 /// Windows' accent colour (Settings > Personalization > Colors), for an
 /// accent of Default in Options > Fonts and Colors; Windows' default blue
 /// if it cannot be read.
 pub fn system_accent() -> u32 {
-    match ext::reg_dword(
+    match win::reg::get_dword(
         Hive::CurrentUser,
         r"Software\Microsoft\Windows\DWM",
         "AccentColor",
@@ -299,27 +301,27 @@ pub fn set_app_mode(mode: ThemeMode) {
         ThemeMode::Dark => AppMode::ForceDark,
         ThemeMode::Standard => AppMode::ForceLight,
     };
-    ext::set_preferred_app_mode(value);
+    win::uxtheme::set_preferred_app_mode(value);
 }
 
 /// Applies `dark` to a top-level window's title bar.
 pub fn set_titlebar(hwnd: HWND, dark: bool) {
     allow(hwnd, dark);
     // DWMWA_USE_IMMERSIVE_DARK_MODE (20) takes a BOOL.
-    ext::dwm_set_attribute_i32(hwnd, 20, dark.into());
+    win::set_dwm_attribute(hwnd, 20, dark.into());
 }
 
 /// Lets `hwnd`'s themed parts (scroll bars, header) draw dark.
 pub fn allow(hwnd: HWND, dark: bool) {
-    ext::allow_dark_mode_for_window(hwnd, dark);
+    win::uxtheme::allow_dark_mode_for_window(hwnd, dark);
 }
 
 /// Sets a control's visual style class, or its default with `None`.
 pub fn set_class(hwnd: HWND, class: Option<&str>) {
-    ext::set_window_theme(hwnd, class, None);
+    win::uxtheme::set_window_theme(hwnd, class, None);
 }
 
 /// Makes menus opened from now on use the current theme.
 pub fn flush_menus() {
-    ext::flush_menu_themes();
+    win::uxtheme::flush_menu_themes();
 }

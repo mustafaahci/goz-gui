@@ -19,7 +19,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::{App, key_down};
-use crate::wide::window_text;
 use crate::win::{self, Msg, edit, subclass};
 use crate::{dropdown, menu};
 
@@ -158,7 +157,7 @@ impl App {
             return;
         }
         self.focus_box();
-        dropdown::open(self, &window_text(self.edit));
+        dropdown::open(self, &win::text(self.edit));
     }
 
     /// Puts the keyboard in the search box. While the window is not the
@@ -214,7 +213,7 @@ fn edit_message(app: &App, m: &Msg) -> LRESULT {
             if cmd == crate::searchtools::ADVANCED_SEARCH {
                 let (_, end) = edit::sel(hwnd);
                 let caret = end as usize;
-                if crate::filelist::slots::term_at(&window_text(hwnd), caret)
+                if crate::filelist::slots::term_at(&win::text(hwnd), caret)
                     .is_some_and(|t| t.func.editable())
                 {
                     crate::slotedit::post_edit_at(app.hwnd, caret);
@@ -226,7 +225,7 @@ fn edit_message(app: &App, m: &Msg) -> LRESULT {
         }
     }
     // The search box's menu (F4's, `tools.rs`).
-    if let Some(answer) = app.search_box_message(msg, w, l) {
+    if let Some(answer) = app.search_box_message(m) {
         return answer;
     }
     match msg {
@@ -274,7 +273,7 @@ fn edit_message(app: &App, m: &Msg) -> LRESULT {
                 // (-1 in both words: no character there.)
                 if (unit, line) != (0xffff, 0xffff) {
                     let unit = usize::from(unit);
-                    if crate::filelist::slots::term_at(&window_text(hwnd), unit)
+                    if crate::filelist::slots::term_at(&win::text(hwnd), unit)
                         .is_some_and(|t| t.func.editable())
                     {
                         crate::slotedit::post_edit_at(app.hwnd, unit);
@@ -346,7 +345,7 @@ fn word_end_after(text: &[u16], caret: usize) -> usize {
 pub(super) fn delete_word(e: HWND, back: bool) {
     let (start, end) = edit::sel(e);
     if start == end {
-        let text: Vec<u16> = window_text(e).encode_utf16().collect();
+        let text: Vec<u16> = win::text(e).encode_utf16().collect();
         let caret = start as usize;
         let (from, to) = if back {
             (word_start_before(&text, caret), caret)

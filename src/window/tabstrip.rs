@@ -184,7 +184,7 @@ impl TabStrip {
     /// What is under the mouse now: after a tab closed or moved, the ×
     /// that slid under it lights at once.
     fn rehover(&self, app: &App) {
-        let pt = win::screen_to_client(app.hwnd, sys::cursor_pos());
+        let pt = win::screen_to_client(app.hwnd, sys::cursor_pos().unwrap_or_default());
         self.set_hot(app, self.hit_at(app, pt));
     }
 

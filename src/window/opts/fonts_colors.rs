@@ -30,7 +30,6 @@ use crate::dialog::{Class, LIST_BOX};
 use crate::options::{Invalid, LABEL, Page, Rows, enable, item, order, set_text, text};
 use crate::paint::fill;
 use crate::theme::{Ink, Palette};
-use crate::win::ext::b4 as ext;
 use crate::win::{self, Msg, combo, dlg, gdi, listbox};
 use crate::window::App;
 
@@ -177,10 +176,10 @@ impl FontsColors {
                 font.face.clone()
             };
             let fonts = dlg::item(page, FONT);
-            if ext::combo_select_string(fonts, -1, &face) == CB_ERR {
+            if win::combo::select_string(fonts, -1, &face) == CB_ERR {
                 // A face this system has not: listed so it shows.
                 combo::add(fonts, &face);
-                ext::combo_select_string(fonts, -1, &face);
+                win::combo::select_string(fonts, -1, &face);
             }
             let size = if font.size == 0 {
                 DEFAULT.to_owned()
@@ -386,7 +385,7 @@ impl FontsColors {
 /// `@` faces left out).
 fn font_families() -> Vec<String> {
     // DEFAULT_CHARSET: every face once per charset.
-    let mut out: Vec<String> = ext::font_faces(1)
+    let mut out: Vec<String> = win::gdi::font_faces(1)
         .into_iter()
         .filter(|name| !name.starts_with('@') && !name.is_empty())
         .collect();
@@ -691,7 +690,7 @@ impl Page for FontsColors {
         }
     }
 
-    fn message_msg(&self, app: &App, page: HWND, m: &Msg) -> Option<isize> {
+    fn message(&self, app: &App, page: HWND, m: &Msg) -> Option<isize> {
         if m.id == WM_DRAWITEM {
             let dis = m.draw_item()?;
             if matches!(

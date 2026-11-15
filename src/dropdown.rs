@@ -24,7 +24,7 @@ use crate::paint::fill;
 use crate::searchbox::{self, Button};
 use crate::theme;
 use crate::win::class::{self, Class, Create};
-use crate::win::ext::b9::scroll;
+use crate::win::scroll;
 use crate::win::{self, Msg, gdi};
 use crate::window::App;
 

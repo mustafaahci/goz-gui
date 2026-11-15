@@ -19,13 +19,13 @@ use windows_sys::Win32::UI::Controls::{
     TVIF_STATE, TVIS_EXPANDED, TVITEMW, TVSIL_NORMAL,
 };
 use windows_sys::Win32::UI::Shell::{
-    SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGSI_SYSICONINDEX, SIID_FIND,
+    SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SIID_FIND,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
 
 use crate::colors::{Item, State};
 use crate::theme::{self, Palette};
-use crate::win::ext::b2::{self, ImageList};
+use crate::win::imagelist::ImageList;
 use crate::win::{self, gdi, imagelist, tv};
 
 /// No item: the tree's root (as a parent), or nothing (as an answer).
@@ -61,7 +61,7 @@ pub fn insert(tree: HWND, item: &New<'_>) -> HTREEITEM {
         lParam: item.param,
         ..Default::default()
     };
-    b2::tv_insert_wide(tree, item.parent, after, it, item.text)
+    win::tv::insert_units(tree, item.parent, after, it, item.text)
 }
 
 /// `item`'s param; `None` for no item.
@@ -88,7 +88,7 @@ pub fn set_children(tree: HWND, item: HTREEITEM, children: bool) {
 
 /// `item`'s text.
 pub fn set_text(tree: HWND, item: HTREEITEM, text: &[u16]) {
-    b2::tv_set_text_wide(tree, item, text);
+    win::tv::set_text_units(tree, item, text);
 }
 
 /// Whether `item` shows an expand button.
@@ -270,7 +270,7 @@ pub fn plain_icons() -> (i32, i32) {
     let lookup = |name: &str, attributes: u32| {
         // An attribute-only lookup.
         let name: Vec<u16> = name.encode_utf16().collect();
-        let (_, info) = b2::file_info(
+        let (_, info) = win::shell::file_info(
             &name,
             attributes,
             SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
@@ -286,7 +286,7 @@ pub fn plain_icons() -> (i32, i32) {
 /// The system image list's index of the shell's search icon (a
 /// magnifier); -1 if the shell has none.
 fn stock_search_icon() -> i32 {
-    b2::stock_icon_info(SIID_FIND, SHGSI_SYSICONINDEX).map_or(-1, |info| info.iSysImageIndex)
+    win::icon::stock_index(SIID_FIND).unwrap_or(-1)
 }
 
 /// The system image list to copy `size` px icons from: the one whose icons
@@ -298,10 +298,9 @@ fn system_list(size: i32) -> HIMAGELIST {
     for which in [1, 0, 2] {
         // The shell hands out its own image list, which lives as long as
         // the process; it is never released.
-        let list = b2::system_image_list(which);
-        if list == 0 {
+        let Some(list) = win::imagelist::system(which) else {
             continue;
-        }
+        };
         let (cx, _) = imagelist::icon_size(list).unwrap_or((0, 0));
         if cx >= size && best.is_none_or(|(b, _)| cx < b) {
             best = Some((cx, list));
@@ -366,7 +365,7 @@ impl Images {
                 return core::ptr::null_mut();
             }
             // A copy of one of the system list's icons, ours to destroy.
-            b2::imagelist_icon(list, index, ILD_NORMAL)
+            win::imagelist::icon(list, index, ILD_NORMAL)
         };
         let icon: HICON = match source {
             // A build without an icon of its own (no assets/goz.ico) shows

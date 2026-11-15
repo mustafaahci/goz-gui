@@ -9,6 +9,7 @@ use windows_sys::Win32::UI::Controls::{
     TTM_UPDATETIPTEXTW, TTTOOLINFOW,
 };
 
+/// The class these messages are for.
 pub const CLASS: &str = "tooltips_class32";
 
 /// A tool's text.
@@ -16,6 +17,8 @@ pub enum Text<'a> {
     None,
     /// The tooltip copies it.
     Str(&'a str),
+    /// As UTF-16 (up to a NUL, if it has one); the tooltip copies it.
+    Units(&'a [u16]),
     /// Asked for with TTN_GETDISPINFO when the tip shows.
     Callback,
 }
@@ -39,6 +42,10 @@ fn with_tool(tip: HWND, msg: u32, w: usize, ti: &TTTOOLINFOW, text: Text) -> isi
         Text::None => core::ptr::null_mut(),
         Text::Str(s) => {
             z = super::wz(s);
+            z.as_ptr().cast_mut()
+        }
+        Text::Units(s) => {
+            z = super::wz_units(s);
             z.as_ptr().cast_mut()
         }
         // LPSTR_TEXTCALLBACKW: a marker, not a pointer.
@@ -81,6 +88,7 @@ pub fn track_position(tip: HWND, x: i32, y: i32) {
     unsafe { send(tip, TTM_TRACKPOSITION, 0, l) };
 }
 
+/// The widest a tip shows before it wraps, in pixels (-1: no wrapping).
 pub fn set_max_width(tip: HWND, width: i32) {
     // SAFETY: an integer.
     unsafe { send(tip, TTM_SETMAXTIPWIDTH, 0, width as isize) };
@@ -92,6 +100,7 @@ pub fn delay_time(tip: HWND, which: u32) -> i32 {
     unsafe { send(tip, TTM_GETDELAYTIME, which as usize, 0) as i32 }
 }
 
+/// Sets delay TTDT_* `which`, in ms (-1: the default).
 pub fn set_delay_time(tip: HWND, which: u32, ms: i32) {
     // SAFETY: integers.
     unsafe { send(tip, TTM_SETDELAYTIME, which as usize, ms as isize) };
@@ -113,26 +122,31 @@ pub fn adjust_rect(tip: HWND, larger: bool, rc: RECT) -> RECT {
     r
 }
 
+/// The room round a tip's text, in pixels.
 pub fn set_margin(tip: HWND, rc: RECT) {
     // SAFETY: TTM_SETMARGIN's lParam is a RECT, read.
     unsafe { send(tip, TTM_SETMARGIN, 0, (&raw const rc) as isize) };
 }
 
+/// Turns the tips on or off.
 pub fn activate(tip: HWND, on: bool) {
     // SAFETY: a flag.
     unsafe { send(tip, TTM_ACTIVATE, usize::from(on), 0) };
 }
 
+/// Hides the tip shown.
 pub fn pop(tip: HWND) {
     // SAFETY: no parameters.
     unsafe { send(tip, TTM_POP, 0, 0) };
 }
 
+/// Shows the tip of the tool under the mouse now.
 pub fn popup(tip: HWND) {
     // SAFETY: no parameters.
     unsafe { send(tip, TTM_POPUP, 0, 0) };
 }
 
+/// The tips' text and background colours.
 pub fn set_colors(tip: HWND, text: COLORREF, back: COLORREF) {
     // SAFETY: colours.
     unsafe {

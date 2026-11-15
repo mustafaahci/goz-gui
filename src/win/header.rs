@@ -9,6 +9,7 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::WINDOWPOS;
 
+/// The class these messages are for.
 pub const CLASS: &str = "SysHeader32";
 
 /// # Safety
@@ -18,6 +19,7 @@ unsafe fn send(h: HWND, msg: u32, w: usize, l: isize) -> isize {
     unsafe { super::send_raw(super::of_class(h, CLASS), msg, w, l) }
 }
 
+/// How many items (columns) the header has.
 pub fn item_count(h: HWND) -> usize {
     // SAFETY: no parameters.
     usize::try_from(unsafe { send(h, HDM_GETITEMCOUNT, 0, 0) }).unwrap_or(0)
@@ -37,6 +39,7 @@ pub fn order(h: HWND) -> Vec<i32> {
     if ok { v } else { Vec::new() }
 }
 
+/// Item `i`'s rectangle, in the header's client coordinates.
 pub fn item_rect(h: HWND, i: i32) -> Option<RECT> {
     let mut rc = RECT::default();
     // SAFETY: HDM_GETITEMRECT's lParam is a RECT out.
@@ -62,6 +65,18 @@ pub fn hit_test(h: HWND, pt: POINT) -> HDHITTESTINFO {
     ht
 }
 
+/// HDM_HITTEST's answer at `pt` (client coordinates): the item there, -1
+/// for none. ([`hit_test`] gives the filled structure, whose item a header
+/// may set even where it answers -1.)
+pub fn item_at(h: HWND, pt: POINT) -> i32 {
+    let mut ht = HDHITTESTINFO {
+        pt,
+        ..Default::default()
+    };
+    // SAFETY: HDM_HITTEST's lParam is an HDHITTESTINFO, in and out.
+    unsafe { send(h, HDM_HITTEST, 0, (&raw mut ht) as isize) as i32 }
+}
+
 /// HDM_LAYOUT: where the header goes in `rc`, and what of `rc` is left.
 pub fn layout(h: HWND, rc: RECT) -> (WINDOWPOS, RECT) {
     let mut rest = rc;
@@ -74,6 +89,30 @@ pub fn layout(h: HWND, rc: RECT) -> (WINDOWPOS, RECT) {
     // WINDOWPOS out, all alive for the call.
     unsafe { send(h, HDM_LAYOUT, 0, (&raw const lay) as isize) };
     (pos, rest)
+}
+
+/// HDM_LAYOUT as a header's procedure (or its subclass) gets it: `f`
+/// changes where the header goes (the WINDOWPOS) and what of the parent's
+/// rectangle is left under it (the RECT). `None` for any other message, a
+/// window that is not a header, or a layout without its two structures.
+pub fn on_layout<R>(m: &super::Msg, f: impl FnOnce(&mut WINDOWPOS, &mut RECT) -> R) -> Option<R> {
+    if m.id != HDM_LAYOUT || !super::class_is(m.hwnd, CLASS) {
+        return None;
+    }
+    // SAFETY: a delivered HDM_LAYOUT's lParam, for a header, is an HDLAYOUT.
+    let view = unsafe { m.view_lparam::<HDLAYOUT>() }?;
+    let (prc, pwpos) = (view.prc, view.pwpos);
+    if prc.is_null() || pwpos.is_null() {
+        return None;
+    }
+    // SAFETY: HDLAYOUT's two pointers are the sender's RECT and WINDOWPOS,
+    // two objects apart from the HDLAYOUT and from each other, valid while
+    // the header's procedure runs. They are lent to `f` only, while the view
+    // is out (so the message cannot be passed on meanwhile).
+    let (pos, rest) = unsafe { (&mut *pwpos, &mut *prc) };
+    let r = f(pos, rest);
+    drop(view);
+    Some(r)
 }
 
 /// The fields `mask` asks for (HDI_*) of item `i`, and its text when
@@ -130,7 +169,20 @@ pub fn set_item(h: HWND, i: i32, item: HDITEMW, text: Option<&str>) -> bool {
     }
 }
 
+/// The image list the items' images come from; the one before.
 pub fn set_image_list(h: HWND, il: HIMAGELIST) -> HIMAGELIST {
     // SAFETY: a handle.
     unsafe { send(h, HDM_SETIMAGELIST, 0, il) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_made_message_hands_out_no_layout() {
+        let m = super::super::Msg::new(core::ptr::null_mut(), HDM_LAYOUT, 0, 0x1000);
+        assert!(on_layout(&m, |_, _| ()).is_none());
+        assert_eq!(item_at(core::ptr::null_mut(), POINT::default()), 0);
+    }
 }

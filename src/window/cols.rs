@@ -23,7 +23,6 @@ use windows_sys::Win32::UI::Controls::{
 
 use super::{App, WM_COLUMNS};
 use crate::columns::{self, COL_CREATED, COL_NAME, COL_SIZE, LIST_COLS, Layout};
-use crate::win::ext::b1;
 use crate::win::{self, gdi, lv};
 use crate::{header, menu, paint};
 
@@ -277,7 +276,7 @@ impl App {
         let popup = menu::header_menu(&shown, on_id);
         let cmd = crate::popup::track(popup, self.hwnd, pt, "header menu", &|_| None);
         // The menu this function made.
-        b1::destroy_menu(popup);
+        win::menu::destroy(popup);
         let Ok(cmd) = u16::try_from(cmd) else {
             return;
         };

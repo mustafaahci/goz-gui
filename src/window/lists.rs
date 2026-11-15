@@ -19,7 +19,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::MB_OK;
 
 use super::App;
@@ -112,7 +111,7 @@ impl App {
         now.set(n, names);
         *self.data_tools.slots.borrow_mut() = Arc::new(now);
         // A search that reads the slot finds what it holds now.
-        let text = crate::wide::window_text(self.edit);
+        let text = crate::win::text(self.edit);
         if slots::terms(&text)
             .iter()
             .any(|t| t.slot == Some(n) && t.func != Func::Save)
@@ -123,17 +122,17 @@ impl App {
     }
 
     /// W7's WM_APP messages (`WM_APP + 380..390`).
-    pub(super) fn w7_message(&self, msg: u32, w: WPARAM, l: LPARAM) {
-        match msg {
+    pub(super) fn w7_message(&self, m: &Msg) {
+        match m.id {
             slotedit::WM_EDIT_TERM_AT => {
-                let text = crate::wide::window_text(self.edit);
-                if let Some(term) = slots::term_at(&text, w) {
+                let text = crate::win::text(self.edit);
+                if let Some(term) = slots::term_at(&text, m.w) {
                     self.edit_file_list_term(term);
                 }
             }
-            slotedit::WM_SLOT_SAVED if l != 0 => {
+            slotedit::WM_SLOT_SAVED if m.l != 0 => {
                 // What the save thread posted.
-                if let Some(saved) = parcel::take::<Saved>(&Msg::new(self.hwnd, msg, w, l)) {
+                if let Some(saved) = parcel::take::<Saved>(m) {
                     self.slots_saved(saved);
                 }
             }
@@ -152,7 +151,7 @@ impl App {
             self.pick_term_file(&term);
             return;
         }
-        let text = crate::wide::window_text(self.edit);
+        let text = crate::win::text(self.edit);
         let (title, names) = match term.slot {
             Some(n) => (
                 format!("Edit File List {n}"),
@@ -235,7 +234,7 @@ impl App {
         };
         let Some(path) = path else { return };
         let path = std::path::absolute(&path).unwrap_or(path);
-        let text = crate::wide::window_text(self.edit);
+        let text = crate::win::text(self.edit);
         // The box may have changed while the dialog was up: the term is
         // looked for again where it was.
         let Some(now) = slots::terms(&text)
@@ -402,8 +401,8 @@ impl App {
     }
 
     /// Wave 6's WM_APP messages (`WM_APP + 360..370`).
-    pub(super) fn lists_message(&self, msg: u32, _w: WPARAM, _l: LPARAM) {
-        if msg == crate::listedit::WM_EDITOR_CLOSED {
+    pub(super) fn lists_message(&self, m: &Msg) {
+        if m.id == crate::listedit::WM_EDITOR_CLOSED {
             self.editor_closed();
         }
     }

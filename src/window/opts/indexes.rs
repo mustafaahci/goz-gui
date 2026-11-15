@@ -16,7 +16,7 @@
 use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_AUTOCHECKBOX, ES_AUTOHSCROLL, ES_NUMBER, WM_APP, WS_EX_CLIENTEDGE, WS_TABSTOP,
@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::dialog::Class;
 use crate::indexes::{IndexConfig, IndexSettings, Key};
 use crate::options::{Page, RESTORE, Rows, checked, enable, order, set_check, set_text};
-use crate::win::{self, parcel};
+use crate::win::{self, Msg, parcel};
 use crate::window::App;
 
 // Everything's control ids.
@@ -439,8 +439,8 @@ impl Page for Indexes {
         }
     }
 
-    fn message(&self, _app: &App, page: HWND, msg: u32, _w: WPARAM, _l: LPARAM) -> Option<isize> {
-        if msg != WM_LOADED {
+    fn message(&self, _app: &App, page: HWND, m: &Msg) -> Option<isize> {
+        if m.id != WM_LOADED {
             return None;
         }
         let got = self
