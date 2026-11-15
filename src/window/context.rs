@@ -14,10 +14,6 @@
 //! in place, which the shell's cannot do outside Explorer); the others run
 //! in the shell, which shows its own questions.
 
-// Only `shell_menu_message` (raw parameters, as the window passes them
-// still) reads its lParam itself; `shell_menu_msg` replaces it.
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{LPARAM, POINT};
@@ -296,10 +292,9 @@ impl App {
     /// its submenus as they open and draws its own items. `Some` is the
     /// window's answer when the shell took the message; for
     /// WM_INITMENUPOPUP the window readies its own menus too.
-    // The window procedure calls `shell_menu_message` until it hands out
-    // its `Msg`.
-    #[allow(dead_code)]
-    pub(super) fn shell_menu_msg(&self, m: &Msg) -> Option<isize> {
+    /// A message of the shell's menu while it is up, passed to it: `Some`
+    /// with the answer when it took it.
+    pub(super) fn shell_menu_message(&self, m: &Msg) -> Option<isize> {
         let take = match m.id {
             WM_INITMENUPOPUP | WM_MENUCHAR => true,
             // An item a menu draws itself (not a control's).
@@ -307,35 +302,14 @@ impl App {
             WM_DRAWITEM => m.draw_item().is_some_and(|di| di.CtlType == ODT_MENU),
             _ => false,
         };
-        self.pass_to_shell_menu(take, m.id, m.w, m.l)
-    }
-
-    /// [`App::shell_menu_msg`] of a message by its raw parameters, as the
-    /// window procedure passes them until it hands out its `Msg`.
-    pub(super) fn shell_menu_message(&self, msg: u32, w: usize, l: isize) -> Option<isize> {
-        let owner_drawn = |l: isize| {
-            // SAFETY: WM_MEASUREITEM's and WM_DRAWITEM's lParam starts with
-            // the control type (MEASUREITEMSTRUCT, DRAWITEMSTRUCT).
-            unsafe { *(l as *const u32) == ODT_MENU }
-        };
-        let take = match msg {
-            WM_INITMENUPOPUP | WM_MENUCHAR => true,
-            WM_MEASUREITEM | WM_DRAWITEM => l != 0 && owner_drawn(l),
-            _ => false,
-        };
-        self.pass_to_shell_menu(take, msg, w, l)
-    }
-
-    /// A menu message `take`n for the shell's menu, passed to it.
-    fn pass_to_shell_menu(&self, take: bool, msg: u32, w: usize, l: isize) -> Option<isize> {
         if !take {
             return None;
         }
         // Out of the cell before the call: the shell's handler may send
         // the window more messages.
         let cm = self.shell_menu.borrow().clone()?;
-        let answer = cm.message(msg, w, l);
-        match msg {
+        let answer = cm.message(m);
+        match m.id {
             WM_MEASUREITEM | WM_DRAWITEM => answer.map(|_| 1),
             _ => answer,
         }

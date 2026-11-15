@@ -1497,7 +1497,7 @@ impl App {
         if matches!(
             msg,
             WM_INITMENUPOPUP | WM_MEASUREITEM | WM_DRAWITEM | WM_MENUCHAR
-        ) && let Some(answer) = self.shell_menu_message(msg, w, l)
+        ) && let Some(answer) = self.shell_menu_message(m)
             && msg != WM_INITMENUPOPUP
         {
             return answer;

@@ -22,17 +22,13 @@
 //! The cache is let go of when the window hides and trimmed to the items in
 //! view once the view has rested ([`Thumbs::release`], [`Thumbs::trim`]).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::UI::Shell::{SIIGBF_ICONONLY, SIIGBF_THUMBNAILONLY};
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, HBITMAP,
-};
+use windows_sys::Win32::Graphics::Gdi::HBITMAP;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows_sys::Win32::System::Registry::HKEY_CLASSES_ROOT;
 use windows_sys::Win32::System::Threading::INFINITE;
@@ -563,51 +559,6 @@ fn shell_thumbnail(path: &[u16], side: i32, is_dir: bool) -> Option<Bitmap> {
     // The shell's bitmap, copied above and no longer used, is deleted.
     drop(shell);
     out
-}
-
-/// A new 32-bit top-down DIB section `w` by `h` (all zero), and its pixels.
-///
-/// Still a raw pointer to GDI's memory, for `bigicon` and `bigicons`,
-/// which draw into the bitmap and read it back: the one item here not yet
-/// on `win` (`Bitmap::with_pixels` and `Bitmap::pixels` are the safe way),
-/// so this file keeps its `allow(unsafe_code)` until they move.
-pub fn dib(w: i32, h: i32) -> Option<(Bitmap, *mut core::ffi::c_void)> {
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    // SAFETY: a plain header for a DIB section that the returned `Bitmap`
-    // owns; its pixels stay valid until the bitmap is deleted.
-    unsafe {
-        let mut bi: BITMAPINFO = core::mem::zeroed();
-        bi.bmiHeader = BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w,
-            // Top-down.
-            biHeight: -h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            ..core::mem::zeroed()
-        };
-        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
-        let made = CreateDIBSection(
-            core::ptr::null_mut(),
-            &bi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            core::ptr::null_mut(),
-            0,
-        );
-        if made.is_null() {
-            return None;
-        }
-        let out = Bitmap {
-            handle: made as usize,
-            width: w,
-            height: h,
-        };
-        (!bits.is_null()).then_some((out, bits))
-    }
 }
 
 /// A copy of `src` as a 32-bit top-down DIB with premultiplied alpha. The

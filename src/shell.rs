@@ -14,8 +14,6 @@
 //! The `windows` crate brings the interfaces; the rest of goz-gui stays on
 //! `windows-sys`, whose handles are the same pointers.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -573,27 +571,9 @@ impl ContextMenu {
     /// A message of the menu while it is up (WM_INITMENUPOPUP,
     /// WM_MEASUREITEM, WM_DRAWITEM, WM_MENUCHAR), for the handlers that
     /// fill or draw their items; `Some` with the answer when one took it.
-    ///
-    /// Its parameters must be the message's as the system delivered it
-    /// (WM_MEASUREITEM's and WM_DRAWITEM's lParam is a pointer the handler
-    /// writes through), which this signature cannot vouch for: so this file
-    /// is not yet on `win`. [`ContextMenu::message_of`] takes the message
-    /// itself.
-    pub fn message(&self, msg: u32, w: usize, l: isize) -> Option<isize> {
-        // SAFETY: the message's own parameters, passed on unchanged, while
-        // the menu they are about is up (the callers pass on what their
-        // window procedure was delivered).
-        unsafe { self.menu.message_raw(msg, w, l) }
-    }
-
-    /// [`ContextMenu::message`] for a message as the window procedure got
-    /// it: WM_MEASUREITEM and WM_DRAWITEM only as the system delivered
-    /// them.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the window's procedures are not on win yet")
-    )]
-    pub fn message_of(&self, m: &Msg) -> Option<isize> {
+    /// WM_MEASUREITEM and WM_DRAWITEM are passed on only as the system
+    /// delivered them.
+    pub fn message(&self, m: &Msg) -> Option<isize> {
         self.menu.message(m)
     }
 }
@@ -820,7 +800,7 @@ mod tests {
                 sub as usize,
                 pos as isize,
             );
-            menu.message_of(&opened);
+            menu.message(&opened);
             let after = b7::menu_item_count(sub);
             if after > before {
                 grew.push((pos, before, after));
