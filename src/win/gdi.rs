@@ -251,7 +251,15 @@ pub fn draw_text(hdc: HDC, text: &[u16], rc: &mut RECT, format: DRAW_TEXT_FORMAT
     let len = i32::try_from(text.len()).unwrap_or(i32::MAX);
     // SAFETY: `len` units of `text`, read only (DT_MODIFYSTRING is masked
     // off); the rectangle is in-out.
-    unsafe { DrawTextW(hdc, text.as_ptr(), len, rc, format & !DT_MODIFYSTRING) }
+    unsafe {
+        DrawTextW(
+            hdc,
+            super::units_ptr(text),
+            len,
+            rc,
+            format & !DT_MODIFYSTRING,
+        )
+    }
 }
 
 /// DrawTextW of `text` in `rc` with DT_MODIFYSTRING added to `format`: the
@@ -303,7 +311,7 @@ pub fn ext_text_out(
             y,
             options,
             rc,
-            text.as_ptr(),
+            super::units_ptr(text),
             len,
             core::ptr::null(),
         ) != 0
@@ -315,7 +323,7 @@ pub fn text_extent(hdc: HDC, text: &[u16]) -> SIZE {
     let mut size = SIZE::default();
     let len = i32::try_from(text.len()).unwrap_or(i32::MAX);
     // SAFETY: `len` units of `text`; an out-struct.
-    unsafe { GetTextExtentPoint32W(hdc, text.as_ptr(), len, &mut size) };
+    unsafe { GetTextExtentPoint32W(hdc, super::units_ptr(text), len, &mut size) };
     size
 }
 
@@ -329,7 +337,7 @@ pub fn text_fit(hdc: HDC, text: &[u16], max: i32) -> (i32, SIZE) {
     unsafe {
         GetTextExtentExPointW(
             hdc,
-            text.as_ptr(),
+            super::units_ptr(text),
             len,
             max,
             &mut fit,
@@ -559,6 +567,27 @@ pub fn destroy_icon(icon: HICON) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_text_is_drawn_and_measured_without_a_dangling_pointer() {
+        use windows_sys::Win32::Graphics::Gdi::{DT_CALCRECT, DT_END_ELLIPSIS, DT_SINGLELINE};
+        // An empty slice's own pointer is dangling; DrawTextW reads the
+        // first unit even when told the text is empty (an empty column of
+        // a dialog's list crashed it so).
+        let dc = MemDc::compatible(core::ptr::null_mut());
+        let mut rc = RECT {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 20,
+        };
+        draw_text(dc.hdc(), &[], &mut rc, DT_SINGLELINE | DT_END_ELLIPSIS);
+        draw_text(dc.hdc(), &[], &mut rc, DT_CALCRECT | DT_SINGLELINE);
+        assert_eq!(text_extent(dc.hdc(), &[]).cx, 0);
+        assert_eq!(text_fit(dc.hdc(), &[], 50).0, 0);
+        // Drawn or not, nothing is read past the text.
+        let _ = ext_text_out(dc.hdc(), (0, 0), 0, None, &[]);
+    }
 
     #[test]
     fn a_long_path_is_shortened_in_its_own_buffer() {

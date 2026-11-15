@@ -394,7 +394,7 @@ impl OverlappedFile {
         let ok = unsafe {
             WriteFile(
                 handle,
-                data.as_ptr(),
+                super::bytes_ptr(data),
                 len_u32(data.len()),
                 core::ptr::null_mut(),
                 ov,

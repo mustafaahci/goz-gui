@@ -135,6 +135,29 @@ pub fn class_is(hwnd: HWND, name: &str) -> bool {
     want.next().is_none()
 }
 
+/// A pointer to the units of `s` for a call that takes a pointer and a
+/// length: a real address even when `s` is empty. An empty slice's own
+/// pointer is dangling (fine for Rust, as nothing is read), but parts of
+/// Windows read the first unit whatever the length (DrawTextW does).
+pub(crate) fn units_ptr(s: &[u16]) -> *const u16 {
+    static EMPTY: [u16; 1] = [0];
+    if s.is_empty() {
+        EMPTY.as_ptr()
+    } else {
+        s.as_ptr()
+    }
+}
+
+/// [`units_ptr`] for bytes.
+pub(crate) fn bytes_ptr(s: &[u8]) -> *const u8 {
+    static EMPTY: [u8; 1] = [0];
+    if s.is_empty() {
+        EMPTY.as_ptr()
+    } else {
+        s.as_ptr()
+    }
+}
+
 /// `hwnd`'s window class's name (empty for a window that is not there).
 pub fn class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];

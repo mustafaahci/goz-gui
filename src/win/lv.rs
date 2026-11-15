@@ -478,6 +478,9 @@ pub fn get_column(lv: HWND, at: i32, mask: u32) -> Option<(LVCOLUMNW, Option<Str
 
 /// The columns' display order (`count` of them: the header's item count).
 pub fn column_order(lv: HWND, count: usize) -> Vec<i32> {
+    if count == 0 {
+        return Vec::new();
+    }
     let mut order = vec![0i32; count];
     // SAFETY: LVM_GETCOLUMNORDERARRAY's lParam is an array of wParam ints.
     let ok = unsafe {
@@ -493,6 +496,9 @@ pub fn column_order(lv: HWND, count: usize) -> Vec<i32> {
 
 /// Sets the columns' display order.
 pub fn set_column_order(lv: HWND, order: &[i32]) -> bool {
+    if order.is_empty() {
+        return false;
+    }
     // SAFETY: LVM_SETCOLUMNORDERARRAY's lParam is an array of wParam ints.
     unsafe {
         send(

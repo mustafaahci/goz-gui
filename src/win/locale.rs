@@ -32,7 +32,7 @@ pub fn normalize(form: NORM_FORM, src: &[u16], out: &mut [u16]) -> i32 {
     unsafe {
         NormalizeString(
             form,
-            src.as_ptr(),
+            super::units_ptr(src),
             len_i32(src.len()),
             out_ptr(out),
             len_i32(out.len()),
@@ -47,9 +47,9 @@ pub fn compare_ordinal(a: &[u16], b: &[u16], ignore_case: bool) -> COMPARESTRING
     // SAFETY: two buffers, each read for its own length.
     unsafe {
         CompareStringOrdinal(
-            a.as_ptr(),
+            super::units_ptr(a),
             len_i32(a.len()),
-            b.as_ptr(),
+            super::units_ptr(b),
             len_i32(b.len()),
             ignore_case.into(),
         )
@@ -74,7 +74,7 @@ pub fn upper_invariant(src: &[u16], dst: &mut [u16]) -> i32 {
         LCMapStringEx(
             LOCALE_NAME_INVARIANT,
             LCMAP_UPPERCASE,
-            src.as_ptr(),
+            super::units_ptr(src),
             len_i32(src.len()),
             out_ptr(dst),
             len_i32(dst.len()),
@@ -96,7 +96,7 @@ pub fn wide_to_multi_byte(code_page: u32, wide: &[u16], out: &mut [u8]) -> i32 {
         WideCharToMultiByte(
             code_page,
             0,
-            wide.as_ptr(),
+            super::units_ptr(wide),
             len_i32(wide.len()),
             out_ptr(out),
             len_i32(out.len()),
@@ -115,9 +115,9 @@ pub fn multi_byte_to_wide(cp: u32, flags: u32, src: &[u8], out: &mut [u16]) -> u
         MultiByteToWideChar(
             cp,
             flags,
-            src.as_ptr(),
+            super::bytes_ptr(src),
             len_i32(src.len()),
-            out.as_mut_ptr(),
+            out_ptr(out),
             len_i32(out.len()),
         )
     };

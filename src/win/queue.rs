@@ -102,7 +102,10 @@ impl AccelTable {
     /// A table of `entries` (Windows copies them); `None` for an empty one,
     /// which cannot be made, or when Windows would not make it.
     pub fn new(entries: &[ACCEL]) -> Option<AccelTable> {
-        // SAFETY: the entries and their count.
+        if entries.is_empty() {
+            return None;
+        }
+        // SAFETY: the entries and their count (at least one).
         let h = unsafe { CreateAcceleratorTableW(entries.as_ptr(), super::len_i32(entries.len())) };
         (!h.is_null()).then_some(AccelTable(h))
     }

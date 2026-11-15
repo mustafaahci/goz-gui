@@ -132,6 +132,12 @@ pub fn set_rect_np(e: HWND, rc: &RECT) {
 
 /// The tab stops of a multiline box, in dialog template units.
 pub fn set_tab_stops(e: HWND, stops: &[u32]) {
-    // SAFETY: EM_SETTABSTOPS's lParam is an array of wParam u32s.
-    unsafe { super::send_raw(e, EM_SETTABSTOPS, stops.len(), stops.as_ptr() as isize) };
+    let ptr = if stops.is_empty() {
+        0
+    } else {
+        stops.as_ptr() as isize
+    };
+    // SAFETY: EM_SETTABSTOPS's lParam is an array of wParam u32s (none for
+    // none: the defaults).
+    unsafe { super::send_raw(e, EM_SETTABSTOPS, stops.len(), ptr) };
 }
