@@ -10,40 +10,95 @@
 //!
 //! - **The system behaves as documented.** user32, gdi32, comctl32, shell32
 //!   and ole32 check the handles they are given: a stale or wrong `HWND`,
-//!   `HDC`, `HMENU` or GDI object is reported as a failure, never followed
-//!   as a pointer. Handles are therefore plain values here, `Copy`, and any
-//!   value is a valid argument.
+//!   `HDC`, `HMENU`, `HICON`, `HACCEL` or GDI object is reported as a
+//!   failure, never followed as a pointer. Those handles are therefore
+//!   plain values here, `Copy`, and any value is a valid argument. Two
+//!   kinds of "handle" are not checked, and are not plain values here:
+//!   - An image list (`HIMAGELIST`) is an object's address (an
+//!     `IImageList*`, as SHGetImageList documents), followed by every call.
+//!     A list is an [`imagelist::ImageList`] (owned, destroyed with its last
+//!     clone) or an [`imagelist::SystemList`] (the shell's, kept for the
+//!     process); no safe function takes a raw one or destroys one, and a
+//!     control given one keeps it alive as long as it shows it.
+//!   - A tree view's item (`HTREEITEM`) is the address of the item's memory
+//!     in its tree, which comctl32 checks only by a signature there, never
+//!     against the tree it is sent to. Items are [`tv::Item`]s, made only
+//!     from the tree's own answers and notifications and naming their tree,
+//!     and taken only while the tree has them: a subclass of the tree sees
+//!     every item inserted and deleted and the tree's end, and an item is
+//!     refused from the moment its deletion starts. A stale item names, at
+//!     worst, a new item the same tree put at its address: wrong, not
+//!     unsound.
 //! - **A message's parameters mean what its documentation says.** A message
-//!   below `WM_USER` means the same to every window class, so a wrapper for
-//!   one may be sent to any window. A message from `WM_USER` up is defined
-//!   by its control class (`LVM_FIRST` and `DTM_FIRST` are both `0x1000`), so
-//!   the wrappers for those check the window's class first and do nothing
-//!   for a window of another class.
+//!   below `WM_USER` is the system's: every window class of the system and
+//!   of the common controls means by it what the system documents, so a
+//!   wrapper for one may be sent to any window. Rich Edit is the documented
+//!   exception: it reads some edit messages otherwise (EM_CHARFROMPOS takes
+//!   a POINTL's address there, EM_POSFROMCHAR one to write to), and those
+//!   are sent only to an Edit ([`edit`] lists the others it checked). A
+//!   message from `WM_USER` up is defined by its control class (`LVM_FIRST`
+//!   and `DTM_FIRST` are both `0x1000`), so the wrappers for those check the
+//!   window's class first and do nothing for a window of another class. A
+//!   reply that sizes a buffer for the next message is never taken from
+//!   whatever may answer it (a subclass): LB_GETTEXTLEN goes, with
+//!   LB_GETTEXT, to the list box's class's own procedure ([`listbox`]).
 //! - **What the system delivers is what it documents.** A procedure's
 //!   `lParam` for `WM_NOTIFY`, `WM_DRAWITEM` and the like points at the
 //!   structure the message defines. Only a [`Msg`] the system delivered
-//!   hands those out; one made by goz-gui's own code does not.
-//! - **goz-gui's private messages (`WM_APP` and up) carry no pointers.** A
-//!   value that has to travel with one goes as a [`parcel`].
+//!   hands those out, as a [`View`]: read-only, but for the structures with
+//!   no pointer field ([`msg::Writable`]); what a notification asks its
+//!   procedure to write goes in through a setter that checks the
+//!   notification and writes through the pointers the system gave. A
+//!   message made by goz-gui's own code hands out nothing.
+//! - **Another process of the user is as trusted as goz-gui.** A process of
+//!   the same user and integrity can send or post goz-gui's windows any
+//!   message with any parameters, and the system marshals few of them:
+//!   `WM_NOTIFY`, `HDM_LAYOUT`, the menu bar's `0x91` and `0x92` and
+//!   `WM_DROPFILES` from such a process carry whatever addresses it chose.
+//!   The layer, like any Win32 program, trusts what its message queue
+//!   delivers: that process can already do anything goz-gui can (write its
+//!   memory, run code in it). What other programs leave on the clipboard is
+//!   read from a copy, no further than its size.
+//! - **goz-gui's private messages (`WM_APP` up to `0xC000`) carry no
+//!   pointers,** and go only to goz-gui's own windows (of this process,
+//!   handled by a trampoline) and message loops, which read them so; to
+//!   another window the same numbers may be its own messages. A value that
+//!   has to travel with one goes as a [`parcel`].
+//! - **Some undocumented interfaces are as described.** The menu bar's
+//!   drawing messages and their structures ([`menubar`], laid out so since
+//!   Windows 10 1809), and uxtheme's dark-mode exports at ordinals 133, 135
+//!   and 136 with the signatures [`uxtheme`] gives them, looked up only on
+//!   build 17763 (1809) or later. A shell folder given an item ID list it
+//!   did not make (another folder's, a shortcut's) checks it rather than
+//!   reading past it ([`shell`]'s ID lists are the shell's own, so each is
+//!   well-formed).
 //! - **In-process COM servers keep their interfaces' contracts.** The calls
 //!   here load third-party code into the process: shell extensions
 //!   (context menu, icon and thumbnail handlers), WIC's codecs, namespace
 //!   extensions. Like the system, they write no further than the buffers
-//!   they are given, and a server's DllCanUnloadNow says it can go only
-//!   when nothing of it is in use or running. Code in the process could
-//!   break any promise of Rust's anyway; this is the narrow part of that
-//!   trust the layer relies on, stated because it is about code that is not
-//!   the system's. The second half is relied on by one call alone,
-//!   [`com::Apartment::end_unloading_unused`], which goz-gui makes only as
-//!   the preview's thread ends, its objects released; never on the UI
-//!   thread, where a context menu handler is known to leave a thread
-//!   behind (see `crate::shell::ContextMenu`).
+//!   they are given. Code in the process could break any promise of Rust's
+//!   anyway; this is the narrow part of that trust the layer relies on,
+//!   stated because it is about code that is not the system's. COM is never
+//!   uninitialized on a thread ([`com::Apartment`]), so no object outlives
+//!   the libraries it runs from. One call more relies on servers' word:
+//!   [`com::Apartment::end_unloading_unused`] (CoFreeUnusedLibrariesEx with
+//!   no delay), which unloads the DLLs COM loaded for the calling thread's
+//!   apartments whose DllCanUnloadNow says they can go. goz-gui makes it as
+//!   the preview's thread ends, its objects released, and it does nothing
+//!   on a thread whose apartment was kept (the UI thread's) or that made an
+//!   Explorer context menu, whose handlers are known to answer wrongly
+//!   (Work Folders' says yes while a thread of its own lives: see
+//!   `crate::shell::ContextMenu`). The assumption is so: the COM servers a
+//!   thread that neither kept its apartment nor made a context menu loads
+//!   answer DllCanUnloadNow truthfully, saying they can go only when
+//!   nothing of theirs is in use or running.
 //!
 //! The procedures goz-gui gives Windows (window, dialog and subclass
 //! procedures) are the trampolines here; they hand each message to a safe
 //! Rust closure as a [`Msg`]. The closure is kept alive for as long as a
 //! call to it runs, so a window that is destroyed by its own handler does
-//! not free what that handler is using.
+//! not free what that handler is using; a COM object of goz-gui's holds a
+//! reference to itself while a method of it runs a closure.
 
 #![allow(unsafe_code)]
 #![warn(clippy::undocumented_unsafe_blocks)]
