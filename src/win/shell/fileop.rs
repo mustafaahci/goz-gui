@@ -11,6 +11,7 @@ use windows::Win32::UI::Shell::{
     IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem,
 };
 use windows::core::{HRESULT, PCWSTR, implement};
+use windows_core::IUnknownImpl;
 use windows_sys::Win32::Foundation::HWND;
 
 use super::ShellItem;
@@ -242,7 +243,9 @@ impl ProgressSink {
     }
 }
 
-/// The COM object behind a [`ProgressSink`].
+/// The COM object behind a [`ProgressSink`]. A method that runs the
+/// closure holds a reference to the object meanwhile: the closure may let
+/// the last other one go.
 #[implement(IFileOperationProgressSink)]
 struct Sink {
     on_post: OnThread<OnPost>,
@@ -282,6 +285,7 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
         hr: HRESULT,
         new: ItemRef<'_>,
     ) -> R {
+        let _hold = self.to_object();
         self.post(ItemOp::Rename, item, new, hr);
         Ok(())
     }
@@ -297,6 +301,7 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
         hr: HRESULT,
         new: ItemRef<'_>,
     ) -> R {
+        let _hold = self.to_object();
         self.post(ItemOp::Move, item, new, hr);
         Ok(())
     }
@@ -312,6 +317,7 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
         hr: HRESULT,
         new: ItemRef<'_>,
     ) -> R {
+        let _hold = self.to_object();
         self.post(ItemOp::Copy, item, new, hr);
         Ok(())
     }
@@ -319,6 +325,7 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
         Ok(())
     }
     fn PostDeleteItem(&self, _f: u32, item: ItemRef<'_>, hr: HRESULT, new: ItemRef<'_>) -> R {
+        let _hold = self.to_object();
         self.post(ItemOp::Delete, item, new, hr);
         Ok(())
     }
@@ -335,6 +342,7 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
         hr: HRESULT,
         new: ItemRef<'_>,
     ) -> R {
+        let _hold = self.to_object();
         self.post(ItemOp::New, folder, new, hr);
         Ok(())
     }

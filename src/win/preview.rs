@@ -28,6 +28,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{HACCEL as WHACCEL, MSG as WMSG};
 use windows::core::{GUID, HRESULT, Interface, PCWSTR, PWSTR, Ref, Result, implement};
+use windows_core::IUnknownImpl;
 use windows_sys::Win32::Foundation::{
     CloseHandle, FILETIME, GENERIC_READ, HANDLE, HWND, INVALID_HANDLE_VALUE, POINT,
 };
@@ -36,7 +37,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
     FILE_SHARE_MODE, GetFileInformationByHandle, OPEN_EXISTING, ReadFile, SetFilePointerEx,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{HACCEL, MSG};
+use windows_sys::Win32::UI::WindowsAndMessaging::{CopyAcceleratorTableW, HACCEL, MSG};
 
 use super::shell::ShellItem;
 use super::{nul_ended, sys, wz_units};
@@ -113,7 +114,7 @@ impl Handler {
             lfClipPrecision: FONT_CLIP_PRECISION(font.lfClipPrecision),
             lfQuality: FONT_QUALITY(font.lfQuality),
             lfPitchAndFamily: font.lfPitchAndFamily,
-            lfFaceName: font.lfFaceName,
+            lfFaceName: super::gdi::face_name_ended(font.lfFaceName),
         };
         // SAFETY: values, and a font structure read during the call.
         unsafe {
@@ -190,10 +191,10 @@ pub struct Frame(IPreviewHandlerFrame);
 
 impl Frame {
     /// A frame whose GetWindowContext answers the accelerator table and its
-    /// count `context` gives, and whose TranslateAccelerator hands
-    /// `translate` a copy of each message the handler passes on (true: it
-    /// was one of the window's keys, S_OK; false: S_FALSE, the handler's to
-    /// use).
+    /// count `context` gives (the count no more than the table holds), and
+    /// whose TranslateAccelerator hands `translate` a copy of each message
+    /// the handler passes on (true: it was one of the window's keys, S_OK;
+    /// false: S_FALSE, the handler's to use).
     pub fn new(
         context: impl Fn() -> (HACCEL, u32) + 'static,
         translate: impl Fn(&MSG) -> bool + 'static,
@@ -210,6 +211,8 @@ impl Frame {
 
 /// The object behind a [`Frame`]. Not agile: calls from elsewhere come
 /// through its thread's apartment, one at a time, as its closures need.
+/// Each method holds a reference to the object while it runs a closure,
+/// which may let the last other one go (a handler's site, say).
 #[implement(IPreviewHandlerFrame, Agile = false)]
 struct KeyFrame {
     context: Box<dyn Fn() -> (HACCEL, u32)>,
@@ -218,14 +221,19 @@ struct KeyFrame {
 
 impl IPreviewHandlerFrame_Impl for KeyFrame_Impl {
     fn GetWindowContext(&self) -> Result<PREVIEWHANDLERFRAMEINFO> {
+        let _hold = self.to_object();
         let (table, count) = (self.context)();
+        // SAFETY: no buffer: asks the table (a handle the system checks)
+        // how many entries it has; 0 for none.
+        let entries = unsafe { CopyAcceleratorTableW(table, core::ptr::null_mut(), 0) };
         Ok(PREVIEWHANDLERFRAMEINFO {
             haccel: WHACCEL(table),
-            cAccelEntries: count,
+            cAccelEntries: count.min(u32::try_from(entries).unwrap_or(0)),
         })
     }
 
     fn TranslateAccelerator(&self, pmsg: *const WMSG) -> Result<()> {
+        let _hold = self.to_object();
         // SAFETY: the handler passes a message of its own, alive across the
         // call, or null; it is copied.
         let msg = unsafe { pmsg.as_ref() }.ok_or(windows::core::Error::from(E_POINTER))?;
@@ -498,6 +506,26 @@ mod tests {
             }
         });
         Ok((st.cbSize, name))
+    }
+
+    #[test]
+    fn a_frame_s_key_count_is_no_more_than_its_table_holds() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ACCEL, FVIRTKEY};
+        let keys = [ACCEL {
+            fVirt: FVIRTKEY,
+            key: 0x74,
+            cmd: 1,
+        }; 2];
+        let table = std::rc::Rc::new(crate::win::queue::AccelTable::new(&keys).unwrap());
+        let held = std::rc::Rc::clone(&table);
+        let frame = Frame::new(move || (held.handle(), 99), |_| false);
+        // SAFETY: a call on this thread's frame.
+        let info = unsafe { frame.0.GetWindowContext() }.expect("a context");
+        assert_eq!(info.cAccelEntries, 2);
+        let none = Frame::new(|| (core::ptr::null_mut(), 5), |_| false);
+        // SAFETY: as above.
+        let info = unsafe { none.0.GetWindowContext() }.expect("a context");
+        assert_eq!(info.cAccelEntries, 0);
     }
 
     #[test]

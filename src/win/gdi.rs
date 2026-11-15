@@ -501,9 +501,23 @@ pub fn line_to(hdc: HDC, x: i32, y: i32) {
 }
 
 /// A font as `lf` describes it, to delete (null if it could not be made).
+/// Its face name is read up to its last unit, which is made a NUL.
 pub fn create_font(lf: &LOGFONTW) -> HFONT {
-    // SAFETY: an in-struct (the face name is read within its array).
-    unsafe { CreateFontIndirectW(lf) }
+    let lf = LOGFONTW {
+        lfFaceName: face_name_ended(lf.lfFaceName),
+        ..*lf
+    };
+    // SAFETY: an in-struct whose face name ends with a NUL within its
+    // array.
+    unsafe { CreateFontIndirectW(&lf) }
+}
+
+/// A LOGFONTW's face name with its last unit a NUL, so a call reading it as
+/// a string stops within the array.
+pub(crate) fn face_name_ended(face: [u16; 32]) -> [u16; 32] {
+    let mut face = face;
+    face[31] = 0;
+    face
 }
 
 /// A brush of colour `c`, to delete.
