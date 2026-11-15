@@ -1,5 +1,6 @@
-//! The system: the keyboard and mouse state, metrics and DPI, monitors,
-//! sounds, the last error, its folder and environment.
+//! The system: the keyboard and mouse state, the current message's time,
+//! metrics and DPI, monitors, sounds, the last error and its text, the
+//! system folder and the environment.
 
 use windows_sys::Win32::Foundation::{GetLastError, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{

@@ -362,7 +362,9 @@ pub fn item_text(lv: HWND, item: i32, sub: i32, max: usize) -> String {
 /// Inserts `item` (at `item.iItem`), with `text`; its index, -1 if not.
 pub fn insert_item(lv: HWND, item: LVITEMW, text: Option<&str>) -> i32 {
     with_item(item, text, |it| {
-        // SAFETY: as in `set_item`.
+        // SAFETY: LVM_INSERTITEMW's lParam is an LVITEMW, read during the
+        // call, whose pointers `with_item` set: its text (alive with `it`)
+        // or none, and no column arrays.
         unsafe { send(lv, LVM_INSERTITEMW, 0, (&raw const *it) as isize) as i32 }
     })
 }

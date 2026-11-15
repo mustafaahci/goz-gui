@@ -25,6 +25,19 @@
 //!   hands those out; one made by goz-gui's own code does not.
 //! - **goz-gui's private messages (`WM_APP` and up) carry no pointers.** A
 //!   value that has to travel with one goes as a [`parcel`].
+//! - **In-process COM servers keep their interfaces' contracts.** The calls
+//!   here load third-party code into the process: shell extensions
+//!   (context menu, icon and thumbnail handlers), WIC's codecs, namespace
+//!   extensions. Like the system, they write no further than the buffers
+//!   they are given, and a server's DllCanUnloadNow says it can go only
+//!   when nothing of it is in use or running. Code in the process could
+//!   break any promise of Rust's anyway; this is the narrow part of that
+//!   trust the layer relies on, stated because it is about code that is not
+//!   the system's. The second half is relied on by one call alone,
+//!   [`com::Apartment::end_unloading_unused`], which goz-gui makes only as
+//!   the preview's thread ends, its objects released; never on the UI
+//!   thread, where a context menu handler is known to leave a thread
+//!   behind (see `crate::shell::ContextMenu`).
 //!
 //! The procedures goz-gui gives Windows (window, dialog and subclass
 //! procedures) are the trampolines here; they hand each message to a safe

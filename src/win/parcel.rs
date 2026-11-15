@@ -63,7 +63,7 @@ pub fn post<T: Send + 'static>(hwnd: HWND, msg: u32, w: WPARAM, value: T) -> boo
     false
 }
 
-/// Takes the `T` that came with `m` (sent with [`post`] or [`send`]);
+/// Takes the `T` that came with `m` (sent with [`post`]);
 /// `None` if `m` brought none, or one of another type (which is left).
 pub fn take<T: 'static>(m: &Msg) -> Option<T> {
     let mut w = WAITING.lock().unwrap_or_else(|e| e.into_inner());

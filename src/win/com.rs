@@ -1,6 +1,6 @@
-//! COM apartments. A thread's COM objects live while its apartment does,
-//! so the apartment is a guard: uninitialized when it drops, after the
-//! objects the code that holds it made (which are dropped first, being
+//! COM apartments, and OLE. A thread's COM objects live while its apartment
+//! does, so the apartment is a guard: uninitialized when it drops, after
+//! the objects the code that holds it made (which are dropped first, being
 //! made later, or are tied to the guard's scope).
 
 use core::marker::PhantomData;

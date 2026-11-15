@@ -40,8 +40,7 @@ pub fn item_rect(h: HWND, i: i32) -> Option<RECT> {
 }
 
 /// HDM_HITTEST's answer at `pt` (client coordinates): the item there, -1
-/// for none. ([`hit_test`] gives the filled structure, whose item a header
-/// may set even where it answers -1.)
+/// for none.
 pub fn item_at(h: HWND, pt: POINT) -> i32 {
     let mut ht = HDHITTESTINFO {
         pt,

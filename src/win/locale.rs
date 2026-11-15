@@ -1,6 +1,6 @@
 //! Text as the system's national language support has it: Unicode
-//! normalization, comparisons, case, code pages, and the user's formats of
-//! dates, times and sizes. Every buffer a call writes is a slice given in,
+//! normalization, comparisons, case, code pages (the ANSI one among them),
+//! and the user's formats of dates and times. Every buffer a call writes is a slice given in,
 //! written no further than its length.
 
 use windows_sys::Win32::Foundation::SYSTEMTIME;

@@ -6,9 +6,10 @@
 //! window's own procedure nests: the depth counts both). When the outermost
 //! of them returns, the drop is finished (`DragFinish`). [`Msg::dropped_files`]
 //! reads it only while it is in flight, so never after it is freed, and no
-//! handler frees it itself. `Msg::forward` does not pass a WM_DROPFILES on,
-//! so no window outside goz-gui's procedures frees it either (the system's
-//! controls do not handle WM_DROPFILES).
+//! handler frees it itself. No function here sends a WM_DROPFILES on to
+//! another window (`send_plain` does not take it), so no window outside
+//! goz-gui's procedures frees it either (the system's controls do not
+//! handle WM_DROPFILES).
 //!
 //! [`Msg::dropped_files`]: super::Msg::dropped_files
 
