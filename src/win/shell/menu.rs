@@ -15,7 +15,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     HMENU, SW_SHOWNORMAL, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
 };
 
+use std::cell::Cell;
+
+use windows_sys::Win32::UI::Controls::ODT_MENU;
+
 use crate::win::len_u32;
+use crate::win::menu::holds_drawn_item;
 use crate::win::msg::Msg;
 
 /// CMIC_MASK_HASLINKNAME and CMIC_MASK_HASTITLE (SEE_MASK_*'s values): the
@@ -28,6 +33,9 @@ pub struct ShellMenu {
     menu: IContextMenu,
     menu2: Option<IContextMenu2>,
     menu3: Option<IContextMenu3>,
+    /// The menu its handlers filled ([`ShellMenu::query`]): only an item
+    /// of it, or of a menu under it, is passed to them to measure or draw.
+    filled: Cell<HMENU>,
 }
 
 impl ShellMenu {
@@ -40,6 +48,7 @@ impl ShellMenu {
             menu2: menu.cast().ok(),
             menu3: menu.cast().ok(),
             menu,
+            filled: Cell::new(core::ptr::null_mut()),
         }
     }
 
@@ -47,6 +56,7 @@ impl ShellMenu {
     /// ids from `first` to `last`, as CMF_* `flags` ask (QueryContextMenu);
     /// how many ids they used, `None` if it failed.
     pub fn query(&self, menu: HMENU, at: u32, first: u32, last: u32, flags: u32) -> Option<u32> {
+        self.filled.set(menu);
         // SAFETY: a menu handle (user32 checks it, as the handlers add to
         // it); no pointers.
         let hr = unsafe {
@@ -116,20 +126,33 @@ impl ShellMenu {
     /// A message of the menu while it is up, for the handlers that fill
     /// their submenus as they open (WM_INITMENUPOPUP, WM_MENUCHAR) or draw
     /// their own items (WM_MEASUREITEM, WM_DRAWITEM: only as the system
-    /// delivered them); `Some` with the answer when one took it, `None` for
-    /// any other message.
+    /// delivered them, and only for an item of the menu they filled or of
+    /// a menu under it, whose value is theirs); `Some` with the answer
+    /// when one took it, `None` for any other message.
     pub fn message(&self, m: &Msg) -> Option<isize> {
         // The structure a delivered WM_MEASUREITEM or WM_DRAWITEM points
         // at, held as a view (kept from any other use) across the call.
         let measure;
         let draw;
+        let filled = self.filled.get();
         let l = match m.id {
             WM_MEASUREITEM => {
                 measure = m.measure_item()?;
+                let ours = measure.CtlType == ODT_MENU
+                    && holds_drawn_item(filled, None, measure.itemID, measure.itemData);
+                if !ours {
+                    return None;
+                }
                 measure.as_ptr() as isize
             }
             WM_DRAWITEM => {
                 draw = m.draw_item()?;
+                let within = draw.hwndItem as HMENU;
+                let ours = draw.CtlType == ODT_MENU
+                    && holds_drawn_item(filled, Some(within), draw.itemID, draw.itemData);
+                if !ours {
+                    return None;
+                }
                 draw.as_ptr() as isize
             }
             // Their parameters are a menu handle and integers.
@@ -141,7 +164,8 @@ impl ShellMenu {
             let mut result = WLRESULT(0);
             // SAFETY: the message's parameters as the system delivered them
             // (WM_MEASUREITEM's and WM_DRAWITEM's structure lent by the
-            // view above, which the handler may write to), passed on while
+            // view above, which the handler may write to, about an item of
+            // the menu it filled whose value is its own), passed on while
             // the menu they are about is up; the answer comes into a local.
             unsafe { m3.HandleMenuMsg2(m.id, w, l, Some(&mut result)) }.ok()?;
             return Some(result.0);

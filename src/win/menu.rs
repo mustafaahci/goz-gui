@@ -398,12 +398,45 @@ fn owner_drawn(menu: HMENU, pos: u32) -> Option<(u32, usize)> {
     (ok && drawn).then_some((mii.wID, mii.dwItemData))
 }
 
+/// Whether `root` or a menu under it (`within`, when given: that one only,
+/// if it is `root` or under it) has an item its owner draws whose command
+/// is `id` and whose owner's value is `data`.
+pub(crate) fn holds_drawn_item(root: HMENU, within: Option<HMENU>, id: u32, data: usize) -> bool {
+    /// How deep submenus are looked into (menus nest a few levels).
+    const DEPTH: usize = 16;
+    let mut todo = vec![(root, 0)];
+    let mut seen = Vec::new();
+    while let Some((menu, depth)) = todo.pop() {
+        if menu.is_null() || depth > DEPTH || seen.contains(&menu) {
+            continue;
+        }
+        seen.push(menu);
+        let n = u32::try_from(count(menu)).unwrap_or(0);
+        for pos in 0..n {
+            if within.is_none_or(|w| w == menu) && owner_drawn(menu, pos) == Some((id, data)) {
+                return true;
+            }
+            let mut mii = info(MIIM_SUBMENU);
+            // SAFETY: an out-struct with its size; no text is read.
+            if unsafe { GetMenuItemInfoW(menu, pos, 1, &mut mii) } != 0 {
+                todo.push((mii.hSubMenu, depth + 1));
+            }
+        }
+    }
+    false
+}
+
 /// What `owner` measures item `pos` of `menu` at, asked as the menu loop
 /// asks before it shows an item its owner draws (WM_MEASUREITEM, with
 /// the item's command and value as the menu holds them): its width and
-/// height. `None` if there is no such item, or its owner does not draw
-/// it.
+/// height. `None` if there is no such item, its owner does not draw it,
+/// or `owner` is not one of goz-gui's own windows (whose procedure is a
+/// trampoline: another window's may read the value as an address of its
+/// own, for a menu that is not its).
 pub fn measure_item(owner: HWND, menu: HMENU, pos: u32) -> Option<(u32, u32)> {
+    if !super::is_goz_window(owner) {
+        return None;
+    }
     let (id, data) = owner_drawn(menu, pos)?;
     let mut mis = MEASUREITEMSTRUCT {
         CtlType: ODT_MENU,
@@ -414,10 +447,12 @@ pub fn measure_item(owner: HWND, menu: HMENU, pos: u32) -> Option<(u32, u32)> {
         itemData: data,
     };
     // SAFETY: WM_MEASUREITEM's lParam is a MEASUREITEMSTRUCT: this one,
-    // alive and writable for the call. The item is one its owner draws,
-    // and its command and value are the ones `menu` holds for it: what
-    // the menu loop sends with this message to the window it shows the
-    // menu for (see `track`). Its other fields are numbers.
+    // alive and writable for the call, to one of goz-gui's own windows. The
+    // item is one its owner draws, and its command and value are the ones
+    // `menu` holds for it: what the menu loop sends with this message to
+    // the window it shows the menu for (see `track`), and what a handler
+    // the window passes it on to checks is its own
+    // (`shell::ShellMenu::message`). Its other fields are numbers.
     unsafe { send_raw(owner, WM_MEASUREITEM, 0, (&raw mut mis) as LPARAM) };
     Some((mis.itemWidth, mis.itemHeight))
 }
@@ -425,8 +460,12 @@ pub fn measure_item(owner: HWND, menu: HMENU, pos: u32) -> Option<(u32, u32)> {
 /// Has `owner` draw item `pos` of `menu` into `hdc`, in `rc`, as the
 /// menu loop asks (WM_DRAWITEM, the whole item, in no particular state,
 /// with its command and value as the menu holds them). False if there
-/// is no such item, or its owner does not draw it.
+/// is no such item, its owner does not draw it, or `owner` is not one of
+/// goz-gui's own windows (as for [`measure_item`]).
 pub fn draw_item(owner: HWND, menu: HMENU, pos: u32, hdc: HDC, rc: RECT) -> bool {
+    if !super::is_goz_window(owner) {
+        return false;
+    }
     let Some((id, data)) = owner_drawn(menu, pos) else {
         return false;
     };
@@ -442,9 +481,10 @@ pub fn draw_item(owner: HWND, menu: HMENU, pos: u32, hdc: HDC, rc: RECT) -> bool
         itemData: data,
     };
     // SAFETY: WM_DRAWITEM's lParam is a DRAWITEMSTRUCT: this one, alive
-    // (and writable, as a handler may treat it) for the call. Its
-    // command and value are the ones `menu` holds for the item, as in
-    // `measure_item`; the menu and the DC are handles, the rest numbers.
+    // (and writable, as a handler may treat it) for the call, to one of
+    // goz-gui's own windows. Its command and value are the ones `menu`
+    // holds for the item, as in `measure_item`; the menu and the DC are
+    // handles, the rest numbers.
     unsafe { send_raw(owner, WM_DRAWITEM, 0, (&raw mut dis) as LPARAM) };
     true
 }
@@ -598,8 +638,36 @@ mod tests {
         let canvas = crate::win::dib::Canvas::new(30, 12).unwrap();
         assert!(draw_item(owner, menu, 0, canvas.hdc(), RECT::default()));
         assert_eq!(seen.get(), (42, 7, menu));
+        // Only to one of goz-gui's own windows, not to a window of the
+        // system's classes.
+        let other = class::create_plain(&Create {
+            ex_style: 0,
+            class: "Static",
+            title: "",
+            style: 0,
+            rect: (0, 0, 0, 0),
+            parent: HWND_MESSAGE,
+            menu: core::ptr::null_mut(),
+        });
+        assert!(!other.is_null());
+        assert_eq!(measure_item(other, menu, 0), None);
+        assert!(!draw_item(other, menu, 0, canvas.hdc(), RECT::default()));
+        // The item is found under a menu that holds the one it is in.
+        let root = create_popup();
+        assert!(append(root, &NewItem::submenu("Sub", menu)));
+        assert!(holds_drawn_item(root, None, 42, 7));
+        assert!(holds_drawn_item(root, Some(menu), 42, 7));
+        assert!(
+            !holds_drawn_item(root, Some(root), 42, 7),
+            "not in that menu"
+        );
+        assert!(!holds_drawn_item(root, None, 42, 8), "another value");
+        let other_menu = create_popup();
+        assert!(!holds_drawn_item(other_menu, None, 42, 7));
         assert!(crate::win::destroy(owner));
-        assert!(destroy(menu));
+        assert!(crate::win::destroy(other));
+        assert!(destroy(root));
+        assert!(destroy(other_menu));
     }
 
     #[test]
