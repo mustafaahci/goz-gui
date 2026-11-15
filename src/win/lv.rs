@@ -339,19 +339,19 @@ pub fn item_state(lv: HWND, item: i32, mask: u32) -> u32 {
 /// Sets the state bits in `mask` of item `item` (-1 for every item) to
 /// `state`.
 pub fn set_item_state(lv: HWND, item: i32, state: u32, mask: u32) -> bool {
-    let it = LVITEMW {
+    let mut it = LVITEMW {
         state,
         stateMask: mask,
         ..Default::default()
     };
     // SAFETY: LVM_SETITEMSTATE's lParam is an LVITEMW (only its state
-    // fields read), alive for the call.
+    // fields read; mutable, as the list may write it), alive for the call.
     unsafe {
         send(
             lv,
             LVM_SETITEMSTATE,
             item as isize as usize,
-            (&raw const it) as isize,
+            (&raw mut it) as isize,
         ) != 0
     }
 }
@@ -483,7 +483,7 @@ fn text_of(it: &LVITEMW, buf: &[u16]) -> String {
 /// item's text is: the list's, or a callback's).
 pub fn item_text(lv: HWND, item: i32, sub: i32, max: usize) -> String {
     let mut buf = vec![0u16; max.max(1)];
-    let it = LVITEMW {
+    let mut it = LVITEMW {
         iSubItem: sub,
         pszText: buf.as_mut_ptr(),
         cchTextMax: super::len_i32(buf.len()),
@@ -491,13 +491,14 @@ pub fn item_text(lv: HWND, item: i32, sub: i32, max: usize) -> String {
     };
     // SAFETY: LVM_GETITEMTEXTW's lParam is an LVITEMW whose subitem and
     // text buffer of cchTextMax units it reads, the buffer written (the
-    // text copied in, cut to fit, NUL-terminated).
+    // text copied in, cut to fit, NUL-terminated); the structure itself is
+    // written too (its mask and item), so it is mutable.
     let n = unsafe {
         send(
             lv,
             LVM_GETITEMTEXTW,
             item as isize as usize,
-            (&raw const it) as isize,
+            (&raw mut it) as isize,
         )
     };
     let n = usize::try_from(n).unwrap_or(0).min(buf.len());
@@ -508,34 +509,36 @@ pub fn item_text(lv: HWND, item: i32, sub: i32, max: usize) -> String {
 pub fn insert_item(lv: HWND, item: LVITEMW, text: Option<&str>) -> i32 {
     with_item(item, text, |it| {
         // SAFETY: LVM_INSERTITEMW's lParam is an LVITEMW, read during the
-        // call, whose pointers `with_item` set: its text (alive with `it`)
-        // or none, and no column arrays.
-        unsafe { send(lv, LVM_INSERTITEMW, 0, (&raw const *it) as isize) as i32 }
+        // call (mutable, as the list may write it), whose pointers
+        // `with_item` set: its text (alive with `it`) or none, and no
+        // column arrays.
+        unsafe { send(lv, LVM_INSERTITEMW, 0, (&raw mut *it) as isize) as i32 }
     })
 }
 
 /// Sets the text of subitem `sub` of item `item`.
 pub fn set_item_text(lv: HWND, item: i32, sub: i32, text: &str) -> bool {
     let z = super::wz(text);
-    let it = LVITEMW {
+    let mut it = LVITEMW {
         iSubItem: sub,
         pszText: z.as_ptr().cast_mut(),
         ..Default::default()
     };
     // SAFETY: LVM_SETITEMTEXTW's lParam is an LVITEMW whose text is read
-    // during the call.
+    // during the call; the structure is mutable, as the list writes its
+    // mask and item.
     unsafe {
         send(
             lv,
             LVM_SETITEMTEXTW,
             item as isize as usize,
-            (&raw const it) as isize,
+            (&raw mut it) as isize,
         ) != 0
     }
 }
 
 /// `item` with its pointers set here: the text (or none), no column arrays.
-fn with_item<R>(item: LVITEMW, text: Option<&str>, f: impl FnOnce(&LVITEMW) -> R) -> R {
+fn with_item<R>(item: LVITEMW, text: Option<&str>, f: impl FnOnce(&mut LVITEMW) -> R) -> R {
     let mut it = item;
     it.mask &= !(LVIF_COLUMNS | LVIF_COLFMT);
     it.puColumns = core::ptr::null_mut();
@@ -552,11 +555,11 @@ fn with_item<R>(item: LVITEMW, text: Option<&str>, f: impl FnOnce(&LVITEMW) -> R
         }
     }
     it.cchTextMax = 0;
-    f(&it)
+    f(&mut it)
 }
 
 /// `col` with its text pointer set here.
-fn with_column<R>(col: LVCOLUMNW, text: Option<&str>, f: impl FnOnce(&LVCOLUMNW) -> R) -> R {
+fn with_column<R>(col: LVCOLUMNW, text: Option<&str>, f: impl FnOnce(&mut LVCOLUMNW) -> R) -> R {
     let mut c = col;
     let z = text.map(super::wz);
     match &z {
@@ -570,7 +573,7 @@ fn with_column<R>(col: LVCOLUMNW, text: Option<&str>, f: impl FnOnce(&LVCOLUMNW)
         }
     }
     c.cchTextMax = 0;
-    f(&c)
+    f(&mut c)
 }
 
 /// Inserts column `col` (LVCF_* fields), titled `text`; its index, -1 if
@@ -578,13 +581,13 @@ fn with_column<R>(col: LVCOLUMNW, text: Option<&str>, f: impl FnOnce(&LVCOLUMNW)
 pub fn insert_column(lv: HWND, at: i32, col: LVCOLUMNW, text: Option<&str>) -> i32 {
     with_column(col, text, |c| {
         // SAFETY: LVM_INSERTCOLUMNW's lParam is an LVCOLUMNW whose text is
-        // set by `with_column`.
+        // set by `with_column` (mutable, as the list may write it).
         unsafe {
             send(
                 lv,
                 LVM_INSERTCOLUMNW,
                 at as isize as usize,
-                (&raw const *c) as isize,
+                (&raw mut *c) as isize,
             ) as i32
         }
     })

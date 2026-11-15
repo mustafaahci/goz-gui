@@ -50,8 +50,9 @@ fn with_tool(tip: HWND, msg: u32, w: usize, ti: &TTTOOLINFOW, text: Text) -> isi
         Text::Callback => core::ptr::without_provenance_mut(usize::MAX),
     };
     // SAFETY: the tooltip messages that take a TTTOOLINFOW read it (and copy
-    // its text) during the call; its pointers are set above.
-    unsafe { send(tip, msg, w, (&raw const t) as isize) }
+    // its text) during the call; its pointers are set above, and it is
+    // mutable, as a tooltip may write it.
+    unsafe { send(tip, msg, w, (&raw mut t) as isize) }
 }
 
 /// Adds tool `ti` (its hwnd, uId, uFlags, rect, lParam) with `text`.

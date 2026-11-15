@@ -40,13 +40,14 @@ pub fn insert(t: HWND, i: i32, item: TCITEMW, text: &str) -> i32 {
     it.mask = (it.mask | TCIF_TEXT) & !TCIF_PARAM;
     it.pszText = z.as_ptr().cast_mut();
     it.cchTextMax = 0;
-    // SAFETY: TCM_INSERTITEMW's lParam is a TCITEMW whose text is set above.
+    // SAFETY: TCM_INSERTITEMW's lParam is a TCITEMW whose text is set above
+    // (mutable, as the tab control may write it).
     unsafe {
         send(
             t,
             TCM_INSERTITEMW,
             i as isize as usize,
-            (&raw const it) as isize,
+            (&raw mut it) as isize,
         ) as i32
     }
 }
@@ -54,18 +55,12 @@ pub fn insert(t: HWND, i: i32, item: TCITEMW, text: &str) -> i32 {
 /// Sets the title of tab `i`.
 pub fn set_text(t: HWND, i: i32, text: &str) -> bool {
     let z = super::wz(text);
-    let it = TCITEMW {
+    let mut it = TCITEMW {
         mask: TCIF_TEXT,
         pszText: z.as_ptr().cast_mut(),
         ..Default::default()
     };
-    // SAFETY: TCM_SETITEMW's lParam is a TCITEMW whose text is set above.
-    unsafe {
-        send(
-            t,
-            TCM_SETITEMW,
-            i as isize as usize,
-            (&raw const it) as isize,
-        ) != 0
-    }
+    // SAFETY: TCM_SETITEMW's lParam is a TCITEMW whose text is set above
+    // (mutable, as the tab control may write it).
+    unsafe { send(t, TCM_SETITEMW, i as isize as usize, (&raw mut it) as isize) != 0 }
 }

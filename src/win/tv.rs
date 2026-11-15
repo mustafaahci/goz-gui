@@ -544,8 +544,9 @@ pub fn set_item(item: Item, fields: TVITEMW, text: Option<&str>) -> bool {
     }
     it.cchTextMax = 0;
     // SAFETY: TVM_SETITEMW's lParam is a TVITEMW (no field of TVITEMEXW's
-    // named) whose text is set above; its item is in the tree (`live`).
-    unsafe { send(item.tree, TVM_SETITEMW, 0, (&raw const it) as isize) != 0 }
+    // named) whose text is set above, mutable as the tree may write it; its
+    // item is in the tree (`live`).
+    unsafe { send(item.tree, TVM_SETITEMW, 0, (&raw mut it) as isize) != 0 }
 }
 
 /// The parent and the place an insert names, as TVINSERTSTRUCTW takes
@@ -609,9 +610,10 @@ pub fn insert(
     };
     ins.Anonymous.itemex = it;
     // SAFETY: TVM_INSERTITEMW's lParam is a TVINSERTSTRUCTW whose text is
-    // set above (or the callback marker), read during the call; its parent
-    // and place are items in the tree, or its markers (`place`).
-    let h = unsafe { send(tree, TVM_INSERTITEMW, 0, (&raw const ins) as isize) };
+    // set above (or the callback marker), read during the call (mutable,
+    // as the tree may write it); its parent and place are items in the
+    // tree, or its markers (`place`).
+    let h = unsafe { send(tree, TVM_INSERTITEMW, 0, (&raw mut ins) as isize) };
     item_of(tree, h)
 }
 
@@ -639,9 +641,10 @@ pub fn insert_units(
     };
     ins.Anonymous.item = it;
     // SAFETY: TVM_INSERTITEMW's lParam is a TVINSERTSTRUCTW whose only
-    // pointer is the text set above, read during the call; its parent and
-    // place are items in the tree, or its markers (`place`).
-    let h = unsafe { send(tree, TVM_INSERTITEMW, 0, (&raw const ins) as isize) };
+    // pointer is the text set above, read during the call (mutable, as the
+    // tree may write it); its parent and place are items in the tree, or
+    // its markers (`place`).
+    let h = unsafe { send(tree, TVM_INSERTITEMW, 0, (&raw mut ins) as isize) };
     item_of(tree, h)
 }
 
@@ -651,15 +654,16 @@ pub fn set_text_units(item: Item, text: &[u16]) -> bool {
         return false;
     }
     let z = super::wz_units(super::until_nul(text));
-    let it = TVITEMW {
+    let mut it = TVITEMW {
         mask: TVIF_TEXT,
         hItem: item.h,
         pszText: z.as_ptr().cast_mut(),
         ..Default::default()
     };
     // SAFETY: TVM_SETITEMW's lParam is a TVITEMW whose only pointer is the
-    // text set above, read during the call; its item is in the tree.
-    unsafe { send(item.tree, TVM_SETITEMW, 0, (&raw const it) as isize) != 0 }
+    // text set above, read during the call (the structure mutable, as the
+    // tree may write it); its item is in the tree.
+    unsafe { send(item.tree, TVM_SETITEMW, 0, (&raw mut it) as isize) != 0 }
 }
 
 /// An item a tree notified, as an [`Item`]: `tree` is the notifying tree.

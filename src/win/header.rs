@@ -117,15 +117,8 @@ pub fn set_item(h: HWND, i: i32, item: HDITEMW, text: Option<&str>) -> bool {
     }
     it.cchTextMax = 0;
     // SAFETY: HDM_SETITEMW's lParam is an HDITEMW whose pointers are set
-    // above.
-    unsafe {
-        send(
-            h,
-            HDM_SETITEMW,
-            i as isize as usize,
-            (&raw const it) as isize,
-        ) != 0
-    }
+    // above (mutable, as the header may write it).
+    unsafe { send(h, HDM_SETITEMW, i as isize as usize, (&raw mut it) as isize) != 0 }
 }
 
 #[cfg(test)]

@@ -134,8 +134,9 @@ pub fn set_margins(e: HWND, which: u32, left: u16, right: u16) {
 
 /// Sets the formatting rectangle without redrawing (EM_SETRECTNP).
 pub fn set_rect_np(e: HWND, rc: &RECT) {
-    // SAFETY: EM_SETRECTNP's lParam is a RECT, read.
-    unsafe { super::send_raw(e, EM_SETRECTNP, 0, core::ptr::from_ref(rc) as isize) };
+    let mut r = *rc;
+    // SAFETY: EM_SETRECTNP's lParam is a RECT, read: a copy, mutable.
+    unsafe { super::send_raw(e, EM_SETRECTNP, 0, (&raw mut r) as isize) };
 }
 
 /// The tab stops of a multiline box, in dialog template units.

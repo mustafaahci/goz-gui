@@ -30,12 +30,15 @@ pub fn time(picker: HWND) -> Option<SYSTEMTIME> {
 /// Sets the picker's date and time, or with `None` takes it away (clears
 /// its check box, with DTS_SHOWNONE); false if the picker refused.
 pub fn set_time(picker: HWND, time: Option<&SYSTEMTIME>) -> bool {
-    let (flag, l) = match time {
-        Some(st) => (GDT_VALID, core::ptr::from_ref(st) as isize),
+    // A copy of the caller's: the picker gets a structure of its own.
+    let mut st = time.copied();
+    let (flag, l) = match st.as_mut() {
+        Some(st) => (GDT_VALID, core::ptr::from_mut(st) as isize),
         None => (GDT_NONE, 0),
     };
     // SAFETY: DTM_SETSYSTEMTIME's lParam is a SYSTEMTIME read during the
-    // call (not read with GDT_NONE, and null then); sent only to a picker.
+    // call (a copy, mutable; not read with GDT_NONE, and null then); sent
+    // only to a picker.
     unsafe { send_raw(of_class(picker, CLASS), DTM_SETSYSTEMTIME, flag as usize, l) != 0 }
 }
 
