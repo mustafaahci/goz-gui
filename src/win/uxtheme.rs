@@ -101,7 +101,9 @@ pub enum AppMode {
 }
 
 /// The dark-mode functions uxtheme has exported by ordinal only since
-/// Windows 10 1809; each `None` on a Windows without it.
+/// Windows 10 1809 (build 17763); each `None` on a Windows without it,
+/// and on any build before that one, where the ordinals may name other
+/// functions.
 struct DarkMode {
     /// Ordinal 133: `bool AllowDarkModeForWindow(HWND, bool)`.
     allow_for_window: Option<unsafe extern "system" fn(HWND, u8) -> u8>,
@@ -113,9 +115,21 @@ struct DarkMode {
     flush_menu_themes: Option<unsafe extern "system" fn()>,
 }
 
+/// Windows 10 1809's build, the first whose uxtheme has the dark mode's
+/// exports at these ordinals.
+const FIRST_BUILD: u32 = 17763;
+
 fn dark_mode() -> &'static DarkMode {
     static API: OnceLock<DarkMode> = OnceLock::new();
     API.get_or_init(|| {
+        let none = DarkMode {
+            allow_for_window: None,
+            set_preferred_app_mode: None,
+            flush_menu_themes: None,
+        };
+        if super::sys::windows_build() < FIRST_BUILD {
+            return none;
+        }
         let name = wz("uxtheme.dll");
         // SAFETY: loads a system DLL by a NUL-terminated name (kept loaded
         // for the process, as the pointers below are kept).
@@ -127,11 +141,7 @@ fn dark_mode() -> &'static DarkMode {
             )
         };
         if dll.is_null() {
-            return DarkMode {
-                allow_for_window: None,
-                set_preferred_app_mode: None,
-                flush_menu_themes: None,
-            };
+            return none;
         }
         // An export by ordinal: the number travels as the name's address
         // (MAKEINTRESOURCEA), below 0x10000.
@@ -139,9 +149,11 @@ fn dark_mode() -> &'static DarkMode {
         // a string.
         let ordinal = |n: usize| unsafe { GetProcAddress(dll, core::ptr::without_provenance(n)) };
         // SAFETY: each export is cast to the signature uxtheme has given it
-        // at that ordinal since 1809 (named on the fields of `DarkMode`). A
-        // C++ bool is one byte, taken and read here as a u8, so no value
-        // it gives is an invalid Rust bool.
+        // at that ordinal since 1809 (named on the fields of `DarkMode`),
+        // this Windows being that build or later (checked above): an
+        // assumption of the trust model (`win`'s documentation), as the
+        // exports are undocumented. A C++ bool is one byte, taken and read
+        // here as a u8, so no value it gives is an invalid Rust bool.
         unsafe {
             DarkMode {
                 allow_for_window: ordinal(133).map(|f| core::mem::transmute(f)),
@@ -178,5 +190,19 @@ pub fn flush_menu_themes() {
     if let Some(f) = dark_mode().flush_menu_themes {
         // SAFETY: the export's signature (see `DarkMode`): no arguments.
         unsafe { f() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dark_mode_is_asked_for_only_where_it_is() {
+        let build = crate::win::sys::windows_build();
+        assert!(build > 0, "RtlGetVersion says the build");
+        if build < FIRST_BUILD {
+            assert!(dark_mode().allow_for_window.is_none());
+        }
     }
 }

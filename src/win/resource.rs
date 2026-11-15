@@ -7,8 +7,8 @@ use windows_sys::Win32::System::LibraryLoader::{
 };
 
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_GUARD,
+    PAGE_READONLY, VirtualQuery,
 };
 
 use super::nul_ended;
@@ -98,24 +98,53 @@ fn int_name(id: u16) -> *const u16 {
     core::ptr::without_provenance(usize::from(id))
 }
 
-/// Whether the `size` bytes at `data` are in one run of committed,
-/// readable pages (a file's resource directory says where its data is and
-/// how long; a file made to lie is not read past what is mapped).
-fn readable(data: *const core::ffi::c_void, size: usize) -> bool {
+/// The region of pages `at` is in, if it is committed, of a mapped file
+/// (an image or a data file, never memory of the process's own), and
+/// read-only with no guard page: memory nothing in the process writes, and
+/// that a read does not change.
+fn read_only_mapping(at: *const core::ffi::c_void) -> Option<MEMORY_BASIC_INFORMATION> {
     let mut mbi = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: an out-struct and its size; the address is only looked up.
-    let n = unsafe { VirtualQuery(data, &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>()) };
-    if n == 0 || mbi.State != MEM_COMMIT {
+    let n = unsafe { VirtualQuery(at, &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>()) };
+    let access = mbi.Protect & 0xff;
+    (n != 0
+        && mbi.State == MEM_COMMIT
+        && (mbi.Type == MEM_IMAGE || mbi.Type == MEM_MAPPED)
+        && mbi.Protect & PAGE_GUARD == 0
+        && (access == PAGE_READONLY || access == PAGE_EXECUTE_READ))
+        .then_some(mbi)
+}
+
+/// Whether the `size` bytes at `data` are a resource's, read where a file's
+/// resource directory says: in one run of read-only pages (see
+/// [`read_only_mapping`]) of `module`'s own mapping, or of a resource file
+/// the loader found for it (its language's .mui, a .mun: a mapping that is
+/// itself a PE file, MZ). A file made to lie is so read neither past what
+/// is mapped of it, nor in memory the process writes or another module's
+/// pages it has nothing to do with.
+fn readable(module: HMODULE, data: *const core::ffi::c_void, size: usize) -> bool {
+    let Some(region) = read_only_mapping(data) else {
+        return false;
+    };
+    let end = (region.BaseAddress as usize).saturating_add(region.RegionSize);
+    if (data as usize).checked_add(size).is_none_or(|e| e > end) {
         return false;
     }
-    let read = PAGE_READONLY
-        | PAGE_READWRITE
-        | PAGE_WRITECOPY
-        | PAGE_EXECUTE_READ
-        | PAGE_EXECUTE_READWRITE
-        | PAGE_EXECUTE_WRITECOPY;
-    let end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
-    mbi.Protect & read != 0 && (data as usize).checked_add(size).is_some_and(|e| e <= end)
+    // A module loaded as a data file and image resource is its mapping's
+    // address with its low bits marking how it was loaded (a mapping
+    // starts on a 64 KB boundary).
+    let base = (module as usize) & !0xffff;
+    let alloc = region.AllocationBase as usize;
+    if alloc == base {
+        return true;
+    }
+    let head = region.AllocationBase.cast_const();
+    read_only_mapping(head).is_some_and(|first| {
+        let room = (first.BaseAddress as usize).saturating_add(first.RegionSize);
+        // SAFETY: two bytes of a committed, read-only mapping's first page
+        // (checked just above to hold them), read as they are.
+        alloc.saturating_add(2) <= room && unsafe { *head.cast::<[u8; 2]>() } == *b"MZ"
+    })
 }
 
 /// A copy of resource `name` of type `kind` in `module`.
@@ -134,7 +163,7 @@ unsafe fn copy(module: HMODULE, name: *const u16, kind: *const u16) -> Option<Ve
         let size = SizeofResource(module, found) as usize;
         (LockResource(LoadResource(module, found)), size)
     };
-    if data.is_null() || size == 0 || !readable(data, size) {
+    if data.is_null() || size == 0 || !readable(module, data, size) {
         return None;
     }
     // SAFETY: `size` bytes of the loaded module's mapping, readable
@@ -156,5 +185,14 @@ mod tests {
         assert_eq!(&first[..4], &[0, 0, 1, 0]);
         assert!(dll.nth(RT_GROUP_ICON, 1_000_000).is_none());
         assert!(dll.by_id(RT_GROUP_ICON, 0xfff0).is_none());
+        // A program not loaded in this process otherwise: its own mapping.
+        let path: Vec<u16> = r"C:\Windows\explorer.exe".encode_utf16().collect();
+        let exe = DataFile::load(&path).unwrap();
+        assert_eq!(&exe.nth(RT_GROUP_ICON, 0).unwrap()[..4], &[0, 0, 1, 0]);
+        // Memory that is not the file's own mapping is never read as its
+        // resource, readable or not.
+        let elsewhere = [0u8; 16];
+        assert!(!readable(dll.0, elsewhere.as_ptr().cast(), 16));
+        assert!(!readable(dll.0, core::ptr::null(), 1));
     }
 }

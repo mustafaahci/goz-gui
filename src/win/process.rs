@@ -162,10 +162,13 @@ pub fn create(
         ..Default::default()
     };
     let mut pi = PROCESS_INFORMATION::default();
+    // A STARTUPINFOW, not a STARTUPINFOEXW: the flag that says it is the
+    // longer one is taken off.
+    let flags = flags & !windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
     // SAFETY: NUL-terminated strings (the command line in a buffer of its
     // own the call may write to), no security attributes, no handles
     // inherited, this process's environment and folder; an in-struct with
-    // its size and an out-struct.
+    // its size (a STARTUPINFOW, as the flags say) and an out-struct.
     let ok = unsafe {
         CreateProcessW(
             app.as_ptr(),

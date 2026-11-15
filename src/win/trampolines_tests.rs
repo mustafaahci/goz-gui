@@ -68,6 +68,31 @@ fn a_window_handles_its_messages_and_frees_its_handler_when_destroyed() {
 }
 
 static FIRST: subclass::Key = subclass::Key::new("test first");
+
+#[test]
+fn a_window_is_subclassed_only_from_its_own_thread() {
+    let hwnd = window(|m| m.def());
+    let other = hwnd as usize;
+    let refused = std::thread::spawn(move || {
+        let hwnd = other as HWND;
+        (
+            subclass::set(hwnd, &FIRST, |m| m.def()),
+            subclass::has(hwnd, &FIRST),
+            subclass::remove(hwnd, &FIRST),
+        )
+    })
+    .join()
+    .unwrap();
+    assert_eq!(refused, (false, false, false));
+    assert!(subclass::set(hwnd, &FIRST, |m| m.def()));
+    let other = hwnd as usize;
+    let seen = std::thread::spawn(move || subclass::has(other as HWND, &FIRST))
+        .join()
+        .unwrap();
+    assert!(!seen);
+    assert!(subclass::has(hwnd, &FIRST));
+    super::destroy(hwnd);
+}
 static SECOND: subclass::Key = subclass::Key::new("test second");
 
 #[test]

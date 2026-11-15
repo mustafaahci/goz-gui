@@ -156,6 +156,19 @@ pub fn error_message(code: u32) -> String {
     String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())])
 }
 
+/// The build number of the Windows running (RtlGetVersion, which answers
+/// the truth whatever the program's manifest says); 0 if it would not say.
+pub fn windows_build() -> u32 {
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: an out-struct with its size.
+    let status = unsafe { windows_sys::Wdk::System::SystemServices::RtlGetVersion(&mut info) };
+    if status >= 0 { info.dwBuildNumber } else { 0 }
+}
+
 /// This process's id.
 pub fn process_id() -> u32 {
     // SAFETY: no pointers.

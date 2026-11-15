@@ -180,6 +180,11 @@ fn next(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
 }
 
 unsafe extern "system" fn cbt_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    // A negative code is passed on untouched, as the hook's documentation
+    // asks.
+    if code < 0 {
+        return next(code, w, l);
+    }
     let event = if code == HCBT_CREATEWND as i32 && l != 0 {
         // SAFETY: HCBT_CREATEWND's lParam is a CBT_CREATEWNDW whose lpcs is
         // the CREATESTRUCTW of window `w`; both copied out.

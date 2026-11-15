@@ -2,7 +2,7 @@
 
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Controls::{
-    TCIF_TEXT, TCITEMW, TCM_GETITEMRECT, TCM_INSERTITEMW, TCM_SETITEMW,
+    TCIF_PARAM, TCIF_TEXT, TCITEMW, TCM_GETITEMRECT, TCM_INSERTITEMW, TCM_SETITEMW,
 };
 
 /// The class these messages are for.
@@ -30,12 +30,14 @@ pub fn item_rect(t: HWND, i: i32) -> Option<RECT> {
     ok.then_some(rc)
 }
 
-/// Inserts a tab titled `text` at `i` (with `item`'s other TCIF_* fields);
-/// its index, -1 if not.
+/// Inserts a tab titled `text` at `i` (with `item`'s other TCIF_* fields
+/// but TCIF_PARAM: a tab control given more extra bytes per tab than an
+/// LPARAM, TCM_SETITEMEXTRA, reads that many from `lParam` on); its index,
+/// -1 if not.
 pub fn insert(t: HWND, i: i32, item: TCITEMW, text: &str) -> i32 {
     let z = super::wz(text);
     let mut it = item;
-    it.mask |= TCIF_TEXT;
+    it.mask = (it.mask | TCIF_TEXT) & !TCIF_PARAM;
     it.pszText = z.as_ptr().cast_mut();
     it.cchTextMax = 0;
     // SAFETY: TCM_INSERTITEMW's lParam is a TCITEMW whose text is set above.

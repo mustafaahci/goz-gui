@@ -53,8 +53,12 @@ fn slot(hwnd: HWND, key: &'static Key) -> Option<*mut Handler> {
 /// Subclasses `hwnd` as `key`: `handler` sees its messages first, and
 /// passes one on with [`Msg::def`]. Replaces the subclass `key` the window
 /// had. False if the window could not be subclassed (it is not there, or is
-/// another thread's), and then `handler` is dropped.
+/// another thread's: refused here, as the handler and its box are this
+/// thread's), and then `handler` is dropped.
 pub fn set(hwnd: HWND, key: &'static Key, handler: impl Fn(&Msg) -> LRESULT + 'static) -> bool {
+    if !super::is_this_thread(hwnd) {
+        return false;
+    }
     let old = slot(hwnd, key);
     let new: *mut Handler = Box::into_raw(Box::new(Rc::new(handler)));
     // SAFETY: the trampoline below, with the box as its data; the box stays
@@ -72,9 +76,10 @@ pub fn set(hwnd: HWND, key: &'static Key, handler: impl Fn(&Msg) -> LRESULT + 's
     true
 }
 
-/// Removes subclass `key` from `hwnd`; false if it had none.
+/// Removes subclass `key` from `hwnd`; false if it had none, or is a
+/// window of another thread (whose subclasses are its thread's).
 pub fn remove(hwnd: HWND, key: &'static Key) -> bool {
-    remove_id(hwnd, key.id())
+    super::is_this_thread(hwnd) && remove_id(hwnd, key.id())
 }
 
 fn remove_id(hwnd: HWND, id: usize) -> bool {
@@ -94,9 +99,10 @@ fn remove_id(hwnd: HWND, id: usize) -> bool {
     true
 }
 
-/// Whether `hwnd` has subclass `key`.
+/// Whether `hwnd`, a window of this thread, has subclass `key` (false for
+/// another thread's).
 pub fn has(hwnd: HWND, key: &'static Key) -> bool {
-    slot(hwnd, key).is_some()
+    super::is_this_thread(hwnd) && slot(hwnd, key).is_some()
 }
 
 /// The trampoline of every subclass here: `data` is the subclass's

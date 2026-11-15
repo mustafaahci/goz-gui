@@ -11,6 +11,11 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::HMENU as WHMENU;
 use windows::core::{Interface, PCSTR, PCWSTR, PSTR};
 use windows_sys::Win32::Foundation::{HWND, POINT};
+use windows_sys::Win32::UI::Shell::{
+    CMIC_MASK_CONTROL_DOWN, CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, SEE_MASK_ASYNCOK,
+    SEE_MASK_FLAG_LOG_USAGE, SEE_MASK_FLAG_NO_UI, SEE_MASK_NO_CONSOLE, SEE_MASK_NOASYNC,
+    SEE_MASK_NOZONECHECKS, SEE_MASK_UNICODE,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     HMENU, SW_SHOWNORMAL, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
 };
@@ -23,9 +28,22 @@ use crate::win::len_u32;
 use crate::win::menu::holds_drawn_item;
 use crate::win::msg::Msg;
 
-/// CMIC_MASK_HASLINKNAME and CMIC_MASK_HASTITLE (SEE_MASK_*'s values): the
-/// title fields hold a string. Never passed, as those fields are null.
-const HAS_TITLE: u32 = 0x1_0000 | 0x2_0000;
+/// The CMIC_MASK_* flags passed on (the rest are taken off): those that
+/// only ask for a way of running, and those that say a field this sets
+/// holds something (CMIC_MASK_UNICODE: the verb's Unicode form;
+/// CMIC_MASK_PTINVOKE: the point). Not CMIC_MASK_HOTKEY, CMIC_MASK_ICON,
+/// CMIC_MASK_HASLINKNAME or CMIC_MASK_HASTITLE, whose fields are left
+/// empty. SEE_MASK_* share these values.
+const KNOWN_FLAGS: u32 = SEE_MASK_UNICODE
+    | SEE_MASK_FLAG_NO_UI
+    | SEE_MASK_NO_CONSOLE
+    | SEE_MASK_ASYNCOK
+    | SEE_MASK_NOASYNC
+    | SEE_MASK_FLAG_LOG_USAGE
+    | SEE_MASK_NOZONECHECKS
+    | CMIC_MASK_SHIFT_DOWN
+    | CMIC_MASK_CONTROL_DOWN
+    | CMIC_MASK_PTINVOKE;
 
 /// The Explorer context menu of some items (IContextMenu, and the versions
 /// that draw their own items), from [`super::Folder::context_menu`].
@@ -91,9 +109,10 @@ impl ShellMenu {
 
     /// Runs the item `offset` ids after the first for `owner`, as chosen at
     /// `pt` (screen), with CMIC_MASK_* `mask` (InvokeCommand with a
-    /// CMINVOKECOMMANDINFOEX; the flags that say a title is given are taken
-    /// off, as none is). False if the handler failed, or `offset` is not
-    /// one an item can have (it travels as a resource id, under 0x10000).
+    /// CMINVOKECOMMANDINFOEX; only the flags `KNOWN_FLAGS` names are passed
+    /// on: none says a field this leaves empty holds something). False if
+    /// the handler failed, or `offset` is not one an item can have (it
+    /// travels as a resource id, under 0x10000).
     pub fn invoke(&self, owner: HWND, offset: u32, pt: POINT, mask: u32) -> bool {
         // MAKEINTRESOURCE: the offset travels as the pointer's address,
         // which only below 0x10000 is read as an id, not a string.
@@ -103,7 +122,7 @@ impl ShellMenu {
         let verb = offset as usize;
         let info = CMINVOKECOMMANDINFOEX {
             cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-            fMask: mask & !HAS_TITLE,
+            fMask: mask & KNOWN_FLAGS,
             hwnd: WHWND(owner),
             lpVerb: PCSTR(core::ptr::without_provenance(verb)),
             lpVerbW: PCWSTR(core::ptr::without_provenance(verb)),
@@ -113,9 +132,9 @@ impl ShellMenu {
         };
         // SAFETY: the EX structure (its cbSize says so), which outlives the
         // call: its verbs are resource ids (checked above), and its other
-        // pointers (parameters, directory, title) null, which every mask
-        // left allows (none says a title is there). The handler may
-        // dispatch messages meanwhile.
+        // pointers (parameters, directory, title) and handles (icon) null,
+        // which every flag left allows (none says a title, an icon or a
+        // hotkey is there). The handler may dispatch messages meanwhile.
         unsafe {
             self.menu
                 .InvokeCommand((&raw const info).cast::<CMINVOKECOMMANDINFO>())
