@@ -30,19 +30,35 @@
 //! stale item is so refused, unless the tree has since put a new item at
 //! the same address: then it names that item of the same tree (wrong, not
 //! unsound).
+//!
+//! A message another's code sends through the window that names an item
+//! (TVM_GETITEMW, TVM_EXPAND, an insert's parent...) reaches the tree
+//! through its subclasses, any of which may delete the item, with this
+//! module's functions, before passing it on. So each pass of one by a
+//! subclass of goz-gui's ([`Msg::def`]) checks every item it names against
+//! the record first ([`pass_on`]): one not there (gone, going, or put in
+//! by another's code through the window, which is not noted) stops the
+//! message, which answers 0. The check is made at every pass, so the last
+//! one before the tree is made whatever the order of the subclasses (one
+//! put in at the tree's birth is nearer the tree than the one that keeps
+//! track of it).
 
+use core::mem::offset_of;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LRESULT, POINT, RECT};
 use windows_sys::Win32::UI::Controls::{
-    HTREEITEM, NMTREEVIEWW, NMTVGETINFOTIPW, TVE_COLLAPSERESET, TVGN_CARET, TVGN_CHILD,
-    TVGN_DROPHILITE, TVGN_NEXT, TVGN_PARENT, TVGN_ROOT, TVHITTESTINFO, TVI_FIRST, TVI_LAST,
-    TVI_ROOT, TVIF_EXPANDEDIMAGE, TVIF_INTEGRAL, TVIF_STATEEX, TVIF_TEXT, TVINSERTSTRUCTW,
-    TVITEMEXW, TVITEMW, TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMRECT,
-    TVM_GETITEMW, TVM_GETNEXTITEM, TVM_GETTOOLTIPS, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM,
-    TVM_SETBKCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETIMAGELIST, TVM_SETITEMHEIGHT, TVM_SETITEMW,
-    TVM_SETLINECOLOR, TVM_SETTEXTCOLOR,
+    HTREEITEM, NMTREEVIEWW, NMTVGETINFOTIPW, TVE_COLLAPSERESET, TVGETITEMPARTRECTINFO, TVGN_CARET,
+    TVGN_CHILD, TVGN_DROPHILITE, TVGN_NEXT, TVGN_PARENT, TVGN_ROOT, TVHITTESTINFO, TVI_FIRST,
+    TVI_LAST, TVI_ROOT, TVI_SORT, TVIF_EXPANDEDIMAGE, TVIF_INTEGRAL, TVIF_STATEEX, TVIF_TEXT,
+    TVINSERTSTRUCTA, TVINSERTSTRUCTW, TVITEMA, TVITEMEXW, TVITEMW, TVM_CREATEDRAGIMAGE,
+    TVM_DELETEITEM, TVM_EDITLABELA, TVM_EDITLABELW, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMA,
+    TVM_GETITEMPARTRECT, TVM_GETITEMRECT, TVM_GETITEMSTATE, TVM_GETITEMW, TVM_GETNEXTITEM,
+    TVM_GETTOOLTIPS, TVM_HITTEST, TVM_INSERTITEMA, TVM_INSERTITEMW, TVM_MAPHTREEITEMTOACCID,
+    TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETHOT, TVM_SETIMAGELIST,
+    TVM_SETINSERTMARK, TVM_SETITEMA, TVM_SETITEMHEIGHT, TVM_SETITEMW, TVM_SETLINECOLOR,
+    TVM_SETTEXTCOLOR, TVM_SHOWINFOTIP, TVM_SORTCHILDREN, TVM_SORTCHILDRENCB, TVSORTCB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{CallWindowProcW, WM_DESTROY, WM_NCDESTROY};
 
@@ -115,6 +131,12 @@ struct Tree {
     /// this change while it runs notes nothing, as the item it made may
     /// be gone already.
     deletions: u64,
+    /// The deletions of an item that another's code sent through the
+    /// window and the subclass that keeps track of the tree is passing on
+    /// (the item out of the record by then): the item, and whether a pass
+    /// of it to the next procedure has come back, after which it goes no
+    /// further ([`pass_on`]).
+    passing: Vec<(HTREEITEM, bool)>,
     /// The image lists it shows that goz-gui gave it ([`set_image_list`]):
     /// kept alive (a clone of each) while it does, as a tree never
     /// destroys its lists.
@@ -166,6 +188,7 @@ fn adopt(tree: HWND, born: bool) -> bool {
                 items: Some(items),
                 deleting: 0,
                 deletions: 0,
+                passing: Vec::new(),
                 lists: HashMap::new(),
             },
         )
@@ -311,13 +334,17 @@ fn note(tree: HWND, f: impl FnOnce(&mut HashSet<HTREEITEM>)) {
 
 /// Whether `h` is an item noted of `tree`.
 fn has(tree: HWND, h: HTREEITEM) -> bool {
-    h != 0
-        && tracked(tree)
-        && TREES.with_borrow(|t| {
-            t.get(&(tree as usize))
-                .and_then(|t| t.items.as_ref())
-                .is_some_and(|items| items.contains(&h))
-        })
+    h != 0 && tracked(tree) && noted(tree, h)
+}
+
+/// Whether `h` is in `tree`'s record (whether the tree is kept track of is
+/// the caller's to know): a lookup in its set.
+fn noted(tree: HWND, h: HTREEITEM) -> bool {
+    TREES.with_borrow(|t| {
+        t.get(&(tree as usize))
+            .and_then(|t| t.items.as_ref())
+            .is_some_and(|items| items.contains(&h))
+    })
 }
 
 /// Whether `item` is in its tree (and its tree one of this thread).
@@ -403,9 +430,10 @@ fn deletion(tree: HWND, proc: WndProc, what: Deletion, pass: impl FnOnce() -> LR
 }
 
 /// The subclass that keeps track of a tree: each message passed on as it
-/// came; what another's code deletes through the window (goz-gui's own
-/// deletions go to the class's own procedure, see [`deletion`]) taken out
-/// of the items noted first.
+/// came (checked, as every subclass's pass is: [`pass_on`]); what
+/// another's code deletes through the window (goz-gui's own deletions go
+/// to the class's own procedure, see [`deletion`]) taken out of the items
+/// noted first.
 fn track_proc(m: &Msg) -> LRESULT {
     let tree = m.hwnd;
     match m.id {
@@ -424,7 +452,12 @@ fn track_proc(m: &Msg) -> LRESULT {
                 // has no other, but another's code's inserts.
                 return 0;
             };
-            deletion(tree, proc, what, || m.def())
+            match what {
+                // Out of the record now, the item goes on through the
+                // subclasses nearer the tree for one pass ([`through`]).
+                Deletion::Item(h) => deletion(tree, proc, what, || through(tree, h, || m.def())),
+                _ => deletion(tree, proc, what, || m.def()),
+            }
         }
         TVM_EXPAND if m.w & TVE_COLLAPSERESET as usize != 0 => {
             match class_proc(tree) {
@@ -455,6 +488,233 @@ fn track_proc(m: &Msg) -> LRESULT {
         }
         _ => m.def(),
     }
+}
+
+/// Runs `pass`, which passes on a TVM_DELETEITEM of `h` that another's code
+/// sent `tree` through its window, `h` out of the record already (see
+/// [`deletion`]): meanwhile the deletion goes on through the subclasses
+/// nearer the tree until one of them has passed it on and had the answer
+/// back; a second pass of it goes no further ([`pass_on`]), as the tree
+/// would follow the item it freed.
+fn through(tree: HWND, h: HTREEITEM, pass: impl FnOnce() -> LRESULT) -> LRESULT {
+    let key = tree as usize;
+    TREES.with_borrow_mut(|t| {
+        if let Some(t) = t.get_mut(&key) {
+            t.passing.push((h, false));
+        }
+    });
+    let answer = pass();
+    TREES.with_borrow_mut(|t| {
+        if let Some(t) = t.get_mut(&key)
+            && let Some(at) = t.passing.iter().rposition(|&(p, _)| p == h)
+        {
+            t.passing.remove(at);
+        }
+    });
+    answer
+}
+
+/// Whether tree message `id` names an item of the tree it is sent to (in
+/// its wParam, its lParam, or the structure its lParam points at), as the
+/// documentation and windows-sys give the messages: what [`pass_on`]
+/// checks.
+fn names_an_item(id: u32) -> bool {
+    matches!(
+        id,
+        TVM_INSERTITEMA
+            | TVM_INSERTITEMW
+            | TVM_DELETEITEM
+            | TVM_EXPAND
+            | TVM_GETITEMRECT
+            | TVM_GETNEXTITEM
+            | TVM_SELECTITEM
+            | TVM_GETITEMA
+            | TVM_GETITEMW
+            | TVM_SETITEMA
+            | TVM_SETITEMW
+            | TVM_EDITLABELA
+            | TVM_EDITLABELW
+            | TVM_CREATEDRAGIMAGE
+            | TVM_SORTCHILDREN
+            | TVM_ENSUREVISIBLE
+            | TVM_SORTCHILDRENCB
+            | TVM_SETINSERTMARK
+            | TVM_GETITEMSTATE
+            | TVM_MAPHTREEITEMTOACCID
+            | TVM_SETHOT
+            | TVM_SHOWINFOTIP
+            | TVM_GETITEMPARTRECT
+    )
+}
+
+/// A handle a message names where an item goes, and whether 0 there is no
+/// item by the message's documentation (every item, the top, no selection)
+/// rather than a missing one.
+#[derive(Clone, Copy)]
+struct Named {
+    h: HTREEITEM,
+    none: bool,
+}
+
+// The ANSI messages' structures, and TVITEMEXW, have their handles where
+// the structures [`named`] reads have them.
+const _: () = assert!(
+    offset_of!(TVITEMA, hItem) == offset_of!(TVITEMW, hItem)
+        && offset_of!(TVITEMEXW, hItem) == offset_of!(TVITEMW, hItem)
+        && offset_of!(TVINSERTSTRUCTA, hParent) == offset_of!(TVINSERTSTRUCTW, hParent)
+        && offset_of!(TVINSERTSTRUCTA, hInsertAfter) == offset_of!(TVINSERTSTRUCTW, hInsertAfter)
+);
+
+/// The handles tree message `id` (one [`names_an_item`] lists) names where
+/// an item goes, with parameters `w` and `l`: at most two (an insert's
+/// parent and place). A structure's field is read as a copy; a message
+/// whose structure is missing (`l` null) names a missing item.
+///
+/// # Safety
+/// `w` and `l` are what `id` defines for a tree view, as the system
+/// delivered them: for a message whose lParam is a structure, `l` is null
+/// or points at one, valid for reads while the message is delivered.
+unsafe fn named(id: u32, w: usize, l: isize) -> [Option<Named>; 2] {
+    // The handle at byte `at` of the structure `l` points at.
+    let field = |at: usize, none: bool| {
+        if l == 0 {
+            return Some(Named { h: 0, none: false });
+        }
+        // SAFETY: `l` points at the structure `id` defines, valid for reads
+        // (the caller's word), with a handle at `at` (each caller below
+        // gives that structure's offset); copied unaligned, as a RECT that
+        // holds one may be aligned for its 32-bit fields only.
+        let h = unsafe {
+            (l as *const u8)
+                .add(at)
+                .cast::<HTREEITEM>()
+                .read_unaligned()
+        };
+        Some(Named { h, none })
+    };
+    let lparam = |none: bool| Some(Named { h: l, none });
+    match id {
+        // A parent of NULL is the top, as TVI_ROOT is; a place of NULL is
+        // none the documentation gives.
+        TVM_INSERTITEMA | TVM_INSERTITEMW => [
+            field(offset_of!(TVINSERTSTRUCTW, hParent), true),
+            field(offset_of!(TVINSERTSTRUCTW, hInsertAfter), false),
+        ],
+        // NULL: every item (TVM_DELETEITEM); for the codes that take no
+        // item (TVM_GETNEXTITEM); no selection, insertion mark or hot item.
+        TVM_DELETEITEM | TVM_GETNEXTITEM | TVM_SELECTITEM | TVM_SETINSERTMARK | TVM_SETHOT => {
+            [lparam(true), None]
+        }
+        TVM_EXPAND | TVM_ENSUREVISIBLE | TVM_EDITLABELA | TVM_EDITLABELW | TVM_CREATEDRAGIMAGE
+        | TVM_SORTCHILDREN | TVM_SHOWINFOTIP => [lparam(false), None],
+        // The item in the rectangle's first bytes.
+        TVM_GETITEMRECT => [field(0, false), None],
+        TVM_GETITEMA | TVM_GETITEMW | TVM_SETITEMA | TVM_SETITEMW => {
+            [field(offset_of!(TVITEMW, hItem), false), None]
+        }
+        TVM_SORTCHILDRENCB => [field(offset_of!(TVSORTCB, hParent), false), None],
+        TVM_GETITEMPARTRECT => [field(offset_of!(TVGETITEMPARTRECTINFO, hti), false), None],
+        TVM_GETITEMSTATE | TVM_MAPHTREEITEMTOACCID => [
+            Some(Named {
+                h: w as HTREEITEM,
+                none: false,
+            }),
+            None,
+        ],
+        _ => [None, None],
+    }
+}
+
+/// Whether `n`, named by a message passed on to `tree` (kept track of), may
+/// reach the tree: an item in its record; a special handle (TVI_ROOT,
+/// TVI_FIRST, TVI_LAST, TVI_SORT), no item's memory; 0 where the message
+/// takes it for no item.
+fn may_pass(tree: HWND, n: Named) -> bool {
+    match n.h {
+        0 => n.none,
+        TVI_ROOT | TVI_FIRST | TVI_LAST | TVI_SORT => true,
+        h => noted(tree, h),
+    }
+}
+
+/// How a subclass passes a message on to the next procedure of its window
+/// ([`Msg::def`]): `next`, unless the window is a tree kept track of and
+/// the message names an item (in its parameters, or the structure its
+/// lParam points at) that is not in the tree's record now. A special
+/// handle (TVI_ROOT, TVI_FIRST, TVI_LAST, TVI_SORT) is no item, nor is 0
+/// where the message means no item by it; 0 anywhere else, or a structure
+/// missing, names a missing one. Such a message goes no further and
+/// answers 0 (the failure of each), as does one to a window no longer
+/// there. `tv`'s own messages go to the tree's class's procedure and never
+/// come here; another's code's come through the window, and a subclass of
+/// it may delete the item one names (out of the record from then) before
+/// passing it on, which the tree would follow.
+///
+/// The check is at every pass, so the last one before the tree is made
+/// whatever the order of the subclasses (one put in at the tree's birth,
+/// nearer the tree than the one that keeps track of it, makes its own). A
+/// TVM_DELETEITEM of an item out of the record goes on only while that
+/// subclass passes it on, until one pass of it has come back ([`through`]).
+///
+/// # Safety
+/// `w` and `l` are the parameters the system delivered with `id` to a
+/// subclass procedure of `tree` that is running.
+pub(crate) unsafe fn pass_on(
+    tree: HWND,
+    id: u32,
+    w: usize,
+    l: isize,
+    next: impl FnOnce() -> LRESULT,
+) -> LRESULT {
+    if !names_an_item(id) {
+        return next();
+    }
+    if !tracked(tree) {
+        // A window gone has freed its items (a tree's record went with
+        // them); a tree not kept track of has none `tv` takes, so none
+        // goz-gui's code can delete.
+        return if super::is_window(tree) { next() } else { 0 };
+    }
+    // SAFETY: `tree`, kept track of, is a tree view, and `w` and `l` are
+    // what the system delivered with `id` to it (the caller's word), so
+    // what `id` defines for a tree view.
+    let named = unsafe { named(id, w, l) };
+    if id == TVM_DELETEITEM
+        && let Some(n) = named[0]
+        && !may_pass(tree, n)
+    {
+        return pass_deletion(tree, n.h, next);
+    }
+    if named.iter().flatten().all(|&n| may_pass(tree, n)) {
+        next()
+    } else {
+        0
+    }
+}
+
+/// Passes on (`next`) a TVM_DELETEITEM of `h`, an item out of `tree`'s
+/// record, if its deletion through the window is under way and no pass of
+/// it has come back yet; 0 if not.
+fn pass_deletion(tree: HWND, h: HTREEITEM, next: impl FnOnce() -> LRESULT) -> LRESULT {
+    let key = tree as usize;
+    let on = TREES.with_borrow(|t| {
+        t.get(&key)
+            .is_some_and(|t| t.passing.iter().any(|&(p, back)| p == h && !back))
+    });
+    if !on {
+        return 0;
+    }
+    let answer = next();
+    TREES.with_borrow_mut(|t| {
+        if let Some(t) = t.get_mut(&key) {
+            for (p, back) in &mut t.passing {
+                if *p == h {
+                    *back = true;
+                }
+            }
+        }
+    });
+    answer
 }
 
 /// Calls `tree`'s class's own procedure `proc` with message `msg`: the
@@ -1124,6 +1384,321 @@ mod tests {
         assert_eq!((seen.get(), live(x)), (0, true));
         assert!(delete_item(x));
         assert_eq!(seen.get(), 0);
+        super::super::destroy(host);
+    }
+
+    /// A subclass that, for a TVM_GETITEMW or a TVM_EXPAND (another's
+    /// code's, through the window), deletes the tree's first item, the one
+    /// the message names, then passes the message on; and passes a
+    /// TVM_DELETEITEM on twice. What each pass answered goes in `passes`.
+    fn deletes_then_passes(passes: Rc<RefCell<Vec<isize>>>) -> impl Fn(&Msg) -> LRESULT + 'static {
+        move |m| match m.id {
+            TVM_GETITEMW | TVM_EXPAND => {
+                if let Some(first) = root(m.hwnd) {
+                    assert!(delete_item(first));
+                }
+                let answer = m.def();
+                passes.borrow_mut().push(answer);
+                answer
+            }
+            TVM_DELETEITEM => {
+                let first = m.def();
+                let second = m.def();
+                passes.borrow_mut().extend([first, second]);
+                first
+            }
+            _ => m.def(),
+        }
+    }
+
+    /// A subclass put in nearest the tree, at its birth: it notes each
+    /// message naming an item that reaches it (in `reached`), and passes
+    /// it on to the tree.
+    fn nearest(reached: Rc<RefCell<Vec<u32>>>) -> impl Fn(&Msg) -> LRESULT + 'static {
+        move |m| {
+            if names_an_item(m.id) {
+                reached.borrow_mut().push(m.id);
+            }
+            m.def()
+        }
+    }
+
+    /// Sends `tree`, a subclass of which is [`deletes_then_passes`] (what
+    /// its passes answered in `passes`), as another's code would, through
+    /// its window: a TVM_GETITEMW and a TVM_EXPAND of its first item, which
+    /// the subclass deletes before passing each on, and a TVM_DELETEITEM it
+    /// passes on twice. What was passed on after its item went answers 0,
+    /// and never reaches the tree: [`nearest`], nearer it than that
+    /// subclass, notes in `reached` what does.
+    fn passed_on_after_its_item_went(
+        tree: HWND,
+        passes: &RefCell<Vec<isize>>,
+        reached: &RefCell<Vec<u32>>,
+    ) {
+        use super::super::send_raw;
+        let x = insert(tree, None, After::Last, item(1), Some("x")).expect("x");
+        let c = insert(tree, Some(x), After::Last, item(2), Some("c")).expect("c");
+        let mut it = TVITEMW {
+            mask: TVIF_PARAM,
+            hItem: x.h,
+            lParam: 7,
+            ..Default::default()
+        };
+        // SAFETY: TVM_GETITEMW of a TVITEMW asking for no text, alive
+        // across the call, of an item the tree has as it is sent.
+        let answer = unsafe { send_raw(tree, TVM_GETITEMW, 0, (&raw mut it) as isize) };
+        assert_eq!((answer, passes.take()), (0, vec![0]));
+        // The tree did not write it.
+        assert_eq!(it.lParam, 7);
+        assert!(!live(x) && !live(c));
+        let y = insert(tree, None, After::Last, item(3), Some("y")).expect("y");
+        insert(tree, Some(y), After::Last, item(4), Some("d")).expect("d");
+        // SAFETY: TVM_EXPAND of an item the tree has as it is sent.
+        let answer = unsafe { send_raw(tree, TVM_EXPAND, TVE_EXPAND as usize, y.h) };
+        assert_eq!((answer, passes.take()), (0, vec![0]));
+        assert!(!live(y));
+        assert_eq!(root(tree), None);
+        assert_eq!(reached.take(), Vec::<u32>::new());
+        // A deletion passed on twice: the second time it goes no further.
+        let z = insert(tree, None, After::Last, item(5), Some("z")).expect("z");
+        // SAFETY: TVM_DELETEITEM of an item the tree has as it is sent.
+        let answer = unsafe { send_raw(tree, TVM_DELETEITEM, 0, z.h) };
+        assert_ne!(answer, 0);
+        let both = passes.take();
+        assert!(both.len() == 2 && both[0] != 0 && both[1] == 0, "{both:?}");
+        assert_eq!(reached.take(), [TVM_DELETEITEM]);
+        assert!(!live(z));
+        assert_eq!(root(tree), None);
+        // An item the tree has goes through each subclass to it.
+        let v = insert(tree, None, After::Last, item(6), Some("v")).expect("v");
+        let mut it = TVITEMW {
+            mask: TVIF_PARAM,
+            hItem: v.h,
+            ..Default::default()
+        };
+        // SAFETY: TVM_SETITEMW of a TVITEMW naming no text, alive across
+        // the call, of an item the tree has.
+        let answer = unsafe { send_raw(tree, TVM_SETITEMW, 0, (&raw mut it) as isize) };
+        assert_ne!(answer, 0);
+        assert_eq!(reached.take(), [TVM_SETITEMW]);
+        assert!(live(v));
+    }
+
+    static DELETES_AFTER: subclass::Key = subclass::Key::new("test tree subclass, put in after");
+
+    static DELETES_AT_BIRTH: subclass::Key = subclass::Key::new("test tree subclass, at birth");
+
+    static NEAREST_PASSING: subclass::Key =
+        subclass::Key::new("test tree messages that reach it, passed on");
+
+    /// A hidden tree with [`nearest`] put in at its birth by a CBT hook,
+    /// and then the subclass [`deletes_then_passes`] as `key`, if given.
+    fn tree_with_nearest(
+        reached: &Rc<RefCell<Vec<u32>>>,
+        then: Option<(&'static subclass::Key, &Rc<RefCell<Vec<isize>>>)>,
+    ) -> (HWND, HWND) {
+        let r = Rc::clone(reached);
+        let then = then.map(|(key, passes)| (key, Rc::clone(passes)));
+        let hook = hook::set(Kind::Cbt, move |event| {
+            if let Event::Create { hwnd, .. } = *event
+                && super::super::class_is(hwnd, CLASS)
+            {
+                // Each subclass put in goes in front of those before it.
+                subclass::set(hwnd, &NEAREST_PASSING, nearest(Rc::clone(&r)));
+                if let Some((key, passes)) = &then {
+                    subclass::set(hwnd, key, deletes_then_passes(Rc::clone(passes)));
+                }
+            }
+            None
+        });
+        let made = hidden_tree(|m| m.def());
+        drop(hook);
+        assert!(subclass::has(made.0, &NEAREST_PASSING));
+        made
+    }
+
+    #[test]
+    fn a_subclass_passes_on_no_message_whose_item_it_deleted() {
+        let passes = Rc::new(RefCell::new(Vec::new()));
+        let reached = Rc::new(RefCell::new(Vec::new()));
+        // Put in after the tree was made: farther from the tree than the
+        // subclass that keeps track of it.
+        let (tree, host) = tree_with_nearest(&reached, None);
+        assert!(subclass::set(
+            tree,
+            &DELETES_AFTER,
+            deletes_then_passes(Rc::clone(&passes))
+        ));
+        passed_on_after_its_item_went(tree, &passes, &reached);
+        super::super::destroy(host);
+        // Put in at the tree's birth by a CBT hook: nearer the tree.
+        let (tree, host) = tree_with_nearest(&reached, Some((&DELETES_AT_BIRTH, &passes)));
+        assert!(subclass::has(tree, &DELETES_AT_BIRTH));
+        passed_on_after_its_item_went(tree, &passes, &reached);
+        super::super::destroy(host);
+    }
+
+    static DESTROYS: subclass::Key = subclass::Key::new("test tree subclass destroying it");
+
+    #[test]
+    fn a_subclass_passes_on_no_item_message_to_a_tree_it_destroyed() {
+        use std::cell::Cell;
+        let (tree, host) = hidden_tree(|m| m.def());
+        let x = insert(tree, None, After::Last, item(1), Some("x")).expect("x");
+        let passed = Rc::new(Cell::new(None));
+        let p = Rc::clone(&passed);
+        assert!(subclass::set(tree, &DESTROYS, move |m| {
+            if m.id == TVM_GETITEMW {
+                super::super::destroy(m.hwnd);
+                let answer = m.def();
+                p.set(Some(answer));
+                return answer;
+            }
+            m.def()
+        }));
+        let mut it = TVITEMW {
+            mask: TVIF_PARAM,
+            hItem: x.h,
+            lParam: 7,
+            ..Default::default()
+        };
+        // SAFETY: TVM_GETITEMW of a TVITEMW asking for no text, alive
+        // across the call, of an item the tree has as it is sent.
+        let answer =
+            unsafe { super::super::send_raw(tree, TVM_GETITEMW, 0, (&raw mut it) as isize) };
+        assert_eq!((answer, passed.get(), it.lParam), (0, Some(0), 7));
+        assert!(!super::super::is_window(tree) && !live(x));
+        super::super::destroy(host);
+    }
+
+    /// Sends `tree`, through its window, each message that names an item,
+    /// naming `h` where the item goes (each of an insert's two places in
+    /// turn, the other a special handle). The messages sent, in order.
+    fn send_each_naming(tree: HWND, h: HTREEITEM) -> Vec<u32> {
+        let mut sent = Vec::new();
+        let mut send = |id: u32, w: usize, l: isize| {
+            // SAFETY: the parameters are what `id` defines for a tree view
+            // (any structure alive across the call); the item they name may
+            // be gone, but the subclass nearest the tree answers every such
+            // message itself, so the tree reads none of them.
+            unsafe { super::super::send_raw(tree, id, w, l) };
+            sent.push(id);
+        };
+        for (id, w) in [
+            (TVM_DELETEITEM, 0),
+            (TVM_EXPAND, TVE_EXPAND as usize),
+            (TVM_GETNEXTITEM, TVGN_CHILD as usize),
+            (TVM_SELECTITEM, TVGN_CARET as usize),
+            (TVM_EDITLABELA, 0),
+            (TVM_EDITLABELW, 0),
+            (TVM_CREATEDRAGIMAGE, 0),
+            (TVM_SORTCHILDREN, 0),
+            (TVM_ENSUREVISIBLE, 0),
+            (TVM_SETINSERTMARK, 0),
+            (TVM_SETHOT, 0),
+            (TVM_SHOWINFOTIP, 0),
+        ] {
+            send(id, w, h);
+        }
+        for id in [TVM_GETITEMSTATE, TVM_MAPHTREEITEMTOACCID] {
+            send(id, h as usize, 0);
+        }
+        let mut rc = RECT::default();
+        // SAFETY: a RECT is 16 bytes, room for the handle.
+        unsafe { (&raw mut rc).cast::<HTREEITEM>().write_unaligned(h) };
+        send(TVM_GETITEMRECT, 0, (&raw mut rc) as isize);
+        for id in [TVM_GETITEMA, TVM_GETITEMW, TVM_SETITEMA, TVM_SETITEMW] {
+            let mut it = TVITEMW {
+                hItem: h,
+                ..Default::default()
+            };
+            send(id, 0, (&raw mut it) as isize);
+        }
+        for id in [TVM_INSERTITEMA, TVM_INSERTITEMW] {
+            for (parent, after) in [(h, TVI_LAST), (TVI_ROOT, h)] {
+                let mut ins = TVINSERTSTRUCTW {
+                    hParent: parent,
+                    hInsertAfter: after,
+                    ..Default::default()
+                };
+                send(id, 0, (&raw mut ins) as isize);
+            }
+        }
+        let mut cb = TVSORTCB {
+            hParent: h,
+            ..Default::default()
+        };
+        send(TVM_SORTCHILDRENCB, 0, (&raw mut cb) as isize);
+        let mut part = RECT::default();
+        let mut info = TVGETITEMPARTRECTINFO {
+            hti: h,
+            prc: &raw mut part,
+            ..Default::default()
+        };
+        send(TVM_GETITEMPARTRECT, 0, (&raw mut info) as isize);
+        sent
+    }
+
+    static NEAREST: subclass::Key = subclass::Key::new("test tree messages that reach it");
+
+    #[test]
+    fn a_message_passed_on_to_a_tree_names_only_its_items() {
+        // Nearest the tree, put in at its birth: it notes the messages
+        // naming an item that reach it, and answers them itself.
+        let reached = Rc::new(RefCell::new(Vec::new()));
+        let r = Rc::clone(&reached);
+        let hook = hook::set(Kind::Cbt, move |event| {
+            if let Event::Create { hwnd, .. } = *event
+                && super::super::class_is(hwnd, CLASS)
+            {
+                let r = Rc::clone(&r);
+                subclass::set(hwnd, &NEAREST, move |m| {
+                    if names_an_item(m.id) {
+                        r.borrow_mut().push(m.id);
+                        return 0;
+                    }
+                    m.def()
+                });
+            }
+            None
+        });
+        let (tree, host) = hidden_tree(|m| m.def());
+        drop(hook);
+        assert!(subclass::has(tree, &NEAREST));
+        let x = insert(tree, None, After::Last, item(1), Some("x")).expect("x");
+        let gone = insert(tree, None, After::Last, item(2), Some("gone")).expect("gone");
+        assert!(delete_item(gone));
+        // Each message naming an item the tree has reaches it, and so does
+        // each naming a special handle.
+        let sent = send_each_naming(tree, x.h);
+        assert_eq!(reached.take(), sent);
+        assert!(live(x));
+        let sent = send_each_naming(tree, TVI_ROOT);
+        assert_eq!(reached.take(), sent);
+        // None naming an item that went.
+        send_each_naming(tree, gone.h);
+        assert_eq!(reached.take(), Vec::<u32>::new());
+        // 0 only where the message means no item by it.
+        send_each_naming(tree, 0);
+        assert_eq!(
+            reached.take(),
+            [
+                TVM_DELETEITEM,
+                TVM_GETNEXTITEM,
+                TVM_SELECTITEM,
+                TVM_SETINSERTMARK,
+                TVM_SETHOT,
+                TVM_INSERTITEMA,
+                TVM_INSERTITEMW,
+            ]
+        );
+        // Nor a message whose structure is missing.
+        // SAFETY: TVM_GETITEMW with no structure, answered by the subclass
+        // nearest the tree if it gets that far.
+        let answer = unsafe { super::super::send_raw(tree, TVM_GETITEMW, 0, 0) };
+        assert_eq!(answer, 0);
+        assert_eq!(reached.take(), Vec::<u32>::new());
+        assert!(live(x));
         super::super::destroy(host);
     }
 

@@ -110,7 +110,9 @@ impl Msg {
     /// The default processing of the message: the window class's for a
     /// window procedure, the next procedure's for a subclass; 0 for a dialog
     /// procedure (whose answer of 0 lets the dialog manager handle it) and
-    /// for a message goz-gui made.
+    /// for a message goz-gui made. A subclass's message to a tree view kept
+    /// track of that names an item the tree no longer has (its handler may
+    /// have deleted it) goes no further, and answers 0 ([`super::tv`]).
     ///
     /// # Panics
     /// If a [`View`] of the message's `lParam` is still out: the default
@@ -122,10 +124,17 @@ impl Msg {
             // SAFETY: the parameters as the system delivered them, to the
             // window they were delivered to.
             Via::Window => unsafe { DefWindowProcW(self.hwnd, self.id, self.w, self.l) },
-            // SAFETY: as above, from within the subclass procedure the
-            // system called (the trampoline's call is still running: a
-            // `Msg` does not outlive it).
-            Via::Subclass => unsafe { DefSubclassProc(self.hwnd, self.id, self.w, self.l) },
+            Via::Subclass => {
+                let next = || {
+                    // SAFETY: as above, from within the subclass procedure
+                    // the system called (the trampoline's call is still
+                    // running: a `Msg` does not outlive it).
+                    unsafe { DefSubclassProc(self.hwnd, self.id, self.w, self.l) }
+                };
+                // SAFETY: the parameters as the system delivered them to
+                // that subclass procedure, which is running for the window.
+                unsafe { super::tv::pass_on(self.hwnd, self.id, self.w, self.l, next) }
+            }
             Via::Dialog | Via::Made => 0,
         }
     }

@@ -38,9 +38,15 @@
 //!     and, by a subclass put in as the tree is made, another's code's
 //!     through the window; so an item is refused from the moment its
 //!     deletion starts, and while one is under way the tree takes no
-//!     insert, deletion or reset of goz-gui's. A stale item names, at
-//!     worst, a new item the same tree put at its address: wrong, not
-//!     unsound.
+//!     insert, deletion or reset of goz-gui's. Another's code's message
+//!     that names an item comes through the window's subclasses, any of
+//!     which may delete the item before passing it on: each pass of one by
+//!     a subclass of goz-gui's ([`Msg::def`]) checks every item it names
+//!     (in its parameters, or copied from the structure its `lParam` points
+//!     at) against the record first, and stops it, answering 0, if one is
+//!     not there; so the last check before the tree is made whatever the
+//!     order of the subclasses. A stale item names, at worst, a new item
+//!     the same tree put at its address: wrong, not unsound.
 //! - **A message's parameters mean what its documentation says.** A message
 //!   below `WM_USER` is the system's: every window class of the system and
 //!   of the common controls means by it what the system documents, so a
@@ -62,9 +68,11 @@
 //!   LVM_SETIMAGELIST) and the one a tree takes (TVM_SETIMAGELIST), a
 //!   tree's new items and every walk of its items (TVM_INSERTITEMW,
 //!   TVM_GETNEXTITEM). So does a message whose item a subclass could
-//!   delete before passing it on (every [`tv`] message naming an item).
-//!   Any other answer that comes back through the chain is taken as a
-//!   value that may be wrong, never followed.
+//!   delete before passing it on (every [`tv`] message naming an item);
+//!   another's code's come through the chain, which passes one on only
+//!   while the tree has its items (above). Any other answer that comes
+//!   back through the chain is taken as a value that may be wrong, never
+//!   followed.
 //! - **What the system delivers is what it documents.** A procedure's
 //!   `lParam` for `WM_NOTIFY`, `WM_DRAWITEM` and the like points at the
 //!   structure the message defines. Only a [`Msg`] the system delivered
