@@ -46,7 +46,11 @@
 //!     at) against the record first, and stops it, answering 0, if one is
 //!     not there; so the last check before the tree is made whatever the
 //!     order of the subclasses. A stale item names, at worst, a new item
-//!     the same tree put at its address: wrong, not unsound.
+//!     the same tree put at its address: wrong, not unsound. What is
+//!     trusted to comctl32 is the tree's own handling of an item deleted
+//!     from inside one of its notifications about that item (TVN_SELCHANGED,
+//!     TVN_ITEMEXPANDED…, sent while the tree is already using it), as any
+//!     program with a tree view trusts it.
 //! - **A message's parameters mean what its documentation says.** A message
 //!   below `WM_USER` is the system's: every window class of the system and
 //!   of the common controls means by it what the system documents, so a
