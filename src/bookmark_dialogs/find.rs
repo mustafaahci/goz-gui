@@ -6,40 +6,33 @@
 //! and Page Down in it move in the list. Open (Enter, a double-click) opens
 //! the bookmark and closes; Copy Search puts its search on the clipboard.
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Controls::{
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
-    LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETSELECTIONMARK, LVN_GETDISPINFOW, LVN_ITEMCHANGED,
-    LVN_KEYDOWN, LVN_ODFINDITEMW, LVN_ODSTATECHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE, NMLVCUSTOMDRAW, NMLVDISPINFOW,
-    NMLVKEYDOWN,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVN_GETDISPINFOW,
+    LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW, LVN_ODSTATECHANGED, LVNI_SELECTED,
+    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMITEMACTIVATE, NMLVCUSTOMDRAW,
+    NMLVDISPINFOW, NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
-use windows_sys::Win32::UI::Shell::SetWindowSubclass;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, DM_SETDEFID, DWLP_MSGRESULT, EN_CHANGE, ES_AUTOHSCROLL, EndDialog,
-    GWLP_USERDATA, GetClientRect, GetWindowRect, IDCANCEL, IDOK, MINMAXINFO, MapDialogRect,
-    MoveWindow, SetWindowLongPtrW, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG,
-    WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
+    BS_DEFPUSHBUTTON, EN_CHANGE, ES_AUTOHSCROLL, IDCANCEL, IDOK, WM_COMMAND, WM_DESTROY,
+    WM_GETMINMAXINFO, WM_INITDIALOG, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX,
+    WS_TABSTOP, WS_THICKFRAME,
 };
 
-use super::{Host, WM_REFRESH, enable, item, send};
+use super::{Host, WM_REFRESH, enable};
 use crate::bookmarks::tree::{TOP, Tree};
 use crate::bookmarks::{Bookmarks, Settings, one_line};
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common, fill_last_column,
-    list_custom_draw, state,
+    Class, Look, Template, apply_theme, center_on_owner, common_msg, fill_last_column,
+    list_custom_draw,
 };
-use crate::history_dialogs::filter_proc;
+use crate::history_dialogs::filter_keys;
 use crate::places::{self, Which};
-use crate::wide::{window_text, wz};
+use crate::win::{self, Msg, Notify, View, dlg, lv, sys};
 
 /// What a bookmark opens: its search (`None`: the one in the box stays)
 /// and its options.
@@ -152,62 +145,56 @@ pub fn find(owner: HWND, host: &dyn Host, look: Look) -> Option<Chosen> {
     ] {
         t.control(Class::Button, text, id, style, 0, (0, 0, 50, 14));
     }
-    t.run(owner, Some(find_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| find_proc(&state, m));
     state.chosen.into_inner()
 }
 
 impl Find<'_> {
     fn list(dlg: HWND) -> HWND {
-        item(dlg, ID_LIST)
+        dlg::item(dlg, ID_LIST)
     }
 
     fn init(&self, dlg: HWND) {
         let list = Find::list(dlg);
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
-        send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
+        lv::set_extended_style(list, ex, ex);
         let dpi = crate::custom::window_dpi(dlg) as i32;
         for (i, (title, width)) in COLUMNS.into_iter().enumerate() {
-            let mut text = wz(title);
             let col = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH,
                 cx: width * dpi / 96,
-                pszText: text.as_mut_ptr(),
-                // SAFETY: the rest of LVCOLUMNW is plain data.
-                ..unsafe { core::mem::zeroed() }
+                ..Default::default()
             };
-            send(list, LVM_INSERTCOLUMNW, i, (&raw const col) as isize);
+            lv::insert_column(list, i as i32, col, Some(title));
         }
-        // SAFETY: subclasses this thread's filter box; the list outlives it
-        // (both go with the dialog), and the subclass removes itself.
-        unsafe { SetWindowSubclass(item(dlg, ID_FILTER), Some(filter_proc), 1, list as usize) };
+        // The list outlives the box (both go with the dialog), and the
+        // subclass goes with the box.
+        filter_keys(dlg::item(dlg, ID_FILTER), list);
         apply_theme(dlg, self.look.get().dark);
         center_on_owner(dlg);
-        let mut wr = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetWindowRect(dlg, &mut wr) };
+        let wr = win::window_rect(dlg);
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
         places::restore(dlg, Which::BookmarkSelect, list, self.min.get());
         self.layout(dlg);
-        send(dlg, DM_SETDEFID, usize::from(ID_OPEN), 0);
+        dlg::set_def_id(dlg, ID_OPEN);
         self.host.showing(dlg);
         self.reload(dlg);
     }
 
     fn layout(&self, dlg: HWND) {
         let px = |x: i32, y: i32| {
-            let mut r = RECT {
-                left: 0,
-                top: 0,
-                right: x,
-                bottom: y,
-            };
-            // SAFETY: converts within this thread's dialog.
-            unsafe { MapDialogRect(dlg, &mut r) };
+            let r = dlg::map_rect(
+                dlg,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: x,
+                    bottom: y,
+                },
+            );
             (r.right, r.bottom)
         };
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetClientRect(dlg, &mut rc) };
+        let rc = win::client_rect(dlg);
         let (w, h) = (rc.right, rc.bottom);
         let (m, _) = px(7, 7);
         let (_, my) = px(0, 7);
@@ -217,8 +204,7 @@ impl Find<'_> {
         let (label, top) = px(29, 24);
         let (_, edit_h) = px(0, 12);
         let place = |id: u16, x: i32, y: i32, cw: i32, ch: i32| {
-            // SAFETY: moves a control of this thread's dialog.
-            unsafe { MoveWindow(item(dlg, id), x, y, cw.max(0), ch.max(0), 1) };
+            win::move_window(dlg::item(dlg, id), x, y, cw.max(0), ch.max(0), true);
         };
         place(ID_FILTER, m + label, my, w - 2 * m - label, edit_h);
         let by = h - my - bh;
@@ -244,7 +230,7 @@ impl Find<'_> {
     }
 
     fn reshow(&self, dlg: HWND, keep: Option<&str>) {
-        let filter = window_text(item(dlg, ID_FILTER));
+        let filter = dlg::item_text(dlg, ID_FILTER);
         let (n, select) = {
             let all = self.all.borrow();
             let rows = view(&all, &filter);
@@ -258,27 +244,20 @@ impl Find<'_> {
         // The list's notifications come back into this dialog: no borrow
         // is held from here on.
         let list = Find::list(dlg);
-        send(list, LVM_SETITEMCOUNT, n, 0);
+        lv::set_item_count(list, n, 0);
         // The rows may have brought the vertical scroll bar (or taken it
         // away): the Search column fills what the list has now.
         fill_last_column(list);
-        let state = |row: usize, on: u32| {
-            let it = LVITEMW {
-                state: on,
-                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
-                // SAFETY: the rest of LVITEMW is plain data.
-                ..unsafe { core::mem::zeroed() }
-            };
-            send(list, LVM_SETITEMSTATE, row, (&raw const it) as isize);
+        let state = |row: i32, on: u32| {
+            lv::set_item_state(list, row, on, LVIS_SELECTED | LVIS_FOCUSED);
         };
-        state(usize::MAX, 0);
+        state(-1, 0);
         if let Some(i) = select {
-            state(i, LVIS_SELECTED | LVIS_FOCUSED);
-            send(list, LVM_SETSELECTIONMARK, 0, i as isize);
-            send(list, LVM_ENSUREVISIBLE, i, 0);
+            state(i as i32, LVIS_SELECTED | LVIS_FOCUSED);
+            lv::set_selection_mark(list, i as i32);
+            lv::ensure_visible(list, i as i32, false);
         }
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(list, core::ptr::null(), 1) };
+        win::invalidate(list, None, true);
         self.update_buttons(dlg);
     }
 
@@ -290,12 +269,7 @@ impl Find<'_> {
     }
 
     fn update_buttons(&self, dlg: HWND) {
-        let row = send(
-            Find::list(dlg),
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_SELECTED as isize,
-        );
+        let row = lv::next_item(Find::list(dlg), -1, LVNI_SELECTED);
         self.selected_row.set(usize::try_from(row).ok());
         let any = self.current().is_some();
         enable(dlg, ID_OPEN, any);
@@ -305,8 +279,7 @@ impl Find<'_> {
     fn open(&self, dlg: HWND) {
         let Some(i) = self.current() else { return };
         *self.chosen.borrow_mut() = Some(self.all.borrow()[i].chosen.clone());
-        // SAFETY: ends this modal dialog.
-        unsafe { EndDialog(dlg, 1) };
+        dlg::end(dlg, 1);
     }
 
     fn copy(&self) {
@@ -319,7 +292,7 @@ impl Find<'_> {
         self.host.copy(&text);
     }
 
-    fn disp_info(&self, info: &mut NMLVDISPINFOW) {
+    fn disp_info(&self, info: &mut View<'_, NMLVDISPINFOW>) {
         if info.item.mask & LVIF_TEXT == 0
             || info.item.pszText.is_null()
             || info.item.cchTextMax <= 0
@@ -339,64 +312,47 @@ impl Find<'_> {
                 _ => Vec::new(),
             }
         };
-        let n = text.len().min(info.item.cchTextMax as usize - 1);
-        // SAFETY: the list gave a buffer of `cchTextMax` code units.
-        unsafe {
-            core::ptr::copy_nonoverlapping(text.as_ptr(), info.item.pszText, n);
-            *info.item.pszText.add(n) = 0;
-        }
+        info.set_text(&text);
     }
 
     /// Answers the list's notifications; `Some` is DWLP_MSGRESULT's value.
-    ///
-    /// # Safety
-    /// `l` is a WM_NOTIFY's lParam from the list.
-    unsafe fn notify(&self, dlg: HWND, l: LPARAM) -> Option<isize> {
-        // SAFETY: as the caller promises; each code's struct is read as
-        // the list sends it.
-        unsafe {
-            let hdr = &*(l as *const NMHDR);
-            match hdr.code {
-                NM_CUSTOMDRAW => {
-                    let cd = &*(l as *const NMLVCUSTOMDRAW);
-                    return Some(list_custom_draw(hdr.hwndFrom, cd, self.look.get().dark));
-                }
-                LVN_GETDISPINFOW => self.disp_info(&mut *(l as *mut NMLVDISPINFOW)),
-                // No type-ahead: the filter box is for finding.
-                LVN_ODFINDITEMW => return Some(-1),
-                LVN_ITEMCHANGED | LVN_ODSTATECHANGED => self.update_buttons(dlg),
-                NM_DBLCLK => {
-                    if (*(l as *const NMITEMACTIVATE)).iItem >= 0 {
-                        self.open(dlg);
-                    }
-                }
-                LVN_KEYDOWN => {
-                    let ctrl = GetKeyState(i32::from(VK_CONTROL)) < 0;
-                    if ctrl && (*(l as *const NMLVKEYDOWN)).wVKey == 0x43 {
-                        self.copy();
-                    }
-                }
-                _ => {}
+    fn notify(&self, dlg: HWND, n: &Notify) -> Option<isize> {
+        match n.code() {
+            NM_CUSTOMDRAW => {
+                let cd = n.get::<NMLVCUSTOMDRAW>()?;
+                return Some(list_custom_draw(n.from(), &cd, self.look.get().dark));
             }
-            None
+            LVN_GETDISPINFOW => {
+                if let Some(mut info) = n.get::<NMLVDISPINFOW>() {
+                    self.disp_info(&mut info);
+                }
+            }
+            // No type-ahead: the filter box is for finding.
+            LVN_ODFINDITEMW => return Some(-1),
+            LVN_ITEMCHANGED | LVN_ODSTATECHANGED => self.update_buttons(dlg),
+            NM_DBLCLK => {
+                if n.get::<NMITEMACTIVATE>().is_some_and(|a| a.iItem >= 0) {
+                    self.open(dlg);
+                }
+            }
+            LVN_KEYDOWN => {
+                let ctrl = sys::key_down(VK_CONTROL);
+                if ctrl && n.get::<NMLVKEYDOWN>().is_some_and(|k| k.wVKey == 0x43) {
+                    self.copy();
+                }
+            }
+            _ => {}
         }
+        None
     }
 }
 
-unsafe extern "system" fn find_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Find` that `find` keeps alive until the
-        // dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Find` from `find`, or null before.
-    let Some(s) = (unsafe { state::<Find<'_>>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn find_proc(s: &Find<'_>, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common_msg(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.init(dlg);
             // The dialog manager puts the keyboard in the filter box.
@@ -408,26 +364,26 @@ unsafe extern "system" fn find_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         }
         WM_GETMINMAXINFO => {
             let (w, h) = s.min.get();
-            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
-            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = w;
-            mmi.ptMinTrackSize.y = h;
+            if let Some(mut mmi) = m.min_max_info() {
+                mmi.ptMinTrackSize.x = w;
+                mmi.ptMinTrackSize.y = h;
+            }
             1
         }
         WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR.
-            if unsafe { (*(l as *const NMHDR)).idFrom } != usize::from(ID_LIST) {
+            let Some(n) = m.notify() else {
+                return 0;
+            };
+            if n.id() != usize::from(ID_LIST) {
                 return 0;
             }
-            // SAFETY: a notification from the list.
-            if let Some(answer) = unsafe { s.notify(dlg, l) } {
-                // SAFETY: the answer of this dialog's WM_NOTIFY.
-                unsafe { SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, answer) };
+            if let Some(answer) = s.notify(dlg, &n) {
+                dlg::set_result(dlg, answer);
             }
             1
         }
         WM_COMMAND => {
-            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
             match id {
                 // Enter is Open, the default button.
                 ID_OPEN | OK => s.open(dlg),
@@ -436,10 +392,7 @@ unsafe extern "system" fn find_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     let keep = s.current().map(|i| s.all.borrow()[i].label.clone());
                     s.reshow(dlg, keep.as_deref());
                 }
-                // SAFETY: ends this modal dialog.
-                CANCEL => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                CANCEL => dlg::end(dlg, 0),
                 _ => return 0,
             }
             1

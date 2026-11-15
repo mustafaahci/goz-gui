@@ -1,27 +1,24 @@
 //! The small dialogs Organize Bookmarks asks with: a folder's name (New
 //! Folder..., renaming a folder) and a folder to move to (Move To...).
 
-#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
-
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::{
-    HTREEITEM, NM_DBLCLK, NMHDR, TVM_SETIMAGELIST, TVN_SELCHANGEDW, TVS_HASBUTTONS, TVS_HASLINES,
-    TVS_LINESATROOT, TVS_SHOWSELALWAYS, TVSIL_NORMAL,
+    HTREEITEM, NM_DBLCLK, TVN_SELCHANGEDW, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT,
+    TVS_SHOWSELALWAYS, TVSIL_NORMAL,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, EN_CHANGE, ES_AUTOHSCROLL, EndDialog, GWLP_USERDATA, GetWindowTextLengthW,
-    IDCANCEL, IDOK, SetWindowLongPtrW, WM_COMMAND, WM_INITDIALOG, WM_NOTIFY, WS_EX_CLIENTEDGE,
-    WS_TABSTOP,
+    BS_DEFPUSHBUTTON, EN_CHANGE, ES_AUTOHSCROLL, IDCANCEL, IDOK, WM_COMMAND, WM_INITDIALOG,
+    WM_NOTIFY, WS_EX_CLIENTEDGE, WS_TABSTOP,
 };
 
-use super::{Icons, enable, fill_tree, item, send, set_text, tree_select, tree_selected, warn};
+use super::{Icons, enable, fill_tree, tree_select, tree_selected, warn};
 use crate::bookmarks::FolderPath;
 use crate::bookmarks::tree::Tree;
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common, state};
-use crate::wide::window_text;
+use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common_msg};
+use crate::win::{self, Msg, dlg, tv};
 
 const STATIC: u16 = 0xffff;
 const ID_NAME: u16 = 100;
@@ -80,26 +77,18 @@ pub fn folder_name(
             0,
             (163, 29, 50, 14),
         );
-    t.run(owner, Some(name_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| name_proc(&state, m));
     state.result.into_inner()
 }
 
-unsafe extern "system" fn name_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Name` that `folder_name` keeps alive until
-        // the dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Name` from `folder_name`, or null.
-    let Some(s) = (unsafe { state::<Name<'_>>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn name_proc(s: &Name<'_>, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common_msg(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
-            set_text(item(dlg, ID_NAME), &s.initial);
+            win::set_text(dlg::item(dlg, ID_NAME), &s.initial);
             enable(dlg, OK, !s.initial.is_empty());
             apply_theme(dlg, s.look.get().dark);
             center_on_owner(dlg);
@@ -107,25 +96,20 @@ unsafe extern "system" fn name_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             1
         }
         WM_COMMAND => {
-            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
             match id {
                 OK => {
-                    let name = window_text(item(dlg, ID_NAME)).trim().to_owned();
+                    let name = dlg::item_text(dlg, ID_NAME).trim().to_owned();
                     if let Some(why) = (s.problem)(&name) {
                         warn(dlg, &why);
                         return 1;
                     }
                     *s.result.borrow_mut() = Some(name);
-                    // SAFETY: ends this modal dialog.
-                    unsafe { EndDialog(dlg, 1) };
+                    dlg::end(dlg, 1);
                 }
-                // SAFETY: ends this modal dialog.
-                CANCEL => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                CANCEL => dlg::end(dlg, 0),
                 ID_NAME if code == EN_CHANGE => {
-                    // SAFETY: reads a control of this thread's dialog.
-                    let named = unsafe { GetWindowTextLengthW(item(dlg, ID_NAME)) } > 0;
+                    let named = win::text_len(dlg::item(dlg, ID_NAME)) > 0;
                     enable(dlg, OK, named);
                 }
                 _ => return 0,
@@ -198,38 +182,29 @@ pub fn pick_folder(
         0,
         (143, 169, 50, 14),
     );
-    t.run(owner, Some(pick_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| pick_proc(&state, m));
     state.result.into_inner()
 }
 
 impl Pick<'_> {
     fn choose(&self, dlg: HWND) {
-        let Some(node) = tree_selected(item(dlg, ID_TREE)) else {
+        let Some(node) = tree_selected(dlg::item(dlg, ID_TREE)) else {
             return;
         };
         *self.result.borrow_mut() = Some(self.tree.nodes[node].path.clone());
-        // SAFETY: ends this modal dialog.
-        unsafe { EndDialog(dlg, 1) };
+        dlg::end(dlg, 1);
     }
 }
 
-unsafe extern "system" fn pick_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Pick` that `pick_folder` keeps alive until
-        // the dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Pick` from `pick_folder`, or null.
-    let Some(s) = (unsafe { state::<Pick<'_>>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn pick_proc(s: &Pick<'_>, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common_msg(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
-            let view = item(dlg, ID_TREE);
-            send(view, TVM_SETIMAGELIST, TVSIL_NORMAL as usize, s.icons.list);
+            let view = dlg::item(dlg, ID_TREE);
+            tv::set_image_list(view, TVSIL_NORMAL, s.icons.list);
             let made = fill_tree(view, s.tree, s.skip, s.icons);
             tree_select(view, &made, s.select);
             *s.made.borrow_mut() = made;
@@ -238,12 +213,12 @@ unsafe extern "system" fn pick_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             1
         }
         WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR.
-            let hdr = unsafe { &*(l as *const NMHDR) };
-            if hdr.idFrom == usize::from(ID_TREE) {
-                match hdr.code {
+            if let Some(n) = m.notify()
+                && n.id() == usize::from(ID_TREE)
+            {
+                match n.code() {
                     TVN_SELCHANGEDW => {
-                        let picked = tree_selected(item(dlg, ID_TREE)).is_some();
+                        let picked = tree_selected(dlg::item(dlg, ID_TREE)).is_some();
                         enable(dlg, OK, picked);
                     }
                     NM_DBLCLK => s.choose(dlg),
@@ -253,12 +228,9 @@ unsafe extern "system" fn pick_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             0
         }
         WM_COMMAND => {
-            match (w & 0xffff) as u16 {
+            match win::loword(m.w) {
                 OK => s.choose(dlg),
-                // SAFETY: ends this modal dialog.
-                CANCEL => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                CANCEL => dlg::end(dlg, 0),
                 _ => return 0,
             }
             1
