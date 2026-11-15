@@ -80,10 +80,10 @@ pub trait PaneContent: Any {
     /// A key message (`WM_KEYDOWN`, `WM_SYSKEYDOWN`, `WM_CHAR`,
     /// `WM_SYSCHAR`) for one of the pane's windows, before the window's
     /// shortcuts (the accelerator table) and Tab see it: true when the
-    /// content took it, and then it goes no further (to hand it to its
-    /// control past the shortcuts, `TranslateMessage` and
-    /// `DispatchMessageW` it here). For the keys a control must keep
-    /// (Enter in a box, F2 in a tree, Ctrl+A in an edit box...).
+    /// content took it, having done what the key means itself; it then
+    /// goes no further (it is neither translated nor dispatched). For the
+    /// keys a control must keep (Enter in a box, F2 in a tree, Ctrl+A in an
+    /// edit box...).
     fn key(&self, _app: &App, _msg: &MSG) -> bool {
         false
     }

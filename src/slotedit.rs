@@ -86,17 +86,15 @@ pub const MSG_FIRST: u32 = WM_APP + 380;
 /// UTF-16 position `wParam` (Ctrl+click and F2 post it, so the dialog runs
 /// outside the box's own message).
 pub const WM_EDIT_TERM_AT: u32 = MSG_FIRST;
-/// The main window's: a `save-filelistN:` search's results were read
-/// (lParam: a `Box<window::lists::Saved>`).
+/// The main window's: a `save-filelistN:` search's results were read (a
+/// `win::parcel` of a `window::lists::Saved`).
 pub const WM_SLOT_SAVED: u32 = MSG_FIRST + 1;
 /// The dialog's own: Import...'s job has names, or ended.
 const WM_IMPORTED: u32 = MSG_FIRST + 2;
-/// The dialog's own: files were dropped on it (a parcel of their paths).
-const WM_DROPPED: u32 = MSG_FIRST + 3;
 /// One past W7's messages.
 pub const MSG_END: u32 = MSG_FIRST + 10;
 
-const _: () = assert!(WM_DROPPED < MSG_END && crate::listedit::W6_MSG_END <= MSG_FIRST);
+const _: () = assert!(WM_IMPORTED < MSG_END && crate::listedit::W6_MSG_END <= MSG_FIRST);
 
 const ID_LIST: u16 = 100;
 const ID_COUNT: u16 = 101;
