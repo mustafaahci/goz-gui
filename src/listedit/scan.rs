@@ -8,6 +8,8 @@
 //! dozen messages, not a million. Esc (or Edit > Stop Adding) sets the
 //! job's stop flag; the walk checks it between items.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};

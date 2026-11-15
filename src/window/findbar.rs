@@ -12,6 +12,8 @@
 //! Wrapping round the end and finding nothing say so in the status bar, in
 //! Everything's words.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

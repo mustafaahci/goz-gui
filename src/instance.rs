@@ -13,6 +13,8 @@
 //! another class, titled with the key, through which Exit in any of them
 //! closes them all, as Everything's Exit ends every window.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{

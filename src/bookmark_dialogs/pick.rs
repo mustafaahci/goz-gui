@@ -1,6 +1,8 @@
 //! The small dialogs Organize Bookmarks asks with: a folder's name (New
 //! Folder..., renaming a folder) and a folder to move to (Move To...).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};

@@ -24,6 +24,8 @@
 //!
 //! No `RefCell` of the window is borrowed while a dialog runs.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

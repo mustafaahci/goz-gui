@@ -5,6 +5,8 @@
 //! so that it cannot). It only reads; it lives on the preview's thread,
 //! where the handler's process calls it.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows::Win32::Foundation::{
     E_NOTIMPL, FILETIME, S_FALSE, S_OK, STG_E_ACCESSDENIED, STG_E_INVALIDFUNCTION,
 };

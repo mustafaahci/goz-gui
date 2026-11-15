@@ -3,6 +3,8 @@
 //! was saved at, and moved into the nearest work area when that monitor is
 //! gone or the title bar would be out of reach.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,

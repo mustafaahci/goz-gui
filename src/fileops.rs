@@ -14,6 +14,8 @@
 //! When goz-gui closes with a job still running, the process waits for it
 //! ([`FileOps::finish`]): a copy or move is never cut off half way.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::os::windows::io::AsRawHandle;

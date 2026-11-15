@@ -20,6 +20,8 @@
 //! call that sends messages (showing, moving or filling its windows, the
 //! list's state, the menu).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 mod image;
 mod settings;
 mod stream;

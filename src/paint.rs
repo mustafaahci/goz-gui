@@ -1,6 +1,8 @@
 //! Drawing: result rows with their matches in bold, the search band, the
 //! main window's own surface, and the dark menu bar.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{HWND, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DC_BRUSH, DT_CENTER,

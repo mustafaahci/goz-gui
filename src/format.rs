@@ -1,5 +1,7 @@
 //! Sizes and dates as the user's locale writes them.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 

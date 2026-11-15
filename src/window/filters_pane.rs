@@ -15,6 +15,8 @@
 //! rows, which it measures with the pane (`WM_MEASUREITEM`) whenever its
 //! size changes. The rows are painted in its custom draw as before.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 

@@ -9,6 +9,8 @@
 //! message back into the window procedure (most `SendMessageW` calls to the
 //! list can), which is what keeps re-entrancy from panicking.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;

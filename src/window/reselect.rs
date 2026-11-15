@@ -33,6 +33,8 @@
 //!
 //! A restored session (`session.rs`) selects its files again the same way.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::collections::HashSet;
 
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;

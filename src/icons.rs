@@ -8,6 +8,8 @@
 //! are looked up on a background thread of their own and the row is
 //! redrawn when the answer arrives.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 

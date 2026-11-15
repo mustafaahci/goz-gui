@@ -6,6 +6,8 @@
 //! 1809 but only exports by ordinal; every call checks the export exists, so
 //! a Windows without it just stays light.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND};

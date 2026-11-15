@@ -11,6 +11,8 @@
 //! The dialogs read the bookmarks from, and change them through, a [`Host`]
 //! (the window), which writes the file.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::sync::Arc;
 
 mod edit;

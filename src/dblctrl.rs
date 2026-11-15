@@ -9,6 +9,8 @@
 //! Ctrl keys: it posts a message when it sees the double press and lets
 //! every key go on.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};

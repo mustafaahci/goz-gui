@@ -22,6 +22,8 @@
 //! candidate. The candidates of several searches are put in the search's
 //! order before they are read.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 mod exact;
 pub mod plan;
 pub mod scan;

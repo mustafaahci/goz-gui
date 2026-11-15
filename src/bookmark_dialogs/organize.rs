@@ -17,6 +17,8 @@
 //! Delete and F2 delete or rename the folder. Each change is made at once
 //! and the window writes the file.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 

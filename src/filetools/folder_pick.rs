@@ -6,6 +6,8 @@
 //! A test names the folder in `GOZ_GUI_PICK_FOLDER` instead
 //! (`store::location::pick_folder`): nothing is shown.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows::Win32::Foundation::HWND as WHWND;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::{

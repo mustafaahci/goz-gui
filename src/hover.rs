@@ -5,6 +5,8 @@
 //! redrawn. The cell under the mouse goes on to `celltip`, which shows a
 //! cell's cut-off text.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::UI::Controls::{

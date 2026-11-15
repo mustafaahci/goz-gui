@@ -8,6 +8,8 @@
 //! a pressed item in that notification but not the one under the mouse, so
 //! its own subclass here tracks that.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DrawTextW, HDC,

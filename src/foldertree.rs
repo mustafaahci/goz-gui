@@ -19,6 +19,8 @@
 //! `Box<Reply>` in lParam, unless the pane has closed meanwhile ([`Alive`]);
 //! a reply posted just before it closed is freed as it closes ([`close`]).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

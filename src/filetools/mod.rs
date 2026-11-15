@@ -16,6 +16,8 @@
 //! and is skipped (with the reason) otherwise. Nothing is ever written
 //! over, even with the questions turned off.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 /// The file tools' commands, from `menu::F5_FIRST` (3400..=3499).
 pub mod cmd {
     use crate::menu::F5_FIRST;

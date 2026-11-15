@@ -30,6 +30,8 @@
 //! A modal dialog of the window's thread; no `RefCell` of the window is
 //! borrowed while it runs.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 

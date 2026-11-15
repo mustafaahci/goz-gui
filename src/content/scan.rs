@@ -17,6 +17,8 @@
 //! 1 MB pieces with the text that may start a match carried over, and the
 //! read ends as soon as every term is decided.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::io::Read;
 
 use memchr::memmem::Finder;

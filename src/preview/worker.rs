@@ -14,6 +14,8 @@
 //! thread is abandoned (`Worker::abandon`), left to finish whenever its call
 //! returns, and a new thread takes over.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};

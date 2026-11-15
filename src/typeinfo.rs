@@ -25,6 +25,8 @@
 //! own thread (`filetype::name`); the answers the thread gives are kept
 //! where that looks first, so those seldom need to.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

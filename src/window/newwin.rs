@@ -8,6 +8,8 @@
 //! background for the first with `run_in_background`); Exit closes every
 //! window of this goz-gui.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};

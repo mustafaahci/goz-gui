@@ -22,6 +22,8 @@
 //! The cache is let go of when the window hides and trimmed to the items in
 //! view once the view has rested ([`Thumbs::release`], [`Thumbs::trim`]).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};

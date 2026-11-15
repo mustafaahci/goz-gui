@@ -4,6 +4,8 @@
 //! delay), the search box's text selected by a click or when the window is
 //! activated, one-click opening, closing on execute, and new windows.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::UI::Controls::{
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_FULLROWSELECT, LVS_EX_TRACKSELECT,

@@ -16,6 +16,8 @@
 //! layout hides it, and its place then is not kept (its width is, as any
 //! hidden column's).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{GetDC, InvalidateRect, ReleaseDC, SelectObject};
 use windows_sys::Win32::UI::Controls::{

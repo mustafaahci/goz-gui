@@ -7,6 +7,8 @@
 //! "Automatically scroll view" and "Underline icon titles" are the list
 //! control's own doing, which goz-gui leaves as Windows has it: not here.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::KillTimer;
 

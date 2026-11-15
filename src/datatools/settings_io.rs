@@ -12,6 +12,8 @@
 //! bookmarks and session go with the settings: they are files of the same
 //! folder, and a copy of goz-gui moved to another computer wants them all.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::{Path, PathBuf};

@@ -14,6 +14,8 @@
 //! The `windows` crate brings the interfaces; the rest of goz-gui stays on
 //! `windows-sys`, whose handles are the same pointers.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;

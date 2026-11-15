@@ -8,6 +8,8 @@
 //! another command has where it would work is named, and taken from it by
 //! Add, as Everything unbinds the other.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};

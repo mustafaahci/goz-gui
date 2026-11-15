@@ -11,6 +11,8 @@
 //! the sort, the columns, the panes, the dialogs' places) is shown but
 //! changed only where it is changed: the window, the View menu.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -19,6 +19,8 @@
 //! icon). That one is a single entry of the lists however many files show
 //! it, as a type's icon is, so the view draws it from them.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::os::windows::ffi::OsStringExt;
 
 use windows::Win32::UI::Shell::{

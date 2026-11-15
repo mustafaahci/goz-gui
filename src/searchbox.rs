@@ -10,6 +10,8 @@
 //! drawn pixel by pixel from their geometry, antialiased, so they are crisp
 //! and the same shape at every scale.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{HDC, InvalidateRect, PtInRect, SetPixelV};
 use windows_sys::Win32::UI::Controls::{

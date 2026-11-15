@@ -9,6 +9,8 @@
 //! `GOZ_GUI_SHORTCUT_DIR` the shortcuts under `<dir>\Programs` and
 //! `<dir>\Desktop`, so a test never touches the real ones.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;

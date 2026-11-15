@@ -2,6 +2,8 @@
 //! file, on a thread of its own (`crate::export`). The status bar follows
 //! it; Esc or File > Export... again stops it.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, MB_ICONWARNING, MB_OK};
 

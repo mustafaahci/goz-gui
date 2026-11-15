@@ -11,6 +11,8 @@
 //! submenu; a drawn one with its size and how many pixels the drawing set. `GOZ_GUI_MENU_PICK=<label or verb>` then returns that item's
 //! id, as if it had been clicked.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, DC_BRUSH, DeleteDC, DeleteObject, FillRect, GetDC,

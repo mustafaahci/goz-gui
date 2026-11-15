@@ -20,6 +20,8 @@
 //! The thread starts with the first read asked for, and asks are dropped
 //! when the results change (`reset`), as the icon thread's are.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 

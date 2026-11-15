@@ -5,6 +5,8 @@
 //! with its aspect kept. The arithmetic is here, tested; the decoding is
 //! `Wic`.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::collections::HashSet;
 
 use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY, GENERIC_READ};

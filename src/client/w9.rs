@@ -15,6 +15,8 @@
 //! - **Index settings** (`"config"`): [`get_config`] and [`set_config`],
 //!   for Options > Indexes.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::sync::Mutex;
 
 use goz_core::proto::{

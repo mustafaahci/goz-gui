@@ -9,6 +9,8 @@
 //! The jump list is made on a thread of its own (the shell's destination
 //! list can take a while), from what the window hands it.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 

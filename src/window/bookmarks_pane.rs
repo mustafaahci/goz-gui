@@ -25,6 +25,8 @@
 //! Re-entrancy: no `RefCell` here is borrowed across a message to the tree
 //! or the box, a menu or a dialog.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;

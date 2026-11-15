@@ -6,6 +6,8 @@
 //! through hand-written vtables; the slots not called are kept as plain
 //! pointer-sized fields so the ones that are sit at their places.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;

@@ -8,6 +8,8 @@
 //! view is switched by the list's style bits (LVM_SETVIEW leaves a
 //! virtual, owner-drawn list unable to place or draw its icons).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;

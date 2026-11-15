@@ -8,6 +8,8 @@
 //! known and have the others looked up on a thread (`typeinfo`), whose
 //! answers are kept here ([`learn`]).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

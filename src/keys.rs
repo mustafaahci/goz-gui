@@ -10,6 +10,8 @@
 //! The tables here are goz-gui's defaults. Options > Keyboard rebinds them
 //! (`crate::keymap`): what is in force is asked of `keymap::current`.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_ADD, VK_BACK, VK_DELETE, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F11,
     VK_HOME, VK_INSERT, VK_LEFT, VK_NUMPAD0, VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS,

@@ -5,6 +5,8 @@
 //! changes (checks, radio dots, greyed items, and the File menu's selection
 //! part) are set when their menu opens, from a [`State`] the window fills in.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CheckMenuItem, CreateMenu, CreatePopupMenu, DeleteMenu, EnableMenuItem, GetMenuItemCount,
     GetMenuItemID, GetMenuItemInfoW, HMENU, InsertMenuItemW, MENUITEMINFOW, MF_BYCOMMAND,

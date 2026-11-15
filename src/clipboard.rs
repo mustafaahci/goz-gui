@@ -6,6 +6,8 @@
 //! OpenClipboard/CloseClipboard so a paste never sees half of them. A paste
 //! reads them back the same way ([`files`]), whoever put them there.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{GlobalFree, HWND};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,

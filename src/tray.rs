@@ -1,6 +1,8 @@
 //! The notification-area (tray) icon: shown while `show_tray_icon` is on,
 //! put back when Explorer restarts, and its click and menu.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,

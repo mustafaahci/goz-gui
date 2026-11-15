@@ -10,6 +10,8 @@
 //! navigation history), so a tab costs no rows and no searches while
 //! another is shown (`window/tabs.rs`).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use crate::menu;
 
 // The commands (F3's range, `menu::F3_FIRST`).

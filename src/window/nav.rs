@@ -11,6 +11,8 @@
 //! and sort) a navigation entry. Going back, forward or to an entry restores
 //! that state without adding one.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use goz_core::types::{SortDir, SortSpec};
 use windows_sys::Win32::UI::Controls::EM_SETSEL;
 use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;

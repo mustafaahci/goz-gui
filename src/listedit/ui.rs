@@ -48,6 +48,8 @@
 //! (Ctrl+V): files copied in Explorer as a drop adds them, or text, a name a
 //! line (`GOZ_GUI_PASTE_TEXT` in a test).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

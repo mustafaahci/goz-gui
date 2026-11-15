@@ -14,6 +14,8 @@
 //! `ui` is the window, which runs on a thread of its own too, so the main
 //! window never waits for it, nor it for the main window.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 pub mod scan;
 pub mod ui;
 

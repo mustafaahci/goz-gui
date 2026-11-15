@@ -14,6 +14,8 @@
 //! the tab menu (`tabs.rs`). The strip never takes the keyboard: Ctrl+Tab,
 //! Ctrl+T, Ctrl+W and the menus reach every command.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::any::Any;
 use std::cell::Cell;
 

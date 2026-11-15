@@ -26,6 +26,8 @@
 //! - `GOZ_GUI_DESKTOP_DIR=<folder>`: Create Shortcut puts a shortcut it
 //!   cannot make beside its item there instead of on the Desktop.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;

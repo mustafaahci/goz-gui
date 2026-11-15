@@ -13,6 +13,8 @@
 //! the journal and Force Rebuild are Everything's own, with nothing in
 //! gozd to set: they are shown greyed, as Everything lays the page out.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 

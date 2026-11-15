@@ -2,6 +2,8 @@
 //! right edge, the total size, the search options in force, and gozd's own
 //! state. Double-clicking an option's label turns that option off.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     DC_BRUSH, DC_PEN, DT_CALCRECT, DT_MODIFYSTRING, DT_NOPREFIX, DT_PATH_ELLIPSIS, DT_SINGLELINE,

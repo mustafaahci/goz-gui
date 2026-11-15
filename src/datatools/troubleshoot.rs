@@ -7,6 +7,8 @@
 //! and the settings that differ from the defaults (Everything's "Config").
 //! Copy puts it all on the clipboard.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};

@@ -8,6 +8,8 @@
 //! a tmp file beside it and renamed into place once complete; a stopped or
 //! failed export deletes the tmp file and leaves whatever was there.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};

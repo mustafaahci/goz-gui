@@ -22,6 +22,8 @@
 //! Those bitmaps (64 KB an icon at 128 px) are one per type shown, at most
 //! `SHRUNK_BUDGET`, and go with the view's size or the window's showing.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};

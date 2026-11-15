@@ -23,6 +23,8 @@
 //! a moment after the folder changes. The Presets button keeps named Old
 //! and New formats (shared by the three), to put in the boxes again later.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 

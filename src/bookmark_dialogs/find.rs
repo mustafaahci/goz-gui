@@ -6,6 +6,8 @@
 //! and Page Down in it move in the list. Open (Enter, a double-click) opens
 //! the bookmark and closes; Copy Search puts its search on the clipboard.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};

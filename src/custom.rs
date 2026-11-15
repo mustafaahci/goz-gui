@@ -4,6 +4,8 @@
 //! `crate::keymap`), the UI scale (`dpi`), the double-Ctrl action
 //! (`double_ctrl_action`) and the color filters (`color_filters`).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::colorfilter::{self, ColorFilter};

@@ -13,6 +13,8 @@
 //! No `RefCell` of the window is borrowed while a dialog or a folder picker
 //! runs its loop.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::HWND;

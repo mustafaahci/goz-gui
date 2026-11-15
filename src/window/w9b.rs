@@ -16,6 +16,8 @@
 //!   (`client::Row::from_item`); a column shown after the search asks
 //!   gozd again, once.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
 

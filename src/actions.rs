@@ -7,6 +7,8 @@
 //! runs on a thread of its own and the window never waits for it. So does
 //! Properties, whose items are parsed from their paths on the disk.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::collections::{HashMap, VecDeque};
 use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicUsize, Ordering};

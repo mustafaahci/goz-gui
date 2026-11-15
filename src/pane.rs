@@ -20,6 +20,8 @@
 //! call that sends messages (creating, moving or destroying its windows,
 //! SendMessage to its controls), since they come back here.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::any::Any;
 use std::cell::Cell;
 use std::rc::Rc;

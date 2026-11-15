@@ -6,6 +6,8 @@
 //! Its WM_APP messages are `WM_APP + 420..430`, its timers `420..430`, its
 //! commands `5150..5200` (the header menu's columns and Organize Columns).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 

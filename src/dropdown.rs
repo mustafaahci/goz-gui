@@ -11,6 +11,8 @@
 //! `App::search_history` as it is drawn, so the popup holds no copy of it;
 //! suggestions (at most a few hundred) are kept as texts.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};

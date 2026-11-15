@@ -2,6 +2,8 @@
 //! dates its Custom boxes take (Everything's: `YYYY-MM-DDThh:mm:ss`, the
 //! earliest value for what is left out, in local time).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows_sys::Win32::System::Time::{
     FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime,

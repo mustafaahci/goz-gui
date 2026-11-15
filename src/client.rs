@@ -7,6 +7,8 @@
 //! drops that connection at once (gozd stops a search whose client went away)
 //! instead of reading the rest of an answer nobody will look at.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 use std::io;
 use std::os::windows::io::BorrowedHandle;

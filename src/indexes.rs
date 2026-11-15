@@ -16,6 +16,8 @@
 //! and the page shows them as unavailable rather than pretend to read or
 //! save them.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

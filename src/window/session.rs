@@ -23,6 +23,8 @@
 //! - **Several goz-gui windows**: each writes its own session, so the file
 //!   holds the window written last, which is the last one closed.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::RefCell;
 use std::sync::Arc;
 

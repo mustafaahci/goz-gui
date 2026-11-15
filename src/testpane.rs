@@ -6,6 +6,8 @@
 //! find bar placeholder, each a labelled row. `GOZ_GUI_TEST_PANES=LLRTF`
 //! has two left panes, one right, and both rows.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::any::Any;
 use std::cell::Cell;
 use std::rc::Rc;

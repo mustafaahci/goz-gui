@@ -17,6 +17,8 @@
 //! borrow across a page's method, and a page must not hold one of its own
 //! across a call that sends messages.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -768,7 +770,12 @@ impl Dialog<'_> {
             (PAGE_W - mx - w, PAGE_AREA_H - my - h, w, h),
         );
         let dlg = self.frame.get();
-        let hwnd = t.create_child(dlg, Some(page_proc), (&raw const self.refs[i]) as LPARAM);
+        let hwnd = crate::legacy::create_child(
+            &t,
+            dlg,
+            Some(page_proc),
+            (&raw const self.refs[i]) as LPARAM,
+        );
         if hwnd.is_null() {
             return hwnd;
         }

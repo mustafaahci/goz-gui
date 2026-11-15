@@ -2,6 +2,8 @@
 //! show as they open. The navigation history is `nav.rs`; the result
 //! actions are `results.rs`; the bookmarks are `bookmarks.rs`.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use goz_core::types::{SortDir, SortKey, SortSpec};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;

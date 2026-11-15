@@ -34,6 +34,8 @@
 //!   tries again too, wherever it is read: only a damaged file another
 //!   program holds waits so.)
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Write};

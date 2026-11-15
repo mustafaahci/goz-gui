@@ -9,6 +9,8 @@
 //! button is pressed. It is a tracking tooltip that lets the mouse through
 //! (TTF_TRANSPARENT), so the list goes on getting its moves and clicks.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};

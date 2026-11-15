@@ -14,6 +14,8 @@
 //! in place, which the shell's cannot do outside Explorer); the others run
 //! in the shell, which shows its own questions.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{LPARAM, POINT, RECT};

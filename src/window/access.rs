@@ -2,6 +2,8 @@
 //! (`crate::a11y`), from the window's side: the parts each has now, and
 //! their actions.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{HWND, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetParent, GetWindowTextLengthW, PostMessageW};
 

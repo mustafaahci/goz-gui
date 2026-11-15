@@ -15,6 +15,8 @@
 //! Up, Down, Page Up and Page Down in the filter box move in the list, so
 //! the keyboard can stay in the box.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};

@@ -2,6 +2,8 @@
 //! items count as run, as Everything's ("Set to 0 to remove the run
 //! count.").
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};

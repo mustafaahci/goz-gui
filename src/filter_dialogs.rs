@@ -9,6 +9,8 @@
 //! match option goz cannot apply yet is listed and kept, and says so; its
 //! name and search can still be edited.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};

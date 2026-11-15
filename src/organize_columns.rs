@@ -7,6 +7,8 @@
 //! alignment) has nothing to edit in goz-gui's fixed columns and is left
 //! out.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};

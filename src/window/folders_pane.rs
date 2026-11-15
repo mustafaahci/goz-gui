@@ -41,6 +41,8 @@
 //! `RefCell` here is borrowed across a message to the tree, a menu or the
 //! shell.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;

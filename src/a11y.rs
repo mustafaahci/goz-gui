@@ -16,6 +16,8 @@
 //! apartment through its message loop) and asks the window for its parts
 //! each time, so it never holds anything of the window between calls.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows::Win32::Foundation::{E_INVALIDARG, HWND, LRESULT, S_FALSE, WPARAM};
 use windows::Win32::System::Com::{
     DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO, IDispatch, IDispatch_Impl, ITypeInfo,

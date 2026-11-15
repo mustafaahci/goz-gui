@@ -16,6 +16,8 @@
 //! takes long over is run less often, so gozd spends at most about a
 //! twentieth of its time on them.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::time::Duration;
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{

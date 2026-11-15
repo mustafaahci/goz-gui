@@ -27,6 +27,8 @@
 //! name). Each new name is trimmed of white-space at its ends
 //! (Everything's `rename_trim=1`).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 

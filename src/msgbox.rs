@@ -16,6 +16,8 @@
 //! [`show`] takes `MessageBoxW`'s arguments and gives its answers; a style
 //! it does not draw (other buttons) is left to `MessageBoxW`.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};

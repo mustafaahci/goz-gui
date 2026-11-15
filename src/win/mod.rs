@@ -1,0 +1,194 @@
+//! The Win32 boundary: every `unsafe` in goz-gui is in this module.
+//!
+//! The rest of the crate is `#![deny(unsafe_code)]` (see `main.rs`) and
+//! reaches Windows through the safe functions here. Each one is sound for
+//! any arguments safe code can give it, given the trust model below; where
+//! that would not hold (a message whose parameters are pointers, a raw
+//! `lParam`), the API is typed instead.
+//!
+//! # Trust model
+//!
+//! - **The system behaves as documented.** user32, gdi32, comctl32, shell32
+//!   and ole32 check the handles they are given: a stale or wrong `HWND`,
+//!   `HDC`, `HMENU` or GDI object is reported as a failure, never followed
+//!   as a pointer. Handles are therefore plain values here, `Copy`, and any
+//!   value is a valid argument.
+//! - **A message's parameters mean what its documentation says.** A message
+//!   below `WM_USER` means the same to every window class, so a wrapper for
+//!   one may be sent to any window. A message from `WM_USER` up is defined
+//!   by its control class (`LVM_FIRST` and `DTM_FIRST` are both `0x1000`), so
+//!   the wrappers for those check the window's class first and do nothing
+//!   for a window of another class.
+//! - **What the system delivers is what it documents.** A procedure's
+//!   `lParam` for `WM_NOTIFY`, `WM_DRAWITEM` and the like points at the
+//!   structure the message defines. Only a [`Msg`] the system delivered
+//!   hands those out; one made by goz-gui's own code does not.
+//! - **goz-gui's private messages (`WM_APP` and up) carry no pointers.** A
+//!   value that has to travel with one goes as a [`parcel`].
+//!
+//! The procedures goz-gui gives Windows (window, dialog and subclass
+//! procedures) are the trampolines here; they hand each message to a safe
+//! Rust closure as a [`Msg`]. The closure is kept alive for as long as a
+//! call to it runs, so a window that is destroyed by its own handler does
+//! not free what that handler is using.
+
+#![allow(unsafe_code)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+// Until the whole crate is on this module, some of it is not used yet.
+#![allow(dead_code, unused_imports)]
+
+pub mod button;
+pub mod class;
+pub mod com;
+pub mod combo;
+pub mod dlg;
+pub mod edit;
+pub mod gdi;
+pub mod header;
+pub mod hook;
+pub mod hotkey;
+pub mod imagelist;
+pub mod listbox;
+pub mod lv;
+pub mod msg;
+pub mod parcel;
+pub mod queue;
+pub mod subclass;
+pub mod sync;
+pub mod sys;
+pub mod tab;
+pub mod tip;
+pub mod trackbar;
+pub mod tv;
+pub mod uxtheme;
+pub mod wnd;
+
+pub mod ext;
+
+#[cfg(test)]
+mod trampolines_tests;
+
+pub use msg::{Msg, Notify, View};
+pub use wnd::*;
+
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, SendMessageW};
+
+/// Sends any message. Only the wrappers in this module call it, each for a
+/// message whose parameters it has typed.
+///
+/// # Safety
+/// `w` and `l` are what message `msg` defines for `hwnd`'s class: any
+/// pointer among them is valid for the access the message makes, for the
+/// length of the call.
+pub(crate) unsafe fn send_raw(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    // SAFETY: as the caller promises.
+    unsafe { SendMessageW(hwnd, msg, w, l) }
+}
+
+/// Whether `hwnd`'s window class is `name`, which window classes compare
+/// as: ignoring ASCII case. False for a window that is not there.
+pub fn class_is(hwnd: HWND, name: &str) -> bool {
+    let mut buf = [0u16; 64];
+    // SAFETY: the buffer and its length in code units.
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    let Ok(n) = usize::try_from(n) else {
+        return false;
+    };
+    let got = &buf[..n.min(buf.len())];
+    let mut want = name.encode_utf16();
+    for &unit in got {
+        match want.next() {
+            Some(w) if fold(w) == fold(unit) => {}
+            _ => return false,
+        }
+    }
+    want.next().is_none()
+}
+
+/// `hwnd`'s window class's name (empty for a window that is not there).
+pub fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    // SAFETY: the buffer and its length in code units.
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    String::from_utf16_lossy(&buf[..usize::try_from(n).unwrap_or(0).min(buf.len())])
+}
+
+fn fold(unit: u16) -> u16 {
+    if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
+        unit + 32
+    } else {
+        unit
+    }
+}
+
+/// `hwnd` if its class is `name`, else null: a message sent to null does
+/// nothing and answers 0, as a message to a window that has gone does.
+pub(crate) fn of_class(hwnd: HWND, name: &str) -> HWND {
+    if class_is(hwnd, name) {
+        hwnd
+    } else {
+        debug_assert!(
+            hwnd.is_null() || !wnd::is_window(hwnd),
+            "a {name} message for a window of another class"
+        );
+        core::ptr::null_mut()
+    }
+}
+
+/// A NUL-terminated UTF-16 copy of `s`.
+pub fn wz(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+/// `s` with a NUL appended, for a call that wants a C string.
+pub fn wz_units(s: &[u16]) -> Vec<u16> {
+    let mut v = Vec::with_capacity(s.len() + 1);
+    v.extend_from_slice(s);
+    v.push(0);
+    v
+}
+
+/// The UTF-16 units before the first NUL of `buf` (all of it without one).
+pub fn until_nul(buf: &[u16]) -> &[u16] {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    &buf[..end]
+}
+
+/// The low and high words of a message parameter.
+pub fn loword(v: usize) -> u16 {
+    (v & 0xffff) as u16
+}
+
+pub fn hiword(v: usize) -> u16 {
+    ((v >> 16) & 0xffff) as u16
+}
+
+/// `lo` and `hi` as one `LPARAM`, as MAKELPARAM makes it.
+pub fn make_lparam(lo: u16, hi: u16) -> LPARAM {
+    (u32::from(lo) | (u32::from(hi) << 16)) as i32 as LPARAM
+}
+
+/// `lo` and `hi` as one `WPARAM`, as MAKEWPARAM makes it.
+pub fn make_wparam(lo: u16, hi: u16) -> WPARAM {
+    (u32::from(lo) | (u32::from(hi) << 16)) as WPARAM
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn words_go_in_and_come_out() {
+        assert_eq!(loword(make_wparam(3, 7)), 3);
+        assert_eq!(hiword(make_wparam(3, 7)), 7);
+        assert_eq!(make_lparam(0xffff, 0xffff), -1);
+    }
+
+    #[test]
+    fn a_string_ends_at_its_nul() {
+        assert_eq!(until_nul(&[104, 105, 0, 33]), &[104, 105]);
+        assert_eq!(until_nul(&[104, 105]), &[104, 105]);
+        assert_eq!(wz("hi"), vec![104, 105, 0]);
+    }
+}

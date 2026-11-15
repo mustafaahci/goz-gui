@@ -12,6 +12,8 @@
 //! [`query`] writes exactly what goz's parser takes (its tests parse every
 //! form with `goz_core::query`).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, SYSTEMTIME, WPARAM};

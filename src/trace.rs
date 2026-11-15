@@ -11,6 +11,8 @@
 //! long, and whether it worked or waited. Without the variable nothing is
 //! hooked or kept.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 

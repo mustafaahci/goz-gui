@@ -1,6 +1,8 @@
 //! View > Filter Bar, View > Zoom, and Search > Next and Previous Filter
 //! (Ctrl+] and Ctrl+[).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, MapWindowPoints};
 use windows_sys::Win32::UI::WindowsAndMessaging::{

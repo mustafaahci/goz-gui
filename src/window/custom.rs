@@ -7,6 +7,8 @@
 //! G2's main-window messages are `WM_APP + 300..320` and its timers
 //! `300..310` (wave 4's G1 has `WM_APP + 250..300` and `250..300`).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 

@@ -18,6 +18,8 @@
 //! ([`App::finish_selecting`]), and a selection replaced (the rows
 //! cleared for others) drops what was still to be set.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::{Duration, Instant};

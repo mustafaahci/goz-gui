@@ -23,6 +23,8 @@
 //!   `search_edit_enter_action` says; with none of them ever run, the top
 //!   one, as before. The next Enter opens it.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 

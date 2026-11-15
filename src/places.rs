@@ -15,6 +15,8 @@
 //! dialogs [`restore`] theirs as they open and [`keep`] it as they close,
 //! which asks the window to write the settings.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::RefCell;
 
 use windows_sys::Win32::Foundation::{HWND, RECT};

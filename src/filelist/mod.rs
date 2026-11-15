@@ -25,6 +25,8 @@
 //! search can be sorted by it here ([`Order::Created`]), which gozd's four
 //! sort keys cannot say.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 pub mod create;
 pub mod matcher;
 pub mod parse;

@@ -22,6 +22,8 @@
 //! only if goz-gui is still in front and, for a copy, nothing else was
 //! copied meanwhile.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;

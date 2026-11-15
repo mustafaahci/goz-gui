@@ -12,6 +12,8 @@
 //! filters, a sort by Extension) is listed as it is, and stays unless
 //! another is chosen; the columns goz-gui does not edit are not touched.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};

@@ -9,6 +9,8 @@
 //! not read the new syntax yet (`client::boolean_syntax`) gets lines
 //! saying what its searches of the index refuse.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 
 use goz_core::escompat::{HelpScreen, help};

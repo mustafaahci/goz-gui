@@ -7,6 +7,8 @@
 //! the box marks the user's own edits, `App::typing`). Ctrl+Backspace and
 //! Ctrl+Delete delete a word.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::SystemServices::MK_CONTROL;
 use windows_sys::Win32::UI::Controls::{

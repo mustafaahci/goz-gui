@@ -8,6 +8,8 @@
 //! keep each other's settings; a key Home holds fixed is never written
 //! (see `crate::settings`).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

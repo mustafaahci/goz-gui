@@ -4,6 +4,8 @@
 //! menu). The find bar is `findbar.rs`, the user's filters
 //! `custom_filters.rs`.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::RefCell;
 use std::rc::Rc;
 

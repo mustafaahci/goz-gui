@@ -8,6 +8,8 @@
 //! Esc closes. The place, size, columns and sort are kept (Everything's
 //! `undo_history_*` keys).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};

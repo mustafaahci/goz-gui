@@ -2,6 +2,8 @@
 //! minimizing to the tray, the global hotkeys, and command lines handed over
 //! by a second start (`crate::instance`).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use windows_sys::Win32::Foundation::{LPARAM, POINT, WPARAM};
 use windows_sys::Win32::UI::Controls::{HOTKEYF_ALT, HOTKEYF_CONTROL, HOTKEYF_SHIFT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{

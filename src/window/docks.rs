@@ -7,6 +7,8 @@
 //! `crate::strip` for the strips. FRAMEWORK.md (in the wave's notes) says
 //! how a feature uses it.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};

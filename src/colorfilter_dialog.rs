@@ -6,6 +6,8 @@
 //! The colour picker is Windows' (ChooseColor); the test hook
 //! `GOZ_GUI_PICK_COLOR=#RRGGBB` answers it without showing it.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};

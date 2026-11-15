@@ -16,6 +16,8 @@
 //! there clears it, as does the status bar menu's Clear Selection or the
 //! tree's top item.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 

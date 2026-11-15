@@ -16,6 +16,8 @@
 //!   searches are kept and its deletions stick; this window then takes the
 //!   file as written for its own history.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 

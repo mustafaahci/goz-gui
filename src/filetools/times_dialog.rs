@@ -5,6 +5,8 @@
 //! OK checks the Custom dates first and says which one it cannot read.
 //! The choices and dates are kept for next time (Everything's keys).
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};

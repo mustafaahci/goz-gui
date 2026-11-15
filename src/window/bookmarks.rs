@@ -14,6 +14,8 @@
 //!   `bookmark_remember_*` settings say (Everything's defaults: the match
 //!   options and the search; the filter and sort "(No change)").
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 

@@ -11,6 +11,8 @@
 //! then (and what a closed pane freed) is handed back to Windows
 //! (`runs::give_back_memory`), which the heap does not do by itself.
 
+#![allow(unsafe_code)] // Not yet moved onto `crate::win`.
+
 use std::cell::Cell;
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
