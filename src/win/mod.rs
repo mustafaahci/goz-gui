@@ -21,7 +21,10 @@
 //!     process); no safe function takes a raw one or destroys one, and a
 //!     control given one keeps it alive as long as it shows it. Which list
 //!     a control shows, takes or gives back is asked of its class's own
-//!     procedure (see below).
+//!     procedure (see below), after each giving: one may be nested in
+//!     another, from a notification the control sends as it takes a list.
+//!     A list a control gave back or no longer shows is let go only once
+//!     the control is done with the giving that ended its use.
 //!   - A tree view's item (`HTREEITEM`) is the address of the item's memory
 //!     in its tree, which comctl32 checks only by a signature there, never
 //!     against the tree it is sent to. Items are [`tv::Item`]s, made only

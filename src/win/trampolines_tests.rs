@@ -1050,3 +1050,53 @@ fn a_custom_draw_structure_is_read_and_its_colours_set() {
     assert_eq!(*rows.borrow(), vec![0, 1]);
     super::destroy(host);
 }
+
+#[test]
+fn a_list_s_nested_image_lists_are_let_go_as_it_gives_them_back() {
+    use super::imagelist::ImageList;
+    use super::lv;
+    use windows_sys::Win32::UI::Controls::{ILC_COLOR32, ILD_NORMAL, LVSIL_NORMAL, NM_CUSTOMDRAW};
+    // Lists of 16 and 32 pixels in turn, of one image each.
+    let size = Rc::new(Cell::new(16));
+    let list = move || {
+        size.set(48 - size.get());
+        let l = ImageList::create(size.get(), size.get(), ILC_COLOR32, 1, 1).expect("a list");
+        assert!(l.set_image_count(1));
+        l
+    };
+    // In icon view, a list view notifies its parent as it takes a normal
+    // list of a new size: the parent gives it another meanwhile.
+    let nested = Rc::new(Cell::new(false));
+    let (n, inner) = (Rc::clone(&nested), list.clone());
+    let (view, host) = hidden_list(0, move |m| {
+        if let Some(note) = m.notify()
+            && note.code() == NM_CUSTOMDRAW
+            && n.replace(false)
+        {
+            assert!(lv::set_image_list(note.from(), LVSIL_NORMAL, Some(inner())));
+        }
+        m.def()
+    });
+    for _ in 0..4 {
+        nested.set(true);
+        assert!(lv::set_image_list(view, LVSIL_NORMAL, Some(list())));
+        assert!(!nested.get(), "the list notified as it took it");
+        // What goz-gui holds as given is what the list shows, and nothing
+        // more: every list given back was let go; and the one it shows is
+        // drawn from.
+        assert_eq!(
+            lv::given(view, LVSIL_NORMAL),
+            vec![lv::shown(view, LVSIL_NORMAL)]
+        );
+        let canvas = super::dib::Canvas::new(40, 40).expect("a canvas");
+        assert!(lv::draw_image(
+            view,
+            LVSIL_NORMAL,
+            0,
+            canvas.hdc(),
+            (0, 0),
+            ILD_NORMAL
+        ));
+    }
+    super::destroy(host);
+}

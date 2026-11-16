@@ -218,7 +218,7 @@ pub fn draw_image(
 }
 
 /// What a list view was given as one of its image lists by
-/// [`set_image_list`] or [`set_system_image_list`], while it shows it.
+/// [`set_image_list`] or [`set_system_image_list`], until it gives it back.
 #[derive(Clone, Copy)]
 enum Given {
     /// A list given up whole ([`ImageList::into_unique`]): the list view's
@@ -230,10 +230,37 @@ enum Given {
     System(HIMAGELIST),
 }
 
+impl Given {
+    fn raw(self) -> HIMAGELIST {
+        match self {
+            Given::Own(il) | Given::System(il) => il,
+        }
+    }
+
+    /// Lets go of a list the list view gave back: goz-gui's again.
+    fn release(self) {
+        match self {
+            // SAFETY: a list given up whole (`ImageList::into_unique`), which
+            // the list view gave back and no longer shows: goz-gui's again,
+            // reclaimed once.
+            Given::Own(il) => drop(unsafe { ImageList::reclaim(il) }),
+            Given::System(il) => release_system(il),
+        }
+    }
+}
+
 thread_local! {
     /// What each list view of this thread was given, by its window and
-    /// image list kind (LVSIL_*), until it gives it back or is destroyed.
-    static GIVEN: RefCell<HashMap<(usize, u32), Given>> = RefCell::new(HashMap::new());
+    /// image list kind (LVSIL_*), until it gives it back or is destroyed:
+    /// every list it may show or give back. Most often one, the list it
+    /// shows; more while a giving runs into another, nested in it (from a
+    /// notification the list view sent as it took a list), as the list
+    /// views take them in either order.
+    static GIVEN: RefCell<HashMap<(usize, u32), Vec<Given>>> = RefCell::new(HashMap::new());
+    /// How many givings ([`give`]) run on this thread, one in another, and
+    /// the lists given back meanwhile: let go once the outermost returns,
+    /// as the list view that gave one back may still be using it.
+    static GIVING: RefCell<(u32, Vec<Given>)> = const { RefCell::new((0, Vec::new())) };
 }
 
 static GIVEN_KEY: super::subclass::Key = super::subclass::Key::new("list view image lists");
@@ -294,9 +321,10 @@ fn release_system(il: HIMAGELIST) {
 
 /// Sends LVM_SETIMAGELIST of `il` to `lv`'s class's own procedure, notes
 /// `given` for it, and lets go of the list it gives back if it was one
-/// given here. Past any subclass of the window: the list view takes `il`,
-/// and what it gives back is the list it showed, which no subclass can
-/// answer for (a list it still shows, destroyed as given back).
+/// given here (once no giving runs any more). Past any subclass of the
+/// window: the list view takes `il`, and what it gives back is the list it
+/// showed, which no subclass can answer for (a list it still shows,
+/// destroyed as given back).
 fn give(lv: HWND, which: u32, il: HIMAGELIST, given: Option<Given>) -> bool {
     let Some(proc) = super::system_class_proc(lv, CLASS) else {
         return false;
@@ -319,19 +347,52 @@ fn give(lv: HWND, which: u32, il: HIMAGELIST, given: Option<Given>) -> bool {
         }
     }
     let key = (lv as usize, which);
-    let before = GIVEN.with_borrow_mut(|g| match given {
-        Some(given) => g.insert(key, given),
-        None => g.remove(&key),
-    });
+    // Noted before the list view takes it: a giving nested in this one may
+    // be given it back.
+    if let Some(given) = given {
+        GIVEN.with_borrow_mut(|g| g.entry(key).or_default().push(given));
+    }
+    GIVING.with_borrow_mut(|g| g.0 += 1);
     let old = class_send(lv, proc, LVM_SETIMAGELIST, which as usize, il);
-    match before {
-        // SAFETY: the list given up whole here before, which the list view
-        // no longer shows (it gave it back): goz-gui's again.
-        Some(Given::Own(had)) if had == old && old != 0 => drop(unsafe { ImageList::reclaim(old) }),
-        Some(Given::System(had)) if had == old && old != 0 => release_system(old),
-        _ => {}
+    // The list it gave back, if goz-gui gave it that list: goz-gui's again.
+    let back = GIVEN.with_borrow_mut(|g| {
+        let given = g.get_mut(&key)?;
+        let at = given.iter().position(|had| old != 0 && had.raw() == old)?;
+        Some(given.remove(at))
+    });
+    let done = GIVING.with_borrow_mut(|g| {
+        g.1.extend(back);
+        g.0 -= 1;
+        if g.0 == 0 {
+            core::mem::take(&mut g.1)
+        } else {
+            Vec::new()
+        }
+    });
+    for given in done {
+        given.release();
     }
     true
+}
+
+/// The image lists goz-gui gave `lv` as `which` that it may still show or
+/// give back.
+#[cfg(test)]
+pub(crate) fn given(lv: HWND, which: u32) -> Vec<HIMAGELIST> {
+    GIVEN.with_borrow(|g| {
+        g.get(&(lv as usize, which))
+            .map(|v| v.iter().map(|given| given.raw()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// The image list `lv` shows as `which`, as its class's own procedure
+/// answers.
+#[cfg(test)]
+pub(crate) fn shown(lv: HWND, which: u32) -> HIMAGELIST {
+    super::system_class_proc(lv, CLASS).map_or(0, |proc| {
+        class_send(lv, proc, LVM_GETIMAGELIST, which as usize, 0)
+    })
 }
 
 /// Deletes every item; false if it could not.
