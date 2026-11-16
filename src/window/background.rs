@@ -2,23 +2,21 @@
 //! minimizing to the tray, the global hotkeys, and command lines handed over
 //! by a second start (`crate::instance`).
 
-use windows_sys::Win32::Foundation::{LPARAM, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{POINT, WPARAM};
 use windows_sys::Win32::UI::Controls::{HOTKEYF_ALT, HOTKEYF_CONTROL, HOTKEYF_SHIFT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey, UnregisterHotKey,
+    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::NIN_SELECT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, DestroyWindow, GetForegroundWindow, IsIconic,
-    IsWindowVisible, MB_ICONWARNING, MB_OK, MF_SEPARATOR, MF_STRING, PostMessageW, SW_HIDE,
-    SW_MINIMIZE, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetMenuDefaultItem, ShowWindow,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_NULL,
+    MB_ICONWARNING, MB_OK, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_NULL,
 };
 
 use super::{App, Options, WM_TRAY};
 use crate::cmdline::{self, Launch};
 use crate::settings::Background;
-use crate::wide::wz;
+use crate::win::{self, Msg};
 use crate::{menu, msgbox, tray};
 
 /// The tray icon chosen with the keyboard (NIN_SELECT | NINF_KEY).
@@ -65,7 +63,9 @@ impl App {
         }
         if b.tray_icon() {
             if !self.tray_on.get() {
-                let icon = self.window_icons.get()[0];
+                let icon = self.window_icons.borrow()[0]
+                    .as_ref()
+                    .map_or(core::ptr::null_mut(), win::icon::Icon::handle);
                 self.tray_on.set(tray::add(self.hwnd, WM_TRAY, icon, "goz"));
             }
         } else if self.tray_on.replace(false) {
@@ -76,14 +76,13 @@ impl App {
             (HOTKEY_TOGGLE, b.toggle_window_key, "Toggle window"),
             (HOTKEY_SHOW, b.show_window_key, "Show window"),
         ] {
-            // SAFETY: this window's own hotkey ids; unregistering one not
+            // This window's own hotkey ids; unregistering one not
             // registered is harmless.
-            unsafe { UnregisterHotKey(self.hwnd, id) };
-            if let Some((mods, vk)) = hotkey_parts(word) {
-                // SAFETY: as above.
-                if unsafe { RegisterHotKey(self.hwnd, id, mods, vk) } == 0 {
-                    taken.push(name);
-                }
+            win::unregister_hotkey(self.hwnd, id);
+            if let Some((mods, vk)) = hotkey_parts(word)
+                && !win::register_hotkey(self.hwnd, id, mods, vk)
+            {
+                taken.push(name);
             }
         }
         taken
@@ -104,8 +103,7 @@ impl App {
 
     /// Whether the window is on screen and not minimized.
     pub(super) fn shown(&self) -> bool {
-        // SAFETY: reads this thread's window's state.
-        unsafe { IsWindowVisible(self.hwnd) != 0 && IsIconic(self.hwnd) == 0 }
+        win::is_visible(self.hwnd) && !win::is_iconic(self.hwnd)
     }
 
     /// The window closes but goz-gui keeps running (run in background), or
@@ -114,24 +112,20 @@ impl App {
     pub(super) fn hide_to_background(&self) {
         self.save_and_flush();
         crate::dropdown::close(self);
-        // SAFETY: hides this thread's window.
-        unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+        win::show(self.hwnd, SW_HIDE);
     }
 
     /// Brings the window up from the tray, a hotkey or a second start, with
     /// the keyboard in the search box and its text selected.
     pub(super) fn show_window(&self) {
-        // SAFETY: shows and activates this thread's window; Windows lets
-        // it come forward from a hotkey, a tray click, or a process that
-        // allowed it.
-        unsafe {
-            if IsIconic(self.hwnd) != 0 {
-                ShowWindow(self.hwnd, SW_RESTORE);
-            } else {
-                ShowWindow(self.hwnd, SW_SHOW);
-            }
-            SetForegroundWindow(self.hwnd);
+        // Shows and activates this thread's window; Windows lets it come
+        // forward from a hotkey, a tray click, or a process that allowed it.
+        if win::is_iconic(self.hwnd) {
+            win::show(self.hwnd, SW_RESTORE);
+        } else {
+            win::show(self.hwnd, SW_SHOW);
         }
+        win::set_foreground(self.hwnd);
         self.command(menu::FOCUS_SEARCH);
     }
 
@@ -139,8 +133,7 @@ impl App {
     /// the tray if there is one or goz-gui runs in the background, else
     /// minimized.
     pub(super) fn toggle_window(&self) {
-        // SAFETY: reads the foreground window.
-        let in_front = self.shown() && unsafe { GetForegroundWindow() } == self.hwnd;
+        let in_front = self.shown() && win::foreground() == self.hwnd;
         if !in_front {
             self.show_window();
             return;
@@ -149,8 +142,7 @@ impl App {
         if b.run_in_background || b.tray_icon() {
             self.hide_to_background();
         } else {
-            // SAFETY: minimizes this thread's window.
-            unsafe { ShowWindow(self.hwnd, SW_MINIMIZE) };
+            win::show(self.hwnd, SW_MINIMIZE);
         }
     }
 
@@ -164,8 +156,8 @@ impl App {
 
     /// A tray icon event (`NOTIFYICON_VERSION_4`: the event in lParam's low
     /// word, the anchor point in wParam).
-    pub(super) fn on_tray(&self, w: WPARAM, l: LPARAM) {
-        let event = (l as u32) & 0xffff;
+    pub(super) fn on_tray(&self, m: &Msg) {
+        let (w, event) = (m.w, (m.l as u32) & 0xffff);
         match event {
             WM_CONTEXTMENU => {
                 let pt = POINT {
@@ -197,38 +189,23 @@ impl App {
     }
 
     fn tray_menu(&self, pt: POINT) {
-        // SAFETY: a popup menu this function makes, shows and destroys; the
-        // window comes forward first so the menu closes when the user
-        // clicks elsewhere (and WM_NULL after, the documented pairing).
-        let cmd = unsafe {
-            let m = CreatePopupMenu();
-            AppendMenuW(
-                m,
-                MF_STRING,
-                usize::from(menu::TRAY_SHOW),
-                wz("&Show Window").as_ptr(),
-            );
-            AppendMenuW(m, MF_SEPARATOR, 0, core::ptr::null());
-            AppendMenuW(
-                m,
-                MF_STRING,
-                usize::from(menu::OPTIONS),
-                wz("&Options...").as_ptr(),
-            );
-            AppendMenuW(m, MF_SEPARATOR, 0, core::ptr::null());
-            AppendMenuW(m, MF_STRING, usize::from(menu::EXIT), wz("E&xit").as_ptr());
-            SetMenuDefaultItem(m, u32::from(menu::TRAY_SHOW), 0);
-            SetForegroundWindow(self.hwnd);
-            let cmd = TrackPopupMenuEx(
-                m,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                pt.x,
-                pt.y,
-                self.hwnd,
-                core::ptr::null(),
-            );
-            PostMessageW(self.hwnd, WM_NULL, 0, 0);
-            DestroyMenu(m);
+        // A popup menu this function makes, shows and destroys; the window
+        // comes forward first so the menu closes when the user clicks
+        // elsewhere (and WM_NULL after, the documented pairing).
+        let cmd = {
+            use win::menu::{By, NewItem};
+            let m = win::menu::create_popup();
+            let command = |id: u16, text| NewItem::command(u32::from(id), text);
+            win::menu::append(m, &command(menu::TRAY_SHOW, "&Show Window"));
+            win::menu::append(m, &NewItem::separator());
+            win::menu::append(m, &command(menu::OPTIONS, "&Options..."));
+            win::menu::append(m, &NewItem::separator());
+            win::menu::append(m, &command(menu::EXIT, "E&xit"));
+            win::menu::set_default(m, By::Command(u32::from(menu::TRAY_SHOW)));
+            win::set_foreground(self.hwnd);
+            let cmd = win::menu::track(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt, self.hwnd);
+            win::post_plain(self.hwnd, WM_NULL, 0, 0);
+            win::menu::destroy(m);
             cmd
         };
         match cmd as u16 {
@@ -254,8 +231,8 @@ impl App {
         if l.exit {
             // Every window of this goz-gui (File > New Window's) closes.
             self.exit_other_windows();
-            // SAFETY: closes this thread's window for good.
-            unsafe { DestroyWindow(self.hwnd) };
+            // Closes this thread's window for good.
+            win::destroy(self.hwnd);
             return;
         }
         // W4 (G1): -filelist (or a bare .efu) opens a file list.
@@ -307,7 +284,7 @@ impl App {
         }
         let text = l
             .search_text()
-            .unwrap_or_else(|| crate::wide::window_text(self.edit));
+            .unwrap_or_else(|| crate::win::text(self.edit));
         if l.path.is_some() {
             // A folder of its own (Explorer's "Search goz..."): the Folders
             // pane's goes, or the search would be inside both (F2).

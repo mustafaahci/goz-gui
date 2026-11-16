@@ -5,23 +5,20 @@
 //! OK checks the Custom dates first and says which one it cannot read.
 //! The choices and dates are kept for next time (Everything's keys).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows_sys::Win32::UI::Controls::{EM_SETCUEBANNER, EM_SETSEL};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_GROUPBOX, ES_AUTOHSCROLL, EndDialog,
-    GWLP_USERDATA, IDCANCEL, IDOK, MB_ICONWARNING, MB_OK, SetWindowLongPtrW, SetWindowTextW,
-    WM_COMMAND, WM_INITDIALOG, WS_EX_CLIENTEDGE, WS_GROUP, WS_TABSTOP,
+    BN_CLICKED, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_GROUPBOX, ES_AUTOHSCROLL, IDCANCEL, IDOK,
+    MB_ICONWARNING, MB_OK, WM_COMMAND, WM_INITDIALOG, WS_EX_CLIENTEDGE, WS_GROUP, WS_TABSTOP,
 };
 
 use super::times::{Local, Set, parse_iso};
-use super::ui::{checked, enable, item, send, set_check};
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common, state};
+use super::ui::{checked, enable, item, set_check};
+use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common};
 use crate::history::filetime_now;
 use crate::msgbox;
-use crate::wide::{window_text, wz};
+use crate::win::{self, Msg, dlg, edit};
 
 const TITLE: &str = "Set File Time";
 
@@ -179,26 +176,21 @@ pub fn run(owner: HWND, kinds: [u8; 3], custom: [String; 3], look: Look) -> Opti
         0,
         (120, 242, 50, 14),
     );
-    let mut out: Option<Chosen> = None;
-    let param = (&raw const state, &raw mut out);
-    t.run(owner, Some(dialog_proc), (&raw const param) as LPARAM);
-    out
+    // Where OK puts its answer.
+    let out: RefCell<Option<Chosen>> = RefCell::new(None);
+    t.show(owner, &|m| dialog_proc(&state, &out, m));
+    out.into_inner()
 }
-
-/// The dialog's state and where OK puts its answer.
-type Param = (*const Dlg, *mut Option<Chosen>);
 
 impl Dlg {
     fn init(&self, dlg: HWND) {
-        let cue = wz("YYYY-MM-DDThh:mm:ss");
+        let cue = "YYYY-MM-DDThh:mm:ss";
         for (g, group) in GROUPS.iter().enumerate() {
             let kind = self.kinds[g].min(CUSTOM);
             set_check(dlg, group.first + u16::from(kind), true);
-            let edit = item(dlg, group.first + 5);
-            let text = wz(&self.custom[g]);
-            // SAFETY: NUL-terminated text for this thread's box.
-            unsafe { SetWindowTextW(edit, text.as_ptr()) };
-            send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+            let field = item(dlg, group.first + 5);
+            win::set_text(field, &self.custom[g]);
+            edit::set_cue_banner(field, cue, true);
         }
         self.update(dlg);
         apply_theme(dlg, self.look.get().dark);
@@ -224,11 +216,8 @@ impl Dlg {
     fn ok(&self, dlg: HWND) -> Option<Chosen> {
         let now = filetime_now();
         let kinds: [u8; 3] = core::array::from_fn(|g| Dlg::kind(dlg, g));
-        let custom: [String; 3] = core::array::from_fn(|g| {
-            window_text(item(dlg, GROUPS[g].first + 5))
-                .trim()
-                .to_owned()
-        });
+        let custom: [String; 3] =
+            core::array::from_fn(|g| win::text(item(dlg, GROUPS[g].first + 5)).trim().to_owned());
         let mut set = [Set::Keep; 3];
         for g in 0..3 {
             let date = (kinds[g] == CUSTOM)
@@ -243,10 +232,9 @@ impl Dlg {
                         TITLE,
                         MB_OK | MB_ICONWARNING,
                     );
-                    let edit = item(dlg, GROUPS[g].first + 5);
-                    // SAFETY: focuses and selects in this thread's box.
-                    unsafe { SetFocus(edit) };
-                    send(edit, EM_SETSEL, 0, -1);
+                    let field = item(dlg, GROUPS[g].first + 5);
+                    win::set_focus(field);
+                    edit::select_all(field);
                     return None;
                 }
             }
@@ -255,48 +243,32 @@ impl Dlg {
     }
 }
 
-unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Param` that `run` keeps alive until the dialog
-        // has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Param` from `run`, or null before.
-    let Some(&(s, out)) = (unsafe { state::<Param>(dlg) }) else {
-        return 0;
-    };
-    // SAFETY: the `Dlg` `run` keeps alive until the dialog has ended.
-    let s = unsafe { &*s };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+/// The dialog's procedure: `s` its state, `out` where OK puts its answer.
+fn dialog_proc(s: &Dlg, out: &RefCell<Option<Chosen>>, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.init(dlg);
             // The dialog manager puts the keyboard on the first choice.
             1
         }
         WM_COMMAND => {
-            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
             match id {
                 x if x == IDOK as u16 => {
                     if let Some(chosen) = s.ok(dlg) {
                         // Nothing changes: nothing to do.
                         let any = chosen.set.iter().any(|&t| t != Set::Keep);
-                        // SAFETY: `out` is `run`'s, alive until it returns;
-                        // then this modal dialog ends.
-                        unsafe {
-                            if any {
-                                *out = Some(chosen);
-                            }
-                            EndDialog(dlg, 1);
+                        if any {
+                            *out.borrow_mut() = Some(chosen);
                         }
+                        dlg::end(dlg, 1);
                     }
                 }
-                // SAFETY: ends this modal dialog.
-                x if x == IDCANCEL as u16 => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                x if x == IDCANCEL as u16 => dlg::end(dlg, 0),
                 _ if code == BN_CLICKED => s.update(dlg),
                 _ => {}
             }

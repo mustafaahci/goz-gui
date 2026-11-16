@@ -14,12 +14,12 @@ use std::rc::Rc;
 
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::UI::Shell::{
-    SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES,
-    SHGetFileInfoW,
+    SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES,
 };
 
 use crate::client::Row;
 use crate::highlight::fold;
+use crate::win;
 
 /// The text after the name's last dot: empty for a folder, and for a name
 /// with no dot or ending in one.
@@ -106,20 +106,9 @@ pub fn look_up(ext: Option<&[u16]>, icon: bool) -> (Option<i32>, Vec<u16>) {
     if icon {
         flags |= SHGFI_SYSICONINDEX | SHGFI_SMALLICON;
     }
-    // SAFETY: SHFILEINFOW is plain data; all-zero is a valid value.
-    let mut info: SHFILEINFOW = unsafe { core::mem::zeroed() };
-    // SAFETY: an attribute-only lookup by name (nothing is read from disk);
-    // `probe` is NUL-terminated and `info` a plain out-struct.
-    let ok = unsafe {
-        SHGetFileInfoW(
-            probe.as_ptr(),
-            attrs,
-            &mut info,
-            size_of::<SHFILEINFOW>() as u32,
-            flags,
-        )
-    };
-    if ok == 0 {
+    // An attribute-only lookup by name (nothing is read from disk).
+    let (found, info) = win::shell::file_info(&probe, attrs, flags);
+    if found == 0 {
         return (None, Vec::new());
     }
     let len = info

@@ -13,29 +13,25 @@
 //! form with `goz_core::query`).
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, SYSTEMTIME, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT};
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::{
-    DTM_GETMONTHCAL, DTM_GETSYSTEMTIME, DTM_SETSYSTEMTIME, DTN_DROPDOWN, DTS_SHORTDATEFORMAT,
-    DTS_SHOWNONE, GDT_NONE, GDT_VALID, ICC_DATE_CLASSES, INITCOMMONCONTROLSEX,
-    InitCommonControlsEx, NMHDR,
+    DTN_DROPDOWN, DTS_SHORTDATEFORMAT, DTS_SHOWNONE, ICC_DATE_CLASSES,
 };
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_GETCURSEL, CBS_DROPDOWNLIST, ES_AUTOHSCROLL,
-    ES_NUMBER, EndDialog, GWLP_USERDATA, GetDlgItem, IDCANCEL, IDOK, KillTimer, MB_ICONWARNING,
-    MB_OK, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowTextW, USER_TIMER_MINIMUM,
-    WM_COMMAND, WM_INITDIALOG, WM_NOTIFY, WM_SHOWWINDOW, WM_TIMER, WS_EX_CLIENTEDGE, WS_TABSTOP,
-    WS_VSCROLL,
+    BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, ES_AUTOHSCROLL, ES_NUMBER, IDCANCEL, IDOK,
+    MB_ICONWARNING, MB_OK, USER_TIMER_MINIMUM, WM_COMMAND, WM_INITDIALOG, WM_NOTIFY, WM_SHOWWINDOW,
+    WM_TIMER, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
 };
 
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-
-use crate::dialog::{Class, Look, Template, center_on_owner, common, state, theme_new};
+use crate::dialog::{Class, Look, Template, center_on_owner, common, theme_new};
 use crate::msgbox;
 use crate::searchtools::folder_term;
-use crate::wide::{window_text, wz};
+use crate::win::dib::Canvas;
+use crate::win::shell::FileDialog;
+use crate::win::{self, Msg, button, combo, dlg, gdi, subclass, sys};
 
 /// A size's unit: Everything's list, 1024-based as goz's.
 pub const UNITS: [(&str, &str); 5] = [
@@ -235,44 +231,28 @@ pub fn query(form: &Form) -> Result<String, Problem> {
 /// Asks for a folder, starting in `start` (if any); its path, or `None`
 /// when cancelled.
 pub fn pick_folder(owner: HWND, start: &str) -> Option<String> {
-    use windows::Win32::Foundation::HWND as WHWND;
-    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
     use windows::Win32::UI::Shell::{
-        FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog,
-        IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+        FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
     };
-    use windows::core::{HSTRING, PCWSTR};
-    // SAFETY: the system's folder dialog, made, shown modal over a window
-    // of this (COM) thread and read on it; the strings outlive the calls
-    // and the path it gives is freed with the COM allocator.
-    unsafe {
-        let dialog: IFileOpenDialog =
-            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        let options = dialog.GetOptions().ok()?;
-        dialog
-            .SetOptions(
-                options
-                    | FOS_PICKFOLDERS
-                    | FOS_FORCEFILESYSTEM
-                    | FOS_PATHMUSTEXIST
-                    | FOS_NOCHANGEDIR,
-            )
-            .ok()?;
-        let start = start.trim();
-        if !start.is_empty()
-            && let Ok(folder) =
-                SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(start), None)
-        {
-            let _ = dialog.SetFolder(&folder);
-        }
-        let _ = dialog.SetTitle(PCWSTR(wz("Select a folder").as_ptr()));
-        dialog.Show(Some(WHWND(owner))).ok()?;
-        let item = dialog.GetResult().ok()?;
-        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-        let path = name.to_string().ok();
-        CoTaskMemFree(Some(name.0 as *const core::ffi::c_void));
-        path
+    // The system's folder picker (the Open dialog, picking folders), made,
+    // shown modal and read on this thread (making it fails on a thread
+    // without COM).
+    let dialog = FileDialog::open()?;
+    let options = dialog.options()?;
+    let folders = FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR;
+    if !dialog.set_options(options | folders.0) {
+        return None;
     }
+    let start = start.trim();
+    if !start.is_empty() {
+        let start: Vec<u16> = start.encode_utf16().collect();
+        dialog.set_folder(&start);
+    }
+    dialog.set_title("Select a folder");
+    if !dialog.show(owner) {
+        return None;
+    }
+    String::from_utf16(&dialog.result()?.file_system_path()?).ok()
 }
 
 const STATIC: u16 = 0xffff;
@@ -328,7 +308,8 @@ pub struct Done {
 
 struct Dlg<'a> {
     start: &'a Start,
-    look: Cell<Look>,
+    /// Shared with the date pickers' subclasses, which draw them dark.
+    look: Rc<Cell<Look>>,
     browsed: RefCell<Option<String>>,
     result: RefCell<Option<Done>>,
     /// Whether the Filter list is made yet (`make_filter`).
@@ -337,30 +318,14 @@ struct Dlg<'a> {
     dy: i16,
 }
 
-fn item(dlg: HWND, id: u16) -> HWND {
-    // SAFETY: looks up a child of this thread's dialog.
-    unsafe { GetDlgItem(dlg, i32::from(id)) }
-}
-
-fn send(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: a message to a control of this thread's dialog; any pointer
-    // in `l` is the caller's and lives across the call.
-    unsafe { SendMessageW(hwnd, msg, w, l) }
-}
-
 /// Shows the dialog over `owner`; the search it built on OK.
 pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
-    // The date pickers' class.
-    let icc = INITCOMMONCONTROLSEX {
-        dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_DATE_CLASSES,
-    };
-    // SAFETY: registers the common controls' date classes, once per
-    // process whatever the number of calls.
-    unsafe { InitCommonControlsEx(&icc) };
+    // The date pickers' class (registered once per process, whatever the
+    // number of calls).
+    sys::init_common_controls(ICC_DATE_CLASSES);
     let state = Dlg {
         start,
-        look: Cell::new(look),
+        look: Rc::new(Cell::new(look)),
         browsed: RefCell::new(None),
         result: RefCell::new(None),
         filter_made: Cell::new(false),
@@ -617,28 +582,32 @@ pub fn ask(owner: HWND, start: &Start, look: Look) -> Option<Done> {
         0,
         (243, 241 + dy, 50, 14),
     );
-    t.run(owner, Some(proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| proc(&state, m));
     state.result.into_inner()
 }
 
 fn fill_combo(dlg: HWND, id: u16, items: impl IntoIterator<Item = String>, select: usize) {
     // A themed list takes half a millisecond an item: the chosen item now,
     // the rest once the dialog shows (`dialog::fill_later`).
-    crate::dialog::fill_later(item(dlg, id), items.into_iter().collect(), Some(select));
+    crate::dialog::fill_later(
+        dlg::item(dlg, id),
+        items.into_iter().collect(),
+        Some(select),
+    );
 }
 
 fn selection(dlg: HWND, id: u16) -> usize {
-    usize::try_from(send(item(dlg, id), CB_GETCURSEL, 0, 0)).unwrap_or(0)
+    usize::try_from(combo::cur_sel(dlg::item(dlg, id))).unwrap_or(0)
 }
 
 fn checked(dlg: HWND, id: u16) -> bool {
-    send(item(dlg, id), BM_GETCHECK, 1, 0) == 1
+    button::is_checked(dlg::item(dlg, id))
 }
 
 /// A size box's value with its unit; `Err` when it holds something that
 /// is no whole number.
 fn size_of_box(dlg: HWND, id: u16, unit: u16) -> Result<Option<Size>, ()> {
-    let text = window_text(item(dlg, id));
+    let text = dlg::item_text(dlg, id);
     let text = text.trim();
     if text.is_empty() {
         return Ok(None);
@@ -652,9 +621,7 @@ fn size_of_box(dlg: HWND, id: u16, unit: u16) -> Result<Option<Size>, ()> {
 
 /// A date picker's day, `None` while its box is unticked.
 fn day_of(dlg: HWND, id: u16) -> Option<Day> {
-    let mut st = SYSTEMTIME::default();
-    let r = send(item(dlg, id), DTM_GETSYSTEMTIME, 0, (&raw mut st) as isize);
-    (r == GDT_VALID as isize).then_some((st.wYear, st.wMonth, st.wDay))
+    win::datetime::time(dlg::item(dlg, id)).map(|st| (st.wYear, st.wMonth, st.wDay))
 }
 
 impl Dlg<'_> {
@@ -664,14 +631,14 @@ impl Dlg<'_> {
         fill_combo(dlg, ID_SIZE_TO_UNIT, units(), DEFAULT_UNIT);
         // No date until one is ticked.
         for id in [ID_DATE_FROM, ID_DATE_TO] {
-            send(item(dlg, id), DTM_SETSYSTEMTIME, GDT_NONE as usize, 0);
+            win::datetime::set_time(dlg::item(dlg, id), None);
         }
         theme_new(dlg, self.look.get().dark);
         for id in [ID_DATE_FROM, ID_DATE_TO] {
-            let picker = item(dlg, id);
-            // SAFETY: subclasses this thread's date picker; the subclass
-            // removes itself when the picker goes.
-            unsafe { SetWindowSubclass(picker, Some(picker_proc), 1, dlg as usize) };
+            let picker = dlg::item(dlg, id);
+            // Dark with the dialog; the subclass goes with the picker.
+            let look = Rc::clone(&self.look);
+            subclass::set(picker, &PICKER, move |m| picker_proc(m, &look));
         }
         center_on_owner(dlg);
     }
@@ -683,15 +650,15 @@ impl Dlg<'_> {
         if self.filter_made.replace(true) {
             return;
         }
-        // SAFETY: a timer of this thread's dialog (fired or not).
-        unsafe { KillTimer(dlg, MAKE_FILTER) };
+        // The timer, fired or not.
+        win::kill_timer(dlg, MAKE_FILTER);
         let list = crate::dialog::make_control(
             dlg,
             "ComboBox",
             ID_FILTER,
             WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
             filter_at(self.dy),
-            item(dlg, ID_FILTER_LABEL),
+            dlg::item(dlg, ID_FILTER_LABEL),
         );
         fill_combo(
             dlg,
@@ -708,18 +675,18 @@ impl Dlg<'_> {
             field,
         };
         Ok(Form {
-            words: window_text(item(dlg, ID_WORDS)),
-            phrase: window_text(item(dlg, ID_PHRASE)),
+            words: dlg::item_text(dlg, ID_WORDS),
+            phrase: dlg::item_text(dlg, ID_PHRASE),
             match_case: checked(dlg, ID_CASE),
             match_path: checked(dlg, ID_PATH),
-            located_in: window_text(item(dlg, ID_FOLDER)),
+            located_in: dlg::item_text(dlg, ID_FOLDER),
             size_from: size_of_box(dlg, ID_SIZE_FROM, ID_SIZE_FROM_UNIT)
                 .map_err(|()| bad(Field::SizeFrom, "smallest"))?,
             size_to: size_of_box(dlg, ID_SIZE_TO, ID_SIZE_TO_UNIT)
                 .map_err(|()| bad(Field::SizeTo, "largest"))?,
             date_from: day_of(dlg, ID_DATE_FROM),
             date_to: day_of(dlg, ID_DATE_TO),
-            extensions: window_text(item(dlg, ID_EXT)),
+            extensions: dlg::item_text(dlg, ID_EXT),
             any_words: self.boolean_text(dlg, ID_ANY),
             none_words: self.boolean_text(dlg, ID_NONE),
             boolean: self.start.boolean_syntax,
@@ -729,7 +696,7 @@ impl Dlg<'_> {
     /// An any or none box's text; nothing when the dialog has none.
     fn boolean_text(&self, dlg: HWND, id: u16) -> String {
         if self.start.boolean_syntax {
-            window_text(item(dlg, id))
+            dlg::item_text(dlg, id)
         } else {
             String::new()
         }
@@ -744,8 +711,7 @@ impl Dlg<'_> {
                     filter: selection(dlg, ID_FILTER),
                     browsed: self.browsed.borrow_mut().take(),
                 });
-                // SAFETY: ends this modal dialog.
-                unsafe { EndDialog(dlg, 1) };
+                dlg::end(dlg, 1);
             }
             Err(p) => {
                 msgbox::show(dlg, &p.message, "Advanced Search", MB_OK | MB_ICONWARNING);
@@ -754,14 +720,13 @@ impl Dlg<'_> {
                     Field::SizeTo => ID_SIZE_TO,
                     Field::DateTo => ID_DATE_TO,
                 };
-                // SAFETY: focuses a control of this thread's dialog.
-                unsafe { SetFocus(item(dlg, id)) };
+                win::set_focus(dlg::item(dlg, id));
             }
         }
     }
 
     fn browse(&self, dlg: HWND) {
-        let typed = window_text(item(dlg, ID_FOLDER));
+        let typed = dlg::item_text(dlg, ID_FOLDER);
         let from = if typed.trim().is_empty() {
             self.browsed
                 .borrow()
@@ -771,9 +736,7 @@ impl Dlg<'_> {
             typed
         };
         if let Some(folder) = pick_folder(dlg, &from) {
-            // SAFETY: a NUL-terminated string for a control of this
-            // thread's dialog.
-            unsafe { SetWindowTextW(item(dlg, ID_FOLDER), wz(&folder).as_ptr()) };
+            win::set_text(dlg::item(dlg, ID_FOLDER), &folder);
             *self.browsed.borrow_mut() = Some(folder);
         }
     }
@@ -794,176 +757,107 @@ fn flip_lightness(bgra: u32) -> u32 {
 /// Paints a date picker as the system draws it, its lightness turned over:
 /// its themes draw it light whatever the dark ones ask, and drawn this way
 /// it keeps every part the system draws (the field being typed in lit,
-/// the check box, the button, the hover edge), only dark.
-fn paint_dark_picker(hwnd: HWND) {
-    use windows_sys::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CreateCompatibleDC,
-        CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, GdiFlush, PAINTSTRUCT,
-        SRCCOPY, SelectObject,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, WM_PAINT};
-    // SAFETY: a standard WM_PAINT of this thread's picker, drawn by its own
-    // procedure into a bitmap of the client's size, whose pixels (32-bit,
-    // top-down, `w * h` of them) are changed in place; every GDI object
-    // made is let go before returning.
-    unsafe {
-        let mut ps: PAINTSTRUCT = core::mem::zeroed();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let mut rc = windows_sys::Win32::Foundation::RECT::default();
-        GetClientRect(hwnd, &mut rc);
-        let (w, h) = (rc.right, rc.bottom);
-        if w > 0 && h > 0 {
-            let mut bmi: BITMAPINFO = core::mem::zeroed();
-            bmi.bmiHeader = BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB,
-                ..core::mem::zeroed()
-            };
-            let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
-            let dib = CreateDIBSection(
-                hdc,
-                &bmi,
-                DIB_RGB_COLORS,
-                &mut bits,
-                core::ptr::null_mut(),
-                0,
-            );
-            if !dib.is_null() && !bits.is_null() {
-                let mem = CreateCompatibleDC(hdc);
-                let old = SelectObject(mem, dib);
-                DefSubclassProc(hwnd, WM_PAINT, mem as usize, 0);
-                GdiFlush();
-                let px = core::slice::from_raw_parts_mut(bits.cast::<u32>(), (w * h) as usize);
-                for p in px.iter_mut() {
-                    *p = flip_lightness(*p);
-                }
-                BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-                SelectObject(mem, old);
-                DeleteDC(mem);
-            }
-            if !dib.is_null() {
-                DeleteObject(dib);
-            }
+/// the check box, the button, the hover edge), only dark. `m` is the
+/// picker's WM_PAINT, as its subclass has it.
+fn paint_dark_picker(m: &Msg) {
+    use windows_sys::Win32::Graphics::Gdi::SRCCOPY;
+    // The picker's own procedure draws into a canvas of the client's size,
+    // whose pixels are copied out, changed and copied back; the canvas is
+    // let go as it drops, then the painting ends.
+    let hwnd = m.hwnd;
+    let paint = gdi::Paint::begin(hwnd);
+    let hdc = paint.hdc();
+    let rc = win::client_rect(hwnd);
+    let (w, h) = (rc.right, rc.bottom);
+    if w > 0
+        && h > 0
+        && let Some(canvas) = Canvas::new(w, h)
+    {
+        m.paint_next_into(canvas.hdc());
+        if let Some(px) = canvas.pixels() {
+            let flip = |p: [u8; 4]| flip_lightness(u32::from_le_bytes(p)).to_le_bytes();
+            let px: Vec<[u8; 4]> = px.into_iter().map(flip).collect();
+            canvas.set_pixels(&px);
         }
-        EndPaint(hwnd, &ps);
+        gdi::bit_blt(hdc, (0, 0, w, h), canvas.hdc(), (0, 0), SRCCOPY);
     }
 }
+
+/// The subclass of the window a picker's calendar drops down in
+/// ([`frame_proc`]).
+static FRAME: subclass::Key = subclass::Key::new("advanced search: calendar frame");
 
 /// The subclass of the window a picker's calendar drops down in, in the
 /// dark theme: its one-pixel frame in the theme's border colour, not white.
-unsafe extern "system" fn frame_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
+fn frame_proc(m: &Msg) -> LRESULT {
     use windows_sys::Win32::Foundation::RECT;
-    use windows_sys::Win32::Graphics::Gdi::{GetWindowDC, ReleaseDC};
-    use windows_sys::Win32::UI::Shell::RemoveWindowSubclass;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, WM_NCDESTROY, WM_NCPAINT};
-    // SAFETY: `w` and `l` are passed on as they came; the frame is drawn
-    // on this thread's window's own DC, released after.
-    unsafe {
-        match msg {
-            WM_NCPAINT => {
-                let done = DefSubclassProc(hwnd, msg, w, l);
-                let mut rc = RECT::default();
-                GetWindowRect(hwnd, &mut rc);
-                let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-                let dc = GetWindowDC(hwnd);
-                let border = crate::theme::Palette::new(true).border;
-                for edge in [
-                    RECT {
-                        left: 0,
-                        top: 0,
-                        right: w,
-                        bottom: 1,
-                    },
-                    RECT {
-                        left: 0,
-                        top: h - 1,
-                        right: w,
-                        bottom: h,
-                    },
-                    RECT {
-                        left: 0,
-                        top: 0,
-                        right: 1,
-                        bottom: h,
-                    },
-                    RECT {
-                        left: w - 1,
-                        top: 0,
-                        right: w,
-                        bottom: h,
-                    },
-                ] {
-                    crate::paint::fill(dc, &edge, border);
-                }
-                ReleaseDC(hwnd, dc);
-                return done;
-            }
-            WM_NCDESTROY => {
-                RemoveWindowSubclass(hwnd, Some(frame_proc), 1);
-            }
-            _ => {}
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_NCPAINT;
+    if m.id == WM_NCPAINT {
+        let done = m.def();
+        let rc = win::window_rect(m.hwnd);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        // The window's own DC, released when it drops.
+        let dc = gdi::WindowDc::whole(m.hwnd);
+        let border = crate::theme::Palette::new(true).border;
+        for edge in [
+            RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: 1,
+            },
+            RECT {
+                left: 0,
+                top: h - 1,
+                right: w,
+                bottom: h,
+            },
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: h,
+            },
+            RECT {
+                left: w - 1,
+                top: 0,
+                right: w,
+                bottom: h,
+            },
+        ] {
+            crate::paint::fill(dc.hdc(), &edge, border);
         }
-        DefSubclassProc(hwnd, msg, w, l)
+        return done;
     }
+    m.def()
 }
+
+/// The subclass of the date pickers and of their calendars
+/// ([`picker_proc`]).
+static PICKER: subclass::Key = subclass::Key::new("advanced search: date picker");
 
 /// The subclass of the date pickers and of their calendars as they drop
-/// down (`data` is the dialog): drawn dark in the dark theme.
-unsafe extern "system" fn picker_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    data: usize,
-) -> LRESULT {
-    use windows_sys::Win32::UI::Shell::RemoveWindowSubclass;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_ERASEBKGND, WM_NCDESTROY, WM_PAINT};
-    // SAFETY: `data` is the dialog, whose GWLP_USERDATA is its `Dlg` while
-    // it lives (a calendar is gone before it); `w` and `l` are passed on as
-    // they came.
-    unsafe {
-        let dark = state::<Dlg<'_>>(data as HWND).is_some_and(|s| s.look.get().dark);
-        match msg {
-            WM_ERASEBKGND if dark => return 1,
-            WM_PAINT if dark && w == 0 => {
-                paint_dark_picker(hwnd);
-                return 0;
-            }
-            WM_NCDESTROY => {
-                RemoveWindowSubclass(hwnd, Some(picker_proc), 1);
-            }
-            _ => {}
+/// down (`look` is the dialog's): drawn dark in the dark theme.
+fn picker_proc(m: &Msg, look: &Cell<Look>) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_ERASEBKGND, WM_PAINT};
+    let dark = look.get().dark;
+    match m.id {
+        WM_ERASEBKGND if dark => return 1,
+        WM_PAINT if dark && m.w == 0 => {
+            paint_dark_picker(m);
+            return 0;
         }
-        DefSubclassProc(hwnd, msg, w, l)
+        _ => {}
     }
+    m.def()
 }
 
-unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Dlg` that `ask` keeps alive until the dialog
-        // has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Dlg` from `ask`, or null.
-    let Some(s) = (unsafe { state::<Dlg<'_>>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn proc(s: &Dlg, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.init(dlg);
             // The keyboard in the first box, the words.
@@ -972,22 +866,18 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isi
         // Shown (a modal dialog shows once its queue is empty): the Filter
         // list follows once it has been drawn, as timers come after the
         // paints waiting.
-        WM_SHOWWINDOW if w != 0 => {
-            // SAFETY: a timer of this thread's dialog.
-            unsafe { SetTimer(dlg, MAKE_FILTER, USER_TIMER_MINIMUM, None) };
+        WM_SHOWWINDOW if m.w != 0 => {
+            win::set_timer(dlg, MAKE_FILTER, USER_TIMER_MINIMUM);
             0
         }
-        WM_TIMER if w == MAKE_FILTER => {
+        WM_TIMER if m.w == MAKE_FILTER => {
             s.make_filter(dlg);
             1
         }
         WM_COMMAND => {
-            match (w & 0xffff) as u16 {
+            match win::loword(m.w) {
                 OK => s.ok(dlg),
-                // SAFETY: ends this modal dialog.
-                CANCEL => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                CANCEL => dlg::end(dlg, 0),
                 ID_BROWSE => s.browse(dlg),
                 _ => return 0,
             }
@@ -995,35 +885,22 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isi
         }
         // A picker's calendar drops down: dark too, as the picker is.
         WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR from a control.
-            let hdr = unsafe { &*(l as *const NMHDR) };
-            if hdr.code == DTN_DROPDOWN && s.look.get().dark {
-                let calendar = send(hdr.hwndFrom, DTM_GETMONTHCAL, 0, 0) as HWND;
+            if let Some(n) = m.notify()
+                && n.code() == DTN_DROPDOWN
+                && s.look.get().dark
+            {
+                let calendar = win::datetime::calendar(n.from());
                 if !calendar.is_null() {
-                    // SAFETY: subclasses this thread's calendar; the
-                    // subclass removes itself when it goes.
-                    unsafe {
-                        SetWindowSubclass(calendar, Some(picker_proc), 1, dlg as usize);
-                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
-                            calendar,
-                            core::ptr::null(),
-                            0,
-                        );
-                        // Its frame, the window it drops down in, too.
-                        let frame =
-                            windows_sys::Win32::UI::WindowsAndMessaging::GetParent(calendar);
-                        if !frame.is_null() {
-                            use windows_sys::Win32::Graphics::Gdi::{
-                                RDW_FRAME, RDW_INVALIDATE, RedrawWindow,
-                            };
-                            SetWindowSubclass(frame, Some(frame_proc), 1, 0);
-                            RedrawWindow(
-                                frame,
-                                core::ptr::null(),
-                                core::ptr::null_mut(),
-                                RDW_FRAME | RDW_INVALIDATE,
-                            );
-                        }
+                    // The subclass goes with the calendar.
+                    let look = Rc::clone(&s.look);
+                    subclass::set(calendar, &PICKER, move |m| picker_proc(m, &look));
+                    win::invalidate(calendar, None, false);
+                    // Its frame, the window it drops down in, too.
+                    let frame = win::parent(calendar);
+                    if !frame.is_null() {
+                        use windows_sys::Win32::Graphics::Gdi::{RDW_FRAME, RDW_INVALIDATE};
+                        subclass::set(frame, &FRAME, frame_proc);
+                        win::redraw(frame, None, RDW_FRAME | RDW_INVALIDATE);
                     }
                 }
             }

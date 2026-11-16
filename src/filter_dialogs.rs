@@ -11,29 +11,23 @@
 
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::{
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
-    LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED, LVN_KEYDOWN,
-    LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_NOSORTHEADER,
-    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE,
-    NMLVCUSTOMDRAW, NMLVKEYDOWN,
+    LVN_ITEMCHANGED, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW,
+    NM_DBLCLK, NMITEMACTIVATE, NMLVCUSTOMDRAW, NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_DELETE, VK_F2};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_F2};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, DWLP_MSGRESULT, EN_CHANGE,
-    ES_AUTOHSCROLL, EndDialog, GWLP_USERDATA, GetClientRect, GetDlgItem, GetWindowRect,
-    GetWindowTextLengthW, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_OK, MB_YESNO,
-    MINMAXINFO, MapDialogRect, MoveWindow, SendMessageW, SetWindowLongPtrW, SetWindowTextW,
-    WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE,
-    WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
+    BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, EN_CHANGE, ES_AUTOHSCROLL, IDCANCEL, IDOK, IDYES,
+    MB_DEFBUTTON2, MB_ICONWARNING, MB_OK, MB_YESNO, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO,
+    WM_INITDIALOG, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
 };
 
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common, fill_last_column,
-    list_custom_draw, state,
+    Class, Look, Template, apply_theme, center_on_owner, common, fill_last_column, list_custom_draw,
 };
 use crate::filedlg;
 use crate::filter::Filter;
@@ -41,34 +35,17 @@ use crate::filters::{FilterDef, List, name_problem, one_line};
 use crate::msgbox;
 use crate::places::{self, Which};
 use crate::store;
-use crate::wide::{window_text, wz};
+use crate::win::{self, Msg, Notify, button, dlg, lv};
 
 const STATIC: u16 = 0xffff;
 const OK: u16 = IDOK as u16;
 const CANCEL: u16 = IDCANCEL as u16;
 
-fn item(dlg: HWND, id: u16) -> HWND {
-    // SAFETY: looks up a child of this thread's dialog.
-    unsafe { GetDlgItem(dlg, i32::from(id)) }
-}
-
-fn send(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: a message to a window of this thread; any pointer in `l` is
-    // the caller's and lives across the synchronous call.
-    unsafe { SendMessageW(hwnd, msg, w, l) }
-}
-
 fn enable(dlg: HWND, id: u16, on: bool) {
-    let h = item(dlg, id);
+    let h = dlg::item(dlg, id);
     if !h.is_null() {
-        // SAFETY: a control of this thread's dialog.
-        unsafe { EnableWindow(h, on.into()) };
+        win::enable(h, on);
     }
-}
-
-fn set_text(hwnd: HWND, text: &str) {
-    // SAFETY: a NUL-terminated string for a window of this thread.
-    unsafe { SetWindowTextW(hwnd, wz(text).as_ptr()) };
 }
 
 fn warn(owner: HWND, title: &str, text: &str) {
@@ -187,26 +164,16 @@ pub fn edit(
         0,
         (203, cy - 21, 50, 14),
     );
-    t.run(owner, Some(edit_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| edit_proc(&state, m));
     state.result.into_inner()
 }
 
 impl Editor<'_> {
     fn init(&self, dlg: HWND) {
-        set_text(item(dlg, ID_NAME), &one_line(&self.was.name));
-        set_text(item(dlg, ID_SEARCH), &one_line(&self.was.search));
-        send(
-            item(dlg, ID_CASE),
-            BM_SETCHECK,
-            usize::from(self.was.case),
-            0,
-        );
-        send(
-            item(dlg, ID_PATH),
-            BM_SETCHECK,
-            usize::from(self.was.path),
-            0,
-        );
+        win::set_text(dlg::item(dlg, ID_NAME), &one_line(&self.was.name));
+        win::set_text(dlg::item(dlg, ID_SEARCH), &one_line(&self.was.search));
+        button::set_checked(dlg::item(dlg, ID_CASE), self.was.case);
+        button::set_checked(dlg::item(dlg, ID_PATH), self.was.path);
         enable(dlg, OK, !self.was.name.trim().is_empty());
         apply_theme(dlg, self.look.get().dark);
         center_on_owner(dlg);
@@ -216,7 +183,7 @@ impl Editor<'_> {
         let was = &self.was;
         // A text shown on one line comes back as it was unless edited.
         let keep = |id: u16, old: &str| {
-            let now = window_text(item(dlg, id));
+            let now = dlg::item_text(dlg, id);
             if now == one_line(old) {
                 old.to_owned()
             } else {
@@ -226,8 +193,8 @@ impl Editor<'_> {
         FilterDef {
             name: keep(ID_NAME, &was.name).trim().to_owned(),
             search: keep(ID_SEARCH, &was.search),
-            case: send(item(dlg, ID_CASE), BM_GETCHECK, 0, 0) == 1,
-            path: send(item(dlg, ID_PATH), BM_GETCHECK, 0, 0) == 1,
+            case: button::is_checked(dlg::item(dlg, ID_CASE)),
+            path: button::is_checked(dlg::item(dlg, ID_PATH)),
             other: was.other.clone(),
         }
     }
@@ -236,47 +203,33 @@ impl Editor<'_> {
         let def = self.read(dlg);
         if let Some(problem) = name_problem(self.others, &def.name, self.editing) {
             warn(dlg, "Filter", &problem);
-            // SAFETY: focuses a control of this thread's dialog.
-            unsafe { SetFocus(item(dlg, ID_NAME)) };
+            win::set_focus(dlg::item(dlg, ID_NAME));
             return;
         }
         *self.result.borrow_mut() = Some(def);
-        // SAFETY: ends this modal dialog.
-        unsafe { EndDialog(dlg, 1) };
+        dlg::end(dlg, 1);
     }
 }
 
-unsafe extern "system" fn edit_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Editor` that `edit` keeps alive until the
-        // dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Editor` from `edit`, or null before.
-    let Some(s) = (unsafe { state::<Editor<'_>>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn edit_proc(s: &Editor<'_>, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.init(dlg);
             // The keyboard in the name, its text selected.
             1
         }
         WM_COMMAND => {
-            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
             match id {
                 OK => s.ok(dlg),
-                // SAFETY: ends this modal dialog.
-                CANCEL => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                CANCEL => dlg::end(dlg, 0),
                 // A filter needs a name.
                 ID_NAME if code == EN_CHANGE => {
-                    // SAFETY: reads a control of this thread's dialog.
-                    let named = unsafe { GetWindowTextLengthW(item(dlg, ID_NAME)) } > 0;
+                    let named = win::text_len(dlg::item(dlg, ID_NAME)) > 0;
                     enable(dlg, OK, named);
                 }
                 _ => return 0,
@@ -388,7 +341,7 @@ pub fn organize(owner: HWND, list: List, look: Look) -> Option<List> {
         0,
         (cx - 61, cy - 21, 54, 14),
     );
-    t.run(owner, Some(organize_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| organize_proc(&state, m));
     state.result.into_inner()
 }
 
@@ -426,30 +379,25 @@ fn row_texts(list: &List, row: Row) -> [String; 2] {
 
 impl Organize {
     fn list_view(dlg: HWND) -> HWND {
-        item(dlg, ID_LIST)
+        dlg::item(dlg, ID_LIST)
     }
 
     fn init(&self, dlg: HWND) {
         let lv = Organize::list_view(dlg);
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
-        send(lv, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
+        lv::set_extended_style(lv, ex, ex);
         let dpi = crate::custom::window_dpi(dlg) as i32;
         for (i, (title, width)) in COLUMNS.into_iter().enumerate() {
-            let mut text = wz(title);
             let col = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH,
                 cx: width * dpi / 96,
-                pszText: text.as_mut_ptr(),
-                // SAFETY: the rest of LVCOLUMNW is plain data.
-                ..unsafe { core::mem::zeroed() }
+                ..Default::default()
             };
-            send(lv, LVM_INSERTCOLUMNW, i, (&raw const col) as isize);
+            lv::insert_column(lv, i as i32, col, Some(title));
         }
         apply_theme(dlg, self.look.get().dark);
         center_on_owner(dlg);
-        let mut wr = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetWindowRect(dlg, &mut wr) };
+        let wr = win::window_rect(dlg);
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
         places::restore(dlg, Which::FilterOrganize, lv, self.min.get());
         self.layout(dlg);
@@ -466,29 +414,27 @@ impl Organize {
     /// the buttons at the right, the note under the list.
     fn layout(&self, dlg: HWND) {
         let px = |x: i32, y: i32| {
-            let mut r = RECT {
-                left: 0,
-                top: 0,
-                right: x,
-                bottom: y,
-            };
-            // SAFETY: converts within this thread's dialog.
-            unsafe { MapDialogRect(dlg, &mut r) };
+            let r = dlg::map_rect(
+                dlg,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: x,
+                    bottom: y,
+                },
+            );
             (r.right, r.bottom)
         };
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetClientRect(dlg, &mut rc) };
+        let rc = win::client_rect(dlg);
         let (w, h) = (rc.right, rc.bottom);
         let (m, my) = px(7, 7);
         let (bw, bh) = px(54, 14);
         let (gap, _) = px(6, 0);
         let (_, note_h) = px(0, 16);
         let place = |id: u16, x: i32, y: i32, cw: i32, ch: i32| {
-            let hwnd = item(dlg, id);
+            let hwnd = dlg::item(dlg, id);
             if !hwnd.is_null() {
-                // SAFETY: moves a control of this thread's dialog.
-                unsafe { MoveWindow(hwnd, x, y, cw.max(0), ch.max(0), 1) };
+                win::move_window(hwnd, x, y, cw.max(0), ch.max(0), true);
             }
         };
         let bx = w - m - bw;
@@ -497,7 +443,7 @@ impl Organize {
         place(ID_LIST, m, my, lw, bottom - my - note_h - my);
         // The Search column takes what the Name column leaves (again in
         // `fill`, once the rows are in).
-        fill_last_column(item(dlg, ID_LIST));
+        fill_last_column(dlg::item(dlg, ID_LIST));
         place(ID_ABOUT, m, bottom - my - note_h + my / 2, lw, note_h);
         for (id, _, y) in BUTTONS {
             place(id, bx, px(0, y).1, bw, bh);
@@ -509,7 +455,7 @@ impl Organize {
     /// Shows the filters again, `select` (a row) selected.
     fn fill(&self, dlg: HWND, select: Option<usize>) {
         let lv = Organize::list_view(dlg);
-        send(lv, LVM_DELETEALLITEMS, 0, 0);
+        lv::delete_all_items(lv);
         let list = self.list.borrow();
         let n = Filter::ALL.len() + list.custom.len();
         for index in 0..n {
@@ -517,22 +463,17 @@ impl Organize {
                 continue;
             };
             for (col, text) in row_texts(&list, row).iter().enumerate() {
-                let mut t = wz(text);
-                let item = LVITEMW {
-                    mask: LVIF_TEXT,
-                    iItem: index as i32,
-                    iSubItem: col as i32,
-                    pszText: t.as_mut_ptr(),
-                    // SAFETY: the rest of LVITEMW is plain data.
-                    ..unsafe { core::mem::zeroed() }
-                };
-                let msg = if col == 0 {
-                    LVM_INSERTITEMW
+                if col == 0 {
+                    let item = LVITEMW {
+                        mask: LVIF_TEXT,
+                        iItem: index as i32,
+                        iSubItem: col as i32,
+                        ..Default::default()
+                    };
+                    lv::insert_item(lv, item, Some(text));
                 } else {
-                    LVM_SETITEMTEXTW
-                };
-                let at = if col == 0 { 0 } else { index };
-                send(lv, msg, at, (&raw const item) as isize);
+                    lv::set_item_text(lv, index as i32, col as i32, text);
+                }
             }
         }
         drop(list);
@@ -541,25 +482,14 @@ impl Organize {
         fill_last_column(lv);
         if let Some(i) = select.filter(|&i| i < n) {
             let state = LVIS_SELECTED | LVIS_FOCUSED;
-            let item = LVITEMW {
-                state,
-                stateMask: state,
-                // SAFETY: the rest of LVITEMW is plain data.
-                ..unsafe { core::mem::zeroed() }
-            };
-            send(lv, LVM_SETITEMSTATE, i, (&raw const item) as isize);
-            send(lv, LVM_ENSUREVISIBLE, i, 0);
+            lv::set_item_state(lv, i as i32, state, state);
+            lv::ensure_visible(lv, i as i32, false);
         }
         self.update(dlg);
     }
 
     fn selected(&self, dlg: HWND) -> Option<Row> {
-        let i = send(
-            Organize::list_view(dlg),
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_SELECTED as isize,
-        );
+        let i = lv::next_item(Organize::list_view(dlg), -1, LVNI_SELECTED);
         usize::try_from(i)
             .ok()
             .and_then(|i| row_of(&self.list.borrow(), i))
@@ -597,7 +527,7 @@ impl Organize {
             }
             None => String::new(),
         };
-        set_text(item(dlg, ID_ABOUT), &about);
+        win::set_text(dlg::item(dlg, ID_ABOUT), &about);
     }
 
     fn new_filter(&self, dlg: HWND) {
@@ -757,13 +687,9 @@ impl Organize {
         match id {
             OK => {
                 *self.result.borrow_mut() = Some(self.list.borrow().clone());
-                // SAFETY: ends this modal dialog.
-                unsafe { EndDialog(dlg, 1) };
+                dlg::end(dlg, 1);
             }
-            // SAFETY: ends this modal dialog.
-            CANCEL => unsafe {
-                EndDialog(dlg, 0);
-            },
+            CANCEL => dlg::end(dlg, 0),
             ID_NEW => self.new_filter(dlg),
             ID_EDIT => self.edit_filter(dlg),
             ID_DELETE => self.delete(dlg),
@@ -778,58 +704,42 @@ impl Organize {
     }
 
     /// Answers a notification; `Some` is DWLP_MSGRESULT's value.
-    ///
-    /// # Safety
-    /// `l` is a WM_NOTIFY's lParam.
-    unsafe fn notify(&self, dlg: HWND, l: LPARAM) -> Option<isize> {
-        // SAFETY: as the caller promises; each code's struct is read as
-        // the list sends it.
-        unsafe {
-            let hdr = &*(l as *const NMHDR);
-            if hdr.idFrom != usize::from(ID_LIST) {
-                return None;
-            }
-            match hdr.code {
-                NM_CUSTOMDRAW => {
-                    let cd = &*(l as *const NMLVCUSTOMDRAW);
-                    return Some(list_custom_draw(hdr.hwndFrom, cd, self.look.get().dark));
-                }
-                LVN_ITEMCHANGED => self.update(dlg),
-                NM_DBLCLK => {
-                    if (*(l as *const NMITEMACTIVATE)).iItem >= 0 {
-                        self.edit_filter(dlg);
-                    }
-                }
-                LVN_KEYDOWN => match (*(l as *const NMLVKEYDOWN)).wVKey {
-                    VK_DELETE => self.delete(dlg),
-                    VK_F2 => self.edit_filter(dlg),
-                    _ => {}
-                },
-                _ => {}
-            }
-            None
+    fn notify(&self, dlg: HWND, n: &Notify) -> Option<isize> {
+        if n.id() != usize::from(ID_LIST) {
+            return None;
         }
+        match n.code() {
+            NM_CUSTOMDRAW => {
+                let cd = n.get::<NMLVCUSTOMDRAW>()?;
+                return Some(list_custom_draw(n.from(), &cd, self.look.get().dark));
+            }
+            LVN_ITEMCHANGED => self.update(dlg),
+            NM_DBLCLK => {
+                if n.get::<NMITEMACTIVATE>().is_some_and(|a| a.iItem >= 0) {
+                    self.edit_filter(dlg);
+                }
+            }
+            LVN_KEYDOWN => match n.get::<NMLVKEYDOWN>().map(|k| k.wVKey) {
+                Some(VK_DELETE) => self.delete(dlg),
+                Some(VK_F2) => self.edit_filter(dlg),
+                _ => {}
+            },
+            _ => {}
+        }
+        None
     }
 }
 
-unsafe extern "system" fn organize_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Organize` that `organize` keeps alive until
-        // the dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Organize` from `organize`, or null.
-    let Some(s) = (unsafe { state::<Organize>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn organize_proc(s: &Organize, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.init(dlg);
-            // SAFETY: the keyboard in the list, a control of this dialog.
-            unsafe { SetFocus(Organize::list_view(dlg)) };
+            // The keyboard in the list.
+            win::set_focus(Organize::list_view(dlg));
             0
         }
         WM_SIZE => {
@@ -838,21 +748,19 @@ unsafe extern "system" fn organize_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARA
         }
         WM_GETMINMAXINFO => {
             let (w, h) = s.min.get();
-            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
-            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = w;
-            mmi.ptMinTrackSize.y = h;
-            1
-        }
-        WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR from a control.
-            if let Some(answer) = unsafe { s.notify(dlg, l) } {
-                // SAFETY: the answer of this dialog's WM_NOTIFY.
-                unsafe { SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, answer) };
+            if let Some(mut mmi) = m.min_max_info() {
+                mmi.ptMinTrackSize.x = w;
+                mmi.ptMinTrackSize.y = h;
             }
             1
         }
-        WM_COMMAND => isize::from(s.command(dlg, (w & 0xffff) as u16)),
+        WM_NOTIFY => {
+            if let Some(answer) = m.notify().and_then(|n| s.notify(dlg, &n)) {
+                dlg::set_result(dlg, answer);
+            }
+            1
+        }
+        WM_COMMAND => isize::from(s.command(dlg, win::loword(m.w))),
         WM_DESTROY => {
             places::keep(dlg, Which::FilterOrganize, Organize::list_view(dlg));
             0

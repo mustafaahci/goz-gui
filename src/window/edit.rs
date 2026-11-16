@@ -9,23 +9,21 @@
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::SystemServices::MK_CONTROL;
-use windows_sys::Win32::UI::Controls::{
-    EM_CHARFROMPOS, EM_GETSEL, EM_REPLACESEL, EM_SETSEL, EM_UNDO,
-};
+use windows_sys::Win32::UI::Controls::EM_UNDO;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetActiveWindow, GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_NEXT,
-    VK_PRIOR, VK_RETURN, VK_SHIFT, VK_UP,
+    VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_UP,
 };
-use windows_sys::Win32::UI::Shell::DefSubclassProc;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetWindowTextLengthW, SendMessageW, SetWindowTextW, WM_CHAR, WM_CLEAR, WM_CUT, WM_DROPFILES,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEWHEEL, WM_PASTE, WM_SYSKEYDOWN,
-    WM_UNDO,
+    WM_CHAR, WM_CLEAR, WM_CUT, WM_DROPFILES, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_PASTE, WM_SYSKEYDOWN, WM_UNDO,
 };
 
-use super::{App, key_down, send};
-use crate::wide::{window_text, wz};
+use super::{App, key_down};
+use crate::win::{self, Msg, edit, subclass};
 use crate::{dropdown, menu};
+
+/// The search box's subclass ([`edit_proc`]).
+pub(super) static SUBCLASS: subclass::Key = subclass::Key::new("search box");
 
 /// What a key pressed in the search box does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,7 +102,7 @@ impl App {
             // The list moves its focus and selection as for its own keys,
             // reading Shift and Ctrl itself.
             EditKey::List => {
-                send(self.list, WM_KEYDOWN, w, l);
+                win::send_plain(self.list, WM_KEYDOWN, w, l);
             }
             EditKey::Enter => self.edit_enter(),
             EditKey::OpenPath => {
@@ -113,11 +111,9 @@ impl App {
                 }
             }
             EditKey::Clear => {
-                // SAFETY: reads and clears this thread's search box.
-                unsafe {
-                    if GetWindowTextLengthW(self.edit) > 0 {
-                        SetWindowTextW(self.edit, wz("").as_ptr());
-                    }
+                // Clears this thread's search box.
+                if win::text_len(self.edit) > 0 {
+                    win::set_text(self.edit, "");
                 }
             }
             EditKey::DeleteNextWord => delete_word(self.edit, false),
@@ -161,20 +157,18 @@ impl App {
             return;
         }
         self.focus_box();
-        dropdown::open(self, &window_text(self.edit));
+        dropdown::open(self, &win::text(self.edit));
     }
 
     /// Puts the keyboard in the search box. While the window is not the
     /// active one, the box is where the keyboard goes when it is: focusing
     /// would activate the window, which only the user should do.
     pub(super) fn focus_box(&self) {
-        // SAFETY: reads and moves the focus within this thread's window.
-        unsafe {
-            if GetActiveWindow() != self.hwnd {
-                self.last_focus.set(self.edit);
-            } else if GetFocus() != self.edit {
-                SetFocus(self.edit);
-            }
+        // Moves the focus within this thread's window.
+        if win::active() != self.hwnd {
+            self.last_focus.set(self.edit);
+        } else if win::focus() != self.edit {
+            win::set_focus(self.edit);
         }
     }
 
@@ -188,35 +182,24 @@ impl App {
     }
 }
 
-pub(super) unsafe extern "system" fn edit_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    data: usize,
-) -> LRESULT {
-    // SAFETY: `data` is the leaked `App` passed to SetWindowSubclass.
-    let app = unsafe { &*(data as *const App) };
+/// The search box's subclass ([`SUBCLASS`]).
+pub(super) fn edit_proc(app: &App, m: &Msg) -> LRESULT {
     // The user's own editing (a character, Delete, a paste, an undo): the
     // change of text it makes may bring suggestions (`App::text_changed`).
-    let typed = match msg {
+    let typed = match m.id {
         WM_CHAR | WM_PASTE | WM_CUT | WM_CLEAR | WM_UNDO | EM_UNDO => true,
-        WM_KEYDOWN => w as u16 == VK_DELETE,
+        WM_KEYDOWN => m.w as u16 == VK_DELETE,
         _ => false,
     };
     let was = app.typing.replace(app.typing.get() || typed);
-    // SAFETY: the message as it came, for the box it came to.
-    let r = unsafe { edit_message(app, hwnd, msg, w, l) };
+    let r = edit_message(app, m);
     app.typing.set(was);
     r
 }
 
 /// The search box's messages.
-///
-/// # Safety
-/// `w` and `l` are what `msg` carries, for the box `hwnd`.
-unsafe fn edit_message(app: &App, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+fn edit_message(app: &App, m: &Msg) -> LRESULT {
+    let (hwnd, msg, w, l): (HWND, u32, WPARAM, LPARAM) = (m.hwnd, m.id, m.w, m.l);
     // The search box's own keys (Options > Keyboard's "Search Edit" ones:
     // F2 is Advanced Search..., F4's) before the box's fixed ones below.
     if matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) {
@@ -228,15 +211,9 @@ unsafe fn edit_message(app: &App, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             // W7: F2 (Advanced Search...'s key) with the caret in a
             // file-list term edits its slot, as in Everything.
             if cmd == crate::searchtools::ADVANCED_SEARCH {
-                let (mut start, mut end) = (0u32, 0u32);
-                send(
-                    hwnd,
-                    EM_GETSEL,
-                    (&raw mut start) as usize,
-                    (&raw mut end) as isize,
-                );
+                let (_, end) = edit::sel(hwnd);
                 let caret = end as usize;
-                if crate::filelist::slots::term_at(&window_text(hwnd), caret)
+                if crate::filelist::slots::term_at(&win::text(hwnd), caret)
                     .is_some_and(|t| t.func.editable())
                 {
                     crate::slotedit::post_edit_at(app.hwnd, caret);
@@ -248,93 +225,87 @@ unsafe fn edit_message(app: &App, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
     }
     // The search box's menu (F4's, `tools.rs`).
-    if let Some(answer) = app.search_box_message(msg, w, l) {
+    if let Some(answer) = app.search_box_message(m) {
         return answer;
     }
-    // SAFETY: `w` and `l` are passed on as they came.
-    unsafe {
-        match msg {
-            WM_KEYDOWN | WM_SYSKEYDOWN => {
-                // Bit 29: Alt is down (WM_SYSKEYDOWN also comes for F10).
-                let alt = msg == WM_SYSKEYDOWN && l & (1 << 29) != 0;
-                let key = edit_key(
-                    w as u16,
-                    key_down(VK_CONTROL),
-                    key_down(VK_SHIFT),
-                    alt,
-                    app.dropdown.is_open(),
-                );
-                if let Some(key) = key
-                    && app.run_edit_key(key, w, l)
-                {
-                    return 0;
-                }
-            }
-            // Enter, Ctrl+Enter and Esc would beep in a single-line edit.
-            WM_CHAR if matches!(w, 0x0a | 0x0d | 0x1b) => return 0,
-            // Ctrl+Backspace arrives as DEL; a single-line edit types it.
-            WM_CHAR if w == 0x7f => {
-                delete_word(hwnd, true);
+    match msg {
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            // Bit 29: Alt is down (WM_SYSKEYDOWN also comes for F10).
+            let alt = msg == WM_SYSKEYDOWN && l & (1 << 29) != 0;
+            let key = edit_key(
+                w as u16,
+                key_down(VK_CONTROL),
+                key_down(VK_SHIFT),
+                alt,
+                app.dropdown.is_open(),
+            );
+            if let Some(key) = key
+                && app.run_edit_key(key, w, l)
+            {
                 return 0;
             }
-            WM_KILLFOCUS => {
-                app.click_select.set(false);
-                dropdown::close(app);
-            }
-            // Options > Search's "Select search on mouse click": a click
-            // that puts the keyboard here selects all of the text once the
-            // button is up, unless it dragged over some of it.
-            WM_LBUTTONDOWN => {
-                if app.ui().select_on_click && GetFocus() != hwnd {
-                    app.click_select.set(true);
-                }
-            }
-            WM_LBUTTONUP => {
-                let r = DefSubclassProc(hwnd, msg, w, l);
-                // W7: Ctrl+click on a file-list term edits its slot (posted:
-                // the dialog runs outside the box's own message).
-                if w & MK_CONTROL as usize != 0 {
-                    let at = SendMessageW(hwnd, EM_CHARFROMPOS, 0, l);
-                    if at != -1 {
-                        let unit = (at as usize) & 0xffff;
-                        if crate::filelist::slots::term_at(&window_text(hwnd), unit)
-                            .is_some_and(|t| t.func.editable())
-                        {
-                            crate::slotedit::post_edit_at(app.hwnd, unit);
-                            app.click_select.set(false);
-                            return r;
-                        }
-                    }
-                }
-                if app.click_select.replace(false) {
-                    let (mut start, mut end) = (0u32, 0u32);
-                    send(
-                        hwnd,
-                        EM_GETSEL,
-                        (&raw mut start) as usize,
-                        (&raw mut end) as isize,
-                    );
-                    if start == end {
-                        send(hwnd, EM_SETSEL, 0, -1);
-                    }
-                }
-                return r;
-            }
-            // A drop on the box is a drop on the window.
-            WM_DROPFILES => {
-                app.drop_files(w as _);
-                return 0;
-            }
-            // The wheel goes to the focus, which stays here while the
-            // dropdown is open.
-            WM_MOUSEWHEEL if app.dropdown.is_open() => {
-                SendMessageW(app.dropdown.hwnd(), msg, w, l);
-                return 0;
-            }
-            _ => {}
         }
-        DefSubclassProc(hwnd, msg, w, l)
+        // Enter, Ctrl+Enter and Esc would beep in a single-line edit.
+        WM_CHAR if matches!(w, 0x0a | 0x0d | 0x1b) => return 0,
+        // Ctrl+Backspace arrives as DEL; a single-line edit types it.
+        WM_CHAR if w == 0x7f => {
+            delete_word(hwnd, true);
+            return 0;
+        }
+        WM_KILLFOCUS => {
+            app.click_select.set(false);
+            dropdown::close(app);
+        }
+        // Options > Search's "Select search on mouse click": a click
+        // that puts the keyboard here selects all of the text once the
+        // button is up, unless it dragged over some of it.
+        WM_LBUTTONDOWN => {
+            if app.ui().select_on_click && win::focus() != hwnd {
+                app.click_select.set(true);
+            }
+        }
+        WM_LBUTTONUP => {
+            let r = m.def();
+            // W7: Ctrl+click on a file-list term edits its slot (posted:
+            // the dialog runs outside the box's own message).
+            if w & MK_CONTROL as usize != 0 {
+                let (unit, line) = edit::char_from_pos(hwnd, m.point());
+                // (-1 in both words: no character there.)
+                if (unit, line) != (0xffff, 0xffff) {
+                    let unit = usize::from(unit);
+                    if crate::filelist::slots::term_at(&win::text(hwnd), unit)
+                        .is_some_and(|t| t.func.editable())
+                    {
+                        crate::slotedit::post_edit_at(app.hwnd, unit);
+                        app.click_select.set(false);
+                        return r;
+                    }
+                }
+            }
+            if app.click_select.replace(false) {
+                let (start, end) = edit::sel(hwnd);
+                if start == end {
+                    edit::select_all(hwnd);
+                }
+            }
+            return r;
+        }
+        // A drop on the box is a drop on the window.
+        WM_DROPFILES => {
+            if let Some(paths) = m.dropped_files() {
+                app.drop_files(paths);
+            }
+            return 0;
+        }
+        // The wheel goes to the focus, which stays here while the
+        // dropdown is open.
+        WM_MOUSEWHEEL if app.dropdown.is_open() => {
+            win::send_plain(app.dropdown.hwnd(), msg, w, l);
+            return 0;
+        }
+        _ => {}
     }
+    m.def()
 }
 
 /// Characters that end a word for Ctrl+Backspace and Ctrl+Delete: spaces
@@ -371,16 +342,10 @@ fn word_end_after(text: &[u16], caret: usize) -> usize {
 
 /// Deletes the selection, or with none the word before the caret
 /// (`back`, Ctrl+Backspace) or after it (Ctrl+Delete); undoable.
-pub(super) fn delete_word(edit: HWND, back: bool) {
-    let (mut start, mut end) = (0u32, 0u32);
-    send(
-        edit,
-        EM_GETSEL,
-        (&raw mut start) as usize,
-        (&raw mut end) as isize,
-    );
+pub(super) fn delete_word(e: HWND, back: bool) {
+    let (start, end) = edit::sel(e);
     if start == end {
-        let text: Vec<u16> = window_text(edit).encode_utf16().collect();
+        let text: Vec<u16> = win::text(e).encode_utf16().collect();
         let caret = start as usize;
         let (from, to) = if back {
             (word_start_before(&text, caret), caret)
@@ -390,10 +355,9 @@ pub(super) fn delete_word(edit: HWND, back: bool) {
         if from == to {
             return;
         }
-        send(edit, EM_SETSEL, from, to as isize);
+        edit::set_sel(e, from as i32, to as i32);
     }
-    let empty = [0u16];
-    send(edit, EM_REPLACESEL, 1, empty.as_ptr() as isize);
+    edit::replace_sel(e, "", true);
 }
 
 #[cfg(test)]

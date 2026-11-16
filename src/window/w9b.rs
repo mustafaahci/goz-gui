@@ -21,12 +21,13 @@ use std::time::Instant;
 
 use goz_core::proto::feature;
 use goz_core::types::SortKey;
-use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer, WM_APP};
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_APP;
 
 use super::App;
 use crate::client::{self, WATCH_CHANGED, WATCH_OFF, WATCH_ON, Watcher};
 use crate::columns::{self, COL_ACCESSED, COL_ATTRIB, COL_CREATED, COL_RECENT};
 use crate::props::Want;
+use crate::win;
 
 /// The watch's news (`wParam`: `client::WATCH_*`).
 pub(super) const WM_WATCH: u32 = WM_APP + 424;
@@ -179,8 +180,7 @@ impl App {
                 self.end_watch();
                 self.arm_live();
                 if client::has_feature(feature::WATCH) {
-                    // SAFETY: a timer of this window.
-                    unsafe { SetTimer(self.hwnd, TIMER_WATCH_RETRY, WATCH_RETRY_MS, None) };
+                    win::set_timer(self.hwnd, TIMER_WATCH_RETRY, WATCH_RETRY_MS);
                 }
             }
             _ => {}
@@ -189,8 +189,7 @@ impl App {
 
     /// The watch's retry timer.
     pub(super) fn watch_retry(&self) {
-        // SAFETY: a timer of this window.
-        unsafe { KillTimer(self.hwnd, TIMER_WATCH_RETRY) };
+        win::kill_timer(self.hwnd, TIMER_WATCH_RETRY);
         self.start_watch();
     }
 
@@ -252,8 +251,7 @@ impl App {
         };
         if more {
             self.w9.push.refetch_posted.set(true);
-            // SAFETY: a plain post to this thread's window.
-            unsafe { PostMessageW(self.hwnd, WM_REFETCH, 0, 0) };
+            win::post_app(self.hwnd, WM_REFETCH, 0, 0);
         }
     }
 

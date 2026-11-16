@@ -11,47 +11,26 @@
 //! handler showing UI, a menu loop), so callers hold no `RefCell` borrow
 //! across them.
 //!
-//! The `windows` crate brings the interfaces; the rest of goz-gui stays on
-//! `windows-sys`, whose handles are the same pointers.
+//! The shell's objects are `crate::win::shell`'s wrappers.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use windows::Win32::Foundation::{
-    HGLOBAL, HWND as WHWND, LPARAM as WLPARAM, LRESULT as WLRESULT, POINT as WPOINT,
-    WPARAM as WWPARAM,
-};
-use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, CoCreateInstance, DVASPECT_CONTENT, FORMATETC, IDataObject, IPersistFile,
-    STGM_READ, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
-};
 use windows::Win32::System::Ole::{
-    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropSource,
-    OleGetClipboard, ReleaseStgMedium,
+    DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
 };
-use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     CMF_CANRENAME, CMF_EXTENDEDVERBS, CMF_ITEMMENU, CMF_NORMAL, CMIC_MASK_CONTROL_DOWN,
-    CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX,
-    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_RENAMEONCOLLISION,
-    FOF_SILENT, FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE, GCS_VERBW, IContextMenu, IContextMenu2,
-    IContextMenu3, ILClone, ILCombine, ILCreateFromPathW, ILFindLastID, ILFree, ILIsParent,
-    ILRemoveLastID, IShellFolder, IShellLinkW, SHBindToParent, SHDoDragDrop, SHGetDesktopFolder,
-    ShellLink,
+    CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
+    FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_RENAMEONCOLLISION, FOF_SILENT, FOFX_ADDUNDORECORD,
+    FOFX_RECYCLEONDELETE,
 };
-use windows::Win32::UI::WindowsAndMessaging::HMENU as WHMENU;
-use windows::core::{Interface, PCSTR, PCWSTR, PSTR};
-use windows_sys::Win32::Foundation::{GlobalFree, HWND, POINT};
-use windows_sys::Win32::System::DataExchange::{
-    GetClipboardSequenceNumber, RegisterClipboardFormatW,
-};
-use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows_sys::Win32::System::Ole::{OleFlushClipboard, OleInitialize};
-use windows_sys::Win32::UI::Shell::SHGetPathFromIDListEx;
-use windows_sys::Win32::UI::WindowsAndMessaging::{HMENU, SW_SHOWNORMAL};
+use windows_sys::Win32::Foundation::{HWND, POINT};
+use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 
-use crate::wide::{nul, wz};
+use crate::win::shell::{DataObject, Folder, Pidl, ShellLink, ShellMenu};
+use crate::win::{Msg, clipboard, com};
 
 thread_local! {
     /// OLE is initialised on this thread.
@@ -64,9 +43,8 @@ thread_local! {
 /// loads it.
 pub fn ole_ready() -> bool {
     if !OLE.get() {
-        // SAFETY: on the UI thread, which is already an STA (as OLE wants).
-        let hr = unsafe { OleInitialize(core::ptr::null()) };
-        OLE.set(hr >= 0);
+        // On the UI thread, which is already an STA (as OLE wants).
+        OLE.set(com::ole_initialize());
     }
     OLE.get()
 }
@@ -76,19 +54,9 @@ pub fn ole_ready() -> bool {
 /// works once goz-gui is gone.
 pub fn ole_done() {
     if OLE.get() {
-        // SAFETY: OLE is initialised on this thread; with no data object of
-        // this thread on the clipboard it does nothing.
-        unsafe { OleFlushClipboard() };
-    }
-}
-
-/// An absolute item ID list, freed with it.
-struct Pidl(*mut ITEMIDLIST);
-
-impl Drop for Pidl {
-    fn drop(&mut self) {
-        // SAFETY: a PIDL the shell allocated for this value alone.
-        unsafe { ILFree(Some(self.0)) };
+        // OLE is initialised on this thread; with no data object of this
+        // thread on the clipboard it does nothing.
+        crate::win::shell::flush_clipboard();
     }
 }
 
@@ -117,7 +85,7 @@ fn split_parent(path: &[u16]) -> Option<(Vec<u16>, &[u16])> {
 /// A folder some items are in: its absolute ID list and the shell's folder.
 struct Dir {
     id: Pidl,
-    folder: IShellFolder,
+    folder: Folder,
 }
 
 /// The folders some items are in, each looked up once by path. A folder is
@@ -127,14 +95,14 @@ struct Dir {
 /// from the desktop for every item instead, which took about 1 ms an item in
 /// a folder some 12 levels deep (3 s for 3,000 rows); this takes some 40 µs.
 struct Dirs {
-    desktop: IShellFolder,
+    desktop: Folder,
     known: HashMap<Vec<u16>, Option<Rc<Dir>>>,
 }
 
 impl Dirs {
     fn new() -> Option<Dirs> {
-        // SAFETY: COM is initialised on this thread (the UI thread's STA).
-        let desktop = unsafe { SHGetDesktopFolder() }.ok()?;
+        // COM is initialised on this thread (the UI thread's STA).
+        let desktop = Folder::desktop()?;
         Some(Dirs {
             desktop,
             known: HashMap::new(),
@@ -154,59 +122,27 @@ impl Dirs {
     fn find(&mut self, path: &[u16]) -> Option<Dir> {
         let Some((parent, name)) = split_parent(path) else {
             let id = id_of_path(path)?;
-            // SAFETY: a valid absolute ID list; the empty one is the desktop.
-            let folder = unsafe {
-                if (*id.0).mkid.cb == 0 {
-                    self.desktop.clone()
-                } else {
-                    self.desktop.BindToObject(id.0, None).ok()?
-                }
+            // The empty absolute ID list is the desktop.
+            let folder = if id.is_empty() {
+                self.desktop.clone()
+            } else {
+                self.desktop.bind(&id)?
             };
             return Some(Dir { id, folder });
         };
         let parent = self.get(&parent)?;
-        let child = parse_name(&parent.folder, name)?;
-        // SAFETY: valid ID lists: the parent's absolute one and the child's
-        // relative to it; the combined one is a copy owned by the new value.
-        unsafe {
-            let folder = parent.folder.BindToObject(child.0, None).ok()?;
-            let id = ILCombine(Some(parent.id.0), Some(child.0));
-            (!id.is_null()).then_some(Dir {
-                id: Pidl(id),
-                folder,
-            })
-        }
+        let child = parent.folder.parse(name)?;
+        // The parent's absolute ID list and the child's relative to it; the
+        // combined one is a copy owned by the new value.
+        let folder = parent.folder.bind(&child)?;
+        let id = parent.id.join(&child)?;
+        Some(Dir { id, folder })
     }
 }
 
 /// The ID list of `path`, parsed whole from the desktop.
 fn id_of_path(path: &[u16]) -> Option<Pidl> {
-    let path = nul(path);
-    // SAFETY: a NUL-terminated path; a null result is no item.
-    let id = unsafe { ILCreateFromPathW(PCWSTR(path.as_ptr())) };
-    (!id.is_null()).then_some(Pidl(id))
-}
-
-/// The ID list, relative to `folder`, of the item `name` in it; `None` when
-/// it is not there (gone since the search).
-fn parse_name(folder: &IShellFolder, name: &[u16]) -> Option<Pidl> {
-    let name = nul(name);
-    let mut id = core::ptr::null_mut();
-    let mut attributes = 0u32;
-    // SAFETY: a NUL-terminated name and out-pointers that outlive the call;
-    // no attributes are asked for.
-    let ok = unsafe {
-        folder.ParseDisplayName(
-            WHWND::default(),
-            None,
-            PCWSTR(name.as_ptr()),
-            None,
-            &mut id,
-            &mut attributes,
-        )
-    }
-    .is_ok();
-    (ok && !id.is_null()).then_some(Pidl(id))
+    Pidl::from_path(path)
 }
 
 /// Some results as the shell knows them: the folder that holds them and
@@ -215,11 +151,13 @@ fn parse_name(folder: &IShellFolder, name: &[u16]) -> Option<Pidl> {
 /// item's absolute ID list (Everything's `single_parent_context_menu=0`),
 /// so the menu and the data object cover them all.
 pub struct Items {
-    folder: IShellFolder,
+    folder: Folder,
     /// Each item's ID list (relative to `folder` when one folder holds them
-    /// all, else absolute); `children` point into them.
-    _pidls: Vec<Pidl>,
-    children: Vec<*const ITEMIDLIST>,
+    /// all, else absolute).
+    pidls: Vec<Pidl>,
+    /// The folder knows each item by its list's last ID (absolute lists of
+    /// items it holds), not by its list whole.
+    last: bool,
     /// The paths the items are, of those asked for (in order).
     taken: Vec<Vec<u16>>,
     /// One folder holds them all.
@@ -245,7 +183,7 @@ impl Items {
                 let found = match split_parent(p) {
                     Some((parent, name)) => {
                         let dir = dirs.get(&parent)?;
-                        let child = parse_name(&dir.folder, name)?;
+                        let child = dir.folder.parse(name)?;
                         Found::In(dir, child)
                     }
                     None => Found::Whole(id_of_path(p)?),
@@ -271,62 +209,44 @@ impl Items {
                     Found::Whole(_) => None,
                 })
                 .collect();
-            let children = pidls.iter().map(|p| p.0.cast_const()).collect();
             return Some(Items {
                 folder,
-                _pidls: pidls,
-                children,
+                pidls,
+                last: false,
                 taken,
                 one_parent: true,
             });
         }
-        let pidls: Vec<Pidl> = found
+        let pidls: Option<Vec<Pidl>> = found
             .into_iter()
             .map(|f| match f {
-                // SAFETY: the folder's absolute ID list and the item's
-                // relative to it; the combined copy is owned by the result.
-                Found::In(dir, child) => Pidl(unsafe { ILCombine(Some(dir.id.0), Some(child.0)) }),
-                Found::Whole(id) => id,
+                // The folder's absolute ID list and the item's relative to
+                // it; the combined copy is owned by the result.
+                Found::In(dir, child) => dir.id.join(&child),
+                Found::Whole(id) => Some(id),
             })
             .collect();
-        if pidls.iter().any(|p| p.0.is_null()) {
-            return None;
-        }
-        Self::of_absolute(pidls, taken)
+        Self::of_absolute(pidls?, taken)
     }
 
     /// Items given by absolute ID lists (several folders, or a root).
     fn of_absolute(pidls: Vec<Pidl>, taken: Vec<Vec<u16>>) -> Option<Items> {
         let first = pidls.first()?;
-        // SAFETY: each PIDL is valid until `pidls` drops, which `Items`
-        // keeps alive as long as the pointers into them; the parent's copy
-        // is freed with `parent`.
-        unsafe {
-            let parent = Pidl(ILClone(first.0));
-            if parent.0.is_null() {
-                return None;
-            }
-            let _ = ILRemoveLastID(Some(parent.0));
-            let one_parent = pidls
-                .iter()
-                .skip(1)
-                .all(|p| ILIsParent(parent.0, p.0, true).as_bool());
-            let (folder, children) = if one_parent {
-                let folder: IShellFolder = SHBindToParent(first.0, None).ok()?;
-                let children = pidls.iter().map(|p| ILFindLastID(p.0).cast_const());
-                (folder, children.collect())
-            } else {
-                let children = pidls.iter().map(|p| p.0.cast_const());
-                (SHGetDesktopFolder().ok()?, children.collect())
-            };
-            Some(Items {
-                folder,
-                _pidls: pidls,
-                children,
-                taken,
-                one_parent,
-            })
-        }
+        // The first item's parent, a copy freed with `parent`.
+        let parent = first.parent()?;
+        let one_parent = pidls.iter().skip(1).all(|p| parent.is_parent_of(p, true));
+        let folder = if one_parent {
+            Folder::parent_of(first)?
+        } else {
+            Folder::desktop()?
+        };
+        Some(Items {
+            folder,
+            pidls,
+            last: one_parent,
+            taken,
+            one_parent,
+        })
     }
 
     /// How many items the shell found, of the paths asked for.
@@ -345,29 +265,16 @@ impl Items {
         self.one_parent
     }
 
-    /// One of the folder's UI objects for the items (a context menu, a
-    /// data object), owned by `owner`.
-    fn ui_object<T: Interface>(&self, owner: HWND) -> Option<T> {
-        // SAFETY: the children are valid while `self` lives.
-        unsafe {
-            self.folder
-                .GetUIObjectOf::<T>(WHWND(owner), &self.children, None)
-                .ok()
-        }
-    }
-
     /// The items' data object, as Explorer puts on the clipboard or drags:
     /// CF_HDROP, the Shell IDList Array, file names and the rest.
-    pub fn data_object(&self, owner: HWND) -> Option<IDataObject> {
-        self.ui_object(owner)
+    pub fn data_object(&self, owner: HWND) -> Option<DataObject> {
+        self.folder.data_object(owner, &self.pidls, self.last)
     }
 
     /// The items' Explorer context menu.
     pub fn context_menu(&self, owner: HWND) -> Option<ContextMenu> {
-        let menu: IContextMenu = self.ui_object(owner)?;
+        let menu = self.folder.context_menu(owner, &self.pidls, self.last)?;
         Some(ContextMenu {
-            menu2: menu.cast().ok(),
-            menu3: menu.cast().ok(),
             menu,
             first: Cell::new(0),
         })
@@ -448,19 +355,17 @@ pub fn fileop_flags(op: FileOp, silent: bool) -> u32 {
 /// allowing a copy, a move or a link. Returns once it is dropped or
 /// cancelled, with the effect the target reported (0: none, or a move the
 /// target made itself: see [`performed_effect`]).
-pub fn drag(owner: HWND, data: &IDataObject) -> u32 {
-    let allowed = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0);
-    // SAFETY: a data object of this thread; the drag's loop pumps messages
-    // and the caller holds no borrow across it.
-    unsafe { SHDoDragDrop(Some(WHWND(owner)), data, None::<&IDropSource>, allowed) }
-        .map(|e| e.0)
-        .unwrap_or(0)
+pub fn drag(owner: HWND, data: &DataObject) -> u32 {
+    let allowed = DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0;
+    // A data object of this thread; the drag's loop pumps messages and the
+    // caller holds no borrow across it.
+    data.drag(owner, allowed)
 }
 
 /// The DROPEFFECT a drop target wrote back into `data` once it was done
 /// ("Performed DropEffect", or the "Logical Performed DropEffect" of an
 /// optimized move, which SHDoDragDrop reports as no effect); 0 if none.
-pub fn performed_effect(data: &IDataObject) -> u32 {
+pub fn performed_effect(data: &DataObject) -> u32 {
     ["Performed DropEffect", "Logical Performed DropEffect"]
         .iter()
         .filter_map(|name| get_effect(data, name))
@@ -481,71 +386,27 @@ pub fn source_deletes(effect: u32, performed: Option<u32>) -> bool {
 }
 
 /// The "Performed DropEffect" a drop target wrote back into `data`.
-pub fn performed(data: &IDataObject) -> Option<u32> {
+pub fn performed(data: &DataObject) -> Option<u32> {
     get_effect(data, "Performed DropEffect")
 }
 
 /// The registered clipboard format `name`.
-fn format(name: &str) -> FORMATETC {
-    let name = wz(name);
-    // SAFETY: a NUL-terminated name that outlives the call.
-    let cf = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
-    FORMATETC {
-        cfFormat: cf as u16,
-        ptd: core::ptr::null_mut(),
-        dwAspect: DVASPECT_CONTENT.0,
-        lindex: -1,
-        tymed: TYMED_HGLOBAL.0 as u32,
-    }
+fn format(name: &str) -> u16 {
+    clipboard::register_format(name) as u16
 }
 
 /// A DROPEFFECT `data` holds as format `name`.
-fn get_effect(data: &IDataObject, name: &str) -> Option<u32> {
-    let format = format(name);
-    // SAFETY: the medium the object hands out is read while locked, then
-    // released.
-    unsafe {
-        let mut medium = data.GetData(&format).ok()?;
-        let mem = medium.u.hGlobal.0;
-        let p = GlobalLock(mem) as *const u32;
-        let value = (!p.is_null()).then(|| p.read_unaligned());
-        GlobalUnlock(mem);
-        ReleaseStgMedium(&mut medium);
-        value
-    }
+fn get_effect(data: &DataObject, name: &str) -> Option<u32> {
+    // The medium the object hands out is copied out, then released.
+    let bytes = data.get(format(name))?;
+    Some(u32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?))
 }
 
 /// Gives `data` the DROPEFFECT `effect` as format `name`; false if it
 /// would not take it.
-fn set_effect(data: &IDataObject, name: &str, effect: u32) -> bool {
-    let format = format(name);
-    // SAFETY: a block of 4 bytes, written while locked. With fRelease the
-    // object owns it once SetData succeeds; it is freed here otherwise.
-    unsafe {
-        let mem = GlobalAlloc(GMEM_MOVEABLE, 4);
-        if mem.is_null() {
-            return false;
-        }
-        let p = GlobalLock(mem) as *mut u32;
-        if p.is_null() {
-            GlobalFree(mem);
-            return false;
-        }
-        p.write_unaligned(effect);
-        GlobalUnlock(mem);
-        let medium = STGMEDIUM {
-            tymed: TYMED_HGLOBAL.0 as u32,
-            u: STGMEDIUM_0 {
-                hGlobal: HGLOBAL(mem),
-            },
-            pUnkForRelease: core::mem::ManuallyDrop::new(None),
-        };
-        let ok = data.SetData(&format, &medium, true).is_ok();
-        if !ok {
-            GlobalFree(mem);
-        }
-        ok
-    }
+fn set_effect(data: &DataObject, name: &str, effect: u32) -> bool {
+    // A block of 4 bytes, which the object owns once it takes it.
+    data.set(format(name), &effect.to_ne_bytes())
 }
 
 /// What a paste that moved the files of a cut writes back into its data
@@ -574,7 +435,7 @@ const MOVED: [(&str, u32); 3] = [
 /// still the clipboard's, and only once none of the files is left
 /// (`crate::window`): never to whatever the user copied or cut since.
 pub struct Cut {
-    data: IDataObject,
+    data: DataObject,
     /// The clipboard's sequence number when its files were read.
     sequence: u32,
 }
@@ -589,8 +450,8 @@ impl Cut {
         if !ole_ready() {
             return None;
         }
-        // SAFETY: OLE is initialised on this thread.
-        let data = unsafe { OleGetClipboard() }.ok()?;
+        // OLE is initialised on this thread.
+        let data = DataObject::clipboard()?;
         (clipboard_sequence() == sequence).then_some(Cut { data, sequence })
     }
 
@@ -618,8 +479,7 @@ impl Cut {
 /// The clipboard's sequence number, which changes with whatever is put on
 /// it.
 fn clipboard_sequence() -> u32 {
-    // SAFETY: reads a counter.
-    unsafe { GetClipboardSequenceNumber() }
+    clipboard::sequence()
 }
 
 /// What the shortcut at `path` (a `.lnk`) points to, as a path; `None`
@@ -628,24 +488,11 @@ pub fn link_target(path: &[u16]) -> Option<Vec<u16>> {
     if !ole_ready() {
         return None;
     }
-    let path = nul(path);
-    // SAFETY: COM is initialised on this thread (OLE); the path outlives
-    // the call that reads it; the ID list is the link's copy, freed here.
-    unsafe {
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
-        link.cast::<IPersistFile>()
-            .ok()?
-            .Load(PCWSTR(path.as_ptr()), STGM_READ)
-            .ok()?;
-        let id = Pidl(link.GetIDList().ok()?);
-        if id.0.is_null() {
-            return None;
-        }
-        let mut buf = vec![0u16; 32_768];
-        let ok = SHGetPathFromIDListEx(id.0.cast(), buf.as_mut_ptr(), buf.len() as u32, 0) != 0;
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
-        (ok && len > 0).then(|| buf[..len].to_vec())
-    }
+    // COM is initialised on this thread (OLE); the ID list is the link's
+    // copy, freed here.
+    let link = ShellLink::new().ok()?;
+    link.load(path).ok()?;
+    link.id_list()?.path()
 }
 
 /// The Explorer context menu of some items, as long as it is shown and
@@ -662,11 +509,9 @@ pub fn link_target(path: &[u16]) -> Option<Vec<u16>> {
 /// `CoFreeUnusedLibrariesEx` must not be called for it: it unloads
 /// `WorkfoldersShell.dll` under its live threads.
 pub struct ContextMenu {
-    menu: IContextMenu,
-    /// The versions that draw their own items (icons, Open with, Send to)
-    /// and want the menu's messages for it.
-    menu2: Option<IContextMenu2>,
-    menu3: Option<IContextMenu3>,
+    /// The menu, with the versions that draw their own items (icons, Open
+    /// with, Send to) and want the menu's messages for it.
+    menu: ShellMenu,
     /// The id of the menu's first item, once [`fill`](Self::fill)ed.
     first: Cell<u32>,
 }
@@ -676,13 +521,11 @@ impl ContextMenu {
     /// `first` to `last`; false if it added none.
     pub fn fill(&self, menu: HMENU, at: u32, first: u32, last: u32, flags: u32) -> bool {
         self.first.set(first);
-        // SAFETY: a menu of this thread; the handlers add to it.
-        let hr = unsafe {
-            self.menu
-                .QueryContextMenu(WHMENU(menu), at, first, last, flags)
-        };
-        // Success carries how many ids were used.
-        hr.is_ok() && hr.0 & 0xffff > 0
+        // A menu of this thread; the handlers add to it. Success carries
+        // how many ids were used.
+        self.menu
+            .query(menu, at, first, last, flags)
+            .is_some_and(|used| used > 0)
     }
 
     /// Whether `id` is one of the shell's (from `fill`'s range).
@@ -694,22 +537,7 @@ impl ContextMenu {
     /// `properties`…), if its handler says.
     pub fn verb(&self, id: u32) -> Option<String> {
         let offset = id.checked_sub(self.first.get())? as usize;
-        let mut buf = [0u16; 260];
-        // SAFETY: a buffer of `len` code units for a Unicode verb; the
-        // handler writes at most that many, NUL included.
-        let ok = unsafe {
-            self.menu
-                .GetCommandString(
-                    offset,
-                    GCS_VERBW,
-                    None,
-                    PSTR(buf.as_mut_ptr().cast()),
-                    buf.len() as u32,
-                )
-                .is_ok()
-        };
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
-        (ok && len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
+        self.menu.verb(offset)
     }
 
     /// Runs the shell's item `id` for `owner`, as chosen at `pt` (screen)
@@ -718,55 +546,27 @@ impl ContextMenu {
         let Some(offset) = id.checked_sub(self.first.get()) else {
             return false;
         };
-        // MAKEINTRESOURCE: the offset travels as the pointer's address.
-        let verb = offset as usize;
-        let info = CMINVOKECOMMANDINFOEX {
-            cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-            fMask: mask,
-            hwnd: WHWND(owner),
-            lpVerb: PCSTR(core::ptr::without_provenance(verb)),
-            lpVerbW: PCWSTR(core::ptr::without_provenance(verb)),
-            nShow: SW_SHOWNORMAL,
-            ptInvoke: WPOINT { x: pt.x, y: pt.y },
-            ..Default::default()
-        };
-        // SAFETY: the EX struct (cbSize says so) outlives the call; the
-        // handler may pump messages, and no borrow of the caller's is held.
-        unsafe {
-            self.menu
-                .InvokeCommand((&raw const info).cast::<CMINVOKECOMMANDINFO>())
-                .is_ok()
-        }
+        // The handler may pump messages, and no borrow of the caller's is
+        // held.
+        self.menu.invoke(owner, offset, pt, mask)
     }
 
     /// A message of the menu while it is up (WM_INITMENUPOPUP,
     /// WM_MEASUREITEM, WM_DRAWITEM, WM_MENUCHAR), for the handlers that
     /// fill or draw their items; `Some` with the answer when one took it.
-    pub fn message(&self, msg: u32, w: usize, l: isize) -> Option<isize> {
-        // SAFETY: the message's own parameters, passed on unchanged, while
-        // the menu they are about is up.
-        unsafe {
-            if let Some(m3) = &self.menu3 {
-                let mut result = WLRESULT(0);
-                m3.HandleMenuMsg2(msg, WWPARAM(w), WLPARAM(l), Some(&mut result))
-                    .ok()?;
-                return Some(result.0);
-            }
-            let m2 = self.menu2.as_ref()?;
-            m2.HandleMenuMsg(msg, WWPARAM(w), WLPARAM(l)).ok()?;
-            Some(0)
-        }
+    /// WM_MEASUREITEM and WM_DRAWITEM are passed on only as the system
+    /// delivered them.
+    pub fn message(&self, m: &Msg) -> Option<isize> {
+        self.menu.message(m)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
-    use windows::Win32::UI::Shell::{CIDA, DragQueryFileW, HDROP};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetSubMenu, WM_INITMENUPOPUP,
-    };
+    use crate::win::com::Apartment;
+    use crate::win::menu;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_INITMENUPOPUP;
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
@@ -776,31 +576,24 @@ mod tests {
         std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())
     }
 
-    /// The files of a data object's CF_HDROP.
-    fn hdrop_files(data: &IDataObject) -> Vec<String> {
-        let format = FORMATETC {
-            cfFormat: 15, // CF_HDROP
-            ptd: core::ptr::null_mut(),
-            dwAspect: DVASPECT_CONTENT.0,
-            lindex: -1,
-            tymed: TYMED_HGLOBAL.0 as u32,
-        };
-        // SAFETY: a data object made by the shell on this thread; the
-        // medium is released after its HGLOBAL was read.
-        unsafe {
-            let mut medium = data.GetData(&format).expect("CF_HDROP");
-            let drop = HDROP(medium.u.hGlobal.0);
-            let n = DragQueryFileW(drop, u32::MAX, None);
-            let files = (0..n)
-                .map(|i| {
-                    let mut buf = [0u16; 520];
-                    let len = DragQueryFileW(drop, i, Some(&mut buf)) as usize;
-                    String::from_utf16_lossy(&buf[..len])
-                })
-                .collect();
-            ReleaseStgMedium(&mut medium);
-            files
-        }
+    /// The files of a data object's CF_HDROP: a DROPFILES block (where
+    /// the list starts, then whether it is UTF-16, at byte 16), then the
+    /// names, each ended by a NUL, the list by an empty one.
+    fn hdrop_files(data: &DataObject) -> Vec<String> {
+        let block = data.get(15).expect("CF_HDROP");
+        let field = |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().unwrap());
+        assert_ne!(field(16), 0, "the shell's names are UTF-16");
+        let units: Vec<u16> = block[field(0) as usize..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
+            .collect();
+        units
+            .split(|&c| c == 0)
+            .take_while(|name| !name.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect()
     }
 
     #[test]
@@ -828,8 +621,8 @@ mod tests {
     /// as the paths they are.
     #[test]
     fn roots_folders_and_files_mix() {
-        // SAFETY: COM for this test thread, which ends with the test.
-        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        // COM for this test thread, while the test runs.
+        let _com = Apartment::sta();
         let dir = windir();
         let drive = format!("{}\\", &dir[..2]);
         let paths: Vec<Vec<u16>> = [
@@ -858,11 +651,10 @@ mod tests {
         let one = Items::of_paths(&[w(&drive)]).expect("drive");
         assert!(one.one_parent());
         let menu = one.context_menu(core::ptr::null_mut()).expect("menu");
-        // SAFETY: a popup menu of this thread, destroyed below.
-        let popup = unsafe { CreatePopupMenu() };
+        // A popup menu of this thread, destroyed below.
+        let popup = menu::create_popup();
         assert!(menu.fill(popup, 0, 0x7000, 0x7fff, query_flags(false, false)));
-        // SAFETY: as above.
-        unsafe { DestroyMenu(popup) };
+        menu::destroy(popup);
     }
 
     #[test]
@@ -934,8 +726,8 @@ mod tests {
     /// data object's CF_HDROP, and the context menu's verbs.
     #[test]
     fn items_menus_and_data_objects() {
-        // SAFETY: COM for this test thread, which ends with the test.
-        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        // COM for this test thread, while the test runs.
+        let _com = Apartment::sta();
         let dir = windir();
         let one = [
             format!(r"{dir}\win.ini"),
@@ -972,11 +764,10 @@ mod tests {
         }
 
         let menu = items.context_menu(core::ptr::null_mut()).expect("menu");
-        // SAFETY: a popup menu of this thread, destroyed below.
-        let popup = unsafe { CreatePopupMenu() };
+        // A popup menu of this thread, destroyed below.
+        let popup = menu::create_popup();
         assert!(menu.fill(popup, 0, 0x7000, 0x7fff, query_flags(false, false)));
-        // SAFETY: as above.
-        let n = unsafe { GetMenuItemCount(popup) };
+        let n = menu::count(popup);
         assert!(n > 3, "the shell added {n} items");
         let verbs: Vec<String> = (0x7000..0x7100).filter_map(|id| menu.verb(id)).collect();
         for verb in ["copy", "properties"] {
@@ -991,19 +782,24 @@ mod tests {
         // menu's owner must forward it.
         let mut grew = Vec::new();
         for pos in 0..n {
-            // SAFETY: reads and fills submenus of the menu made above, as
-            // the menu loop would when each opens.
-            unsafe {
-                let sub = GetSubMenu(popup, pos);
-                if sub.is_null() {
-                    continue;
-                }
-                let before = GetMenuItemCount(sub);
-                menu.message(WM_INITMENUPOPUP, sub as usize, pos as isize);
-                let after = GetMenuItemCount(sub);
-                if after > before {
-                    grew.push((pos, before, after));
-                }
+            // Reads and fills submenus of the menu made above, as the menu
+            // loop would when each opens.
+            let sub = menu::item_info(popup, menu::By::Position(pos as u32))
+                .map_or(core::ptr::null_mut(), |i| i.submenu);
+            if sub.is_null() {
+                continue;
+            }
+            let before = menu::count(sub);
+            let opened = Msg::new(
+                core::ptr::null_mut(),
+                WM_INITMENUPOPUP,
+                sub as usize,
+                pos as isize,
+            );
+            menu.message(&opened);
+            let after = menu::count(sub);
+            if after > before {
+                grew.push((pos, before, after));
             }
         }
         // A CI runner's shell may have no handler that fills a submenu
@@ -1017,50 +813,17 @@ mod tests {
                 "no submenu filled itself on WM_INITMENUPOPUP"
             );
         }
-        // SAFETY: the menu made above.
-        unsafe { DestroyMenu(popup) };
+        // The menu made above.
+        menu::destroy(popup);
     }
 
-    /// The names of the formats a data object offers.
-    fn format_names(data: &IDataObject) -> Vec<String> {
-        use windows::Win32::System::Com::DATADIR_GET;
-        use windows_sys::Win32::System::DataExchange::GetClipboardFormatNameW;
-        let mut out = Vec::new();
-        // SAFETY: enumerates the object's formats into a local array.
-        unsafe {
-            let formats = data.EnumFormatEtc(DATADIR_GET.0 as u32).expect("formats");
-            loop {
-                let mut one = [FORMATETC::default()];
-                let mut got = 0u32;
-                if formats.Next(&mut one, Some(&mut got)).is_err() || got == 0 {
-                    break;
-                }
-                let cf = u32::from(one[0].cfFormat);
-                let mut buf = [0u16; 128];
-                let len = GetClipboardFormatNameW(cf, buf.as_mut_ptr(), 128);
-                out.push(if len > 0 {
-                    String::from_utf16_lossy(&buf[..len as usize])
-                } else {
-                    format!("#{cf}")
-                });
-            }
-        }
-        out
-    }
-
-    /// How many items a data object's Shell IDList Array holds.
-    fn cida_count(data: &IDataObject) -> u32 {
-        let format = format("Shell IDList Array");
-        // SAFETY: the medium is read while locked, then released.
-        unsafe {
-            let mut medium = data.GetData(&format).expect("Shell IDList Array");
-            let mem = medium.u.hGlobal.0;
-            let cida = GlobalLock(mem) as *const CIDA;
-            let n = (*cida).cidl;
-            GlobalUnlock(mem);
-            ReleaseStgMedium(&mut medium);
-            n
-        }
+    /// How many items a data object's Shell IDList Array holds (a CIDA,
+    /// whose count comes first).
+    fn cida_count(data: &DataObject) -> u32 {
+        let cida = data
+            .get(format("Shell IDList Array"))
+            .expect("Shell IDList Array");
+        u32::from_ne_bytes(cida[..4].try_into().expect("a CIDA"))
     }
 
     /// What a drag of scratch files carries (made in process, never
@@ -1068,8 +831,8 @@ mod tests {
     /// entry each, and a drop target's reply written back and read again.
     #[test]
     fn drag_data_of_scratch_files() {
-        // SAFETY: COM for this test thread, which ends with the test.
-        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        // COM for this test thread, while the test runs.
+        let _com = Apartment::sta();
         let dir = crate::store::file::tests::fresh_dir("goz-gui-drag", "");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -1088,11 +851,6 @@ mod tests {
             let data = items
                 .data_object(core::ptr::null_mut())
                 .expect("data object");
-            let names = format_names(&data);
-            assert!(
-                names.iter().any(|n| n == "Shell IDList Array") && names.iter().any(|n| n == "#15"),
-                "{names:?}"
-            );
             assert_eq!(cida_count(&data) as usize, picked.len());
             let want: Vec<String> = picked.iter().map(|p| String::from_utf16_lossy(p)).collect();
             assert_eq!(hdrop_files(&data), want);
@@ -1114,18 +872,10 @@ mod tests {
         let target = dir.join("target folder");
         std::fs::create_dir_all(&target).unwrap();
         let lnk = dir.join("to target.lnk");
-        let (t, l) = (wz(&target.to_string_lossy()), wz(&lnk.to_string_lossy()));
-        // SAFETY: COM is ready (OLE); the strings outlive the calls.
-        unsafe {
-            let link: IShellLinkW =
-                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).expect("link");
-            link.SetPath(PCWSTR(t.as_ptr())).expect("set path");
-            link.cast::<IPersistFile>()
-                .expect("persist")
-                .Save(PCWSTR(l.as_ptr()), true)
-                .expect("save");
-        }
-        let got = link_target(&l[..l.len() - 1]).map(|p| String::from_utf16_lossy(&p));
+        let (t, l) = (w(&target.to_string_lossy()), w(&lnk.to_string_lossy()));
+        // COM is ready (OLE).
+        crate::win::shell::save_shortcut(&t, None, &l).expect("saved");
+        let got = link_target(&l).map(|p| String::from_utf16_lossy(&p));
         assert_eq!(got.as_deref(), Some(&*target.to_string_lossy()));
         assert_eq!(
             link_target(&w(&dir.join("none.lnk").to_string_lossy())),

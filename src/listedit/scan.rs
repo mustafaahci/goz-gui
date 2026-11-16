@@ -13,16 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::FILETIME;
-use windows_sys::Win32::Storage::FileSystem::{
-    FIND_FIRST_EX_LARGE_FETCH, FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW,
-    FindNextFileW, GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA,
-    WIN32_FIND_DATAW,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows_sys::Win32::Foundation::{FILETIME, HWND};
 
 use super::Entry;
-use crate::wide::wz;
+use crate::win;
+use crate::win::file::{Find, Search};
 
 const DIRECTORY: u32 = 0x10;
 const REPARSE_POINT: u32 = 0x400;
@@ -232,9 +227,9 @@ impl<'a> Out<'a> {
             !std::mem::replace(&mut f.posted, true)
         };
         if post && self.hwnd != 0 {
-            // SAFETY: a plain post to the editor's window; nothing is passed
-            // by pointer, and a window gone since just drops it.
-            unsafe { PostMessageW(self.hwnd as _, self.msg, 0, 0) };
+            // Nothing is passed with it, and a window gone since just drops
+            // it.
+            win::post_app(self.hwnd as HWND, self.msg, 0, 0);
         }
         self.last = Instant::now();
     }
@@ -281,14 +276,8 @@ pub fn item(path: &str) -> Option<Entry> {
     if !is_absolute(&p) {
         return None;
     }
-    let z = wz(&p);
-    // SAFETY: a NUL-terminated path and a plain out-struct of the size the
-    // call fills.
-    let data = unsafe {
-        let mut data: WIN32_FILE_ATTRIBUTE_DATA = core::mem::zeroed();
-        (GetFileAttributesExW(z.as_ptr(), GetFileExInfoStandard, (&raw mut data).cast()) != 0)
-            .then_some(data)
-    }?;
+    let z = win::wz(&p);
+    let data = win::file::attribute_data(&z)?;
     let dir = data.dwFileAttributes & DIRECTORY != 0;
     Some(Entry {
         path: p,
@@ -304,50 +293,39 @@ pub fn item(path: &str) -> Option<Entry> {
 /// Lists `folder`'s items, handing each to `each` with its attributes;
 /// false when it could not be listed.
 fn list(folder: &str, mut each: impl FnMut(Entry, u32)) -> bool {
-    let pattern = wz(&join(folder, "*"));
-    // SAFETY: a NUL-terminated pattern, a plain out-struct the calls fill,
-    // and a find handle closed before returning.
-    unsafe {
-        let mut data: WIN32_FIND_DATAW = core::mem::zeroed();
-        let h = FindFirstFileExW(
-            pattern.as_ptr(),
-            FindExInfoBasic,
-            (&raw mut data).cast(),
-            FindExSearchNameMatch,
-            core::ptr::null(),
-            FIND_FIRST_EX_LARGE_FETCH,
-        );
-        if h.is_null() || h as isize == -1 {
-            return false;
+    let pattern = win::wz(&join(folder, "*"));
+    // The find handle is closed before returning.
+    let Ok((mut find, mut data)) = Find::first(&pattern, Search::Names, true) else {
+        return false;
+    };
+    loop {
+        let len = data
+            .cFileName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(data.cFileName.len());
+        let name = String::from_utf16_lossy(&data.cFileName[..len]);
+        if name != "." && name != ".." {
+            let attributes = data.dwFileAttributes;
+            let dir = attributes & DIRECTORY != 0;
+            let e = Entry {
+                path: join(folder, &name),
+                is_dir: dir,
+                size: (!dir).then_some(
+                    (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow),
+                ),
+                modified: filetime(data.ftLastWriteTime),
+                created: filetime(data.ftCreationTime),
+                attributes: Some(attributes),
+            };
+            each(e, attributes);
         }
-        loop {
-            let len = data
-                .cFileName
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(data.cFileName.len());
-            let name = String::from_utf16_lossy(&data.cFileName[..len]);
-            if name != "." && name != ".." {
-                let attributes = data.dwFileAttributes;
-                let dir = attributes & DIRECTORY != 0;
-                let e = Entry {
-                    path: join(folder, &name),
-                    is_dir: dir,
-                    size: (!dir).then_some(
-                        (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow),
-                    ),
-                    modified: filetime(data.ftLastWriteTime),
-                    created: filetime(data.ftCreationTime),
-                    attributes: Some(attributes),
-                };
-                each(e, attributes);
-            }
-            if FindNextFileW(h, &mut data) == 0 {
-                break;
-            }
+        match find.next() {
+            Some(next) => data = next,
+            None => break,
         }
-        FindClose(h);
     }
+    drop(find);
     true
 }
 
@@ -475,9 +453,8 @@ impl Saving {
                     .map_err(|e| e.to_string());
                 *lock(&o) = Some(result);
                 if hwnd != 0 {
-                    // SAFETY: a plain post to the editor's window; a window
-                    // gone since just drops it.
-                    unsafe { PostMessageW(hwnd as _, msg, 0, 0) };
+                    // A window gone since just drops it.
+                    win::post_app(hwnd as HWND, msg, 0, 0);
                 }
             })?;
         Ok(Saving {

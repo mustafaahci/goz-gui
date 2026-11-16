@@ -26,32 +26,18 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Foundation::SIZE;
-use windows::Win32::UI::Shell::{
-    IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY, SIIGBF_THUMBNAILONLY,
-};
-use windows::core::PCWSTR;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
-use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject,
-    GetDC, GetDIBits, GetObjectW, HBITMAP, ReleaseDC,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
-};
-use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
-};
-use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CLASSES_ROOT, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW, RegOpenKeyExW,
-};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForSingleObject,
-};
-use windows_sys::Win32::UI::Shell::{ASSOCF_NONE, ASSOCSTR_SHELLEXTENSION, AssocQueryStringW};
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::Shell::{SIIGBF_ICONONLY, SIIGBF_THUMBNAILONLY};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Graphics::Gdi::HBITMAP;
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+use windows_sys::Win32::System::Threading::INFINITE;
 
-use crate::wide::{nul, wz};
+use crate::win::com::Apartment;
+use crate::win::dib::{self, Section};
+use crate::win::reg::{self, Hive};
+use crate::win::shell::{self, ImageFactory};
+use crate::win::sync::Event;
+use crate::win::{file, gdi, parcel};
 
 /// The shell extension interfaces of a thumbnail handler: `IThumbnailProvider`
 /// and the older `IExtractImage`.
@@ -73,43 +59,49 @@ const MAX_QUEUED: usize = 512;
 /// A 32-bit top-down DIB with premultiplied alpha, ready for `AlphaBlend`;
 /// deleted when dropped.
 pub struct Bitmap {
-    handle: usize,
+    section: Section,
     pub width: i32,
     pub height: i32,
 }
 
 impl Bitmap {
     pub fn handle(&self) -> HBITMAP {
-        self.handle as HBITMAP
+        self.section.handle()
+    }
+
+    /// A new `width` by `height` bitmap, all zero; `None` if it could not
+    /// be made.
+    fn new(width: i32, height: i32) -> Option<Bitmap> {
+        Section::new(width, height).map(|section| Bitmap {
+            section,
+            width,
+            height,
+        })
     }
 
     /// A `width` by `height` bitmap whose pixels (top-down, premultiplied
     /// BGRA) `fill` writes; `None` if it could not be made or `fill` said
-    /// it failed.
+    /// it failed. `fill` writes into a buffer of goz-gui's, copied into the
+    /// bitmap after.
     pub fn with_pixels(
         width: i32,
         height: i32,
         fill: impl FnOnce(&mut [[u8; 4]]) -> bool,
     ) -> Option<Bitmap> {
-        let (out, bits) = dib(width, height)?;
-        // SAFETY: the DIB section's pixels, `width * height` of them, owned
-        // by `out`, which lives across the borrow and is in no DC yet.
-        let pixels = unsafe {
-            core::slice::from_raw_parts_mut(bits.cast::<[u8; 4]>(), (width * height) as usize)
-        };
-        fill(pixels).then_some(out)
+        let out = Bitmap::new(width, height)?;
+        // A new DIB section is all zero, as this is.
+        let mut pixels = vec![[0u8; 4]; width as usize * height as usize];
+        (fill(&mut pixels) && out.section.set_pixels(&pixels)).then_some(out)
+    }
+
+    /// A copy of its pixels (top-down, premultiplied BGRA).
+    #[cfg_attr(not(test), expect(dead_code, reason = "the tests read pixels back"))]
+    pub fn pixels(&self) -> Option<Vec<[u8; 4]>> {
+        self.section.pixels()
     }
 
     fn cost(&self) -> usize {
         (self.width.max(0) as usize * self.height.max(0) as usize * 4).max(MIN_COST)
-    }
-}
-
-impl Drop for Bitmap {
-    fn drop(&mut self) {
-        // SAFETY: the bitmap is owned here and selected into no DC once its
-        // owner lets go of it (drawing borrows it).
-        unsafe { DeleteObject(self.handle as HBITMAP) };
     }
 }
 
@@ -265,29 +257,13 @@ fn source_for(ext: &[u16], handled: impl FnOnce() -> bool) -> Source {
 fn has_thumbnail_handler(ext: &[u16]) -> bool {
     let mut dotted = vec![u16::from(b'.')];
     dotted.extend_from_slice(ext);
-    let dotted_z = nul(&dotted);
-    let assoc = |iid: &str| {
-        let iid = wz(iid);
-        let mut buf = [0u16; 64];
-        let mut len = buf.len() as u32;
-        // SAFETY: NUL-terminated strings; the buffer with its length.
-        unsafe {
-            AssocQueryStringW(
-                ASSOCF_NONE,
-                ASSOCSTR_SHELLEXTENSION,
-                dotted_z.as_ptr(),
-                iid.as_ptr(),
-                buf.as_mut_ptr(),
-                &mut len,
-            ) == 0
-        }
-    };
+    let assoc = |iid: &str| shell::assoc_shell_extension(&dotted, iid).is_some();
     if assoc(THUMBNAIL_PROVIDER) || assoc(EXTRACT_IMAGE) {
         return true;
     }
     // The perceived type's own registration, which the association does not
     // always reach (a type some program took over).
-    let Some(perceived) = perceived_type(&dotted_z) else {
+    let Some(perceived) = perceived_type(&dotted) else {
         return false;
     };
     [THUMBNAIL_PROVIDER, EXTRACT_IMAGE].iter().any(|iid| {
@@ -295,46 +271,20 @@ fn has_thumbnail_handler(ext: &[u16]) -> bool {
         key.extend_from_slice(&perceived);
         key.extend("\\ShellEx\\".encode_utf16());
         key.extend(iid.encode_utf16());
-        key_exists(&nul(&key))
+        key_exists(&key)
     })
 }
 
-/// The `PerceivedType` of extension key `dotted_z` (".png", NUL-terminated)
-/// under HKEY_CLASSES_ROOT.
-fn perceived_type(dotted_z: &[u16]) -> Option<Vec<u16>> {
-    let name = wz("PerceivedType");
-    let mut buf = [0u16; 64];
-    let mut bytes = (buf.len() * 2) as u32;
-    // SAFETY: NUL-terminated names; the buffer with its size in bytes.
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CLASSES_ROOT,
-            dotted_z.as_ptr(),
-            name.as_ptr(),
-            RRF_RT_REG_SZ,
-            core::ptr::null_mut(),
-            buf.as_mut_ptr().cast(),
-            &mut bytes,
-        )
-    };
-    if status != 0 {
-        return None;
-    }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
-    (len > 0).then(|| buf[..len].to_vec())
+/// The `PerceivedType` of extension key `dotted` (".png") under
+/// HKEY_CLASSES_ROOT.
+fn perceived_type(dotted: &[u16]) -> Option<Vec<u16>> {
+    reg::get_string_units(Hive::ClassesRoot, dotted, Some("PerceivedType"))
+        .filter(|t| !t.is_empty())
 }
 
-/// Whether key `path_z` (NUL-terminated) exists under HKEY_CLASSES_ROOT.
-fn key_exists(path_z: &[u16]) -> bool {
-    let mut key: HKEY = core::ptr::null_mut();
-    // SAFETY: a NUL-terminated path; the key opened is closed at once.
-    unsafe {
-        if RegOpenKeyExW(HKEY_CLASSES_ROOT, path_z.as_ptr(), 0, KEY_READ, &mut key) != 0 {
-            return false;
-        }
-        RegCloseKey(key);
-    }
-    true
+/// Whether key `path` exists under HKEY_CLASSES_ROOT.
+fn key_exists(path: &[u16]) -> bool {
+    reg::key_exists(Hive::ClassesRoot, path)
 }
 
 /// `path`'s extension, lower case, without its dot; empty with none.
@@ -385,16 +335,10 @@ struct Queue {
 
 struct Shared {
     queue: Mutex<Queue>,
-    work: usize,
+    /// Set while requests wait (reset by hand).
+    work: Event,
     hwnd: usize,
     msg: u32,
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // SAFETY: the event is owned by `Shared` and closed once.
-        unsafe { CloseHandle(self.work as HANDLE) };
-    }
 }
 
 /// The window's side: the cache, and the thread's queue.
@@ -408,10 +352,9 @@ pub struct Thumbs {
 
 impl Thumbs {
     /// Starts the thumbnail thread; its answers arrive at `hwnd` as `msg`,
-    /// with a `Box<ThumbReply>` in `lParam`.
+    /// each with a [`ThumbReply`] parcel (`win::parcel::take`).
     pub fn new(hwnd: HWND, msg: u32) -> Thumbs {
-        // SAFETY: an unnamed manual-reset event.
-        let work = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) } as usize;
+        let work = Event::new(true, false).expect("an event for the thumbnail thread");
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 generation: 0,
@@ -500,8 +443,7 @@ impl Thumbs {
         let path: Box<[u16]> = path.into();
         q.waiting.insert(path.clone());
         q.items.push(Request { index, path });
-        // SAFETY: a live event handle.
-        unsafe { SetEvent(self.shared.work as HANDLE) };
+        self.shared.work.set();
     }
 
     /// Takes an answer of the thread into the cache; false (and the bitmap
@@ -523,14 +465,11 @@ impl Thumbs {
 }
 
 fn thumb_thread(shared: &Shared) {
-    // SAFETY: the shell's image factories want COM, apartment-threaded, on
-    // the thread that uses them.
-    unsafe {
-        CoInitializeEx(
-            core::ptr::null(),
-            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        )
-    };
+    // The shell's image factories want COM, apartment-threaded, on the
+    // thread that uses them, for as long as it runs.
+    if let Some(apartment) = Apartment::sta() {
+        apartment.keep();
+    }
     // Each extension's source, worked out once (registry reads).
     let mut sources: HashMap<Vec<u16>, Source> = HashMap::new();
     loop {
@@ -545,32 +484,26 @@ fn thumb_thread(shared: &Shared) {
                     }
                     Some(r) => break Some((q.generation, q.side, r)),
                     None => {
-                        // SAFETY: a live event handle.
-                        unsafe { ResetEvent(shared.work as HANDLE) };
+                        shared.work.reset();
                         break None;
                     }
                 }
             }
         };
         let Some((generation, side, request)) = next else {
-            // SAFETY: a live event handle.
-            unsafe { WaitForSingleObject(shared.work as HANDLE, INFINITE) };
+            shared.work.wait(INFINITE);
             continue;
         };
         let picture = make(&request.path, side, &mut sources);
-        let reply = Box::into_raw(Box::new(ThumbReply {
+        let reply = ThumbReply {
             generation,
             index: request.index,
             path: request.path,
             picture,
-        }));
-        // SAFETY: the window owns the box once posted; reclaimed (and its
-        // bitmap deleted) if not.
-        unsafe {
-            if PostMessageW(shared.hwnd as HWND, shared.msg, 0, reply as isize) == 0 {
-                drop(Box::from_raw(reply));
-            }
-        }
+        };
+        // The window takes the reply with the message; if it cannot be
+        // posted, the reply (and its bitmap) is dropped.
+        parcel::post(shared.hwnd as HWND, shared.msg, 0, reply);
     }
 }
 
@@ -579,10 +512,7 @@ fn thumb_thread(shared: &Shared) {
 /// `None` for the view to draw its type's icon. `sources` keeps what each
 /// extension's thumbnails are made from.
 fn make(path: &[u16], side: i32, sources: &mut HashMap<Vec<u16>, Source>) -> Option<Picture> {
-    let path_z = nul(path);
-    // SAFETY: a NUL-terminated path.
-    let attrs = unsafe { GetFileAttributesW(path_z.as_ptr()) };
-    let is_dir = attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let is_dir = file::attributes(path).is_ok_and(|a| a & FILE_ATTRIBUTE_DIRECTORY != 0);
     let source = if is_dir {
         // A folder's picture shows what it holds.
         Source::Shell
@@ -594,133 +524,50 @@ fn make(path: &[u16], side: i32, sources: &mut HashMap<Vec<u16>, Source>) -> Opt
     match source {
         Source::TypeIcon => None,
         Source::OwnIcon => crate::bigicon::own_icon(path, side),
-        Source::Shortcut => shell_thumbnail(&path_z, side, false)
+        Source::Shortcut => shell_thumbnail(path, side, false)
             .map(Picture::Image)
             .or_else(|| crate::bigicon::own_icon(path, side)),
-        Source::Shell => shell_thumbnail(&path_z, side, is_dir).map(Picture::Image),
+        Source::Shell => shell_thumbnail(path, side, is_dir).map(Picture::Image),
     }
 }
 
-/// The shell's picture of `path_z`'s contents (NUL-terminated), at most
-/// `side` pixels square; `None` when it has none (then its type's icon
-/// shows). An empty folder's is its icon, which may be its own (a
-/// `desktop.ini`'s: Downloads, Music).
-fn shell_thumbnail(path_z: &[u16], side: i32, is_dir: bool) -> Option<Bitmap> {
-    // SAFETY: a NUL-terminated path; COM is initialized on this thread.
-    let factory: IShellItemImageFactory =
-        unsafe { SHCreateItemFromParsingName(PCWSTR(path_z.as_ptr()), None) }.ok()?;
-    let size = SIZE { cx: side, cy: side };
-    // SAFETY: a live factory; the bitmap returned is ours to delete.
-    let shell = unsafe {
-        factory.GetImage(size, SIIGBF_THUMBNAILONLY).or_else(|e| {
+/// The shell's picture of `path`'s contents, at most `side` pixels square;
+/// `None` when it has none (then its type's icon shows). An empty folder's
+/// is its icon, which may be its own (a `desktop.ini`'s: Downloads,
+/// Music).
+fn shell_thumbnail(path: &[u16], side: i32, is_dir: bool) -> Option<Bitmap> {
+    // COM is initialized on this thread.
+    let factory = ImageFactory::of_path(path)?;
+    let shell = factory
+        .image(side, SIIGBF_THUMBNAILONLY)
+        .or_else(|e| {
             if is_dir {
-                factory.GetImage(size, SIIGBF_ICONONLY)
+                factory.image(side, SIIGBF_ICONONLY)
             } else {
                 Err(e)
             }
         })
-    }
-    .ok()?;
-    let shell = shell.0 as HBITMAP;
-    let out = premultiplied(shell);
-    // SAFETY: the shell's bitmap, copied above and no longer used.
-    unsafe { DeleteObject(shell) };
+        .ok()?;
+    let out = premultiplied(shell.get());
+    // The shell's bitmap, copied above and no longer used, is deleted.
+    drop(shell);
     out
-}
-
-/// A new 32-bit top-down DIB section `w` by `h` (all zero), and its pixels.
-pub fn dib(w: i32, h: i32) -> Option<(Bitmap, *mut core::ffi::c_void)> {
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    // SAFETY: a plain header for a DIB section that the returned `Bitmap`
-    // owns; its pixels stay valid until the bitmap is deleted.
-    unsafe {
-        let mut bi: BITMAPINFO = core::mem::zeroed();
-        bi.bmiHeader = BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w,
-            // Top-down.
-            biHeight: -h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            ..core::mem::zeroed()
-        };
-        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
-        let made = CreateDIBSection(
-            core::ptr::null_mut(),
-            &bi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            core::ptr::null_mut(),
-            0,
-        );
-        if made.is_null() {
-            return None;
-        }
-        let out = Bitmap {
-            handle: made as usize,
-            width: w,
-            height: h,
-        };
-        (!bits.is_null()).then_some((out, bits))
-    }
 }
 
 /// A copy of `src` as a 32-bit top-down DIB with premultiplied alpha. The
 /// shell's bitmaps come with straight alpha, premultiplied alpha, or (some
 /// photos) no alpha at all, all zero: each is made right for `AlphaBlend`.
 pub fn premultiplied(src: HBITMAP) -> Option<Bitmap> {
-    // SAFETY: reads the bitmap's header into a plain out-struct, then copies
-    // its pixels into a DIB made for them; the screen DC is released.
-    unsafe {
-        let mut bm: BITMAP = core::mem::zeroed();
-        if GetObjectW(src, size_of::<BITMAP>() as i32, (&raw mut bm).cast()) == 0 {
-            return None;
-        }
-        let (w, h) = (bm.bmWidth, bm.bmHeight.abs());
-        if w <= 0 || h <= 0 {
-            return None;
-        }
-        let mut bi: BITMAPINFO = core::mem::zeroed();
-        bi.bmiHeader = BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w,
-            // Top-down.
-            biHeight: -h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            ..core::mem::zeroed()
-        };
-        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
-        let dib = CreateDIBSection(
-            core::ptr::null_mut(),
-            &bi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            core::ptr::null_mut(),
-            0,
-        );
-        if dib.is_null() || bits.is_null() {
-            return None;
-        }
-        let out = Bitmap {
-            handle: dib as usize,
-            width: w,
-            height: h,
-        };
-        let dc = GetDC(core::ptr::null_mut());
-        let lines = GetDIBits(dc, src, 0, h as u32, bits, &mut bi, DIB_RGB_COLORS);
-        ReleaseDC(core::ptr::null_mut(), dc);
-        if lines == 0 {
-            return None;
-        }
-        let pixels = core::slice::from_raw_parts_mut(bits.cast::<[u8; 4]>(), (w * h) as usize);
-        fix_alpha(pixels);
-        Some(out)
+    let bm = gdi::bitmap_info(src)?;
+    let (w, h) = (bm.bmWidth, bm.bmHeight.abs());
+    if w <= 0 || h <= 0 {
+        return None;
     }
+    let out = Bitmap::new(w, h)?;
+    // Its pixels through the screen's DC, made right, then into the DIB.
+    let mut pixels = dib::bitmap_pixels(src, w, h)?;
+    fix_alpha(&mut pixels);
+    out.section.set_pixels(&pixels).then_some(out)
 }
 
 /// Makes BGRA pixels premultiplied: all-zero alpha is opaque; a colour
@@ -885,47 +732,25 @@ mod tests {
 
     /// The pixel (premultiplied BGRA) at the centre of `b`.
     fn centre(b: &Bitmap) -> [u8; 4] {
-        use windows_sys::Win32::Graphics::Gdi::{DIBSECTION, GetObjectW};
-        // SAFETY: a DIB section of ours; its pixels are `width * height`
-        // top-down BGRA, alive while `b` is.
-        unsafe {
-            let mut ds: DIBSECTION = core::mem::zeroed();
-            let n = GetObjectW(
-                b.handle(),
-                size_of::<DIBSECTION>() as i32,
-                (&raw mut ds).cast(),
-            );
-            assert!(n > 0 && !ds.dsBm.bmBits.is_null());
-            let px = ds.dsBm.bmBits.cast::<[u8; 4]>();
-            *px.add((b.height / 2 * b.width + b.width / 2) as usize)
-        }
+        // Its pixels are `width * height` top-down BGRA.
+        let px = b.pixels().expect("a DIB section of ours");
+        px[(b.height / 2 * b.width + b.width / 2) as usize]
     }
 
     /// Explorer's rule: a shortcut to a picture shows the picture; one to
     /// a program shows the program's icon.
     #[test]
     fn a_shortcut_to_a_picture_shows_the_picture() {
-        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
-        use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
-        use windows::core::Interface;
         assert!(crate::shell::ole_ready());
         let dir = crate::store::file::tests::fresh_dir("goz-gui-thumbs", "lnk");
         let picture = dir.join("red.bmp");
         std::fs::write(&picture, bmp(64, 48, [0, 0, 255])).expect("picture");
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
         let link = |name: &str, to: &std::path::Path| {
-            let lnk = dir.join(name);
-            let (t, l) = (wz(&to.to_string_lossy()), wz(&lnk.to_string_lossy()));
-            // SAFETY: COM is ready (OLE); the strings outlive the calls.
-            unsafe {
-                let link: IShellLinkW =
-                    CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).expect("link");
-                link.SetPath(PCWSTR(t.as_ptr())).expect("set path");
-                link.cast::<IPersistFile>()
-                    .expect("persist")
-                    .Save(PCWSTR(l.as_ptr()), true)
-                    .expect("save");
-            }
-            l[..l.len() - 1].to_vec()
+            let lnk = w(&dir.join(name).to_string_lossy());
+            // COM is ready (OLE).
+            shell::save_shortcut(&w(&to.to_string_lossy()), None, &lnk).expect("saved");
+            lnk
         };
         let to_picture = link("to picture.lnk", &picture);
         let to_program = link(

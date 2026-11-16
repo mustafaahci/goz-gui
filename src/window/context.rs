@@ -16,58 +16,45 @@
 
 use std::rc::Rc;
 
-use windows_sys::Win32::Foundation::{LPARAM, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::UI::Controls::{
-    LVHITTESTINFO, LVIR_BOUNDS, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_HITTEST, LVM_SUBITEMHITTEST,
-    LVNI_FOCUSED, ODT_MENU,
-};
+use windows_sys::Win32::Foundation::{LPARAM, POINT};
+use windows_sys::Win32::UI::Controls::{LVIR_BOUNDS, LVNI_FOCUSED, ODT_MENU};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DeleteMenu, DestroyMenu, GetMenuDefaultItem, GetMenuItemCount, GetMenuItemInfoW, HMENU,
-    MB_ICONWARNING, MENUITEMINFOW, MF_BYCOMMAND, MF_BYPOSITION, MFT_SEPARATOR, MIIM_FTYPE,
-    WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
+    HMENU, MB_ICONWARNING, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
 };
 
 use super::files::renamable;
 use super::results::{Act, Busy, Then};
-use super::{App, COL_PATH, key_down, point, send};
+use super::{App, COL_PATH, key_down, point};
 use crate::dialog::Quiet;
 use crate::shell::{self, ContextMenu};
 use crate::store::location;
+use crate::win::menu::By;
+use crate::win::{self, Msg, lv, sys};
 use crate::{menu, popup, run_count};
 
 /// Whether item `pos` of `menu` is a separator.
 fn is_separator(menu: HMENU, pos: u32) -> bool {
-    // SAFETY: the rest of MENUITEMINFOW is plain data.
-    let mut mii: MENUITEMINFOW = unsafe { core::mem::zeroed() };
-    mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
-    mii.fMask = MIIM_FTYPE;
-    // SAFETY: reads an item of a menu of this thread.
-    unsafe { GetMenuItemInfoW(menu, pos, 1, &mut mii) != 0 && mii.fType & MFT_SEPARATOR != 0 }
+    win::menu::is_separator(menu, By::Position(pos))
 }
 
 /// No separator first, last, or after another: what taking items out of
 /// the shell's part can leave.
 pub(super) fn tidy_separators(menu: HMENU) {
-    // SAFETY: counts and deletes items of a menu of this thread.
-    unsafe {
-        let mut pos = 0u32;
-        let mut after_separator = true;
-        while (pos as i32) < GetMenuItemCount(menu) {
-            let sep = is_separator(menu, pos);
-            if sep && after_separator {
-                DeleteMenu(menu, pos, MF_BYPOSITION);
-                continue;
-            }
-            after_separator = sep;
-            pos += 1;
+    let mut pos = 0u32;
+    let mut after_separator = true;
+    while (pos as i32) < win::menu::count(menu) {
+        let sep = is_separator(menu, pos);
+        if sep && after_separator {
+            win::menu::delete(menu, By::Position(pos));
+            continue;
         }
-        let n = GetMenuItemCount(menu);
-        if n > 0 && is_separator(menu, n as u32 - 1) {
-            DeleteMenu(menu, n as u32 - 1, MF_BYPOSITION);
-        }
+        after_separator = sep;
+        pos += 1;
+    }
+    let n = win::menu::count(menu);
+    if n > 0 && is_separator(menu, n as u32 - 1) {
+        win::menu::delete(menu, By::Position(n as u32 - 1));
     }
 }
 
@@ -80,22 +67,18 @@ impl App {
         self.finish_selecting();
         if l == -1 {
             if self.selected(1).is_empty() {
-                let mut pt = POINT {
+                let pt = POINT {
                     x: self.scale(24),
                     y: self.scale(24),
                 };
-                // SAFETY: converts a point of the list.
-                unsafe { ClientToScreen(self.list, &mut pt) };
-                self.background_menu(pt);
+                self.background_menu(win::client_to_screen(self.list, pt));
             } else {
                 self.row_menu(None);
             }
             return;
         }
         let pt = point(l);
-        let mut at = pt;
-        // SAFETY: converts a screen point to the list's.
-        unsafe { ScreenToClient(self.list, &mut at) };
+        let at = win::screen_to_client(self.list, pt);
         if self.hit_row(at).is_some() {
             self.row_menu(Some(pt));
         } else {
@@ -105,21 +88,13 @@ impl App {
 
     /// The row and column under `pt` (the list's client coordinates).
     pub(super) fn hit_row(&self, pt: POINT) -> Option<(usize, i32)> {
-        let mut hit = LVHITTESTINFO {
-            pt,
-            flags: 0,
-            iItem: -1,
-            iSubItem: -1,
-            iGroup: 0,
-        };
         // Icon view has no columns: the item, as the name's column.
-        let msg = if self.view().thumbnails {
-            LVM_HITTEST
+        let hit = if self.view().thumbnails {
+            lv::hit_test(self.list, pt)
         } else {
-            LVM_SUBITEMHITTEST
+            lv::subitem_hit_test(self.list, pt)
         };
-        let item = send(self.list, msg, 0, (&raw mut hit) as isize);
-        (item >= 0).then_some((item as usize, hit.iSubItem.max(0)))
+        (hit.iItem >= 0).then_some((hit.iItem as usize, hit.iSubItem.max(0)))
     }
 
     /// The row menu at the mouse (`Some`, screen) or, from the keyboard,
@@ -131,9 +106,7 @@ impl App {
     fn row_menu(&self, mouse: Option<POINT>) {
         let mut default = menu::OPEN;
         if let Some(pt) = mouse {
-            let mut at = pt;
-            // SAFETY: converts a screen point to the list's.
-            unsafe { ScreenToClient(self.list, &mut at) };
+            let at = win::screen_to_client(self.list, pt);
             if self
                 .hit_row(at)
                 .and_then(|(_, sub)| self.column_id(sub.max(0) as usize))
@@ -163,8 +136,7 @@ impl App {
             if selected > 0 {
                 // None of them could be had: say so, not nothing.
                 self.note_partial(Act::Command, 0, selected);
-                // SAFETY: plays a system sound.
-                unsafe { MessageBeep(MB_ICONWARNING) };
+                sys::beep(MB_ICONWARNING);
             }
             return;
         }
@@ -189,37 +161,21 @@ impl App {
             _ if id > 0 => self.command(id as u16),
             _ => {}
         }
-        // SAFETY: the menu this function made; the shell's handlers are
-        // done with it once its command ran.
-        unsafe { DestroyMenu(popup) };
+        // The menu this function made; the shell's handlers are done with
+        // it once its command ran.
+        win::menu::destroy(popup);
     }
 
     /// Where the keyboard's row menu opens: under the focused row, a little
     /// in from its left edge.
     fn focused_row_point(&self) -> POINT {
-        let focused = send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        );
-        let mut rc = RECT {
-            left: LVIR_BOUNDS as i32,
-            ..RECT::default()
-        };
-        send(
-            self.list,
-            LVM_GETITEMRECT,
-            focused.max(0) as usize,
-            (&raw mut rc) as isize,
-        );
-        let mut pt = POINT {
+        let focused = lv::next_item(self.list, -1, LVNI_FOCUSED);
+        let rc = lv::item_rect(self.list, focused.max(0), LVIR_BOUNDS as i32).unwrap_or_default();
+        let pt = POINT {
             x: rc.left + self.scale(24),
             y: rc.bottom,
         };
-        // SAFETY: converts a point of the list.
-        unsafe { ClientToScreen(self.list, &mut pt) };
-        pt
+        win::client_to_screen(self.list, pt)
     }
 
     /// Fills the empty `popup` with the Explorer menu of `paths`, without
@@ -249,12 +205,10 @@ impl App {
         ) {
             return None;
         }
-        // SAFETY: reads and deletes an item of a menu of this thread.
-        unsafe {
-            let default = GetMenuDefaultItem(popup, 0, 0);
-            if cm.owns(default, u32::from(menu::SHELL_LAST)) {
-                DeleteMenu(popup, default, MF_BYCOMMAND);
-            }
+        if let Some(default) = win::menu::default_item(popup, false, 0)
+            && cm.owns(default, u32::from(menu::SHELL_LAST))
+        {
+            win::menu::delete(popup, By::Command(default));
         }
         Some((Rc::new(cm), items.len()))
     }
@@ -323,8 +277,8 @@ impl App {
         let popup = menu::background_menu();
         self.add_background_items(popup);
         let id = self.track_with_shell(popup, pt, "background menu", None);
-        // SAFETY: the menu this function made.
-        unsafe { DestroyMenu(popup) };
+        // The menu this function made.
+        win::menu::destroy(popup);
         if id > 0 {
             self.command(id as u16);
         }
@@ -334,15 +288,14 @@ impl App {
     /// its submenus as they open and draws its own items. `Some` is the
     /// window's answer when the shell took the message; for
     /// WM_INITMENUPOPUP the window readies its own menus too.
-    pub(super) fn shell_menu_message(&self, msg: u32, w: usize, l: isize) -> Option<isize> {
-        let owner_drawn = |l: isize| {
-            // SAFETY: WM_MEASUREITEM's and WM_DRAWITEM's lParam starts with
-            // the control type (MEASUREITEMSTRUCT, DRAWITEMSTRUCT).
-            unsafe { *(l as *const u32) == ODT_MENU }
-        };
-        let take = match msg {
+    /// A message of the shell's menu while it is up, passed to it: `Some`
+    /// with the answer when it took it.
+    pub(super) fn shell_menu_message(&self, m: &Msg) -> Option<isize> {
+        let take = match m.id {
             WM_INITMENUPOPUP | WM_MENUCHAR => true,
-            WM_MEASUREITEM | WM_DRAWITEM => l != 0 && owner_drawn(l),
+            // An item a menu draws itself (not a control's).
+            WM_MEASUREITEM => m.measure_item().is_some_and(|mi| mi.CtlType == ODT_MENU),
+            WM_DRAWITEM => m.draw_item().is_some_and(|di| di.CtlType == ODT_MENU),
             _ => false,
         };
         if !take {
@@ -351,8 +304,8 @@ impl App {
         // Out of the cell before the call: the shell's handler may send
         // the window more messages.
         let cm = self.shell_menu.borrow().clone()?;
-        let answer = cm.message(msg, w, l);
-        match msg {
+        let answer = cm.message(m);
+        match m.id {
             WM_MEASUREITEM | WM_DRAWITEM => answer.map(|_| 1),
             _ => answer,
         }

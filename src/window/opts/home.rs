@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 
 use goz_core::types::{SortDir, SortKey, SortSpec};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CBN_SELCHANGE, CBS_DROPDOWNLIST, ES_AUTOHSCROLL, WM_COMMAND, WS_EX_CLIENTEDGE, WS_TABSTOP,
@@ -24,6 +24,7 @@ use crate::options::{
 };
 use crate::settings::{HomeFixed, HomeOption, Settings};
 use crate::view::{self, View};
+use crate::win::Msg;
 use crate::window::App;
 
 /// Everything's control ids.
@@ -289,8 +290,9 @@ impl Page for Home {
 
     /// A sort chosen starts in its own direction (names A to Z, sizes and
     /// dates largest and newest first), as a click on its column would.
-    fn message(&self, app: &App, page: HWND, msg: u32, w: WPARAM, _l: LPARAM) -> Option<isize> {
-        if msg == WM_COMMAND
+    fn message(&self, app: &App, page: HWND, m: &Msg) -> Option<isize> {
+        let w = m.w;
+        if m.id == WM_COMMAND
             && (w & 0xffff) as u16 == SORT
             && ((w >> 16) & 0xffff) as u32 == CBN_SELCHANGE
             && let Some(key) = combo_value(page, SORT, &sorts())

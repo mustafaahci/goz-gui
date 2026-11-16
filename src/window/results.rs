@@ -27,26 +27,23 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{HWND, POINT};
-use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::UI::Controls::{
-    LVHITTESTINFO, LVIF_STATE, LVIS_SELECTED, LVM_GETITEMCOUNT, LVM_GETNEXTITEM,
-    LVM_GETSELECTEDCOUNT, LVM_SUBITEMHITTEST, LVN_ITEMCHANGED, LVN_ODSTATECHANGED, LVNI_SELECTED,
-    NMHDR, NMLISTVIEW, NMLVODSTATECHANGE,
+    LVIF_STATE, LVIS_SELECTED, LVN_ITEMCHANGED, LVN_ODSTATECHANGED, LVNI_SELECTED, NMLISTVIEW,
+    NMLVODSTATECHANGE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetForegroundWindow, IDC_APPSTARTING, IDC_WAIT, IDYES, IsChild, KillTimer,
-    LoadCursorW, MB_ICONQUESTION, MB_ICONWARNING, MB_YESNO, PostMessageW, SendMessageW, SetCursor,
-    SetTimer, WM_APP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WindowFromPoint,
+    IDC_APPSTARTING, IDC_WAIT, IDYES, MB_ICONQUESTION, MB_ICONWARNING, MB_YESNO, WM_APP,
+    WM_MOUSEMOVE, WM_NCHITTEST,
 };
 
-use super::{App, COL_PATH, TIMER_NOTE, key_down, send};
+use super::{App, COL_PATH, TIMER_NOTE, key_down};
 use crate::actions::{self, Target};
 use crate::client::{BLOCK_ROWS, Job};
 use crate::clipboard::{self, Effect, Files};
 use crate::copytext::{self, Field};
 use crate::store::location;
+use crate::win::{self, Notify, lv, sys};
 use crate::{format, msgbox};
 
 /// A selection of more rows than this is not fetched: the action takes the
@@ -141,8 +138,7 @@ impl Fetching {
             blocks,
             waiting,
             then,
-            // SAFETY: reads a counter.
-            clipboard: unsafe { GetClipboardSequenceNumber() },
+            clipboard: win::clipboard::sequence(),
             moved: 0,
         }
     }
@@ -155,35 +151,39 @@ impl Fetching {
 }
 
 /// The rows whose selection a list notification (LVN_ITEMCHANGED,
-/// LVN_ODSTATECHANGED at `l`) changed (`None`: all of them, row -1), and
-/// whether they are selected now; nothing when it changed only the focus,
-/// not which rows are selected.
-///
-/// # Safety
-/// `l` is the notification's lParam, for a code of the list's.
-pub(super) unsafe fn selection_change(l: isize) -> Option<(Option<Range<usize>>, bool)> {
-    // SAFETY: each structure starts with the NMHDR its code says it is.
-    unsafe {
-        let code = (*(l as *const NMHDR)).code;
-        let (rows, old, new) = match code {
-            LVN_ITEMCHANGED => {
-                let nm = &*(l as *const NMLISTVIEW);
-                if nm.uChanged & LVIF_STATE == 0 {
-                    return None;
-                }
-                let row = usize::try_from(nm.iItem).ok();
-                (row.map(|i| i..i + 1), nm.uOldState, nm.uNewState)
-            }
-            LVN_ODSTATECHANGED => {
-                let nm = &*(l as *const NMLVODSTATECHANGE);
-                let from = usize::try_from(nm.iFrom).unwrap_or(0);
-                let to = usize::try_from(nm.iTo).ok()?;
-                (Some(from..to + 1), nm.uOldState, nm.uNewState)
-            }
-            _ => return None,
-        };
-        ((old ^ new) & LVIS_SELECTED != 0).then_some((rows, new & LVIS_SELECTED != 0))
+/// LVN_ODSTATECHANGED) changed (`None`: all of them, row -1), and whether
+/// they are selected now; nothing when it changed only the focus, not which
+/// rows are selected.
+pub(super) fn selection_change(n: &Notify) -> Option<(Option<Range<usize>>, bool)> {
+    match n.code() {
+        LVN_ITEMCHANGED => item_change(&*n.get::<NMLISTVIEW>()?),
+        LVN_ODSTATECHANGED => range_change(&*n.get::<NMLVODSTATECHANGE>()?),
+        _ => None,
     }
+}
+
+/// [`selection_change`] of LVN_ITEMCHANGED.
+fn item_change(nm: &NMLISTVIEW) -> Option<(Option<Range<usize>>, bool)> {
+    if nm.uChanged & LVIF_STATE == 0 {
+        return None;
+    }
+    let row = usize::try_from(nm.iItem).ok();
+    state_change(row.map(|i| i..i + 1), nm.uOldState, nm.uNewState)
+}
+
+/// [`selection_change`] of LVN_ODSTATECHANGED.
+fn range_change(nm: &NMLVODSTATECHANGE) -> Option<(Option<Range<usize>>, bool)> {
+    let from = usize::try_from(nm.iFrom).unwrap_or(0);
+    let to = usize::try_from(nm.iTo).ok()?;
+    state_change(Some(from..to + 1), nm.uOldState, nm.uNewState)
+}
+
+fn state_change(
+    rows: Option<Range<usize>>,
+    old: u32,
+    new: u32,
+) -> Option<(Option<Range<usize>>, bool)> {
+    ((old ^ new) & LVIS_SELECTED != 0).then_some((rows, new & LVIS_SELECTED != 0))
 }
 
 /// Opening more items than this asks first, as Everything does
@@ -296,13 +296,13 @@ impl App {
         if self.fetch_bypass.get() {
             return false;
         }
-        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize;
+        let selected = lv::selected_count(self.list);
         if selected == 0 || selected > FETCH_MAX {
             return false;
         }
         let blocks = selection_blocks(|after| {
             let at = after.unwrap_or(usize::MAX);
-            usize::try_from(send(self.list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize)).ok()
+            usize::try_from(lv::next_item(self.list, at as i32, LVNI_SELECTED)).ok()
         });
         let (epoch, search, waiting, missing) = {
             let mut m = self.model.borrow_mut();
@@ -341,8 +341,7 @@ impl App {
             self.trim_requests(old.epoch);
         }
         // Until the action runs: no timer takes it away.
-        // SAFETY: a timer of this window.
-        unsafe { KillTimer(self.hwnd, TIMER_NOTE) };
+        win::kill_timer(self.hwnd, TIMER_NOTE);
         *self.note.borrow_mut() = Some(format!(
             "Loading {} selected items...",
             format::grouped(selected as u64)
@@ -367,8 +366,7 @@ impl App {
             .as_mut()
             .is_some_and(|f| f.arrived(epoch, block));
         if done {
-            // SAFETY: posts to this thread's window.
-            unsafe { PostMessageW(self.hwnd, WM_FETCHED, 0, 0) };
+            win::post_app(self.hwnd, WM_FETCHED, 0, 0);
         }
     }
 
@@ -416,8 +414,7 @@ impl App {
     /// Whether an action whose rows came may still run ([`held_back`]).
     /// `Err`: why not, for the status bar.
     fn may_run(&self, fetching: &Fetching) -> Result<(), &'static str> {
-        // SAFETY: reads the foreground window.
-        let front = unsafe { GetForegroundWindow() } == self.hwnd;
+        let front = win::foreground() == self.hwnd;
         // A test's dry run, silent file operations or dumped menu.
         let quiet = match fetching.then {
             Then::Open { .. } | Then::RunAs | Then::Properties => location::dry_run(),
@@ -425,8 +422,7 @@ impl App {
             Then::RowMenu { .. } => location::menu_dump(),
             Then::Copy(_) | Then::Files(_) | Then::RunCount => false,
         };
-        // SAFETY: reads a counter.
-        let copied = unsafe { GetClipboardSequenceNumber() } != fetching.clipboard;
+        let copied = win::clipboard::sequence() != fetching.clipboard;
         held_back(fetching.then, front, quiet, copied).map_or(Ok(()), Err)
     }
 
@@ -463,7 +459,7 @@ impl App {
         // The selection as it is to be, rows still being set included.
         self.finish_selecting();
         let total = self.model.borrow().total;
-        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
+        let selected = lv::selected_count(self.list) as u64;
         if selected == 0 || selected >= total {
             return;
         }
@@ -474,7 +470,7 @@ impl App {
         // from the top).
         let mut at = (block as usize * rows).wrapping_sub(1);
         loop {
-            let next = send(self.list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize);
+            let next = lv::next_item(self.list, at as i32, LVNI_SELECTED);
             if next < 0 || next as usize >= end {
                 break;
             }
@@ -520,26 +516,18 @@ impl App {
         if self.busy.replace(busy) == busy {
             return;
         }
-        let mut pt = POINT { x: 0, y: 0 };
-        // SAFETY: reads the cursor's place and asks a window of this
-        // thread (checked) for its cursor there, as a mouse move would.
-        unsafe {
-            if GetCursorPos(&mut pt) == 0 {
-                return;
-            }
-            let under = WindowFromPoint(pt);
-            if under.is_null() || (under != self.hwnd && IsChild(self.hwnd, under) == 0) {
-                return;
-            }
-            let at = (pt.x as u16 as u32 | ((pt.y as u16 as u32) << 16)) as isize;
-            let hit = SendMessageW(under, WM_NCHITTEST, 0, at) as u32 & 0xffff;
-            SendMessageW(
-                under,
-                WM_SETCURSOR,
-                under as usize,
-                (hit | (WM_MOUSEMOVE << 16)) as isize,
-            );
+        // The cursor's place; a window of this thread (checked) is asked for
+        // its cursor there, as a mouse move would.
+        let Some(pt): Option<POINT> = win::sys::cursor_pos() else {
+            return;
+        };
+        let under = win::from_point(pt);
+        if under.is_null() || (under != self.hwnd && !win::is_child(self.hwnd, under)) {
+            return;
         }
+        let at = (pt.x as u16 as u32 | ((pt.y as u16 as u32) << 16)) as isize;
+        let hit = win::send_plain(under, WM_NCHITTEST, 0, at) as u32 & 0xffff;
+        win::send_set_cursor(under, under, hit as u16, WM_MOUSEMOVE as u16);
     }
 
     /// WM_SETCURSOR on the client area while busy: the busy cursor; false
@@ -550,8 +538,8 @@ impl App {
             Busy::Wait => IDC_WAIT,
             Busy::Background => IDC_APPSTARTING,
         };
-        // SAFETY: a system cursor, shown for this thread's window.
-        unsafe { SetCursor(LoadCursorW(core::ptr::null_mut(), id)) };
+        // A system cursor, shown for this thread's window.
+        sys::set_cursor(sys::system_cursor(id));
         true
     }
 
@@ -561,8 +549,8 @@ impl App {
         let ranges = self.model.borrow().loaded();
         // Every row selected (Select All): the rows held are the answer,
         // without asking the list about each one.
-        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize;
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
+        let selected = lv::selected_count(self.list);
+        let count = lv::item_count(self.list);
         if selected > 0 && selected >= count {
             return ranges
                 .into_iter()
@@ -575,7 +563,7 @@ impl App {
             // (usize::MAX) means from the top.
             let mut at = range.start.wrapping_sub(1);
             loop {
-                let next = send(self.list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize);
+                let next = lv::next_item(self.list, at as i32, LVNI_SELECTED);
                 if next < 0 || next as usize >= range.end {
                     break;
                 }
@@ -589,7 +577,7 @@ impl App {
     /// What a result action acts on: the selected rows that are held, and
     /// how many rows are selected in all.
     fn picked(&self) -> (Vec<usize>, usize) {
-        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize;
+        let selected = lv::selected_count(self.list);
         if selected == 0 {
             return (Vec::new(), 0);
         }
@@ -629,8 +617,8 @@ impl App {
     /// Shows `text` in the status bar for a while, instead of the counts.
     pub(super) fn show_note(&self, text: String) {
         *self.note.borrow_mut() = Some(text);
-        // SAFETY: a timer of this window; setting it again restarts it.
-        unsafe { SetTimer(self.hwnd, TIMER_NOTE, NOTE_MS, None) };
+        // A timer of this window; setting it again restarts it.
+        win::set_timer(self.hwnd, TIMER_NOTE, NOTE_MS);
         self.invalidate_status();
     }
 
@@ -638,8 +626,7 @@ impl App {
     /// and a paste would bring back whatever was copied before.
     fn copy_failed(&self) {
         self.show_note(clipboard::BUSY.into());
-        // SAFETY: plays a system sound.
-        unsafe { MessageBeep(MB_ICONWARNING) };
+        sys::beep(MB_ICONWARNING);
     }
 
     /// The status bar's note, while it shows one.
@@ -650,8 +637,7 @@ impl App {
     /// Takes the note away (its time is up, or the search changed).
     pub(super) fn clear_note(&self) {
         if self.note.borrow_mut().take().is_some() {
-            // SAFETY: a timer of this window.
-            unsafe { KillTimer(self.hwnd, TIMER_NOTE) };
+            win::kill_timer(self.hwnd, TIMER_NOTE);
             self.invalidate_status();
         }
     }
@@ -791,15 +777,8 @@ impl App {
             // No columns: an item is its name.
             return None;
         }
-        let mut hit = LVHITTESTINFO {
-            pt,
-            flags: 0,
-            iItem: -1,
-            iSubItem: -1,
-            iGroup: 0,
-        };
-        let item = send(self.list, LVM_SUBITEMHITTEST, 0, (&raw mut hit) as isize);
-        if item < 0 || hit.iSubItem < 0 {
+        let hit = lv::subitem_hit_test(self.list, pt);
+        if hit.iItem < 0 || hit.iSubItem < 0 {
             return None;
         }
         // The list gives the column's index; its id says which it is.
@@ -825,8 +804,7 @@ mod tests {
 
     /// LVN_ITEMCHANGED for `item` (-1: all), as the list sends it.
     fn item_changed(item: i32, changed: u32, old: u32, new: u32) -> NMLISTVIEW {
-        // SAFETY: NMLISTVIEW is plain data; all-zero is a valid value.
-        let mut nm: NMLISTVIEW = unsafe { core::mem::zeroed() };
+        let mut nm = NMLISTVIEW::default();
         nm.hdr.code = LVN_ITEMCHANGED;
         nm.iItem = item;
         nm.uChanged = changed;
@@ -835,49 +813,44 @@ mod tests {
         nm
     }
 
-    /// `selection_change` of a notification made here.
-    fn read<T>(nm: &T) -> Option<(Option<Range<usize>>, bool)> {
-        // SAFETY: `nm` is a list notification's struct, whose NMHDR's code
-        // says which one.
-        unsafe { selection_change((nm as *const T) as isize) }
-    }
-
     #[test]
     fn the_rows_a_notification_selects_or_deselects() {
         let (sel, foc) = (LVIS_SELECTED, LVIS_FOCUSED);
         // One row, selected (and focused), then deselected.
         assert_eq!(
-            read(&item_changed(5, LVIF_STATE, 0, sel | foc)),
+            item_change(&item_changed(5, LVIF_STATE, 0, sel | foc)),
             Some((Some(5..6), true))
         );
         assert_eq!(
-            read(&item_changed(5, LVIF_STATE, sel | foc, foc)),
+            item_change(&item_changed(5, LVIF_STATE, sel | foc, foc)),
             Some((Some(5..6), false))
         );
         // Every row (-1), as Select All and a clear send it.
         assert_eq!(
-            read(&item_changed(-1, LVIF_STATE, 0, sel)),
+            item_change(&item_changed(-1, LVIF_STATE, 0, sel)),
             Some((None, true))
         );
         assert_eq!(
-            read(&item_changed(-1, LVIF_STATE, sel | foc, 0)),
+            item_change(&item_changed(-1, LVIF_STATE, sel | foc, 0)),
             Some((None, false))
         );
         // The focus alone, or no state at all: no selection change.
-        assert_eq!(read(&item_changed(7, LVIF_STATE, foc, 0)), None);
-        assert_eq!(read(&item_changed(7, LVIF_STATE, sel, sel | foc)), None);
-        assert_eq!(read(&item_changed(7, LVIF_TEXT, 0, sel)), None);
+        assert_eq!(item_change(&item_changed(7, LVIF_STATE, foc, 0)), None);
+        assert_eq!(
+            item_change(&item_changed(7, LVIF_STATE, sel, sel | foc)),
+            None
+        );
+        assert_eq!(item_change(&item_changed(7, LVIF_TEXT, 0, sel)), None);
         // A range (Shift+End), inclusive of its end.
-        // SAFETY: NMLVODSTATECHANGE is plain data; all-zero is valid.
-        let mut od: NMLVODSTATECHANGE = unsafe { core::mem::zeroed() };
+        let mut od = NMLVODSTATECHANGE::default();
         od.hdr.code = LVN_ODSTATECHANGED;
         od.iFrom = 100;
         od.iTo = 199;
         od.uNewState = sel;
-        assert_eq!(read(&od), Some((Some(100..200), true)));
+        assert_eq!(range_change(&od), Some((Some(100..200), true)));
         od.uOldState = sel;
         od.uNewState = 0;
-        assert_eq!(read(&od), Some((Some(100..200), false)));
+        assert_eq!(range_change(&od), Some((Some(100..200), false)));
     }
 
     #[test]

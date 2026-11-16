@@ -156,8 +156,8 @@ pub fn scaled(system: u32) -> u32 {
 
 /// A window's DPI scaled by the UI scale (what dialogs measure with).
 pub fn window_dpi(hwnd: windows_sys::Win32::Foundation::HWND) -> u32 {
-    // SAFETY: reads a window's DPI; 0 (no window) reads as 96.
-    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+    // No window reads as 96.
+    let dpi = crate::win::sys::dpi_for_window(hwnd);
     scaled(dpi.max(96))
 }
 

@@ -9,225 +9,153 @@
 //! scaled down to it, never up.
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{HFONT, SelectObject};
+use windows_sys::Win32::Graphics::Gdi::HFONT;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_HOT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NEWFONT,
-    CDRF_NOTIFYITEMDRAW, HIMAGELIST, HTREEITEM, ILC_COLOR32, ILC_MASK, ILD_NORMAL,
-    ImageList_Create, ImageList_Destroy, ImageList_GetIcon, ImageList_GetIconSize,
-    ImageList_ReplaceIcon, ImageList_SetImageCount, NMTVCUSTOMDRAW, TVE_COLLAPSE, TVE_EXPAND,
-    TVGN_CARET, TVGN_CHILD, TVGN_DROPHILITE, TVGN_NEXT, TVHITTESTINFO, TVI_FIRST, TVI_LAST,
-    TVI_ROOT, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE, TVIF_STATE, TVIF_TEXT,
-    TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVM_DELETEITEM, TVM_ENSUREVISIBLE,
-    TVM_EXPAND, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_GETTOOLTIPS, TVM_HITTEST,
-    TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETIMAGELIST, TVM_SETITEMHEIGHT,
-    TVM_SETITEMW, TVM_SETTEXTCOLOR, TVSIL_NORMAL,
+    CDRF_NOTIFYITEMDRAW, ILC_COLOR32, ILC_MASK, ILD_NORMAL, NMTVCUSTOMDRAW, TVE_COLLAPSE,
+    TVE_EXPAND, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE, TVIF_STATE,
+    TVIS_EXPANDED, TVITEMW, TVSIL_NORMAL,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows_sys::Win32::UI::Shell::{
-    SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGSI_SYSICONINDEX,
-    SHGetFileInfoW, SHGetImageList, SHGetStockIconInfo, SHSTOCKICONINFO, SIID_FIND,
+    SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SIID_FIND,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON, SendMessageW, WM_SETFONT};
-use windows_sys::core::GUID;
 
 use crate::colors::{Item, State};
 use crate::theme::{self, Palette};
-use crate::wide::{nul, wz};
+use crate::win::icon::Icon;
+use crate::win::imagelist::{ImageList, SystemList};
+pub use crate::win::tv::Item as TreeItem;
+use crate::win::tv::{After, Select};
+use crate::win::{self, View, gdi, imagelist, tv};
 
-fn send(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: a message to a window of this thread; any pointer in `l` is
-    // the caller's and lives across the synchronous call.
-    unsafe { SendMessageW(hwnd, msg, w, l) }
-}
-
-/// No item: the tree's root (as a parent), or nothing (as an answer).
-pub const NONE: HTREEITEM = 0;
-
-/// A new item: under `parent` (`NONE` for the top level), after `after`
-/// (`NONE` for first, `last` for the end), with `text`, `image` and a
-/// `param` of the caller's; `children` shows an expand button before any
-/// child is in.
+/// A new item: under `parent` (`None` for the top level), placed as
+/// `after` says, with `text`, `image` and a `param` of the caller's;
+/// `children` shows an expand button before any child is in.
 pub struct New<'a> {
-    pub parent: HTREEITEM,
-    pub after: Option<HTREEITEM>,
+    pub parent: Option<TreeItem>,
+    pub after: After,
     pub text: &'a [u16],
     pub image: i32,
     pub children: bool,
     pub param: isize,
 }
 
-/// Puts `item` in `tree`; the new item, or `NONE` if it failed.
-pub fn insert(tree: HWND, item: &New<'_>) -> HTREEITEM {
-    let mut text = nul(item.text);
-    let ins = TVINSERTSTRUCTW {
-        hParent: item.parent,
-        hInsertAfter: match item.after {
-            None => TVI_LAST,
-            Some(NONE) => TVI_FIRST,
-            Some(h) => h,
-        },
-        Anonymous: TVINSERTSTRUCTW_0 {
-            item: TVITEMW {
-                mask: TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE | TVIF_SELECTEDIMAGE | TVIF_CHILDREN,
-                pszText: text.as_mut_ptr(),
-                iImage: item.image,
-                iSelectedImage: item.image,
-                cChildren: i32::from(item.children),
-                lParam: item.param,
-                // SAFETY: the rest of TVITEMW is plain data.
-                ..unsafe { core::mem::zeroed() }
-            },
-        },
+/// Puts `item` in `tree`; the new item, `None` if it failed.
+pub fn insert(tree: HWND, item: &New<'_>) -> Option<TreeItem> {
+    // The text goes in as it is, UTF-16 (a file's name need not be valid
+    // Unicode); TVIF_TEXT is added with it.
+    let it = TVITEMW {
+        mask: TVIF_PARAM | TVIF_IMAGE | TVIF_SELECTEDIMAGE | TVIF_CHILDREN,
+        iImage: item.image,
+        iSelectedImage: item.image,
+        cChildren: i32::from(item.children),
+        lParam: item.param,
+        ..Default::default()
     };
-    send(tree, TVM_INSERTITEMW, 0, (&raw const ins) as isize) as HTREEITEM
+    win::tv::insert_units(tree, item.parent, item.after, it, item.text)
 }
 
-/// `item`'s param; `None` for no item.
-pub fn param(tree: HWND, item: HTREEITEM) -> Option<isize> {
-    if item == NONE {
-        return None;
-    }
-    let mut it = TVITEMW {
-        mask: TVIF_PARAM,
-        hItem: item,
-        // SAFETY: the rest of TVITEMW is plain data.
-        ..unsafe { core::mem::zeroed() }
-    };
-    (send(tree, TVM_GETITEMW, 0, (&raw mut it) as isize) != 0).then_some(it.lParam)
-}
-
-fn set(tree: HWND, mut it: TVITEMW) {
-    send(tree, TVM_SETITEMW, 0, (&raw mut it) as isize);
+/// `item`'s param; `None` for an item no longer there.
+pub fn param(item: TreeItem) -> Option<isize> {
+    tv::item_param(item)
 }
 
 /// Shows an expand button on `item`, or not.
-pub fn set_children(tree: HWND, item: HTREEITEM, children: bool) {
-    set(
-        tree,
+pub fn set_children(item: TreeItem, children: bool) {
+    tv::set_item(
+        item,
         TVITEMW {
             mask: TVIF_CHILDREN,
-            hItem: item,
             cChildren: i32::from(children),
-            // SAFETY: the rest of TVITEMW is plain data.
-            ..unsafe { core::mem::zeroed() }
+            ..Default::default()
         },
+        None,
     );
 }
 
 /// `item`'s text.
-pub fn set_text(tree: HWND, item: HTREEITEM, text: &[u16]) {
-    let mut text = nul(text);
-    set(
-        tree,
-        TVITEMW {
-            mask: TVIF_TEXT,
-            hItem: item,
-            pszText: text.as_mut_ptr(),
-            // SAFETY: the rest of TVITEMW is plain data.
-            ..unsafe { core::mem::zeroed() }
-        },
-    );
+pub fn set_text(item: TreeItem, text: &[u16]) {
+    win::tv::set_text_units(item, text);
 }
 
 /// Whether `item` shows an expand button.
-pub fn has_children(tree: HWND, item: HTREEITEM) -> bool {
-    let mut it = TVITEMW {
+pub fn has_children(item: TreeItem) -> bool {
+    let it = TVITEMW {
         mask: TVIF_CHILDREN,
-        hItem: item,
-        // SAFETY: the rest of TVITEMW is plain data.
-        ..unsafe { core::mem::zeroed() }
+        ..Default::default()
     };
-    send(tree, TVM_GETITEMW, 0, (&raw mut it) as isize) != 0 && it.cChildren != 0
+    tv::get_item(item, it, 0).is_some_and(|(it, _)| it.cChildren != 0)
 }
 
 /// Whether `item` shows open.
-pub fn is_expanded(tree: HWND, item: HTREEITEM) -> bool {
-    let mut it = TVITEMW {
+pub fn is_expanded(item: TreeItem) -> bool {
+    let it = TVITEMW {
         mask: TVIF_STATE,
-        hItem: item,
         stateMask: TVIS_EXPANDED,
-        // SAFETY: the rest of TVITEMW is plain data.
-        ..unsafe { core::mem::zeroed() }
+        ..Default::default()
     };
-    send(tree, TVM_GETITEMW, 0, (&raw mut it) as isize) != 0 && it.state & TVIS_EXPANDED != 0
+    tv::get_item(item, it, 0).is_some_and(|(it, _)| it.state & TVIS_EXPANDED != 0)
 }
 
 /// Opens (`open`) or closes `item`.
-pub fn expand(tree: HWND, item: HTREEITEM, open: bool) {
+pub fn expand(item: TreeItem, open: bool) {
     let code = if open { TVE_EXPAND } else { TVE_COLLAPSE };
-    send(tree, TVM_EXPAND, code as usize, item);
+    tv::expand(item, code);
 }
 
-/// Selects `item` (`NONE`: nothing) and scrolls it into view.
-pub fn select(tree: HWND, item: HTREEITEM) {
-    send(tree, TVM_SELECTITEM, TVGN_CARET as usize, item);
-    if item != NONE {
-        send(tree, TVM_ENSUREVISIBLE, 0, item);
+/// Selects `item` (`None`: nothing) and scrolls it into view.
+pub fn select(tree: HWND, item: Option<TreeItem>) {
+    tv::select(tree, Select::Caret, item);
+    if let Some(item) = item {
+        tv::ensure_visible(item);
     }
 }
 
 /// The selected item.
-pub fn selected(tree: HWND) -> HTREEITEM {
-    send(tree, TVM_GETNEXTITEM, TVGN_CARET as usize, 0) as HTREEITEM
+pub fn selected(tree: HWND) -> Option<TreeItem> {
+    tv::selection(tree)
 }
 
-/// Marks `item` as the one a context menu is for (`NONE`: none), as
+/// Marks `item` as the one a context menu is for (`None`: none), as
 /// Explorer's tree does while its menu is up.
-pub fn drop_highlight(tree: HWND, item: HTREEITEM) {
-    send(tree, TVM_SELECTITEM, TVGN_DROPHILITE as usize, item);
+pub fn drop_highlight(tree: HWND, item: Option<TreeItem>) {
+    tv::select(tree, Select::DropHighlight, item);
 }
 
-/// Takes `item` (and what is under it) out; `NONE` empties the tree.
-pub fn delete(tree: HWND, item: HTREEITEM) {
-    let item = if item == NONE { TVI_ROOT } else { item };
-    send(tree, TVM_DELETEITEM, 0, item);
+/// Takes `item` (and what is under it) out.
+pub fn delete(item: TreeItem) {
+    tv::delete_item(item);
 }
 
-/// The items directly under `parent` (`NONE`: the top level), in order.
-pub fn children(tree: HWND, parent: HTREEITEM) -> Vec<HTREEITEM> {
+/// Empties the tree.
+pub fn delete_all(tree: HWND) {
+    tv::delete_all(tree);
+}
+
+/// The items directly under `parent` (`None`: the top level), in order.
+pub fn children(tree: HWND, parent: Option<TreeItem>) -> Vec<TreeItem> {
     let mut out = Vec::new();
-    let mut at = if parent == NONE {
-        send(tree, TVM_GETNEXTITEM, 0, 0)
-    } else {
-        send(tree, TVM_GETNEXTITEM, TVGN_CHILD as usize, parent)
-    } as HTREEITEM;
-    while at != NONE {
-        out.push(at);
-        at = send(tree, TVM_GETNEXTITEM, TVGN_NEXT as usize, at) as HTREEITEM;
+    let mut at = match parent {
+        None => tv::root(tree),
+        Some(parent) => tv::child(parent),
+    };
+    while let Some(item) = at {
+        out.push(item);
+        at = tv::next_sibling(item);
     }
     out
 }
 
 /// The item at `pt` (the tree's client coordinates) and where on it
 /// (`TVHT_*`).
-pub fn hit(tree: HWND, pt: POINT) -> (HTREEITEM, u32) {
-    let mut info = TVHITTESTINFO {
-        pt,
-        flags: 0,
-        hItem: NONE,
-    };
-    send(tree, TVM_HITTEST, 0, (&raw mut info) as isize);
-    (info.hItem, info.flags)
+pub fn hit(tree: HWND, pt: POINT) -> (Option<TreeItem>, u32) {
+    tv::hit_test(tree, pt)
 }
 
 /// `item`'s row, or its text only (`text`), in the tree's coordinates.
-pub fn item_rect(tree: HWND, item: HTREEITEM, text: bool) -> RECT {
-    // TVM_GETITEMRECT takes the item in the rectangle it fills.
-    let mut rc = RECT::default();
-    // SAFETY: an HTREEITEM fits in the RECT's first bytes, as the message
-    // wants it there.
-    unsafe { core::ptr::write_unaligned((&raw mut rc).cast::<HTREEITEM>(), item) };
-    if send(
-        tree,
-        TVM_GETITEMRECT,
-        usize::from(text),
-        (&raw mut rc) as isize,
-    ) == 0
-    {
-        return RECT::default();
-    }
-    rc
+pub fn item_rect(item: TreeItem, text: bool) -> RECT {
+    tv::item_rect(item, text).unwrap_or_default()
 }
 
 /// The tree in `item`'s colours (Options > Fonts and Colors' sidebar: its
@@ -243,9 +171,9 @@ pub fn apply_theme(tree: HWND, pal: &Palette, item: Item) {
     let ink = pal.ink(item, State::Normal);
     theme::allow(tree, pal.dark);
     theme::set_class(tree, Some(class));
-    send(tree, TVM_SETBKCOLOR, 0, ink.bg as isize);
-    send(tree, TVM_SETTEXTCOLOR, 0, ink.fg as isize);
-    let tip = send(tree, TVM_GETTOOLTIPS, 0, 0) as HWND;
+    tv::set_bk_color(tree, ink.bg);
+    tv::set_text_color(tree, ink.fg);
+    let tip = tv::tooltips(tree);
     if !tip.is_null() {
         theme::allow(tip, pal.dark);
         theme::set_class(tip, Some(class));
@@ -256,15 +184,19 @@ pub fn apply_theme(tree: HWND, pal: &Palette, item: Item) {
 /// tree's own, [`apply_theme`]).
 const ROW_STATES: [State; 3] = [State::Selected, State::InactiveSelected, State::Mouseover];
 
-/// A sidebar tree's `NM_CUSTOMDRAW` (`l`), for Options > Fonts and
-/// Colors' `item`: a row in a state whose colours are not the theme's
-/// (chosen, or tinted by an accent) is filled with them and keeps no
-/// selection or hover of the visual style; a row whose style is Bold gets
-/// `bold`. Every other row is the visual style's.
-pub fn custom_draw(tree: HWND, l: isize, pal: &Palette, item: Item, bold: HFONT) -> isize {
-    // SAFETY: a tree view's NM_CUSTOMDRAW carries an NMTVCUSTOMDRAW, which
-    // the tree reads back after this returns.
-    let cd = unsafe { &mut *(l as *mut NMTVCUSTOMDRAW) };
+/// A sidebar tree's `NM_CUSTOMDRAW` (`cd`, whose colours and state the
+/// tree reads back after this returns), for Options > Fonts and Colors' `item`: a row in a state
+/// whose colours are not the theme's (chosen, or tinted by an accent) is
+/// filled with them and keeps no selection or hover of the visual style; a
+/// row whose style is Bold gets `bold`. Every other row is the visual
+/// style's.
+pub fn custom_draw(
+    tree: HWND,
+    cd: &mut View<'_, NMTVCUSTOMDRAW>,
+    pal: &Palette,
+    item: Item,
+    bold: HFONT,
+) -> isize {
     let wanted = ROW_STATES.iter().any(|&s| pal.is_own(item, s))
         || [
             State::Normal,
@@ -278,22 +210,21 @@ pub fn custom_draw(tree: HWND, l: isize, pal: &Palette, item: Item, bold: HFONT)
         CDDS_PREPAINT if wanted => CDRF_NOTIFYITEMDRAW as isize,
         CDDS_ITEMPREPAINT => {
             let st = cd.nmcd.uItemState;
-            // SAFETY: reads this thread's focus.
-            let focused = unsafe { GetFocus() } == tree;
+            let focused = win::focus() == tree;
             let state = State::of_row(st & CDIS_SELECTED != 0, focused, st & CDIS_HOT != 0);
             let mut answer = CDRF_DODEFAULT;
             if state != State::Normal && pal.is_own(item, state) {
                 let ink = pal.ink(item, state);
                 crate::paint::fill(cd.nmcd.hdc, &cd.nmcd.rc, ink.bg);
-                cd.nmcd.uItemState &= !(CDIS_SELECTED | CDIS_HOT);
-                cd.clrText = ink.fg;
-                cd.clrTextBk = ink.bg;
+                cd.set_item_state(st & !(CDIS_SELECTED | CDIS_HOT));
+                cd.set_text_color(ink.fg);
+                cd.set_text_bk_color(ink.bg);
                 answer = CDRF_NEWFONT;
             }
             if pal.is_bold(item, state) {
-                // SAFETY: the tree's DC for this item; the tree puts its own
-                // font back after the item (CDRF_NEWFONT).
-                unsafe { SelectObject(cd.nmcd.hdc, bold) };
+                // The tree's DC for this item; the tree puts its own font
+                // back after the item (CDRF_NEWFONT).
+                gdi::select(cd.nmcd.hdc, bold);
                 answer = CDRF_NEWFONT;
             }
             answer as isize
@@ -305,14 +236,11 @@ pub fn custom_draw(tree: HWND, l: isize, pal: &Palette, item: Item, bold: HFONT)
 /// The tree's font and the height of its rows: the text with 2 px above
 /// and below at 100 % (19 px with the usual 15 px font, as Everything's),
 /// never less than the icons and a pixel above and below them.
-pub fn set_font(tree: HWND, font: isize, font_height: i32, icon: i32, scale: impl Fn(i32) -> i32) {
-    send(tree, WM_SETFONT, font as usize, 1);
+pub fn set_font(tree: HWND, font: HFONT, font_height: i32, icon: i32, scale: impl Fn(i32) -> i32) {
+    win::set_font(tree, font, true);
     let high = (font_height + scale(4)).max(icon + scale(2));
-    send(tree, TVM_SETITEMHEIGHT, high.max(1) as usize, 0);
+    tv::set_item_height(tree, high.max(1));
 }
-
-/// `IID_IImageList`, which `SHGetImageList` hands the system lists out as.
-const IID_IMAGE_LIST: GUID = GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0950);
 
 /// Where an icon of a tree's image list comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,18 +256,14 @@ pub enum Source {
 /// registry alone.
 pub fn plain_icons() -> (i32, i32) {
     let lookup = |name: &str, attributes: u32| {
-        // SAFETY: an attribute-only lookup into a plain out-struct.
-        unsafe {
-            let mut info: SHFILEINFOW = core::mem::zeroed();
-            SHGetFileInfoW(
-                wz(name).as_ptr(),
-                attributes,
-                &mut info,
-                size_of::<SHFILEINFOW>() as u32,
-                SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
-            );
-            info.iIcon
-        }
+        // An attribute-only lookup.
+        let name: Vec<u16> = name.encode_utf16().collect();
+        let (_, info) = win::shell::file_info(
+            &name,
+            attributes,
+            SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+        );
+        info.iIcon
     };
     (
         lookup("folder", FILE_ATTRIBUTE_DIRECTORY),
@@ -350,33 +274,22 @@ pub fn plain_icons() -> (i32, i32) {
 /// The system image list's index of the shell's search icon (a
 /// magnifier); -1 if the shell has none.
 fn stock_search_icon() -> i32 {
-    let mut info = SHSTOCKICONINFO {
-        cbSize: size_of::<SHSTOCKICONINFO>() as u32,
-        // SAFETY: the rest of SHSTOCKICONINFO is plain data.
-        ..unsafe { core::mem::zeroed() }
-    };
-    // SAFETY: fills the struct whose size it is given.
-    let hr = unsafe { SHGetStockIconInfo(SIID_FIND, SHGSI_SYSICONINDEX, &mut info) };
-    if hr >= 0 { info.iSysImageIndex } else { -1 }
+    win::icon::stock_index(SIID_FIND).unwrap_or(-1)
 }
 
 /// The system image list to copy `size` px icons from: the one whose icons
 /// are that size or the least larger, else the largest.
-fn system_list(size: i32) -> HIMAGELIST {
+fn system_list(size: i32) -> Option<SystemList> {
     // SHIL_LARGE (32), SHIL_SMALL (16), SHIL_EXTRALARGE (48).
-    let mut best: Option<(i32, HIMAGELIST)> = None;
-    let mut largest: Option<(i32, HIMAGELIST)> = None;
+    let mut best: Option<(i32, SystemList)> = None;
+    let mut largest: Option<(i32, SystemList)> = None;
     for which in [1, 0, 2] {
-        let mut ppv: *mut core::ffi::c_void = core::ptr::null_mut();
-        // SAFETY: the shell hands out its own image list, which lives as long
-        // as the process; it is never released.
-        if unsafe { SHGetImageList(which, &IID_IMAGE_LIST, &mut ppv) } < 0 || ppv.is_null() {
+        // The shell hands out its own image list, which lives as long as
+        // the process; it is never released.
+        let Some(list) = win::imagelist::system(which) else {
             continue;
-        }
-        let list = ppv as HIMAGELIST;
-        let (mut cx, mut cy) = (0, 0);
-        // SAFETY: reads the size of a system image list's icons.
-        unsafe { ImageList_GetIconSize(list, &mut cx, &mut cy) };
+        };
+        let (cx, _) = imagelist::icon_size(&list).unwrap_or((0, 0));
         if cx >= size && best.is_none_or(|(b, _)| cx < b) {
             best = Some((cx, list));
         }
@@ -384,12 +297,15 @@ fn system_list(size: i32) -> HIMAGELIST {
             largest = Some((cx, list));
         }
     }
-    best.or(largest).map_or(0, |(_, list)| list)
+    best.or(largest).map(|(_, list)| list)
 }
 
-/// A tree's own image list: the icons it shows, at one size.
+/// A tree's own image list: the icons it shows, at one size. The list is
+/// destroyed as this drops, when no tree shows it any more (see
+/// `resized`, and the panes' destroy).
 pub struct Images {
-    list: HIMAGELIST,
+    /// `None` if comctl32 could not make one.
+    list: Option<ImageList>,
     size: i32,
     /// What each image is, in order.
     sources: Vec<Source>,
@@ -399,17 +315,13 @@ impl Images {
     /// An empty list of `size` px icons.
     pub fn new(size: i32) -> Images {
         let size = size.max(1);
-        // SAFETY: a new image list, destroyed in Drop.
-        let list = unsafe { ImageList_Create(size, size, ILC_COLOR32 | ILC_MASK, 8, 8) };
+        // A new image list, destroyed as this drops.
+        let list = ImageList::create(size, size, ILC_COLOR32 | ILC_MASK, 8, 8);
         Images {
             list,
             size,
             sources: Vec::new(),
         }
-    }
-
-    pub fn handle(&self) -> HIMAGELIST {
-        self.list
     }
 
     pub fn size(&self) -> i32 {
@@ -431,39 +343,34 @@ impl Images {
     }
 
     fn add(&self, source: Source) -> bool {
-        let system = |index: i32| -> HICON {
-            let list = system_list(self.size);
-            if list == 0 || index < 0 {
-                return core::ptr::null_mut();
+        let system = |index: i32| -> Option<Icon> {
+            let list = system_list(self.size)?;
+            if index < 0 {
+                return None;
             }
-            // SAFETY: a copy of one of the system list's icons, ours to
-            // destroy.
-            unsafe { ImageList_GetIcon(list, index, ILD_NORMAL) }
+            // A copy of one of the system list's icons, destroyed as it
+            // drops.
+            win::imagelist::icon(&list, index, ILD_NORMAL)
         };
-        let icon: HICON = match source {
+        let icon = match source {
             // A build without an icon of its own (no assets/goz.ico) shows
             // the shell's search icon: the magnifier, as Everything's top
             // item has its own.
             Source::App => {
-                let own = crate::window::app_icon(self.size);
-                if own.is_null() {
-                    system(stock_search_icon())
-                } else {
-                    own
-                }
+                crate::window::app_icon(self.size).or_else(|| system(stock_search_icon()))
             }
             Source::System(index) => system(index),
         };
-        if icon.is_null() {
+        let Some(icon) = icon else {
             return false;
-        }
-        // SAFETY: the list copies the icon (drawn at its own size), after
-        // which the copy made above is destroyed.
-        unsafe {
-            let at = ImageList_ReplaceIcon(self.list, -1, icon);
-            DestroyIcon(icon);
-            at >= 0
-        }
+        };
+        // The list copies the icon (drawn at its own size); the copy made
+        // above is destroyed as it drops.
+        let at = self
+            .list
+            .as_ref()
+            .map_or(-1, |l| l.replace_icon(-1, icon.handle()));
+        at >= 0
     }
 
     /// The same images at `size` px: a new list, in the same order, so the
@@ -474,9 +381,11 @@ impl Images {
         for &source in &self.sources {
             // A source that fails now still takes its place, so the numbers
             // after it hold: a blank image.
-            if !new.add(source) {
-                // SAFETY: grows this list by one blank image.
-                unsafe { ImageList_SetImageCount(new.list, new.sources.len() as u32 + 1) };
+            if !new.add(source)
+                && let Some(list) = &new.list
+            {
+                // Grows this list by one blank image.
+                list.set_image_count(new.sources.len() as u32 + 1);
             }
             new.sources.push(source);
         }
@@ -484,22 +393,8 @@ impl Images {
     }
 }
 
-impl Drop for Images {
-    fn drop(&mut self) {
-        if self.list != 0 {
-            // SAFETY: the list this made; no tree shows it any more (see
-            // `resized`, and the panes' destroy).
-            unsafe { ImageList_Destroy(self.list) };
-        }
-    }
-}
-
-/// Hands `tree` the image list `images` (`None`: none).
+/// Hands `tree` the image list `images` (`None`: none), which the tree
+/// keeps alive while it shows it (`tv::set_image_list`).
 pub fn set_images(tree: HWND, images: Option<&Images>) {
-    send(
-        tree,
-        TVM_SETIMAGELIST,
-        TVSIL_NORMAL as usize,
-        images.map_or(0, Images::handle),
-    );
+    tv::set_image_list(tree, TVSIL_NORMAL, images.and_then(|i| i.list.as_ref()));
 }

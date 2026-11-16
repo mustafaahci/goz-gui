@@ -6,17 +6,13 @@
 //! A test names the folder in `GOZ_GUI_PICK_FOLDER` instead
 //! (`store::location::pick_folder`): nothing is shown.
 
-use windows::Win32::Foundation::HWND as WHWND;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::{
-    FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog,
-    IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+    FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
 };
-use windows::core::PCWSTR;
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::store::location;
-use crate::wide::{nul, wz};
+use crate::win::shell::FileDialog;
 
 /// Asks for a folder, over `owner`, titled `title` with `ok` on its button,
 /// opening in `start` when it is a folder; the folder chosen, `None` when
@@ -31,39 +27,21 @@ pub fn pick(owner: HWND, title: &str, ok: &str, start: Option<&[u16]>) -> Option
                 .collect(),
         );
     }
-    let (title, ok) = (wz(title), wz(ok));
-    // SAFETY: COM is initialised on this (the UI) thread; the dialog runs
-    // its own loop while the caller holds no borrow; every string lives
-    // across the call that takes it; the path the dialog gives is freed
-    // after it is read.
-    unsafe {
-        let dialog: IFileOpenDialog =
-            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        let options = dialog.GetOptions().ok()?;
-        dialog
-            .SetOptions(
-                options
-                    | FOS_PICKFOLDERS
-                    | FOS_FORCEFILESYSTEM
-                    | FOS_PATHMUSTEXIST
-                    | FOS_NOCHANGEDIR,
-            )
-            .ok()?;
-        let _ = dialog.SetTitle(PCWSTR(title.as_ptr()));
-        let _ = dialog.SetOkButtonLabel(PCWSTR(ok.as_ptr()));
-        if let Some(start) = start.filter(|s| super::attributes(s).is_some()) {
-            let z = nul(start);
-            if let Ok(folder) =
-                SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(z.as_ptr()), None)
-            {
-                let _ = dialog.SetFolder(&folder);
-            }
-        }
-        dialog.Show(Some(WHWND(owner))).ok()?;
-        let item = dialog.GetResult().ok()?;
-        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-        let path = name.as_wide().to_vec();
-        CoTaskMemFree(Some(name.0.cast()));
-        Some(path)
+    // COM is initialised on this (the UI) thread; the dialog runs its own
+    // loop while the caller holds no borrow.
+    let dialog = FileDialog::open()?;
+    let options = dialog.options()?;
+    let folders = FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR;
+    if !dialog.set_options(options | folders.0) {
+        return None;
     }
+    dialog.set_title(title);
+    dialog.set_ok_label(ok);
+    if let Some(start) = start.filter(|s| super::attributes(s).is_some()) {
+        dialog.set_folder(start);
+    }
+    if !dialog.show(owner) {
+        return None;
+    }
+    dialog.result()?.file_system_path()
 }

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Every `unsafe` is now in `src/win`, a safe layer over the Win32 API, and the rest of the crate is `#![deny(unsafe_code)]`. Window, dialog and subclass procedures are Rust closures, control messages are typed, and handles, GDI objects, image lists and COM objects are owned. The rules and what the layer trusts are in [docs/WIN.md](docs/WIN.md).
+
+### Fixed
+
+- Another program could crash goz-gui by posting one of its internal messages with a made-up pointer: values sent between goz-gui's threads now travel as tickets the window claims by type, never as pointers.
+
 ## [0.1.0] - 2026-11-11
 
 The first release: a native Windows front end for [goz](https://github.com/mustafaahci/goz), the instant NTFS file search engine, with the window, menus, keys and options of Everything 1.5.

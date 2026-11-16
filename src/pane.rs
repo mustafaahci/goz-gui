@@ -21,28 +21,19 @@
 //! SendMessage to its controls), since they come back here.
 
 use std::any::Any;
-use std::cell::Cell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DC_BRUSH, DT_END_ELLIPSIS,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, EndPaint,
-    GetStockObject, HDC, InvalidateRect, PAINTSTRUCT, SRCCOPY, SelectObject, SetBkColor, SetBkMode,
-    SetDCBrushColor, SetTextColor, SetViewportOrgEx, TRANSPARENT,
+    DC_BRUSH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, SRCCOPY, TRANSPARENT,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetClientRect, GetParent,
-    GetWindowLongPtrW, HMENU, IDC_ARROW, LoadCursorW, MSG, PostMessageW, RegisterClassExW,
-    SetWindowLongPtrW, WM_CAPTURECHANGED, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
+    IDC_ARROW, MSG, WM_CAPTURECHANGED, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
     WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SIZE,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
 };
 
 use crate::colors::{Item, State};
@@ -50,7 +41,9 @@ use crate::dock::{PaneId, Side};
 use crate::paint::fill;
 use crate::searchbox;
 use crate::theme::Ink;
-use crate::wide::wz;
+use crate::win::class::{self, Class, Create};
+use crate::win::gdi::{self, MemDc, Paint, Selected};
+use crate::win::{self, Msg, sys};
 use crate::window::App;
 
 /// What a feature puts in a pane. Every method runs on the UI thread with
@@ -87,10 +80,10 @@ pub trait PaneContent: Any {
     /// A key message (`WM_KEYDOWN`, `WM_SYSKEYDOWN`, `WM_CHAR`,
     /// `WM_SYSCHAR`) for one of the pane's windows, before the window's
     /// shortcuts (the accelerator table) and Tab see it: true when the
-    /// content took it, and then it goes no further (to hand it to its
-    /// control past the shortcuts, `TranslateMessage` and
-    /// `DispatchMessageW` it here). For the keys a control must keep
-    /// (Enter in a box, F2 in a tree, Ctrl+A in an edit box...).
+    /// content took it, having done what the key means itself; it then
+    /// goes no further (it is neither translated nor dispatched). For the
+    /// keys a control must keep (Enter in a box, F2 in a tree, Ctrl+A in an
+    /// edit box...).
     fn key(&self, _app: &App, _msg: &MSG) -> bool {
         false
     }
@@ -100,19 +93,17 @@ pub trait PaneContent: Any {
     /// WM_CTLCOLOR*, WM_DRAWITEM; WM_TIMER; WM_CONTEXTMENU; the keyboard and
     /// WM_SETFOCUS / WM_KILLFOCUS while the pane window itself has the
     /// focus; the left button below the title row; the content's own
-    /// WM_APP+n. `Some` is the answer; `None` lets the framework answer
-    /// (the theme's colours for WM_CTLCOLOR*, else DefWindowProc). The
-    /// framework also passes on WM_MOUSEMOVE, WM_MOUSELEAVE (it tracks
-    /// the leaving for its close button: a content asks for it too) and a
-    /// WM_CAPTURECHANGED not its own, and answers those itself.
-    fn message(
-        &self,
-        _app: &App,
-        _pane: HWND,
-        _msg: u32,
-        _w: WPARAM,
-        _l: LPARAM,
-    ) -> Option<LRESULT> {
+    /// WM_APP+n (a value sent with one comes as a `win::parcel`). `Some`
+    /// is the answer; `None` lets the framework answer (the theme's
+    /// colours for WM_CTLCOLOR*, else DefWindowProc). The framework also
+    /// passes on WM_MOUSEMOVE, WM_MOUSELEAVE (it tracks the leaving for its
+    /// close button: a content asks for it too) and a WM_CAPTURECHANGED
+    /// not its own, and answers those itself.
+    ///
+    /// `m` is the message as the pane window was given it: a notification's
+    /// structure is read with `m.notify()`. By default the content takes
+    /// none.
+    fn handle(&self, _app: &App, _pane: HWND, _m: &Msg) -> Option<LRESULT> {
         None
     }
 
@@ -216,8 +207,9 @@ const CLASS: &str = "goz-gui pane";
 /// A pane window's child id: this plus the pane's code.
 const CHILD_ID: usize = 0x5000;
 
-/// The pane window's own state, in its GWLP_USERDATA from WM_NCCREATE to
-/// WM_NCDESTROY.
+/// The pane window's own state, held by its handler (the closure the
+/// window was made with) until WM_NCDESTROY, and found by its window in
+/// [`WINDOWS`] meanwhile.
 struct PaneWindow {
     id: PaneId,
     title: &'static str,
@@ -229,21 +221,19 @@ struct PaneWindow {
     pressed: Cell<bool>,
 }
 
+thread_local! {
+    /// The open pane windows' states, by window, from WM_NCCREATE to
+    /// WM_NCDESTROY (the handler holds each state itself).
+    static WINDOWS: RefCell<Vec<(HWND, Weak<PaneWindow>)>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Registers the pane window's class (once, as the window starts).
 pub fn register_class() {
-    let class = wz(CLASS);
-    // SAFETY: registers a class of this module with its window procedure.
-    unsafe {
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(pane_proc),
-            hInstance: GetModuleHandleW(core::ptr::null()),
-            hCursor: LoadCursorW(core::ptr::null_mut(), IDC_ARROW),
-            lpszClassName: class.as_ptr(),
-            ..core::mem::zeroed()
-        };
-        RegisterClassExW(&wc);
+    Class {
+        cursor: sys::system_cursor(IDC_ARROW),
+        ..Class::new(CLASS)
     }
+    .register();
 }
 
 /// Makes the (hidden) window of pane `id` in the main window `parent`; its
@@ -254,39 +244,28 @@ pub fn create_window(
     title: &'static str,
     content: Rc<dyn PaneContent>,
 ) -> HWND {
-    let state = Box::into_raw(Box::new(PaneWindow {
+    let state = Rc::new(PaneWindow {
         id,
         title,
         content,
         created: Cell::new(false),
         hot: Cell::new(false),
         pressed: Cell::new(false),
-    }));
-    let class = wz(CLASS);
-    let name = wz(title);
-    // SAFETY: a child of this thread's main window; the state box goes to
-    // the window at WM_NCCREATE and is freed at WM_NCDESTROY, or here if
-    // the window could not be made.
-    unsafe {
-        let hwnd = CreateWindowExW(
-            0,
-            class.as_ptr(),
-            name.as_ptr(),
-            WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-            0,
-            0,
-            0,
-            0,
+    });
+    // The handler owns the state, and goes (with it) after WM_NCDESTROY,
+    // or at once if the window could not be made.
+    class::create(
+        &Create {
+            ex_style: 0,
+            class: CLASS,
+            title,
+            style: WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            rect: (0, 0, 0, 0),
             parent,
-            (CHILD_ID + id.code()) as HMENU,
-            GetModuleHandleW(core::ptr::null()),
-            state.cast(),
-        );
-        if hwnd.is_null() {
-            drop(Box::from_raw(state));
-        }
-        hwnd
-    }
+            menu: class::id_menu(CHILD_ID + id.code()),
+        },
+        move |m| pane_proc(&state, m),
+    )
 }
 
 /// The title row's height (0 with `pane_title=0`): the header's at 100 %
@@ -317,17 +296,17 @@ pub fn close_rect(width: i32, title: i32, scale: impl Fn(i32) -> i32) -> RECT {
     }
 }
 
-fn state<'a>(hwnd: HWND) -> Option<&'a PaneWindow> {
-    // SAFETY: GWLP_USERDATA holds this window's `PaneWindow` from
-    // WM_NCCREATE to WM_NCDESTROY, and null before.
-    unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const PaneWindow).as_ref() }
+/// Pane window `hwnd`'s state, while it is there.
+fn state(hwnd: HWND) -> Option<Rc<PaneWindow>> {
+    WINDOWS.with_borrow(|w| {
+        w.iter()
+            .find(|(h, _)| *h == hwnd)
+            .and_then(|(_, p)| p.upgrade())
+    })
 }
 
 fn client(hwnd: HWND) -> RECT {
-    let mut rc = RECT::default();
-    // SAFETY: reads this thread's window's size.
-    unsafe { GetClientRect(hwnd, &mut rc) };
-    rc
+    win::client_rect(hwnd)
 }
 
 /// The content's place in a pane window: below the title row.
@@ -336,13 +315,6 @@ pub fn content_rect(app: &App, hwnd: HWND) -> RECT {
     RECT {
         top: title_height(app).min(rc.bottom),
         ..rc
-    }
-}
-
-fn point(l: LPARAM) -> POINT {
-    POINT {
-        x: (l & 0xffff) as i16 as i32,
-        y: ((l >> 16) & 0xffff) as i16 as i32,
     }
 }
 
@@ -371,56 +343,55 @@ pub fn accessible_parts(app: &App, hwnd: HWND) -> Vec<crate::a11y::Part> {
 
 fn invalidate_close(app: &App, hwnd: HWND) {
     let rc = close_of(app, hwnd);
-    // SAFETY: repaints part of this thread's window.
-    unsafe { InvalidateRect(hwnd, &rc, 0) };
+    win::invalidate(hwnd, Some(&rc), false);
 }
 
 /// Paints the title row and what of the client area shows, through a
 /// buffer the size of what is being repainted.
 fn paint(app: &App, hwnd: HWND, p: &PaneWindow) {
-    // SAFETY: a standard double-buffered WM_PAINT; every GDI object made
-    // here is released before returning. The buffer's origin is moved to
-    // the invalid rectangle's corner, so drawing stays in the window's
-    // coordinates.
-    unsafe {
-        let mut ps: PAINTSTRUCT = core::mem::zeroed();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let dirty = ps.rcPaint;
-        let (w, h) = (dirty.right - dirty.left, dirty.bottom - dirty.top);
-        if w <= 0 || h <= 0 {
-            EndPaint(hwnd, &ps);
-            return;
-        }
-        let mem = CreateCompatibleDC(hdc);
-        let bmp = CreateCompatibleBitmap(hdc, w, h);
-        let old_bmp = SelectObject(mem, bmp);
-        SetViewportOrgEx(mem, -dirty.left, -dirty.top, core::ptr::null_mut());
-
-        let rc = client(hwnd);
-        let title_h = title_height(app);
-        let title = RECT {
-            bottom: title_h.min(rc.bottom),
-            ..rc
-        };
-        if title_h > 0 {
-            paint_title(app, hwnd, p, mem, &title);
-        }
-        let body = RECT {
-            top: title.bottom,
-            ..rc
-        };
-        if body.bottom > body.top {
-            p.content.paint(app, mem, &body);
-        }
-
-        BitBlt(
-            hdc, dirty.left, dirty.top, w, h, mem, dirty.left, dirty.top, SRCCOPY,
-        );
-        SelectObject(mem, old_bmp);
-        DeleteObject(bmp);
-        DeleteDC(mem);
-        EndPaint(hwnd, &ps);
+    // A standard double-buffered WM_PAINT: every GDI object made here is
+    // released before returning (the guards drop in the reverse order of
+    // their making: the bitmap selected out, deleted, the buffer's DC, then
+    // EndPaint). The buffer's origin is moved to the invalid rectangle's
+    // corner, so drawing stays in the window's coordinates.
+    let ps = Paint::begin(hwnd);
+    let hdc = ps.hdc();
+    let dirty = ps.area();
+    let (w, h) = (dirty.right - dirty.left, dirty.bottom - dirty.top);
+    if w <= 0 || h <= 0 {
+        return;
     }
+    let mem = MemDc::compatible(hdc);
+    let Some(bmp) = gdi::create_compatible_bitmap(hdc, w, h) else {
+        return;
+    };
+    let _bmp_in = Selected::new(mem.hdc(), &bmp);
+    gdi::set_viewport_org(mem.hdc(), -dirty.left, -dirty.top);
+
+    let rc = client(hwnd);
+    let title_h = title_height(app);
+    let title = RECT {
+        bottom: title_h.min(rc.bottom),
+        ..rc
+    };
+    if title_h > 0 {
+        paint_title(app, hwnd, p, mem.hdc(), &title);
+    }
+    let body = RECT {
+        top: title.bottom,
+        ..rc
+    };
+    if body.bottom > body.top {
+        p.content.paint(app, mem.hdc(), &body);
+    }
+
+    gdi::bit_blt(
+        hdc,
+        (dirty.left, dirty.top, w, h),
+        mem.hdc(),
+        (dirty.left, dirty.top),
+        SRCCOPY,
+    );
 }
 
 /// What shows of the pane, in its colours (the title row's, the content's
@@ -476,21 +447,20 @@ fn paint_title(app: &App, hwnd: HWND, p: &PaneWindow, hdc: HDC, rc: &RECT) {
         right: close.left - pad,
         ..*rc
     };
-    let mut text: Vec<u16> = p.title.encode_utf16().collect();
-    // SAFETY: draws into the paint buffer; the old font is put back.
-    unsafe {
+    let text: Vec<u16> = p.title.encode_utf16().collect();
+    {
+        // Drawn into the paint buffer; the old font goes back as this
+        // drops.
         let font = app.part_font(Item::Pane, pal.is_bold(Item::Pane, State::Normal));
-        let old = SelectObject(hdc, font);
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, ink.fg);
-        DrawTextW(
+        let _font = Selected::of(hdc, font);
+        gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+        gdi::set_text_color(hdc, ink.fg);
+        gdi::draw_text(
             hdc,
-            text.as_mut_ptr(),
-            text.len() as i32,
+            &text,
             &mut text_rc,
             DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
-        SelectObject(hdc, old);
     }
     if close.right <= close.left {
         return;
@@ -513,168 +483,160 @@ fn paint_title(app: &App, hwnd: HWND, p: &PaneWindow, hdc: HDC, rc: &RECT) {
 fn mouse_move(app: &App, hwnd: HWND, p: &PaneWindow, pt: POINT) {
     let over = inside(&close_of(app, hwnd), pt);
     if over && !p.pressed.get() {
-        let mut tme = TRACKMOUSEEVENT {
-            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-            dwFlags: TME_LEAVE,
-            hwndTrack: hwnd,
-            dwHoverTime: 0,
-        };
-        // SAFETY: asks for WM_MOUSELEAVE on this thread's window.
-        unsafe { TrackMouseEvent(&mut tme) };
+        // WM_MOUSELEAVE, when the mouse leaves the window.
+        win::track_leave(hwnd);
     }
     if p.hot.replace(over) != over {
         invalidate_close(app, hwnd);
     }
 }
 
-unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // SAFETY: each arm reads `w`/`l` as the message defines them;
-    // GWLP_USERDATA is this window's `PaneWindow` (see `state`).
-    unsafe {
-        if msg == WM_NCCREATE {
-            let cs = &*(l as *const CREATESTRUCTW);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
-            return DefWindowProcW(hwnd, msg, w, l);
+/// The pane window's handler, `p` its state (the closure's own).
+fn pane_proc(p: &Rc<PaneWindow>, m: &Msg) -> LRESULT {
+    let hwnd = m.hwnd;
+    if m.id == WM_NCCREATE {
+        let weak = Rc::downgrade(p);
+        WINDOWS.with_borrow_mut(|w| w.push((hwnd, weak)));
+        return m.def();
+    }
+    if m.id == WM_NCDESTROY {
+        WINDOWS.with_borrow_mut(|w| w.retain(|(h, _)| *h != hwnd));
+        return m.def();
+    }
+    let Some(app) = crate::window::app_of(win::parent(hwnd)) else {
+        return m.def();
+    };
+    // A content's handler may close its own pane (a choice in a menu of
+    // its own), which destroys this window while the handler runs. The
+    // window's handler, this, is kept alive by the call that runs it until
+    // it returns, so `p` and its content stay alive meanwhile; what is
+    // done with the window after such a call does nothing, the window
+    // being gone.
+    let content = Rc::clone(&p.content);
+    let id = p.id;
+    let (msg, w, l) = (m.id, m.w, m.l);
+    match msg {
+        // The content makes its windows as the pane's is made, before
+        // any WM_SIZE places them.
+        WM_CREATE => {
+            content.create(app, hwnd);
+            p.created.set(true);
+            return 0;
         }
-        if msg == WM_NCDESTROY {
-            let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PaneWindow;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            if !raw.is_null() {
-                drop(Box::from_raw(raw));
-            }
-            return DefWindowProcW(hwnd, msg, w, l);
+        WM_PAINT => {
+            paint(app, hwnd, p);
+            return 0;
         }
-        let (Some(p), Some(app)) = (state(hwnd), crate::window::app_of(GetParent(hwnd))) else {
-            return DefWindowProcW(hwnd, msg, w, l);
-        };
-        // The content and the pane's id, owned: a content's handler may
-        // close its own pane (a choice in a menu of its own), which frees
-        // `p` (WM_NCDESTROY) and the window's hold on the content while
-        // the handler runs. This clone keeps the content alive until this
-        // returns, and `p` is not touched after a call to the content.
-        let content = Rc::clone(&p.content);
-        let id = p.id;
-        match msg {
-            // The content makes its windows as the pane's is made, before
-            // any WM_SIZE places them.
-            WM_CREATE => {
-                content.create(app, hwnd);
-                if let Some(p) = state(hwnd) {
-                    p.created.set(true);
-                }
+        // Its title and close button for accessibility tools.
+        m if m == windows_sys::Win32::UI::WindowsAndMessaging::WM_GETOBJECT
+            && crate::a11y::wants_client(l) =>
+        {
+            if let Some(answer) = crate::window::pane_object(hwnd, id.code(), w) {
+                return answer;
+            }
+        }
+        WM_ERASEBKGND => {
+            // wParam is the DC to erase with, a handle GDI checks.
+            erase(app, hwnd, w as HDC, content.colours(app).bg);
+            return 1;
+        }
+        WM_SIZE => {
+            if p.created.get() {
+                content.place(app, content_rect(app, hwnd));
+            }
+            // The close button keeps to the right edge.
+            let title = RECT {
+                bottom: title_height(app),
+                ..client(hwnd)
+            };
+            win::invalidate(hwnd, Some(&title), false);
+            return 0;
+        }
+        // The close button's, then the content's (a button it paints).
+        WM_MOUSEMOVE => {
+            mouse_move(app, hwnd, p, m.point());
+            content.handle(app, hwnd, m);
+            return 0;
+        }
+        WM_MOUSELEAVE => {
+            if !p.pressed.get() && p.hot.replace(false) {
+                invalidate_close(app, hwnd);
+            }
+            content.handle(app, hwnd, m);
+            return 0;
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            let pt = m.point();
+            if inside(&close_of(app, hwnd), pt) {
+                p.pressed.set(true);
+                p.hot.set(true);
+                win::set_capture(hwnd);
+                invalidate_close(app, hwnd);
                 return 0;
             }
-            WM_PAINT => {
-                paint(app, hwnd, p);
-                return 0;
-            }
-            // Its title and close button for accessibility tools.
-            m if m == windows_sys::Win32::UI::WindowsAndMessaging::WM_GETOBJECT
-                && crate::a11y::wants_client(l) =>
-            {
-                if let Some(answer) = crate::window::pane_object(hwnd, id.code(), w) {
-                    return answer;
-                }
-            }
-            WM_ERASEBKGND => {
-                erase(app, hwnd, w as HDC, content.colours(app).bg);
-                return 1;
-            }
-            WM_SIZE => {
-                if p.created.get() {
-                    content.place(app, content_rect(app, hwnd));
-                }
-                // The close button keeps to the right edge.
-                let title = RECT {
-                    bottom: title_height(app),
-                    ..client(hwnd)
-                };
-                InvalidateRect(hwnd, &title, 0);
-                return 0;
-            }
-            // The close button's, then the content's (a button it paints).
-            WM_MOUSEMOVE => {
-                mouse_move(app, hwnd, p, point(l));
-                content.message(app, hwnd, msg, w, l);
-                return 0;
-            }
-            WM_MOUSELEAVE => {
-                if !p.pressed.get() && p.hot.replace(false) {
-                    invalidate_close(app, hwnd);
-                }
-                content.message(app, hwnd, msg, w, l);
-                return 0;
-            }
-            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-                let pt = point(l);
-                if inside(&close_of(app, hwnd), pt) {
-                    p.pressed.set(true);
-                    p.hot.set(true);
-                    SetCapture(hwnd);
-                    invalidate_close(app, hwnd);
-                    return 0;
-                }
-                // The title row, or the client area where the content has
-                // no window and does not want the click: the pane takes
-                // the keyboard.
-                if pt.y < title_height(app) {
-                    app.focus_pane(id);
-                    return 0;
-                }
-                if let Some(answer) = content.message(app, hwnd, msg, w, l) {
-                    return answer;
-                }
+            // The title row, or the client area where the content has
+            // no window and does not want the click: the pane takes
+            // the keyboard.
+            if pt.y < title_height(app) {
                 app.focus_pane(id);
                 return 0;
             }
-            WM_LBUTTONUP if p.pressed.get() => {
-                p.pressed.set(false);
-                if GetCapture() == hwnd {
-                    ReleaseCapture();
-                }
-                let over = inside(&close_of(app, hwnd), point(l));
-                p.hot.set(over);
+            if let Some(answer) = content.handle(app, hwnd, m) {
+                return answer;
+            }
+            app.focus_pane(id);
+            return 0;
+        }
+        WM_LBUTTONUP if p.pressed.get() => {
+            p.pressed.set(false);
+            if win::capture() == hwnd {
+                win::release_capture();
+            }
+            let over = inside(&close_of(app, hwnd), m.point());
+            p.hot.set(over);
+            invalidate_close(app, hwnd);
+            if over {
+                // Closed from the window's own queue: this window
+                // goes, which it must not do inside its own message.
+                win::post_app(app.hwnd, crate::window::WM_PANE_CLOSE, p.id.code(), 0);
+            }
+            return 0;
+        }
+        WM_CAPTURECHANGED => {
+            if p.pressed.replace(false) {
+                p.hot.set(false);
                 invalidate_close(app, hwnd);
-                if over {
-                    // Closed from the window's own queue: this window
-                    // goes, which it must not do inside its own message.
-                    PostMessageW(app.hwnd, crate::window::WM_PANE_CLOSE, p.id.code(), 0);
-                }
+            } else {
+                // The content's own press, if it took the mouse.
+                content.handle(app, hwnd, m);
+            }
+            return 0;
+        }
+        WM_SETFOCUS => {
+            if let Some(target) = content.focus().filter(|&t| t != hwnd) {
+                win::set_focus(target);
                 return 0;
             }
-            WM_CAPTURECHANGED => {
-                if p.pressed.replace(false) {
-                    p.hot.set(false);
-                    invalidate_close(app, hwnd);
-                } else {
-                    // The content's own press, if it took the mouse.
-                    content.message(app, hwnd, msg, w, l);
-                }
-                return 0;
-            }
-            WM_SETFOCUS => {
-                if let Some(target) = content.focus().filter(|&t| t != hwnd) {
-                    SetFocus(target);
-                    return 0;
-                }
-            }
-            _ => {}
         }
-        if let Some(answer) = content.message(app, hwnd, msg, w, l) {
-            return answer;
+        _ => {}
+    }
+    if let Some(answer) = content.handle(app, hwnd, m) {
+        return answer;
+    }
+    match msg {
+        // The content's controls in its colours, unless it said
+        // otherwise.
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            // wParam is the DC the control is about to draw with, a handle
+            // GDI checks; the DC brush takes the colour set on it.
+            let dc = w as HDC;
+            let ink = content.colours(app);
+            gdi::set_text_color(dc, ink.fg);
+            gdi::set_bk_color(dc, ink.bg);
+            gdi::set_dc_brush_color(dc, ink.bg);
+            gdi::stock_object(DC_BRUSH) as LRESULT
         }
-        match msg {
-            // The content's controls in its colours, unless it said
-            // otherwise.
-            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-                let ink = content.colours(app);
-                SetTextColor(w as HDC, ink.fg);
-                SetBkColor(w as HDC, ink.bg);
-                SetDCBrushColor(w as HDC, ink.bg);
-                GetStockObject(DC_BRUSH) as LRESULT
-            }
-            _ => DefWindowProcW(hwnd, msg, w, l),
-        }
+        _ => m.def(),
     }
 }
 

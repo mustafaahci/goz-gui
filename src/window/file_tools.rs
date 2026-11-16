@@ -16,20 +16,15 @@
 use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::UI::Controls::{
-    LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_REDRAWITEMS, LVNI_FOCUSED,
-};
-use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Controls::LVNI_FOCUSED;
+use windows_sys::Win32::UI::Shell::FOLDERID_Desktop;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    HMENU, IDYES, MB_ICONQUESTION, MB_OK, MB_YESNO, MENUITEMINFOW, MFS_ENABLED, MFS_GRAYED,
-    MIIM_STATE, MIIM_STRING, PostMessageW, SetMenuItemInfoW, SetTimer,
+    HMENU, IDYES, MB_ICONQUESTION, MB_OK, MB_YESNO, MFS_ENABLED, MFS_GRAYED,
 };
 
+use super::App;
 use super::results::{Act, Then};
 use super::slots::F5_TIMER;
-use super::{App, send};
 use crate::datatools::cmd::{ADVANCED_COPY_TO, ADVANCED_MOVE_TO};
 use crate::dialog::Quiet;
 use crate::fileops::{Job, Outcome, parent};
@@ -43,7 +38,8 @@ use crate::history::filetime_now;
 use crate::menu::{self, Item as MenuItem};
 use crate::msgbox;
 use crate::store::location;
-use crate::wide::wz;
+use crate::win::menu::By;
+use crate::win::{self, lv, sys};
 
 /// The name a new folder gets, numbered by Windows when taken (Everything's
 /// "New folder", "New folder (2)").
@@ -99,21 +95,13 @@ impl Tools {
 
 /// Sets the text of `menu`'s item `id`, and whether it can be chosen.
 fn set_item(menu: HMENU, id: u16, text: &str, enabled: bool) {
-    let mut text = wz(text);
-    // SAFETY: the rest of MENUITEMINFOW is plain data.
-    let mut mii: MENUITEMINFOW = unsafe { core::mem::zeroed() };
-    mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
-    mii.fMask = MIIM_STRING | MIIM_STATE;
-    mii.fState = if enabled { MFS_ENABLED } else { MFS_GRAYED };
-    mii.dwTypeData = text.as_mut_ptr();
-    // SAFETY: an item of a menu of this thread, by command; Windows copies
-    // the text.
-    unsafe { SetMenuItemInfoW(menu, u32::from(id), 0, &mii) };
+    let state = if enabled { MFS_ENABLED } else { MFS_GRAYED };
+    // By command; Windows copies the text.
+    win::menu::set_item(menu, By::Command(u32::from(id)), Some(text), Some(state));
 }
 
 fn beep() {
-    // SAFETY: plays a system sound.
-    unsafe { MessageBeep(MB_OK) };
+    sys::beep(MB_OK);
 }
 
 fn text(path: &[u16]) -> String {
@@ -142,18 +130,7 @@ fn desktop() -> Option<Vec<u16>> {
     if let Some(dir) = location::desktop_dir() {
         return Some(dir.as_os_str().to_string_lossy().encode_utf16().collect());
     }
-    let mut p: *mut u16 = core::ptr::null_mut();
-    // SAFETY: the shell allocates a NUL-terminated path into `p`, read up to
-    // its NUL and then freed with the allocator the shell used.
-    unsafe {
-        let hr = SHGetKnownFolderPath(&FOLDERID_Desktop, 0, core::ptr::null_mut(), &mut p);
-        let path = (hr >= 0 && !p.is_null()).then(|| {
-            let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-            core::slice::from_raw_parts(p, len).to_vec()
-        });
-        CoTaskMemFree(p.cast());
-        path
-    }
+    win::shell::known_folder(&FOLDERID_Desktop)
 }
 
 /// What the status bar says of the steps that did not go: how many of
@@ -651,13 +628,7 @@ impl App {
     /// the first selected one); `None` with neither held.
     fn new_folder_target(&self) -> Option<Vec<u16>> {
         let selected = self.selected(2);
-        let focused = usize::try_from(send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        ))
-        .ok();
+        let focused = usize::try_from(lv::next_item(self.list, -1, LVNI_FOCUSED)).ok();
         let m = self.model.borrow();
         if let [only] = selected[..]
             && let Some(row) = m.peek(only)
@@ -681,11 +652,10 @@ impl App {
     fn await_new_folder(&self, path: Vec<u16>) {
         *self.file_tools.new_folder.borrow_mut() = Some(NewFolder {
             path,
-            search: crate::wide::window_text(self.edit),
+            search: crate::win::text(self.edit),
             left: NEW_FOLDER_TRIES,
         });
-        // SAFETY: a timer of this window.
-        unsafe { SetTimer(self.hwnd, TIMER_NEW_FOLDER, NEW_FOLDER_EVERY_MS, None) };
+        win::set_timer(self.hwnd, TIMER_NEW_FOLDER, NEW_FOLDER_EVERY_MS);
     }
 
     /// The new folder's row is looked for (searching again now and then:
@@ -697,7 +667,7 @@ impl App {
         let Some(mut nf) = self.file_tools.new_folder.borrow_mut().take() else {
             return;
         };
-        if crate::wide::window_text(self.edit) != nf.search {
+        if crate::win::text(self.edit) != nf.search {
             return;
         }
         if self.model.borrow().find(&nf.path).is_some() {
@@ -711,8 +681,7 @@ impl App {
                 self.start_search(true);
             }
             *self.file_tools.new_folder.borrow_mut() = Some(nf);
-            // SAFETY: a timer of this window.
-            unsafe { SetTimer(self.hwnd, TIMER_NEW_FOLDER, NEW_FOLDER_EVERY_MS, None) };
+            win::set_timer(self.hwnd, TIMER_NEW_FOLDER, NEW_FOLDER_EVERY_MS);
             return;
         }
         let folder = parent(&nf.path).map(text).unwrap_or_default();
@@ -797,9 +766,8 @@ impl App {
     fn undo_changed(&self) {
         let dlg = self.file_tools.history.get();
         if !dlg.is_null() {
-            // SAFETY: posts to this thread's dialog, which ignores it once
-            // gone.
-            unsafe { PostMessageW(dlg, undo_dialog::WM_REFRESH, 0, 0) };
+            // The dialog ignores it once gone.
+            win::post_app(dlg, undo_dialog::WM_REFRESH, 0, 0);
         }
     }
 
@@ -957,7 +925,7 @@ impl App {
             }
         }
         if first <= last {
-            send(self.list, LVM_REDRAWITEMS, first, last as isize);
+            lv::redraw_items(self.list, first as i32, last as i32);
         }
     }
 
@@ -1018,7 +986,7 @@ impl App {
     /// F2 (File > Rename): with several rows selected, Advanced Rename, as
     /// in Everything.
     pub(super) fn rename_many(&self) -> bool {
-        if send(self.list, LVM_GETSELECTEDCOUNT, 0, 0) < 2 {
+        if lv::selected_count(self.list) < 2 {
             return false;
         }
         self.advanced_rename();

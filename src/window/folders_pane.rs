@@ -49,33 +49,23 @@ use std::sync::Arc;
 
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CreatePen, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    DeleteObject, DrawTextW, GetDC, HDC, InvalidateRect, LineTo, MoveToEx, PS_SOLID, ReleaseDC,
-    ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, PS_SOLID, TRANSPARENT,
 };
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
-    HTREEITEM, NM_CUSTOMDRAW, NMHDR, NMTREEVIEWW, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW,
-    TTM_NEWTOOLRECTW, TTM_SETMAXTIPWIDTH, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX,
-    TTTOOLINFOW, TVC_BYMOUSE, TVE_EXPAND, TVM_DELETEITEM, TVM_SETEXTENDEDSTYLE, TVN_ITEMEXPANDINGW,
-    TVN_SELCHANGEDW, TVS_EX_AUTOHSCROLL, TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS,
-    TVS_LINESATROOT, TVS_NOHSCROLL, TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT,
-    WC_TREEVIEWW,
+    NM_CUSTOMDRAW, NMTREEVIEWW, NMTVCUSTOMDRAW, TTF_SUBCLASS, TTS_ALWAYSTIP, TTS_NOPREFIX,
+    TTTOOLINFOW, TVC_BYMOUSE, TVE_EXPAND, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW, TVS_EX_AUTOHSCROLL,
+    TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_LINESATROOT, TVS_NOHSCROLL,
+    TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT,
 };
-use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_F5, VK_RETURN, VK_SHIFT, VK_UP,
 };
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, DeleteMenu, DestroyMenu, DestroyWindow, GetMenuDefaultItem,
-    HMENU, HWND_MESSAGE, KillTimer, MB_ICONWARNING, MF_BYCOMMAND, MSG, MoveWindow, PostMessageW,
-    SM_CXSMICON, SW_HIDE, SendMessageW, SetParent, SetTimer, ShowWindow, WM_APP, WM_CONTEXTMENU,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NOTIFY, WM_SETFOCUS, WM_SYSKEYDOWN, WM_TIMER,
-    WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    CW_USEDEFAULT, HMENU, HWND_MESSAGE, MB_ICONWARNING, MSG, SM_CXSMICON, SW_HIDE, WM_APP,
+    WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NOTIFY, WM_SETFOCUS,
+    WM_SYSKEYDOWN, WM_TIMER, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 use super::sidebars::{FOLDER_COPY_PATH, FOLDER_EXPAND, FOLDER_OPEN, FOLDER_OPEN_PATH};
@@ -89,10 +79,14 @@ use crate::paint::fill;
 use crate::shell;
 use crate::store::location;
 use crate::theme;
-use crate::treeview::{self, Images, NONE, New, Source};
-use crate::wide::wz;
+use crate::treeview::{self, Images, New, Source, TreeItem};
+use crate::win::class::{self, Create};
+use crate::win::gdi::{self, Selected, WindowDc};
+use crate::win::tip::Text;
+use crate::win::tv::After;
+use crate::win::{self, Msg, parcel, subclass, sys, tv};
 
-/// A thread's listing (`foldertree::Reply` in lParam).
+/// A thread's listing (a `foldertree::Reply`, as a parcel).
 const WM_FOUND: u32 = WM_APP + 1;
 /// The next few hundred subfolders of a big listing go in.
 const WM_MORE: u32 = WM_APP + 2;
@@ -171,7 +165,7 @@ struct Node {
     /// A folder's name; a drive's root (`C:\`); nothing for the top item.
     name: Vec<u16>,
     parent: Option<u32>,
-    item: HTREEITEM,
+    item: TreeItem,
     /// Its subfolders' nodes, in the tree's order.
     children: Vec<u32>,
     load: Load,
@@ -226,8 +220,9 @@ pub(super) struct FoldersPane {
     requests: Cell<u64>,
     /// The drives are in.
     roots_listed: Cell<bool>,
-    /// The tree's selection or opening is goz-gui's, not the user's.
-    syncing: Cell<bool>,
+    /// The tree's selection or opening is goz-gui's, not the user's (shared
+    /// with the tree's subclass).
+    syncing: Rc<Cell<bool>>,
     /// The folder to show chosen once the folders above it are listed.
     reveal: RefCell<Option<Vec<u16>>>,
     batches: RefCell<VecDeque<Batch>>,
@@ -253,18 +248,12 @@ impl FoldersPane {
             alive: foldertree::alive(),
             requests: Cell::new(0),
             roots_listed: Cell::new(false),
-            syncing: Cell::new(false),
+            syncing: Rc::new(Cell::new(false)),
             reveal: RefCell::new(None),
             batches: RefCell::new(VecDeque::new()),
             relist: RefCell::new(Vec::new()),
             batch: Cell::new(BATCH_FIRST),
         }
-    }
-
-    fn send(&self, msg: u32, w: usize, l: isize) -> isize {
-        // SAFETY: a message to this pane's tree; any pointer in `l` is the
-        // caller's and lives across the call.
-        unsafe { SendMessageW(self.tree.get(), msg, w, l) }
     }
 
     /// Runs `f` with the tree's notifications taken as goz-gui's own.
@@ -295,15 +284,12 @@ impl FoldersPane {
     fn subfolders_rect(app: &App, bar: &RECT) -> RECT {
         let label: Vec<u16> = "Subfolders".encode_utf16().collect();
         let font = app.part_font(crate::colors::Item::FoldersSidebar, false);
-        // SAFETY: the screen's DC, measured in with the font and given back
-        // with its old one.
-        let w = unsafe {
-            let dc = GetDC(core::ptr::null_mut());
-            let old = SelectObject(dc, font);
-            let w = crate::paint::width(dc, &label);
-            SelectObject(dc, old);
-            ReleaseDC(core::ptr::null_mut(), dc);
-            w
+        // The screen's DC, measured in with the font and given back with
+        // its old one (the guards drop in turn).
+        let w = {
+            let dc = WindowDc::get(core::ptr::null_mut());
+            let _font = Selected::of(dc.hdc(), font);
+            crate::paint::width(dc.hdc(), &label)
         };
         // The label starts past the box (`paint_bar`).
         let right = app.scale(96).max(app.scale(22) + w + app.scale(4));
@@ -356,8 +342,9 @@ impl FoldersPane {
     }
 
     /// The node of a tree item.
-    fn node_of(&self, item: HTREEITEM) -> Option<u32> {
-        let n = u32::try_from(treeview::param(self.tree.get(), item)?).ok()?;
+    fn node_of(&self, item: Option<TreeItem>) -> Option<u32> {
+        let item = item?;
+        let n = u32::try_from(treeview::param(item)?).ok()?;
         let nodes = self.nodes.borrow();
         nodes
             .get(n as usize)
@@ -365,12 +352,12 @@ impl FoldersPane {
             .map(|_| n)
     }
 
-    /// Puts a node in the tree under `parent` (`None`: the top level) after
-    /// `after` (`Some(NONE)`: first; `None`: last); its index.
+    /// Puts a node in the tree under `parent` (`None`: the top level),
+    /// placed as `after` says; its index.
     fn add(
         &self,
         parent: Option<u32>,
-        after: Option<HTREEITEM>,
+        after: After,
         name: Vec<u16>,
         text: &[u16],
         image: i32,
@@ -378,10 +365,7 @@ impl FoldersPane {
     ) -> Option<u32> {
         let (parent_item, at) = {
             let nodes = self.nodes.borrow();
-            (
-                parent.map_or(NONE, |p| nodes[p as usize].item),
-                nodes.len() as u32,
-            )
+            (parent.map(|p| nodes[p as usize].item), nodes.len() as u32)
         };
         let item = treeview::insert(
             self.tree.get(),
@@ -393,10 +377,7 @@ impl FoldersPane {
                 children,
                 param: at as isize,
             },
-        );
-        if item == NONE {
-            return None;
-        }
+        )?;
         let mut nodes = self.nodes.borrow_mut();
         // Inserting sends this pane nothing, so the index still holds.
         debug_assert_eq!(nodes.len() as u32, at);
@@ -457,7 +438,7 @@ impl FoldersPane {
             let image = self.image(root.icon);
             self.add(
                 None,
-                None,
+                After::Last,
                 root.path,
                 &root.label,
                 image,
@@ -518,7 +499,7 @@ impl FoldersPane {
                     nodes[node as usize].open_when_listed = false;
                 }
                 self.sync_more(node);
-                treeview::set_children(self.tree.get(), item, false);
+                treeview::set_children(item, false);
                 self.continue_reveal(app);
                 return;
             }
@@ -595,9 +576,14 @@ impl FoldersPane {
             for f in part {
                 let image = self.image(f.icon);
                 let children = f.has_folders != Some(false);
-                if let Some(id) =
-                    self.add(Some(node), None, f.name.clone(), &f.name, image, children)
-                {
+                if let Some(id) = self.add(
+                    Some(node),
+                    After::Last,
+                    f.name.clone(),
+                    &f.name,
+                    image,
+                    children,
+                ) {
                     added.push(id);
                 }
             }
@@ -622,11 +608,11 @@ impl FoldersPane {
             (done.then_some((n.item, n.children.is_empty())), open)
         };
         if let Some(item) = open {
-            self.quietly(|| treeview::expand(self.tree.get(), item, true));
+            self.quietly(|| treeview::expand(item, true));
         }
         if let Some((item, empty)) = done {
             if empty {
-                treeview::set_children(self.tree.get(), item, false);
+                treeview::set_children(item, false);
             }
             // After the last of them: how many more there are.
             self.sync_more(node);
@@ -647,7 +633,6 @@ impl FoldersPane {
             }
             (node.hidden, node.more)
         };
-        let tree = self.tree.get();
         match (hidden, more) {
             (0, None) => {}
             (0, Some(m)) => {
@@ -657,16 +642,24 @@ impl FoldersPane {
                     Self::forget(&mut nodes, m);
                     nodes[m as usize].item
                 };
-                self.quietly(|| treeview::delete(tree, item));
+                self.quietly(|| treeview::delete(item));
             }
             (h, Some(m)) => {
                 let item = self.nodes.borrow()[m as usize].item;
-                treeview::set_text(tree, item, &more_label(h));
+                treeview::set_text(item, &more_label(h));
             }
             (h, None) => {
                 let image = self.image(None);
-                let id = self
-                    .quietly(|| self.add(Some(n), None, Vec::new(), &more_label(h), image, false));
+                let id = self.quietly(|| {
+                    self.add(
+                        Some(n),
+                        After::Last,
+                        Vec::new(),
+                        &more_label(h),
+                        image,
+                        false,
+                    )
+                });
                 if let Some(id) = id {
                     let mut nodes = self.nodes.borrow_mut();
                     nodes[id as usize].is_more = true;
@@ -679,8 +672,7 @@ impl FoldersPane {
     /// More batches wait: the next one comes with a message of its own.
     fn after_more(&self, again: bool) {
         if again {
-            // SAFETY: posts to this pane's own window.
-            unsafe { PostMessageW(self.pane.get(), WM_MORE, 0, 0) };
+            win::post_app(self.pane.get(), WM_MORE, 0, 0);
         }
     }
 
@@ -710,7 +702,6 @@ impl FoldersPane {
         let old: Vec<&[u16]> = old_names.iter().map(Vec::as_slice).collect();
         let new: Vec<&[u16]> = found.iter().map(|f| f.name.as_slice()).collect();
         let (steps, gone) = foldertree::merge(&old, &new);
-        let tree = self.tree.get();
         self.quietly(|| {
             for &g in &gone {
                 let item = {
@@ -719,9 +710,9 @@ impl FoldersPane {
                     Self::forget(&mut nodes, old_ids[g]);
                     item
                 };
-                treeview::delete(tree, item);
+                treeview::delete(item);
             }
-            let mut prev = NONE;
+            let mut prev = After::First;
             let mut order = Vec::with_capacity(steps.len());
             // A step for each new folder, in their order.
             for (j, step) in steps.into_iter().enumerate() {
@@ -736,28 +727,23 @@ impl FoldersPane {
                         };
                         if name != f.name {
                             // Renamed in case only.
-                            treeview::set_text(tree, item, &f.name);
+                            treeview::set_text(item, &f.name);
                             self.nodes.borrow_mut()[id as usize].name = f.name.clone();
                         }
                         if load == Load::Unlisted {
-                            treeview::set_children(tree, item, f.has_folders != Some(false));
+                            treeview::set_children(item, f.has_folders != Some(false));
                         }
-                        prev = item;
+                        prev = After::Item(item);
                         order.push(id);
                     }
                     Step::Insert(new) => {
                         let f = &found[new];
                         let image = self.image(f.icon);
                         let children = f.has_folders != Some(false);
-                        if let Some(id) = self.add(
-                            Some(n),
-                            Some(prev),
-                            f.name.clone(),
-                            &f.name,
-                            image,
-                            children,
-                        ) {
-                            prev = self.nodes.borrow()[id as usize].item;
+                        if let Some(id) =
+                            self.add(Some(n), prev, f.name.clone(), &f.name, image, children)
+                        {
+                            prev = After::Item(self.nodes.borrow()[id as usize].item);
                             order.push(id);
                         }
                     }
@@ -770,7 +756,7 @@ impl FoldersPane {
                 empty.then_some(nodes[n as usize].item)
             };
             if let Some(item) = item {
-                treeview::set_children(tree, item, false);
+                treeview::set_children(item, false);
             }
         });
     }
@@ -783,7 +769,7 @@ impl FoldersPane {
         match app.folder_selection() {
             None => {
                 *self.reveal.borrow_mut() = None;
-                let top = self.nodes.borrow().first().map_or(NONE, |n| n.item);
+                let top = self.nodes.borrow().first().map(|n| n.item);
                 if treeview::selected(self.tree.get()) != top {
                     self.quietly(|| treeview::select(self.tree.get(), top));
                 }
@@ -804,7 +790,7 @@ impl FoldersPane {
         let tree = self.tree.get();
         let give_up = || {
             *self.reveal.borrow_mut() = None;
-            self.quietly(|| treeview::select(tree, NONE));
+            self.quietly(|| treeview::select(tree, None));
         };
         // `X:\` and the names after it.
         if target.len() < 3 || target[1] != utf16(b':') || target[2] != utf16(b'\\') {
@@ -843,8 +829,8 @@ impl FoldersPane {
             match load {
                 Load::Listed => match child {
                     Some(c) => {
-                        if !treeview::is_expanded(tree, item) {
-                            self.quietly(|| treeview::expand(tree, item, true));
+                        if !treeview::is_expanded(item) {
+                            self.quietly(|| treeview::expand(item, true));
                         }
                         at = c;
                     }
@@ -887,8 +873,8 @@ impl FoldersPane {
         };
         let selected = treeview::selected(tree);
         // Chosen through its "more folders" item, which stays chosen.
-        if selected != item && Some(selected) != more {
-            self.quietly(|| treeview::select(tree, item));
+        if selected != Some(item) && (more.is_none() || selected != more) {
+            self.quietly(|| treeview::select(tree, Some(item)));
         }
     }
 
@@ -902,25 +888,32 @@ impl FoldersPane {
     }
 
     /// A tree notification.
-    fn notify(&self, app: &App, l: LPARAM) -> Option<LRESULT> {
-        // SAFETY: the tree's notifications carry an NMHDR, and these codes an
-        // NMTREEVIEWW.
-        let hdr = unsafe { &*(l as *const NMHDR) };
-        if hdr.hwndFrom != self.tree.get() {
+    fn notify(&self, app: &App, m: &Msg) -> Option<LRESULT> {
+        let n = m.notify()?;
+        if n.from() != self.tree.get() {
             return None;
         }
-        match hdr.code {
+        match n.code() {
             // Options > Fonts and Colors' Folders Sidebar states.
-            NM_CUSTOMDRAW => Some(treeview::custom_draw(
-                hdr.hwndFrom,
-                l,
-                &app.pal.get(),
-                crate::colors::Item::FoldersSidebar,
-                app.part_font(crate::colors::Item::FoldersSidebar, true),
-            )),
+            NM_CUSTOMDRAW => {
+                let pal = app.pal.get();
+                let bold = app.part_font(crate::colors::Item::FoldersSidebar, true);
+                let mut cd = n.get::<NMTVCUSTOMDRAW>()?;
+                Some(treeview::custom_draw(
+                    n.from(),
+                    &mut cd,
+                    &pal,
+                    crate::colors::Item::FoldersSidebar,
+                    bold,
+                ))
+            }
             TVN_ITEMEXPANDINGW => {
-                // SAFETY: as above.
-                let nm = unsafe { &*(l as *const NMTREEVIEWW) };
+                // Copied out: nothing of the message is held while the
+                // tree is sent more.
+                let Some(nm) = n.get::<NMTREEVIEWW>().map(|v| *v) else {
+                    return Some(0);
+                };
+                // The item's param, the node, as the tree notified it.
                 if nm.action == TVE_EXPAND
                     && let Ok(n) = u32::try_from(nm.itemNew.lParam)
                 {
@@ -942,19 +935,19 @@ impl FoldersPane {
                 if self.syncing.get() {
                     return Some(0);
                 }
-                // SAFETY: as above.
-                let nm = unsafe { &*(l as *const NMTREEVIEWW) };
+                let Some(nm) = n.get::<NMTREEVIEWW>().map(|v| *v) else {
+                    return Some(0);
+                };
                 // The user went elsewhere: a folder being shown is not
                 // wanted any more.
                 *self.reveal.borrow_mut() = None;
                 let pane = self.pane.get();
                 if nm.action == TVC_BYMOUSE {
-                    // SAFETY: a timer of this pane's window.
-                    unsafe { KillTimer(pane, TIMER_CHOOSE) };
+                    win::kill_timer(pane, TIMER_CHOOSE);
                     self.choose_selected(app);
                 } else {
-                    // SAFETY: as above; setting it again restarts it.
-                    unsafe { SetTimer(pane, TIMER_CHOOSE, CHOOSE_MS, None) };
+                    // Setting it again restarts it.
+                    win::set_timer(pane, TIMER_CHOOSE, CHOOSE_MS);
                 }
                 Some(0)
             }
@@ -966,9 +959,8 @@ impl FoldersPane {
     /// them.
     fn relist_soon(&self, nodes: &[u32]) {
         self.relist.borrow_mut().extend_from_slice(nodes);
-        // SAFETY: a timer of this pane's window; setting it again restarts
-        // it.
-        unsafe { SetTimer(self.pane.get(), TIMER_RELIST, RELIST_MS, None) };
+        // A timer of this pane's window; setting it again restarts it.
+        win::set_timer(self.pane.get(), TIMER_RELIST, RELIST_MS);
     }
 
     /// The context menu of the folder at `l` (screen), or of the chosen one
@@ -977,22 +969,21 @@ impl FoldersPane {
         let tree = self.tree.get();
         let (item, pt) = if l == -1 {
             let item = treeview::selected(tree);
-            let rc = treeview::item_rect(tree, item, true);
-            let mut pt = POINT {
-                x: rc.left,
-                y: rc.bottom,
-            };
-            // SAFETY: converts a point of this pane's tree.
-            unsafe { ClientToScreen(tree, &mut pt) };
+            let rc = item.map_or_else(RECT::default, |i| treeview::item_rect(i, true));
+            let pt = win::client_to_screen(
+                tree,
+                POINT {
+                    x: rc.left,
+                    y: rc.bottom,
+                },
+            );
             (item, pt)
         } else {
             let pt = point(l);
-            let mut at = pt;
-            // SAFETY: converts a screen point to this pane's tree's.
-            unsafe { ScreenToClient(tree, &mut at) };
+            let at = win::screen_to_client(tree, pt);
             (treeview::hit(tree, at).0, pt)
         };
-        let Some(n) = self.node_of(item) else {
+        let (Some(n), Some(item)) = (self.node_of(item), item) else {
             return;
         };
         if self.nodes.borrow()[n as usize].is_more {
@@ -1003,9 +994,9 @@ impl FoldersPane {
             return;
         };
         // Expand while it shows a button (or holds folders).
-        let can_expand = treeview::has_children(tree, item)
-            || !self.nodes.borrow()[n as usize].children.is_empty();
-        let expanded = treeview::is_expanded(tree, item);
+        let can_expand =
+            treeview::has_children(item) || !self.nodes.borrow()[n as usize].children.is_empty();
+        let expanded = treeview::is_expanded(item);
         let mut items = Vec::new();
         if can_expand {
             items.push(Item::Cmd(
@@ -1035,13 +1026,13 @@ impl FoldersPane {
             },
         );
         super::context::tidy_separators(popup);
-        let marked = item != treeview::selected(tree);
+        let marked = Some(item) != treeview::selected(tree);
         if marked {
-            treeview::drop_highlight(tree, item);
+            treeview::drop_highlight(tree, Some(item));
         }
         let id = app.track_with_shell(popup, pt, "folder menu", shell.as_ref());
         if marked {
-            treeview::drop_highlight(tree, NONE);
+            treeview::drop_highlight(tree, None);
         }
         match (id, &shell) {
             (0, _) => {}
@@ -1050,23 +1041,22 @@ impl FoldersPane {
             }
             (id, _) => self.command(app, id as u16, n, item, path),
         }
-        // SAFETY: the menu made here; the shell's handlers are done with it
-        // once its command ran.
-        unsafe { DestroyMenu(popup) };
+        // The menu made here; the shell's handlers are done with it once
+        // its command ran.
+        win::menu::destroy(popup);
     }
 
     /// One of the folder menu's own items, for node `n` (`item`) at `path`.
-    fn command(&self, app: &App, id: u16, n: u32, item: HTREEITEM, path: Vec<u16>) {
+    fn command(&self, app: &App, id: u16, n: u32, item: TreeItem, path: Vec<u16>) {
         match id {
             FOLDER_EXPAND => {
-                let tree = self.tree.get();
-                if treeview::is_expanded(tree, item) {
-                    treeview::expand(tree, item, false);
+                if treeview::is_expanded(item) {
+                    treeview::expand(item, false);
                 } else {
                     if self.nodes.borrow()[n as usize].load != Load::Listed {
                         self.open_when_listed(n);
                     }
-                    treeview::expand(tree, item, true);
+                    treeview::expand(item, true);
                 }
             }
             FOLDER_OPEN => actions::open(app.hwnd, vec![Target { path, is_dir: true }]),
@@ -1103,8 +1093,7 @@ impl FoldersPane {
                     next: None,
                 };
                 if !app.fileops.run(job) {
-                    // SAFETY: plays a system sound.
-                    unsafe { MessageBeep(MB_ICONWARNING) };
+                    sys::beep(MB_ICONWARNING);
                 }
             }
             _ => {
@@ -1129,16 +1118,12 @@ impl FoldersPane {
         let tip = self.tip.get();
         let rc = crate::pane::content_rect(app, pane);
         let bar = Self::bar(app, &rc);
-        // SAFETY: updates this pane's tooltip (which copies the text) and
-        // repaints its bar.
-        unsafe {
-            if !tip.is_null() {
-                let mut text = wz(subfolders_tip());
-                let info = self.tool(Self::subfolders_rect(app, &bar), &mut text);
-                SendMessageW(tip, TTM_UPDATETIPTEXTW, 0, (&raw const info) as isize);
-            }
-            InvalidateRect(pane, &bar, 0);
+        // The tooltip copies the text.
+        if !tip.is_null() {
+            let info = self.tool(Self::subfolders_rect(app, &bar));
+            win::tip::update_text(tip, &info, Text::Str(subfolders_tip()));
         }
+        win::invalidate(pane, Some(&bar), false);
     }
 
     /// Paints the Subfolders bar: Everything's box and its label; ticked
@@ -1179,63 +1164,55 @@ impl FoldersPane {
         edge(left + side - px, top, left + side, top + side);
         // The tick: down to the bottom third, then up to the right.
         let s = |v: i32| app.scale(v);
-        // SAFETY: a pen made and deleted here, selected out again before.
+        // A pen made and deleted here, selected out again before (the
+        // guards drop in turn).
         if ticked {
-            unsafe {
-                let pen = CreatePen(PS_SOLID, s(2).max(1), colour);
-                let old = SelectObject(hdc, pen);
-                MoveToEx(hdc, left + s(3), top + s(6), core::ptr::null_mut());
-                LineTo(hdc, left + s(5), top + s(9));
-                LineTo(hdc, left + s(10), top + s(3));
-                SelectObject(hdc, old);
-                DeleteObject(pen);
-            }
+            let pen = gdi::create_pen(PS_SOLID, s(2).max(1), colour);
+            let _pen_in = pen.as_ref().map(|p| Selected::new(hdc, p));
+            gdi::move_to(hdc, left + s(3), top + s(6));
+            gdi::line_to(hdc, left + s(5), top + s(9));
+            gdi::line_to(hdc, left + s(10), top + s(3));
         }
-        let mut text: Vec<u16> = "Subfolders".encode_utf16().collect();
+        let text: Vec<u16> = "Subfolders".encode_utf16().collect();
         let mut rc = RECT {
             left: left + side + app.scale(5),
             right: bar.right - app.scale(2),
             top: bar.top + 1,
             bottom: bar.bottom,
         };
-        // SAFETY: draws into the paint buffer; the old font is put back.
-        unsafe {
-            let old = SelectObject(
-                hdc,
-                app.part_font(crate::colors::Item::FoldersSidebar, false),
-            );
-            SetBkMode(hdc, TRANSPARENT as i32);
-            SetTextColor(hdc, colour);
-            DrawTextW(
-                hdc,
-                text.as_mut_ptr(),
-                text.len() as i32,
-                &mut rc,
-                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-            );
-            SelectObject(hdc, old);
-        }
+        // Drawn into the paint buffer; the old font goes back as this
+        // drops.
+        let _font = Selected::of(
+            hdc,
+            app.part_font(crate::colors::Item::FoldersSidebar, false),
+        );
+        gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+        gdi::set_text_color(hdc, colour);
+        gdi::draw_text(
+            hdc,
+            &text,
+            &mut rc,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
     }
 
-    /// The tooltip's tool over the Subfolders box.
-    fn tool(&self, rect: RECT, text: &mut [u16]) -> TTTOOLINFOW {
+    /// The tooltip's tool over the Subfolders box (its text goes with it
+    /// as the tooltip is sent it).
+    fn tool(&self, rect: RECT) -> TTTOOLINFOW {
         TTTOOLINFOW {
             cbSize: size_of::<TTTOOLINFOW>() as u32,
             uFlags: TTF_SUBCLASS,
             hwnd: self.pane.get(),
             uId: 1,
             rect,
-            lpszText: text.as_mut_ptr(),
-            // SAFETY: the rest of TTTOOLINFOW is plain data.
-            ..unsafe { core::mem::zeroed() }
+            ..Default::default()
         }
     }
 
     /// The tree's font, row height and icons for the window's DPI.
     fn fit_dpi(&self, app: &App) {
         let dpi = app.dpi.get();
-        // SAFETY: reads a metric.
-        let icon = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) };
+        let icon = sys::metric_for_dpi(SM_CXSMICON, dpi);
         let resized = {
             let images = self.images.borrow();
             match images.as_ref() {
@@ -1258,14 +1235,14 @@ impl FoldersPane {
         }
         let fh = app.part_height(crate::colors::Item::FoldersSidebar);
         let font = app.part_font(crate::colors::Item::FoldersSidebar, false);
-        treeview::set_font(tree, font as isize, fh, icon, |v| app.scale(v));
+        treeview::set_font(tree, font, fh, icon, |v| app.scale(v));
     }
 }
 
 /// A closed pane's tree still to empty, and its items still in it.
 struct Parked {
     tree: HWND,
-    items: Vec<HTREEITEM>,
+    items: Vec<TreeItem>,
 }
 
 thread_local! {
@@ -1278,25 +1255,34 @@ thread_local! {
 /// for tens of thousands). As the window ends (`ending`) it stays so until
 /// the process ends, which frees it at once; otherwise it is emptied a
 /// slice at a time from a timer of its own ([`empty_parked`]).
-fn park(tree: HWND, items: Vec<HTREEITEM>, ending: bool) {
-    // SAFETY: hides this thread's tree and makes it a message-only window
-    // of this thread, no longer a child of the pane.
-    unsafe {
-        ShowWindow(tree, SW_HIDE);
-        SetParent(tree, HWND_MESSAGE);
-    }
+fn park(tree: HWND, items: Vec<TreeItem>, ending: bool) {
+    // Hides this thread's tree and makes it a message-only window of this
+    // thread, no longer a child of the pane.
+    win::show(tree, SW_HIDE);
+    win::set_parent(tree, HWND_MESSAGE);
     if ending {
         return;
     }
     PARKED.with_borrow_mut(|p| p.push(Parked { tree, items }));
-    // SAFETY: a timer of this thread's tree, which calls `empty_parked`.
-    unsafe { SetTimer(tree, PARK_TIMER, PARK_MS, Some(empty_parked)) };
+    // A timer of this thread's tree, whose WM_TIMER its subclass takes to
+    // `empty_parked`.
+    subclass::set(tree, &PARKED_TREE, |m| {
+        if m.id == WM_TIMER && m.w == PARK_TIMER {
+            empty_parked(m.hwnd, m.w);
+            return 0;
+        }
+        m.def()
+    });
+    win::set_timer(tree, PARK_TIMER, PARK_MS);
 }
+
+/// The subclass of a parked tree, which takes its timer.
+static PARKED_TREE: subclass::Key = subclass::Key::new("a closed Folders pane's tree, emptying");
 
 /// A parked tree's timer: its items go, the last made first (so each is
 /// one with nothing under it), for at most [`PARK_SLICE`]; once there are
 /// none, the tree is destroyed.
-unsafe extern "system" fn empty_parked(tree: HWND, _msg: u32, id: usize, _time: u32) {
+fn empty_parked(tree: HWND, id: usize) {
     let started = Instant::now();
     loop {
         let next = PARKED.with_borrow_mut(|parked| {
@@ -1307,18 +1293,16 @@ unsafe extern "system" fn empty_parked(tree: HWND, _msg: u32, id: usize, _time: 
             }
             Some(item)
         });
-        // SAFETY: this thread's parked tree, its timer, and one of its
-        // items (none goes but here, nothing is borrowed meanwhile).
-        unsafe {
-            match next {
-                Some(Some(item)) => {
-                    SendMessageW(tree, TVM_DELETEITEM, 0, item);
-                }
-                Some(None) | None => {
-                    KillTimer(tree, id);
-                    DestroyWindow(tree);
-                    return;
-                }
+        // This thread's parked tree, its timer, and one of its items (none
+        // goes but here, nothing is borrowed meanwhile).
+        match next {
+            Some(Some(item)) => {
+                tv::delete_item(item);
+            }
+            Some(None) | None => {
+                win::kill_timer(tree, id);
+                win::destroy(tree);
+                return;
             }
         }
         if started.elapsed() >= PARK_SLICE {
@@ -1327,37 +1311,26 @@ unsafe extern "system" fn empty_parked(tree: HWND, _msg: u32, id: usize, _time: 
     }
 }
 
-/// The tree's subclass id.
-const TREE_SUBCLASS: usize = 1;
+/// The tree's subclass.
+static TREE: subclass::Key = subclass::Key::new("the Folders pane's tree");
 
-/// The tree's subclass. A tree view taking the keyboard with nothing chosen
-/// chooses its first item itself; with a folder the tree cannot show (in a
-/// hidden folder) that would let the folder go, so it is taken as goz-gui's
-/// own change and undone.
-unsafe extern "system" fn tree_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    data: usize,
-) -> LRESULT {
-    // SAFETY: `data` is the pane, which outlives its tree's subclass (taken
-    // off in `destroy`); the rest goes on as it came.
-    unsafe {
-        if msg != WM_SETFOCUS {
-            return DefSubclassProc(hwnd, msg, w, l);
-        }
-        let pane = &*(data as *const FoldersPane);
-        let none = treeview::selected(hwnd) == NONE;
-        let was = pane.syncing.replace(true);
-        let r = DefSubclassProc(hwnd, msg, w, l);
-        if none && treeview::selected(hwnd) != NONE {
-            treeview::select(hwnd, NONE);
-        }
-        pane.syncing.set(was);
-        r
+/// The tree's subclass, `syncing` the pane's flag. A tree view taking the
+/// keyboard with nothing chosen chooses its first item itself; with a
+/// folder the tree cannot show (in a hidden folder) that would let the
+/// folder go, so it is taken as goz-gui's own change and undone.
+fn tree_proc(syncing: &Cell<bool>, m: &Msg) -> LRESULT {
+    if m.id != WM_SETFOCUS {
+        return m.def();
     }
+    let hwnd = m.hwnd;
+    let none = treeview::selected(hwnd).is_none();
+    let was = syncing.replace(true);
+    let r = m.def();
+    if none && treeview::selected(hwnd).is_some() {
+        treeview::select(hwnd, None);
+    }
+    syncing.set(was);
+    r
 }
 
 /// Fills the empty `popup` with Explorer's menu for the folder at `path`
@@ -1384,12 +1357,10 @@ fn shell_part(
     ) {
         return None;
     }
-    // SAFETY: reads and deletes an item of a menu of this thread.
-    unsafe {
-        let default = GetMenuDefaultItem(popup, 0, 0);
-        if cm.owns(default, u32::from(menu::SHELL_LAST)) {
-            DeleteMenu(popup, default, MF_BYCOMMAND);
-        }
+    if let Some(default) = win::menu::default_item(popup, false, 0)
+        && cm.owns(default, u32::from(menu::SHELL_LAST))
+    {
+        win::menu::delete(popup, win::menu::By::Command(default));
     }
     Some(Rc::new(cm))
 }
@@ -1414,66 +1385,43 @@ impl crate::pane::PaneContent for FoldersPane {
             | TVS_FULLROWSELECT
             | TVS_NOHSCROLL
             | TVS_NONEVENHEIGHT;
-        // SAFETY: a child of this thread's pane window, and a tooltip popup
-        // (owned by the main window, as a child cannot own one) that
-        // `destroy` destroys.
-        let (tree, tip) = unsafe {
-            let hinst = GetModuleHandleW(core::ptr::null());
-            let tree = CreateWindowExW(
-                0,
-                WC_TREEVIEWW,
-                core::ptr::null(),
-                style,
-                0,
-                0,
-                0,
-                0,
-                pane,
-                TREE_ID as HMENU,
-                hinst,
-                core::ptr::null(),
-            );
-            let tip = CreateWindowExW(
-                WS_EX_TOPMOST,
-                TOOLTIPS_CLASSW,
-                core::ptr::null(),
-                WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                pane,
-                core::ptr::null_mut(),
-                hinst,
-                core::ptr::null(),
-            );
-            (tree, tip)
-        };
+        // A child of this thread's pane window, and a tooltip popup (owned
+        // by the main window, as a child cannot own one) that `destroy`
+        // destroys.
+        let tree = class::create_plain(&Create {
+            ex_style: 0,
+            class: tv::CLASS,
+            title: "",
+            style,
+            rect: (0, 0, 0, 0),
+            parent: pane,
+            menu: class::id_menu(TREE_ID),
+        });
+        let tip = class::create_plain(&Create {
+            ex_style: WS_EX_TOPMOST,
+            class: win::tip::CLASS,
+            title: "",
+            style: WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            rect: (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
+            parent: pane,
+            menu: core::ptr::null_mut(),
+        });
         self.tree.set(tree);
         self.tip.set(tip);
-        // SAFETY: the pane outlives the subclass (`destroy` takes it off
-        // before the tree goes).
-        unsafe {
-            SetWindowSubclass(
-                tree,
-                Some(tree_proc),
-                TREE_SUBCLASS,
-                self as *const FoldersPane as usize,
-            );
-        }
+        // The subclass shares the pane's flag; `destroy` takes it off
+        // before the tree goes.
+        let syncing = Rc::clone(&self.syncing);
+        subclass::set(tree, &TREE, move |m| tree_proc(&syncing, m));
         let ex = TVS_EX_DOUBLEBUFFER | TVS_EX_AUTOHSCROLL;
-        self.send(TVM_SETEXTENDEDSTYLE, ex as usize, ex as isize);
+        tv::set_extended_style(tree, ex, ex);
         self.plain_folder.set(treeview::plain_icons().0);
         self.fit_dpi(app);
         treeview::apply_theme(tree, &app.pal.get(), crate::colors::Item::FoldersSidebar);
         if !tip.is_null() {
-            let mut text = wz(subfolders_tip());
-            let info = self.tool(RECT::default(), &mut text);
-            // SAFETY: the tooltip copies the tool and its text.
-            unsafe {
-                SendMessageW(tip, TTM_ADDTOOLW, 0, (&raw const info) as isize);
-                SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, app.scale(360) as isize);
-            }
+            // The tooltip copies the tool and its text.
+            let info = self.tool(RECT::default());
+            win::tip::add_tool(tip, &info, Text::Str(subfolders_tip()));
+            win::tip::set_max_width(tip, app.scale(360));
             theme_tip(tip, app.pal.get().dark);
         }
         // The top item: no folder, the whole index.
@@ -1483,8 +1431,9 @@ impl crate::pane::PaneContent for FoldersPane {
         };
         let goz: Vec<u16> = "goz".encode_utf16().collect();
         self.quietly(|| {
-            self.add(None, None, Vec::new(), &goz, top, false);
-            treeview::select(tree, self.nodes.borrow()[TOP as usize].item);
+            self.add(None, After::Last, Vec::new(), &goz, top, false);
+            let top = self.nodes.borrow().get(TOP as usize).map(|n| n.item);
+            treeview::select(tree, top);
         });
         let labels = app.sidebar_settings().labels;
         foldertree::spawn(
@@ -1494,39 +1443,32 @@ impl crate::pane::PaneContent for FoldersPane {
             Arc::clone(&self.alive),
         );
         // The window's side follows once the framework has the pane open.
-        // SAFETY: posts to this pane's own window.
-        unsafe { PostMessageW(pane, WM_OPENED, 0, 0) };
+        win::post_app(pane, WM_OPENED, 0, 0);
     }
 
     fn place(&self, app: &App, rc: RECT) {
         let bar = Self::bar(app, &rc);
-        // SAFETY: moves this pane's tree; updates its tooltip's tool.
-        unsafe {
-            MoveWindow(
-                self.tree.get(),
-                rc.left,
-                rc.top,
-                rc.right - rc.left,
-                (bar.top - rc.top).max(0),
-                1,
-            );
-            let tip = self.tip.get();
-            if !tip.is_null() {
-                let mut text = wz(subfolders_tip());
-                let info = self.tool(Self::subfolders_rect(app, &bar), &mut text);
-                SendMessageW(tip, TTM_NEWTOOLRECTW, 0, (&raw const info) as isize);
-            }
-            InvalidateRect(self.pane.get(), &bar, 0);
+        win::move_window(
+            self.tree.get(),
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            (bar.top - rc.top).max(0),
+            true,
+        );
+        // The tooltip's tool follows.
+        let tip = self.tip.get();
+        if !tip.is_null() {
+            let info = self.tool(Self::subfolders_rect(app, &bar));
+            win::tip::new_tool_rect(tip, &info);
         }
+        win::invalidate(self.pane.get(), Some(&bar), false);
     }
 
     fn destroy(&self, app: &App) {
         let pane = self.pane.get();
-        // SAFETY: this pane's own timers.
-        unsafe {
-            KillTimer(pane, TIMER_CHOOSE);
-            KillTimer(pane, TIMER_RELIST);
-        }
+        win::kill_timer(pane, TIMER_CHOOSE);
+        win::kill_timer(pane, TIMER_RELIST);
         // No thread posts a reply after this; those posted are freed.
         foldertree::close(&self.alive, pane, WM_FOUND);
         self.batches.borrow_mut().clear();
@@ -1534,22 +1476,21 @@ impl crate::pane::PaneContent for FoldersPane {
         // own one): it goes now, not with the pane.
         let tip = self.tip.replace(core::ptr::null_mut());
         if !tip.is_null() {
-            // SAFETY: destroys this pane's own tooltip window.
-            unsafe { DestroyWindow(tip) };
+            win::destroy(tip);
         }
         let tree = self.tree.get();
-        // SAFETY: takes off the subclass `create` put on this pane's tree.
-        unsafe { RemoveWindowSubclass(tree, Some(tree_proc), TREE_SUBCLASS) };
+        // Takes off the subclass `create` put on this pane's tree.
+        subclass::remove(tree, &TREE);
         // The tree lets go of the image list before it is destroyed.
         treeview::set_images(tree, None);
         self.images.borrow_mut().take();
         // Its items in the order they were made: a folder's subfolders
         // after it, so the last first can be taken out one at a time.
-        let items: Vec<HTREEITEM> = self
+        let items: Vec<TreeItem> = self
             .nodes
             .borrow()
             .iter()
-            .filter(|n| !n.gone && n.item != NONE)
+            .filter(|n| !n.gone)
             .map(|n| n.item)
             .collect();
         park(tree, items, app.window_ending());
@@ -1590,9 +1531,11 @@ impl crate::pane::PaneContent for FoldersPane {
         }
     }
 
-    fn message(&self, app: &App, _pane: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
-        match msg {
-            WM_NOTIFY => self.notify(app, l),
+    fn handle(&self, app: &App, _pane: HWND, m: &Msg) -> Option<LRESULT> {
+        let (w, l) = (m.w, m.l);
+        match m.id {
+            WM_NOTIFY => self.notify(app, m),
+            // wParam is the window clicked.
             WM_CONTEXTMENU if w as HWND == self.tree.get() => {
                 self.menu(app, l);
                 Some(0)
@@ -1611,16 +1554,15 @@ impl crate::pane::PaneContent for FoldersPane {
                 }
             }
             WM_FOUND => {
-                // SAFETY: a thread's reply, posted with `foldertree::spawn`;
-                // ours to free.
-                let reply = unsafe { Box::from_raw(l as *mut Reply) };
-                match *reply {
-                    Reply::Roots(roots) => self.roots(app, roots),
-                    Reply::Folders {
+                // A thread's reply, posted with `foldertree::spawn`.
+                match parcel::take::<Reply>(m) {
+                    Some(Reply::Roots(roots)) => self.roots(app, roots),
+                    Some(Reply::Folders {
                         node,
                         request,
                         found,
-                    } => self.folders(app, node, request, found),
+                    }) => self.folders(app, node, request, found),
+                    None => {}
                 }
                 Some(0)
             }
@@ -1634,8 +1576,7 @@ impl crate::pane::PaneContent for FoldersPane {
                 Some(0)
             }
             WM_TIMER => {
-                // SAFETY: this pane's own timer.
-                unsafe { KillTimer(self.pane.get(), w) };
+                win::kill_timer(self.pane.get(), w);
                 match w {
                     TIMER_CHOOSE => self.choose_selected(app),
                     TIMER_RELIST => {
@@ -1670,8 +1611,7 @@ impl crate::pane::PaneContent for FoldersPane {
             crate::colors::Item::FoldersSidebar,
         );
         theme_tip(self.tip.get(), dark);
-        // SAFETY: repaints this pane's tree.
-        unsafe { InvalidateRect(self.tree.get(), core::ptr::null(), 1) };
+        win::invalidate(self.tree.get(), None, true);
     }
 
     fn dpi(&self, app: &App, _dpi: u32) {

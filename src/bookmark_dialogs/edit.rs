@@ -14,41 +14,34 @@
 
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DrawTextW, EndPaint, GetSysColor, HDC, HFONT, InvalidateRect, PAINTSTRUCT,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    COLOR_GRAYTEXT, COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC,
+    TRANSPARENT,
 };
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::Controls::{
-    CBRO_DISABLED, CBRO_NORMAL, CBXSR_DISABLED, CBXSR_NORMAL, COMBOBOXINFO, CP_DROPDOWNBUTTONRIGHT,
-    CP_READONLY, CloseThemeData, DrawThemeBackground, EM_REPLACESEL, GetComboBoxInfo,
-    OpenThemeData,
+    CBRO_DISABLED, CBRO_NORMAL, CBXSR_DISABLED, CBXSR_NORMAL, CP_DROPDOWNBUTTONRIGHT, CP_READONLY,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_RETURN, VK_SHIFT,
-};
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_RETURN, VK_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, CB_GETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, EN_CHANGE, ES_AUTOHSCROLL,
-    ES_AUTOVSCROLL, ES_MULTILINE, EndDialog, GWLP_USERDATA, GetWindowRect, GetWindowTextLengthW,
-    IDCANCEL, IDOK, KillTimer, MINMAXINFO, SetTimer, SetWindowLongPtrW, USER_TIMER_MINIMUM,
-    WM_CHAR, WM_COMMAND, WM_DESTROY, WM_GETFONT, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN,
-    WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE,
-    WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
+    BS_DEFPUSHBUTTON, CBN_SELCHANGE, CBS_DROPDOWNLIST, EN_CHANGE, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
+    ES_MULTILINE, IDCANCEL, IDOK, USER_TIMER_MINIMUM, WM_CHAR, WM_COMMAND, WM_DESTROY,
+    WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN, WM_PAINT, WM_PRINTCLIENT, WM_SHOWWINDOW, WM_SIZE,
+    WM_TIMER, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
-use super::{enable, item, send, set_text};
+use super::enable;
 use crate::bookmarks::{Fields, SORT_KEYS, one_line, sort_name};
 use crate::dialog::{
     Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, anchor, center_on_owner, common,
-    fill_later, make_control, placed, state, theme_control, theme_new,
+    fill_later, make_control, placed, theme_control, theme_new,
 };
 use crate::filter::Filter;
 use crate::places::{self, Which};
 use crate::theme::Palette;
-use crate::wide::{window_text, wz};
+use crate::win::uxtheme::Theme;
+use crate::win::{self, Msg, combo, dlg, edit, gdi, subclass, sys};
 
 const STATIC: u16 = 0xffff;
 const ID_NAME: u16 = 100;
@@ -163,7 +156,7 @@ fn crlf(text: &str) -> String {
         .replace('\n', "\r\n")
 }
 
-/// The editor's state, in its GWLP_USERDATA while it is open.
+/// The editor's state, which its procedure is given while it is open.
 struct Edit {
     was: Fields,
     filters: Vec<String>,
@@ -281,7 +274,7 @@ pub fn edit(owner: HWND, title: &str, fields: &Fields, look: Look) -> Option<Fie
             OK_AT,
         )
         .control(Class::Button, "Cancel", CANCEL, WS_TABSTOP, 0, CANCEL_AT);
-    t.run(owner, Some(edit_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| edit_proc(&state, m));
     state.result.into_inner()
 }
 
@@ -296,19 +289,23 @@ fn combo_style(long: bool) -> u32 {
 fn fill_combo(dlg: HWND, id: u16, items: impl IntoIterator<Item = String>, select: usize) {
     // A themed list takes half a millisecond an item (six lists here): the
     // chosen item now, the rest once the editor shows (`fill_later`).
-    fill_later(item(dlg, id), items.into_iter().collect(), Some(select));
+    fill_later(
+        dlg::item(dlg, id),
+        items.into_iter().collect(),
+        Some(select),
+    );
 }
 
 fn selection(dlg: HWND, id: u16) -> usize {
-    usize::try_from(send(item(dlg, id), CB_GETCURSEL, 0, 0)).unwrap_or(0)
+    usize::try_from(combo::cur_sel(dlg::item(dlg, id))).unwrap_or(0)
 }
 
 impl Edit {
     fn init(&self, dlg: HWND) {
         let f = &self.was;
-        set_text(item(dlg, ID_NAME), &one_line(&f.name));
-        set_text(
-            item(dlg, ID_SEARCH),
+        win::set_text(dlg::item(dlg, ID_NAME), &one_line(&f.name));
+        win::set_text(
+            dlg::item(dlg, ID_SEARCH),
             &crlf(f.search.as_deref().unwrap_or_default()),
         );
         let custom = f.search.is_some();
@@ -324,14 +321,11 @@ impl Edit {
         fill_combo(dlg, ID_PATH, tri(), tri_index(f.match_path));
         enable(dlg, OK, !f.name.is_empty());
         // The last row's lists come once the editor shows (WM_SHOWWINDOW).
-        // SAFETY: subclasses this thread's search box; the subclass removes
-        // itself when the box goes.
-        unsafe { SetWindowSubclass(item(dlg, ID_SEARCH), Some(search_proc), 1, 0) };
+        // The search box's keys; the subclass goes with the box.
+        subclass::set(dlg::item(dlg, ID_SEARCH), &SEARCH_KEYS, search_proc);
         theme_new(dlg, self.look.get().dark);
         center_on_owner(dlg);
-        let mut wr = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetWindowRect(dlg, &mut wr) };
+        let wr = win::window_rect(dlg);
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
         places::restore(
             dlg,
@@ -375,83 +369,64 @@ impl Edit {
     /// already made (Match case's, dark or light), at its height, with its
     /// text and button where it has them.
     fn paint_last_row(&self, dlg: HWND, hdc: HDC) {
-        let model = item(dlg, ID_CASE);
+        let model = dlg::item(dlg, ID_CASE);
         let dark = self.look.get().dark;
-        // SAFETY: reads this thread's list (out-structs of the sizes the
-        // calls take), opens its visual style (closed below) and draws on
-        // the DC of this dialog's WM_PAINT with the dialog's font, which is
-        // put back.
-        unsafe {
-            let mut info = COMBOBOXINFO {
-                cbSize: size_of::<COMBOBOXINFO>() as u32,
-                ..core::mem::zeroed()
+        // The list's parts, and where it is (a list that is not there has
+        // no parts).
+        let Some(info) = win::combo::info(model) else {
+            return;
+        };
+        let at = win::window_rect(model);
+        let (width, height) = (at.right - at.left, at.bottom - at.top);
+        // Its visual style (closed when it drops), and the dialog's font on
+        // the DC of its WM_PAINT, put back when `_font` drops (before the
+        // style closes).
+        let theme = Theme::open_for_window(model, "Combobox");
+        let _font = gdi::Selected::of(hdc, win::font(dlg));
+        gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+        let anchors = |id: u16| ANCHORS.iter().find(|a| a.0 == id).map_or(0, |a| a.2);
+        for (id, units, text, enabled) in self.last_row_look() {
+            let r = placed(dlg, SIZE, units, anchors(id));
+            let rc = RECT {
+                bottom: r.top + height,
+                ..r
             };
-            let mut at = RECT::default();
-            if GetComboBoxInfo(model, &mut info) == 0 || GetWindowRect(model, &mut at) == 0 {
-                return;
-            }
-            let (width, height) = (at.right - at.left, at.bottom - at.top);
-            let class = wz("Combobox");
-            let theme = OpenThemeData(model, class.as_ptr());
-            let font = send(dlg, WM_GETFONT, 0, 0) as HFONT;
-            let old = SelectObject(hdc, font);
-            SetBkMode(hdc, TRANSPARENT as i32);
-            let anchors = |id: u16| ANCHORS.iter().find(|a| a.0 == id).map_or(0, |a| a.2);
-            for (id, units, text, enabled) in self.last_row_look() {
-                let r = placed(dlg, SIZE, units, anchors(id));
-                let rc = RECT {
-                    bottom: r.top + height,
-                    ..r
+            // Each part as far from the right edge as in the model.
+            let from_right = |x: i32| rc.right - (width - x);
+            if let Some(theme) = &theme {
+                let (face, arrow) = if enabled {
+                    (CBRO_NORMAL, CBXSR_NORMAL)
+                } else {
+                    (CBRO_DISABLED, CBXSR_DISABLED)
                 };
-                // Each part as far from the right edge as in the model.
-                let from_right = |x: i32| rc.right - (width - x);
-                if theme != 0 {
-                    let (face, arrow) = if enabled {
-                        (CBRO_NORMAL, CBXSR_NORMAL)
-                    } else {
-                        (CBRO_DISABLED, CBXSR_DISABLED)
-                    };
-                    DrawThemeBackground(theme, hdc, CP_READONLY, face, &rc, core::ptr::null());
-                    let button = RECT {
-                        left: from_right(info.rcButton.left),
-                        top: rc.top + info.rcButton.top,
-                        right: from_right(info.rcButton.right),
-                        bottom: rc.top + info.rcButton.bottom,
-                    };
-                    DrawThemeBackground(
-                        theme,
-                        hdc,
-                        CP_DROPDOWNBUTTONRIGHT,
-                        arrow,
-                        &button,
-                        core::ptr::null(),
-                    );
-                }
-                let ink = match (enabled, dark) {
-                    (false, _) => GetSysColor(COLOR_GRAYTEXT),
-                    (true, true) => Palette::new(true).fg,
-                    (true, false) => GetSysColor(COLOR_WINDOWTEXT),
+                theme.draw_background(hdc, CP_READONLY, face, &rc, None);
+                let button = RECT {
+                    left: from_right(info.rcButton.left),
+                    top: rc.top + info.rcButton.top,
+                    right: from_right(info.rcButton.right),
+                    bottom: rc.top + info.rcButton.bottom,
                 };
-                SetTextColor(hdc, ink);
-                let mut tr = RECT {
-                    left: rc.left + info.rcItem.left + STAND_IN_INSET,
-                    top: rc.top + info.rcItem.top,
-                    right: from_right(info.rcItem.right),
-                    bottom: rc.top + info.rcItem.bottom,
-                };
-                let text: Vec<u16> = text.encode_utf16().collect();
-                DrawTextW(
-                    hdc,
-                    text.as_ptr(),
-                    text.len() as i32,
-                    &mut tr,
-                    DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
-                );
+                theme.draw_background(hdc, CP_DROPDOWNBUTTONRIGHT, arrow, &button, None);
             }
-            SelectObject(hdc, old);
-            if theme != 0 {
-                CloseThemeData(theme);
-            }
+            let ink = match (enabled, dark) {
+                (false, _) => gdi::sys_color(COLOR_GRAYTEXT),
+                (true, true) => Palette::new(true).fg,
+                (true, false) => gdi::sys_color(COLOR_WINDOWTEXT),
+            };
+            gdi::set_text_color(hdc, ink);
+            let mut tr = RECT {
+                left: rc.left + info.rcItem.left + STAND_IN_INSET,
+                top: rc.top + info.rcItem.top,
+                right: from_right(info.rcItem.right),
+                bottom: rc.top + info.rcItem.bottom,
+            };
+            let text: Vec<u16> = text.encode_utf16().collect();
+            gdi::draw_text(
+                hdc,
+                &text,
+                &mut tr,
+                DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
         }
     }
 
@@ -465,8 +440,8 @@ impl Edit {
         if self.last_row.replace(true) {
             return;
         }
-        // SAFETY: a timer of this thread's dialog (fired or not).
-        unsafe { KillTimer(dlg, LAST_ROW) };
+        // The timer, fired or not.
+        win::kill_timer(dlg, LAST_ROW);
         let f = &self.was;
         let filter = make_control(
             dlg,
@@ -474,7 +449,7 @@ impl Edit {
             ID_FILTER,
             combo_style(true),
             FILTER,
-            item(dlg, ID_FILTER_LABEL),
+            dlg::item(dlg, ID_FILTER_LABEL),
         );
         let sort = make_control(
             dlg,
@@ -482,7 +457,7 @@ impl Edit {
             ID_SORT,
             combo_style(true),
             SORT,
-            item(dlg, ID_SORT_LABEL),
+            dlg::item(dlg, ID_SORT_LABEL),
         );
         let dir = make_control(dlg, "ComboBox", ID_DIR, combo_style(false), DIR, sort);
         let no_change = || std::iter::once(NO_CHANGE.to_owned());
@@ -523,7 +498,7 @@ impl Edit {
         let was = &self.was;
         // A text shown on one line (a name on several) comes back as it
         // was unless it was edited.
-        let name = window_text(item(dlg, ID_NAME));
+        let name = dlg::item_text(dlg, ID_NAME);
         let name = if name == one_line(&was.name) {
             was.name.clone()
         } else {
@@ -532,7 +507,7 @@ impl Edit {
         let search = search_of(
             was.search.as_deref(),
             selection(dlg, ID_SEARCH_MODE) == 1,
-            window_text(item(dlg, ID_SEARCH)),
+            dlg::item_text(dlg, ID_SEARCH),
         );
         let sort_index = selection(dlg, ID_SORT);
         let sort = chosen(&self.sorts, sort_index, &was.sort);
@@ -556,17 +531,12 @@ impl Edit {
         match id {
             OK => {
                 *self.result.borrow_mut() = Some(self.read(dlg));
-                // SAFETY: ends this modal dialog.
-                unsafe { EndDialog(dlg, 1) };
+                dlg::end(dlg, 1);
             }
-            // SAFETY: ends this modal dialog.
-            CANCEL => unsafe {
-                EndDialog(dlg, 0);
-            },
+            CANCEL => dlg::end(dlg, 0),
             // A bookmark needs a name.
             ID_NAME if code == EN_CHANGE => {
-                // SAFETY: reads a control of this thread's dialog.
-                let named = unsafe { GetWindowTextLengthW(item(dlg, ID_NAME)) } > 0;
+                let named = win::text_len(dlg::item(dlg, ID_NAME)) > 0;
                 enable(dlg, OK, named);
             }
             // The direction goes with a sort.
@@ -581,58 +551,32 @@ impl Edit {
     }
 }
 
-fn key_down(vk: u16) -> bool {
-    // SAFETY: reads this thread's keyboard state.
-    unsafe { GetKeyState(i32::from(vk)) < 0 }
-}
+/// The search box's subclass ([`search_proc`]).
+static SEARCH_KEYS: subclass::Key = subclass::Key::new("bookmark editor: search box keys");
 
 /// The search box's subclass: Shift+Enter starts a new line (Enter alone
-/// is OK, Ctrl+Enter a new line, as in any dialog).
-unsafe extern "system" fn search_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
-    let shift_enter = key_down(VK_SHIFT) && !key_down(VK_CONTROL);
-    // SAFETY: `w` and `l` are passed on as they came; the line break is a
-    // NUL-terminated string for this thread's box.
-    unsafe {
-        match msg {
-            WM_KEYDOWN if w as u16 == VK_RETURN && shift_enter => {
-                let line = wz("\r\n");
-                send(hwnd, EM_REPLACESEL, 1, line.as_ptr() as isize);
-                return 0;
-            }
-            // The character the key makes: the line is in already.
-            WM_CHAR if w == 0x0d && shift_enter => return 0,
-            // (In the dark theme its edge is the one-line boxes', drawn by
-            // `dialog::theme_control`.)
-            WM_NCDESTROY => {
-                RemoveWindowSubclass(hwnd, Some(search_proc), 1);
-            }
-            _ => {}
+/// is OK, Ctrl+Enter a new line, as in any dialog). (In the dark theme its
+/// edge is the one-line boxes', drawn by `dialog::theme_control`.)
+fn search_proc(m: &Msg) -> LRESULT {
+    let shift_enter = sys::key_down(VK_SHIFT) && !sys::key_down(VK_CONTROL);
+    match m.id {
+        WM_KEYDOWN if m.w as u16 == VK_RETURN && shift_enter => {
+            edit::replace_sel(m.hwnd, "\r\n", true);
+            return 0;
         }
-        DefSubclassProc(hwnd, msg, w, l)
+        // The character the key makes: the line is in already.
+        WM_CHAR if m.w == 0x0d && shift_enter => return 0,
+        _ => {}
     }
+    m.def()
 }
 
-unsafe extern "system" fn edit_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Edit` that `edit` keeps alive until the
-        // dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Edit` from `edit`, or null before.
-    let Some(s) = (unsafe { state::<Edit>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn edit_proc(s: &Edit, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.init(dlg);
             // The dialog manager puts the keyboard in the first box, Name,
@@ -640,53 +584,46 @@ unsafe extern "system" fn edit_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             1
         }
         WM_COMMAND => {
-            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
             isize::from(s.command(dlg, id, code))
         }
         // Shown (a modal dialog shows once its queue is empty): the last
         // row's lists follow once it has been drawn, as timers come after
         // the paints waiting. Set before then, the timer would hold the
         // showing up instead.
-        WM_SHOWWINDOW if w != 0 => {
-            // SAFETY: a timer of this thread's dialog.
-            unsafe { SetTimer(dlg, LAST_ROW, USER_TIMER_MINIMUM, None) };
+        WM_SHOWWINDOW if m.w != 0 => {
+            win::set_timer(dlg, LAST_ROW, USER_TIMER_MINIMUM);
             0
         }
-        WM_TIMER if w == LAST_ROW => {
+        WM_TIMER if m.w == LAST_ROW => {
             s.make_last_row(dlg);
             1
         }
         // Until the last row's lists are made, the editor draws them.
         WM_PAINT if !s.last_row.get() => {
-            // SAFETY: a standard WM_PAINT of this thread's dialog.
-            unsafe {
-                let mut ps: PAINTSTRUCT = core::mem::zeroed();
-                let hdc = BeginPaint(dlg, &mut ps);
-                s.paint_last_row(dlg, hdc);
-                EndPaint(dlg, &ps);
-            }
+            let paint = gdi::Paint::begin(dlg);
+            s.paint_last_row(dlg, paint.hdc());
             1
         }
         // Drawn into another DC (a print of the window): the row too.
         WM_PRINTCLIENT if !s.last_row.get() => {
-            s.paint_last_row(dlg, w as HDC);
+            s.paint_last_row(dlg, m.w as HDC);
             1
         }
         WM_SIZE => {
             anchor(dlg, SIZE, &ANCHORS);
             if !s.last_row.get() {
-                // SAFETY: invalidates this thread's dialog: the row it
-                // draws moves with its size.
-                unsafe { InvalidateRect(dlg, core::ptr::null(), 1) };
+                // The row it draws moves with its size.
+                win::invalidate(dlg, None, true);
             }
             1
         }
         WM_GETMINMAXINFO => {
             let (w, h) = s.min.get();
-            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
-            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = w;
-            mmi.ptMinTrackSize.y = h;
+            if let Some(mut mmi) = m.min_max_info() {
+                mmi.ptMinTrackSize.x = w;
+                mmi.ptMinTrackSize.y = h;
+            }
             1
         }
         WM_DESTROY => {

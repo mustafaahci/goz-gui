@@ -6,17 +6,12 @@
 //! OpenClipboard/CloseClipboard so a paste never sees half of them. A paste
 //! reads them back the same way ([`files`]), whoever put them there.
 
-use windows_sys::Win32::Foundation::{GlobalFree, HWND};
-use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
-};
-use windows_sys::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
-};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_MOVE};
-use windows_sys::Win32::System::Threading::Sleep;
-use windows_sys::Win32::UI::Shell::{CFSTR_PREFERREDDROPEFFECT, DROPFILES, DragQueryFileW, HDROP};
+use windows_sys::Win32::UI::Shell::DROPFILES;
+
+use crate::win;
+use crate::win::clipboard::Clipboard;
 
 /// What a paste of the files does with them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +31,10 @@ pub struct Files {
 /// `DROPFILES` as `CF_HDROP` starts with it; the paths follow it.
 const DROPFILES_SIZE: usize = 20;
 const _: () = assert!(size_of::<DROPFILES>() == DROPFILES_SIZE);
+
+/// The registered format that says whether a paste copies or moves
+/// (CFSTR_PREFERREDDROPEFFECT).
+const PREFERRED_DROP_EFFECT: &str = "Preferred DropEffect";
 
 impl Files {
     pub fn new<'a>(paths: impl IntoIterator<Item = &'a [u16]>) -> Files {
@@ -69,43 +68,37 @@ const OPEN_RETRY_MS: u32 = 15;
 
 /// Opens the clipboard for `hwnd`, emptied. Another program may hold it for
 /// a moment (clipboard managers read every change, remote desktop syncs
-/// it), so it tries for a while; false when it never got it, and then the
-/// clipboard is as it was.
-fn open(hwnd: HWND) -> bool {
-    open_as_is(hwnd) && {
-        // SAFETY: the clipboard is open; the caller closes it.
-        unsafe { EmptyClipboard() };
-        true
-    }
+/// it), so it tries for a while; `None` when it never got it, and then the
+/// clipboard is as it was. It closes as the guard drops.
+fn open(hwnd: HWND) -> Option<Clipboard> {
+    let clipboard = open_as_is(hwnd)?;
+    clipboard.empty();
+    Some(clipboard)
 }
 
 /// Opens the clipboard for `hwnd` as it is, trying for a while as
-/// [`open`] does; the caller closes it.
-fn open_as_is(hwnd: HWND) -> bool {
+/// [`open`] does; it closes as the guard drops.
+fn open_as_is(hwnd: HWND) -> Option<Clipboard> {
     for attempt in 0..OPEN_TRIES {
-        // SAFETY: opens the clipboard; the caller closes it.
-        unsafe {
-            if OpenClipboard(hwnd) != 0 {
-                return true;
-            }
-            if attempt + 1 < OPEN_TRIES {
-                Sleep(OPEN_RETRY_MS);
-            }
+        if let Some(clipboard) = Clipboard::open(hwnd) {
+            return Some(clipboard);
+        }
+        if attempt + 1 < OPEN_TRIES {
+            win::process::sleep(OPEN_RETRY_MS);
         }
     }
-    false
+    None
 }
 
 /// The clipboard holds files (CF_HDROP): Paste has something to paste.
 pub fn has_files() -> bool {
-    // SAFETY: asks about a standard format; the clipboard need not be open.
-    unsafe { IsClipboardFormatAvailable(u32::from(CF_HDROP)) != 0 }
+    // A standard format; the clipboard need not be open.
+    win::clipboard::has(u32::from(CF_HDROP))
 }
 
 /// The clipboard holds text, for the search box's Paste.
 pub fn has_text() -> bool {
-    // SAFETY: as in `has_files`.
-    unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT)) != 0 }
+    win::clipboard::has(u32::from(CF_UNICODETEXT))
 }
 
 /// Files on the clipboard, as a paste takes them.
@@ -129,39 +122,21 @@ fn is_move(effect: Option<u32>) -> bool {
 /// The files on the clipboard (CF_HDROP) and whether they were cut;
 /// `None` when it holds none or cannot be opened.
 pub fn files(hwnd: HWND) -> Option<Clip> {
-    // SAFETY: a registered name, NUL-terminated by windows-sys.
-    let preferred = unsafe { RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT) };
-    if !open_as_is(hwnd) {
-        return None;
-    }
-    // SAFETY: the clipboard is open; its handles are read while locked and
-    // stay the clipboard's; it is closed below.
-    let (paths, effect, sequence) = unsafe {
-        let drop = GetClipboardData(u32::from(CF_HDROP)) as HDROP;
-        let paths = if drop.is_null() {
-            Vec::new()
-        } else {
-            dropped_files(drop)
-        };
-        let mut effect = None;
-        let mem = if preferred != 0 {
-            GetClipboardData(preferred)
-        } else {
-            core::ptr::null_mut()
-        };
-        if !mem.is_null() {
-            let p = GlobalLock(mem) as *const u32;
-            if !p.is_null() {
-                effect = Some(p.read_unaligned());
-                GlobalUnlock(mem);
-            }
-        }
-        // While it is still open, and after the formats were rendered for
-        // the reads above: nothing put on it since can be taken for these.
-        let sequence = GetClipboardSequenceNumber();
-        CloseClipboard();
-        (paths, effect, sequence)
+    let preferred = win::clipboard::register_format(PREFERRED_DROP_EFFECT);
+    let clipboard = open_as_is(hwnd)?;
+    // Copies of what it holds, read while it is open.
+    let paths = clipboard.files();
+    let effect = if preferred != 0 {
+        clipboard
+            .data(preferred)
+            .and_then(|d| Some(u32::from_le_bytes(d.get(..4)?.try_into().ok()?)))
+    } else {
+        None
     };
+    // While it is still open, and after the formats were rendered for the
+    // reads above: nothing put on it since can be taken for these.
+    let sequence = win::clipboard::sequence();
+    drop(clipboard);
     if paths.is_empty() {
         return None;
     }
@@ -175,92 +150,36 @@ pub fn files(hwnd: HWND) -> Option<Clip> {
 /// W7: the text on the clipboard (CF_UNICODETEXT), for a paste of file
 /// names; `None` when it holds none or cannot be opened.
 pub fn text(hwnd: HWND) -> Option<String> {
-    if !has_text() || !open_as_is(hwnd) {
+    if !has_text() {
         return None;
     }
-    // SAFETY: the clipboard is open; its handle is read while locked, no
-    // further than its size, and stays the clipboard's; it is closed below.
-    unsafe {
-        let mut out = None;
-        let mem = GetClipboardData(u32::from(CF_UNICODETEXT));
-        if !mem.is_null() {
-            let p = GlobalLock(mem) as *const u16;
-            if !p.is_null() {
-                let units = GlobalSize(mem) / 2;
-                let all = core::slice::from_raw_parts(p, units);
-                let len = all.iter().position(|&c| c == 0).unwrap_or(units);
-                out = Some(String::from_utf16_lossy(&all[..len]));
-                GlobalUnlock(mem);
-            }
-        }
-        CloseClipboard();
-        out
-    }
-}
-
-/// The paths of a CF_HDROP block (a drop's, or the clipboard's).
-///
-/// # Safety
-/// `drop` must be a valid HDROP for as long as the call runs.
-pub unsafe fn dropped_files(drop: HDROP) -> Vec<Vec<u16>> {
-    // SAFETY: as the caller promises; each buffer is sized by the length
-    // DragQueryFileW reports, its NUL included.
-    unsafe {
-        let n = DragQueryFileW(drop, u32::MAX, core::ptr::null_mut(), 0);
-        (0..n)
-            .filter_map(|i| {
-                let len = DragQueryFileW(drop, i, core::ptr::null_mut(), 0) as usize;
-                if len == 0 {
-                    return None;
-                }
-                let mut buf = vec![0u16; len + 1];
-                let got = DragQueryFileW(drop, i, buf.as_mut_ptr(), buf.len() as u32) as usize;
-                buf.truncate(got);
-                (got > 0).then_some(buf)
-            })
-            .collect()
-    }
+    let clipboard = open_as_is(hwnd)?;
+    // A copy of what it holds, read up to its NUL.
+    let bytes = clipboard.data(u32::from(CF_UNICODETEXT));
+    drop(clipboard);
+    let units: Vec<u16> = bytes?
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| u16::from_ne_bytes(c))
+        .collect();
+    Some(String::from_utf16_lossy(crate::win::until_nul(&units)))
 }
 
 /// A paste moved the files read with sequence number `sequence`: the
 /// clipboard is emptied, as after a cut and paste in Explorer (the paths
 /// on it are gone), unless something else was put on it since.
 pub fn clear_after_move(hwnd: HWND, sequence: u32) {
-    // SAFETY: reads a counter.
-    if unsafe { GetClipboardSequenceNumber() } != sequence {
+    if win::clipboard::sequence() != sequence {
         return;
     }
-    if open(hwnd) {
-        // SAFETY: closes the clipboard `open` emptied.
-        unsafe { CloseClipboard() };
-    }
+    // Emptied as it opens, closed as it drops.
+    drop(open(hwnd));
 }
 
-/// Puts `len` bytes from `data` on the open clipboard as `format`.
-///
-/// # Safety
-/// The clipboard must be open, and `data` readable for `len` bytes.
-unsafe fn set(format: u32, data: *const u8, len: usize) -> bool {
-    // SAFETY: the block is sized for `len` bytes and filled while locked; the
-    // clipboard owns it once SetClipboardData succeeds, and it is freed here
-    // otherwise.
-    unsafe {
-        let mem = GlobalAlloc(GMEM_MOVEABLE, len.max(1));
-        if mem.is_null() {
-            return false;
-        }
-        let dst = GlobalLock(mem) as *mut u8;
-        let mut ok = false;
-        if !dst.is_null() {
-            core::ptr::copy_nonoverlapping(data, dst, len);
-            GlobalUnlock(mem);
-            ok = !SetClipboardData(format, mem).is_null();
-        }
-        if !ok {
-            GlobalFree(mem);
-        }
-        ok
-    }
+/// The bytes of `units`, as the clipboard holds text (native order).
+fn bytes_of(units: &[u16]) -> Vec<u8> {
+    units.iter().flat_map(|u| u.to_ne_bytes()).collect()
 }
 
 /// What the status bar says when the clipboard could not be opened.
@@ -268,17 +187,13 @@ pub const BUSY: &str = "Could not copy: another program is using the clipboard";
 
 /// Puts `text` on the clipboard; false if it could not.
 pub fn put_text(hwnd: HWND, text: &[u16]) -> bool {
-    if !open(hwnd) {
+    let Some(clipboard) = open(hwnd) else {
         return false;
-    }
+    };
     let mut z = Vec::with_capacity(text.len() + 1);
     z.extend_from_slice(text);
     z.push(0);
-    // SAFETY: the clipboard is open; `z` holds `z.len()` code units.
-    let ok = unsafe { set(u32::from(CF_UNICODETEXT), z.as_ptr().cast(), z.len() * 2) };
-    // SAFETY: closes the clipboard opened above.
-    unsafe { CloseClipboard() };
-    ok
+    clipboard.set(u32::from(CF_UNICODETEXT), &bytes_of(&z))
 }
 
 /// Puts `files` on the clipboard for Explorer (or any program) to paste,
@@ -289,26 +204,14 @@ pub fn put_files(hwnd: HWND, files: &Files, effect: Effect) -> bool {
         Effect::Move => DROPEFFECT_MOVE,
     }
     .to_le_bytes();
-    // SAFETY: a registered name, NUL-terminated by windows-sys.
-    let preferred = unsafe { RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT) };
-    if !open(hwnd) {
+    let preferred = win::clipboard::register_format(PREFERRED_DROP_EFFECT);
+    let Some(clipboard) = open(hwnd) else {
         return false;
-    }
-    // SAFETY: the clipboard is open; each pointer is readable for the length
-    // given with it.
-    let ok = unsafe {
-        set(u32::from(CF_HDROP), files.hdrop.as_ptr(), files.hdrop.len())
-            && preferred != 0
-            && set(preferred, drop_effect.as_ptr(), drop_effect.len())
-            && set(
-                u32::from(CF_UNICODETEXT),
-                files.text.as_ptr().cast(),
-                files.text.len() * 2,
-            )
     };
-    // SAFETY: closes the clipboard opened above.
-    unsafe { CloseClipboard() };
-    ok
+    clipboard.set(u32::from(CF_HDROP), &files.hdrop)
+        && preferred != 0
+        && clipboard.set(preferred, &drop_effect)
+        && clipboard.set(u32::from(CF_UNICODETEXT), &bytes_of(&files.text))
 }
 
 #[cfg(test)]

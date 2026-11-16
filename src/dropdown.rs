@@ -13,22 +13,19 @@
 
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject,
-    DrawTextW, EndPaint, GetMonitorInfoW, GetWindowDC, InvalidateRect, MONITOR_DEFAULTTONEAREST,
-    MONITORINFO, MonitorFromRect, PAINTSTRUCT, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, ReleaseDC,
-    SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, MONITOR_DEFAULTTONEAREST,
+    RDW_FRAME, RDW_INVALIDATE, SRCCOPY, TRANSPARENT,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::SetScrollInfo;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::paint::fill;
 use crate::searchbox::{self, Button};
 use crate::theme;
-use crate::wide::wz;
+use crate::win::class::{self, Class, Create};
+use crate::win::scroll;
+use crate::win::{self, Msg, gdi};
 use crate::window::App;
 
 const CLASS: &str = "goz-gui-dropdown";
@@ -67,8 +64,7 @@ impl Dropdown {
 
     pub fn is_open(&self) -> bool {
         let hwnd = self.hwnd.get();
-        // SAFETY: asks about a window of this thread, or null.
-        !hwnd.is_null() && unsafe { IsWindowVisible(hwnd) } != 0
+        !hwnd.is_null() && win::is_visible(hwnd)
     }
 
     /// The highlighted entry.
@@ -79,40 +75,29 @@ impl Dropdown {
 
 /// Makes the popup, hidden, owned by the main window.
 pub fn create(app: &'static App) {
-    let class = wz(CLASS);
-    // SAFETY: registers the class once and creates the popup on this
-    // thread; `app` is leaked, so the pointer kept in the window stays good.
-    unsafe {
-        let hinst = GetModuleHandleW(core::ptr::null());
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wndproc),
-            hInstance: hinst,
-            hCursor: LoadCursorW(core::ptr::null_mut(), IDC_ARROW),
-            lpszClassName: class.as_ptr(),
-            ..core::mem::zeroed()
-        };
-        RegisterClassExW(&wc);
-        let hwnd = CreateWindowExW(
-            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            class.as_ptr(),
-            core::ptr::null(),
-            WS_POPUP | WS_BORDER | WS_VSCROLL | WS_CLIPSIBLINGS,
-            0,
-            0,
-            0,
-            0,
-            app.hwnd,
-            core::ptr::null_mut(),
-            hinst,
-            core::ptr::null(),
-        );
-        if hwnd.is_null() {
-            return;
-        }
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as *const App as isize);
-        app.dropdown.hwnd.set(hwnd);
+    // Registered once (again, it fails and the class stays as it was).
+    Class {
+        cursor: win::sys::system_cursor(IDC_ARROW),
+        ..Class::new(CLASS)
     }
+    .register();
+    // `app` is leaked, so the window's handler may keep it.
+    let hwnd = class::create(
+        &Create {
+            ex_style: WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            class: CLASS,
+            title: "",
+            style: WS_POPUP | WS_BORDER | WS_VSCROLL | WS_CLIPSIBLINGS,
+            rect: (0, 0, 0, 0),
+            parent: app.hwnd,
+            menu: core::ptr::null_mut(),
+        },
+        move |m| wndproc(app, m),
+    );
+    if hwnd.is_null() {
+        return;
+    }
+    app.dropdown.hwnd.set(hwnd);
     apply_theme(app);
 }
 
@@ -132,15 +117,8 @@ pub fn apply_theme(app: &App) {
             "Explorer"
         }),
     );
-    // SAFETY: repaints this thread's popup, frame included.
-    unsafe {
-        RedrawWindow(
-            hwnd,
-            core::ptr::null(),
-            core::ptr::null_mut(),
-            RDW_INVALIDATE | RDW_FRAME,
-        )
-    };
+    // Its frame included.
+    win::redraw(hwnd, None, RDW_INVALIDATE | RDW_FRAME);
 }
 
 /// How many entries the popup lists.
@@ -220,8 +198,7 @@ pub fn close(app: &App) {
         *d.suggestions.borrow_mut() = None;
         return;
     }
-    // SAFETY: hides this thread's popup.
-    unsafe { ShowWindow(d.hwnd(), SW_HIDE) };
+    win::show(d.hwnd(), SW_HIDE);
     d.hot.set(None);
     d.pressed.set(None);
     *d.suggestions.borrow_mut() = None;
@@ -237,45 +214,39 @@ fn place(app: &App, show: bool) {
     let search = app.search_rc.get();
     // 1px border round the rows (WS_BORDER).
     let height = rows as i32 * rh + 2;
-    let mut origin = POINT {
-        x: search.left,
-        y: search.top,
+    let origin = win::client_to_screen(
+        app.hwnd,
+        POINT {
+            x: search.left,
+            y: search.top,
+        },
+    );
+    let frame = RECT {
+        left: origin.x,
+        top: origin.y,
+        right: origin.x + (search.right - search.left),
+        bottom: origin.y + (search.bottom - search.top),
     };
-    // SAFETY: plain out-structs for this thread's windows.
-    unsafe {
-        ClientToScreen(app.hwnd, &mut origin);
-        let frame = RECT {
-            left: origin.x,
-            top: origin.y,
-            right: origin.x + (search.right - search.left),
-            bottom: origin.y + (search.bottom - search.top),
-        };
-        let mut y = frame.bottom;
-        let mut mi: MONITORINFO = core::mem::zeroed();
-        mi.cbSize = size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(MonitorFromRect(&frame, MONITOR_DEFAULTTONEAREST), &mut mi) != 0
-            && y + height > mi.rcWork.bottom
-            && frame.top - height >= mi.rcWork.top
-        {
-            y = frame.top - height;
-        }
-        let mut flags = SWP_NOACTIVATE;
-        if show {
-            flags |= SWP_SHOWWINDOW;
-        }
-        SetWindowPos(
-            hwnd,
-            HWND_TOP,
-            frame.left,
-            y,
-            frame.right - frame.left,
-            height,
-            flags,
-        );
+    let mut y = frame.bottom;
+    let monitor = win::sys::monitor_from_rect(&frame, MONITOR_DEFAULTTONEAREST);
+    if let Some(mi) = win::sys::monitor_info(monitor)
+        && y + height > mi.rcWork.bottom
+        && frame.top - height >= mi.rcWork.top
+    {
+        y = frame.top - height;
     }
+    let mut flags = SWP_NOACTIVATE;
+    if show {
+        flags |= SWP_SHOWWINDOW;
+    }
+    win::set_pos(
+        hwnd,
+        HWND_TOP,
+        (frame.left, y, frame.right - frame.left, height),
+        flags,
+    );
     update_scroll(app);
-    // SAFETY: repaints this thread's popup.
-    unsafe { InvalidateRect(hwnd, core::ptr::null(), 0) };
+    win::invalidate(hwnd, None, false);
 }
 
 /// The scroll bar after the entries or the first one shown changed; it
@@ -295,15 +266,13 @@ fn update_scroll(app: &App) {
         nPos: top as i32,
         nTrackPos: 0,
     };
-    // SAFETY: the struct lives across the call.
-    unsafe { SetScrollInfo(d.hwnd(), SB_VERT, &si, 1) };
+    scroll::set_info(d.hwnd(), SB_VERT, &si, true);
 }
 
 fn scroll_to(app: &App, top: usize) {
     app.dropdown.top.set(top);
     update_scroll(app);
-    // SAFETY: repaints this thread's popup.
-    unsafe { InvalidateRect(app.dropdown.hwnd(), core::ptr::null(), 0) };
+    win::invalidate(app.dropdown.hwnd(), None, false);
 }
 
 fn ensure_visible(app: &App, index: usize) {
@@ -318,8 +287,7 @@ fn ensure_visible(app: &App, index: usize) {
 
 fn set_hot(app: &App, hot: Option<usize>) {
     if app.dropdown.hot.replace(hot) != hot {
-        // SAFETY: repaints this thread's popup.
-        unsafe { InvalidateRect(app.dropdown.hwnd(), core::ptr::null(), 0) };
+        win::invalidate(app.dropdown.hwnd(), None, false);
     }
 }
 
@@ -434,83 +402,70 @@ fn scroll_by(app: &App, lines: isize) {
     scroll_to(app, top);
 }
 
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // SAFETY: GWLP_USERDATA holds the leaked `App` once `create` set it, and
-    // null before; each arm reads `w`/`l` as its message defines them.
-    unsafe {
-        let app = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const App;
-        if app.is_null() {
-            return DefWindowProcW(hwnd, msg, w, l);
+/// The popup's messages; `app` is the leaked `App` its handler keeps.
+fn wndproc(app: &App, m: &Msg) -> LRESULT {
+    let hwnd = m.hwnd;
+    let (w, l) = (m.w, m.l);
+    match m.id {
+        // A click must not take the focus from the search box.
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        // Minimizing the window hides the popup with it; it stays closed
+        // when the window comes back.
+        WM_SHOWWINDOW if l == SW_PARENTOPENING as LPARAM => 0,
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            paint(app, hwnd);
+            0
         }
-        let app = &*app;
-        match msg {
-            // A click must not take the focus from the search box.
-            WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
-            // Minimizing the window hides the popup with it; it stays closed
-            // when the window comes back.
-            WM_SHOWWINDOW if l == SW_PARENTOPENING as LPARAM => 0,
-            WM_ERASEBKGND => 1,
-            WM_PAINT => {
-                paint(app, hwnd);
-                0
-            }
-            WM_NCPAINT => {
-                let r = DefWindowProcW(hwnd, msg, w, l);
-                border(app, hwnd);
-                r
-            }
-            WM_MOUSEMOVE => {
-                if let Some(i) = row_at(app, point(l).y) {
-                    set_hot(app, Some(i));
-                }
-                0
-            }
-            WM_LBUTTONDOWN => {
-                app.dropdown.pressed.set(row_at(app, point(l).y));
-                0
-            }
-            WM_LBUTTONUP => {
-                let row = row_at(app, point(l).y);
-                if row.is_some() && app.dropdown.pressed.take() == row {
-                    set_hot(app, row);
-                    app.use_history_entry();
-                }
-                0
-            }
-            WM_MOUSEWHEEL => {
-                let delta = i32::from(((w >> 16) & 0xffff) as u16 as i16);
-                let mut lines: u32 = 3;
-                SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, (&raw mut lines).cast(), 0);
-                let lines = (lines.clamp(1, MAX_ROWS as u32) as i32 * -delta / 120) as isize;
-                scroll_by(app, lines);
-                0
-            }
-            WM_VSCROLL => {
-                let rows = visible(app) as isize;
-                let top = app.dropdown.top.get() as isize;
-                let target = match (w & 0xffff) as i32 {
-                    SB_LINEUP => top - 1,
-                    SB_LINEDOWN => top + 1,
-                    SB_PAGEUP => top - rows,
-                    SB_PAGEDOWN => top + rows,
-                    SB_TOP => 0,
-                    SB_BOTTOM => count(app) as isize,
-                    SB_THUMBTRACK | SB_THUMBPOSITION => {
-                        let mut si = SCROLLINFO {
-                            cbSize: size_of::<SCROLLINFO>() as u32,
-                            fMask: SIF_TRACKPOS,
-                            ..Default::default()
-                        };
-                        GetScrollInfo(hwnd, SB_VERT, &mut si);
-                        si.nTrackPos as isize
-                    }
-                    _ => top,
-                };
-                scroll_to(app, target.max(0) as usize);
-                0
-            }
-            _ => DefWindowProcW(hwnd, msg, w, l),
+        WM_NCPAINT => {
+            let r = m.def();
+            border(app, hwnd);
+            r
         }
+        WM_MOUSEMOVE => {
+            if let Some(i) = row_at(app, point(l).y) {
+                set_hot(app, Some(i));
+            }
+            0
+        }
+        WM_LBUTTONDOWN => {
+            app.dropdown.pressed.set(row_at(app, point(l).y));
+            0
+        }
+        WM_LBUTTONUP => {
+            let row = row_at(app, point(l).y);
+            if row.is_some() && app.dropdown.pressed.take() == row {
+                set_hot(app, row);
+                app.use_history_entry();
+            }
+            0
+        }
+        WM_MOUSEWHEEL => {
+            let delta = i32::from(((w >> 16) & 0xffff) as u16 as i16);
+            let lines = scroll::wheel_lines().unwrap_or(3);
+            let lines = (lines.clamp(1, MAX_ROWS as u32) as i32 * -delta / 120) as isize;
+            scroll_by(app, lines);
+            0
+        }
+        WM_VSCROLL => {
+            let rows = visible(app) as isize;
+            let top = app.dropdown.top.get() as isize;
+            let target = match (w & 0xffff) as i32 {
+                SB_LINEUP => top - 1,
+                SB_LINEDOWN => top + 1,
+                SB_PAGEUP => top - rows,
+                SB_PAGEDOWN => top + rows,
+                SB_TOP => 0,
+                SB_BOTTOM => count(app) as isize,
+                SB_THUMBTRACK | SB_THUMBPOSITION => {
+                    scroll::info(hwnd, SB_VERT, SIF_TRACKPOS).map_or(0, |si| si.nTrackPos as isize)
+                }
+                _ => top,
+            };
+            scroll_to(app, target.max(0) as usize);
+            0
+        }
+        _ => m.def(),
     }
 }
 
@@ -519,77 +474,73 @@ fn paint(app: &App, hwnd: HWND) {
     let pal = app.pal.get();
     let rh = row_height(app);
     let pad = app.scale(4);
-    // SAFETY: a standard double-buffered WM_PAINT; every GDI object made
-    // here is released before returning.
-    unsafe {
-        let mut ps: PAINTSTRUCT = core::mem::zeroed();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let mut client = RECT::default();
-        GetClientRect(hwnd, &mut client);
-        let (w, h) = (client.right.max(1), client.bottom.max(1));
-        let mem = CreateCompatibleDC(hdc);
-        let bmp = CreateCompatibleBitmap(hdc, w, h);
-        let old_bmp = SelectObject(mem, bmp);
-        fill(mem, &client, pal.popup_bg);
-        let old_font = SelectObject(mem, app.ui_font());
-        SetBkMode(mem, TRANSPARENT as i32);
-        SetTextColor(mem, pal.fg);
-        let top = app.dropdown.top.get();
-        let hot = app.dropdown.hot();
-        let suggestions = app.dropdown.suggestions.borrow();
-        let history = app.search_history.borrow();
-        let texts: Box<dyn Iterator<Item = &str>> = match &*suggestions {
-            Some(list) => Box::new(list.iter().map(String::as_str)),
-            None => Box::new(history.entries().iter().map(|e| e.search.as_str())),
-        };
-        for (row, text) in texts.enumerate().skip(top) {
-            let y = (row - top) as i32 * rh;
-            if y >= h {
-                break;
-            }
-            let rc = RECT {
-                top: y,
-                bottom: y + rh,
-                ..client
-            };
-            if hot == Some(row) {
-                fill(mem, &rc, pal.popup_hot);
-            }
-            let mut text: Vec<u16> = text.encode_utf16().collect();
-            let mut text_rc = RECT {
-                left: rc.left + pad,
-                right: rc.right - pad,
-                ..rc
-            };
-            DrawTextW(
-                mem,
-                text.as_mut_ptr(),
-                text.len() as i32,
-                &mut text_rc,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-            );
+    // A standard double-buffered WM_PAINT; every GDI object made here is
+    // released before returning (in the reverse order of these, as they
+    // drop).
+    let ps = gdi::Paint::begin(hwnd);
+    let hdc = ps.hdc();
+    let client = win::client_rect(hwnd);
+    let (w, h) = (client.right.max(1), client.bottom.max(1));
+    let mem_dc = gdi::MemDc::compatible(hdc);
+    let mem = mem_dc.hdc();
+    let Some(bmp) = gdi::create_compatible_bitmap(hdc, w, h) else {
+        return;
+    };
+    let _bmp_in = gdi::Selected::new(mem, &bmp);
+    fill(mem, &client, pal.popup_bg);
+    let font_in = gdi::Selected::of(mem, app.ui_font());
+    gdi::set_bk_mode(mem, TRANSPARENT as i32);
+    gdi::set_text_color(mem, pal.fg);
+    let top = app.dropdown.top.get();
+    let hot = app.dropdown.hot();
+    let suggestions = app.dropdown.suggestions.borrow();
+    let history = app.search_history.borrow();
+    let texts: Box<dyn Iterator<Item = &str>> = match &*suggestions {
+        Some(list) => Box::new(list.iter().map(String::as_str)),
+        None => Box::new(history.entries().iter().map(|e| e.search.as_str())),
+    };
+    for (row, text) in texts.enumerate().skip(top) {
+        let y = (row - top) as i32 * rh;
+        if y >= h {
+            break;
         }
-        drop(history);
-        drop(suggestions);
-        SelectObject(mem, old_font);
-        BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, old_bmp);
-        DeleteObject(bmp);
-        DeleteDC(mem);
-        EndPaint(hwnd, &ps);
+        let rc = RECT {
+            top: y,
+            bottom: y + rh,
+            ..client
+        };
+        if hot == Some(row) {
+            fill(mem, &rc, pal.popup_hot);
+        }
+        let text: Vec<u16> = text.encode_utf16().collect();
+        let mut text_rc = RECT {
+            left: rc.left + pad,
+            right: rc.right - pad,
+            ..rc
+        };
+        gdi::draw_text(
+            mem,
+            &text,
+            &mut text_rc,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
     }
+    drop(history);
+    drop(suggestions);
+    drop(font_in);
+    gdi::bit_blt(hdc, (0, 0, w, h), mem, (0, 0), SRCCOPY);
 }
 
 /// The 1px edge round the popup, in the theme's colour over the one
 /// WS_BORDER draws.
 fn border(app: &App, hwnd: HWND) {
     let colour = app.pal.get().popup_border;
-    // SAFETY: paints this thread's popup's frame; the DC is released.
-    unsafe {
-        let mut wr = RECT::default();
-        GetWindowRect(hwnd, &mut wr);
+    // Paints the popup's frame; the DC is released as it drops.
+    {
+        let wr = win::window_rect(hwnd);
         let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
-        let hdc = GetWindowDC(hwnd);
+        let dc = gdi::WindowDc::whole(hwnd);
+        let hdc = dc.hdc();
         for rc in [
             RECT {
                 left: 0,
@@ -618,6 +569,5 @@ fn border(app: &App, hwnd: HWND) {
         ] {
             fill(hdc, &rc, colour);
         }
-        ReleaseDC(hwnd, hdc);
     }
 }

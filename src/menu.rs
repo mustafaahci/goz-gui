@@ -5,17 +5,11 @@
 //! changes (checks, radio dots, greyed items, and the File menu's selection
 //! part) are set when their menu opens, from a [`State`] the window fills in.
 
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CheckMenuItem, CreateMenu, CreatePopupMenu, DeleteMenu, EnableMenuItem, GetMenuItemCount,
-    GetMenuItemID, GetMenuItemInfoW, HMENU, InsertMenuItemW, MENUITEMINFOW, MF_BYCOMMAND,
-    MF_BYPOSITION, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_UNCHECKED, MFS_GRAYED, MFT_RADIOCHECK,
-    MFT_SEPARATOR, MFT_STRING, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU,
-    SetMenuDefaultItem,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{HMENU, MFS_GRAYED};
 
 use crate::columns::{self, COL_NAME, COLS};
 use crate::filter::Filter;
-use crate::wide::wz;
+use crate::win::menu::{self as wmenu, By, NewItem};
 
 // File, and the row context menu.
 pub const OPEN: u16 = 1000;
@@ -231,46 +225,19 @@ fn append(menu: HMENU, item: &Item<'_>) {
 
 /// Puts `item` at position `pos` of `menu` (`u32::MAX`: at the end).
 fn insert(menu: HMENU, pos: u32, item: &Item<'_>) {
-    let mut text = Vec::new();
-    // SAFETY: the rest of MENUITEMINFOW is plain data.
-    let mut mii: MENUITEMINFOW = unsafe { core::mem::zeroed() };
-    mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
-    mii.fMask = MIIM_FTYPE;
-    match *item {
-        Cmd(id, label) | Radio(id, label) => {
-            text = wz(label);
-            mii.fMask |= MIIM_ID | MIIM_STRING;
-            mii.fType = if matches!(item, Radio(..)) {
-                MFT_STRING | MFT_RADIOCHECK
-            } else {
-                MFT_STRING
-            };
-            mii.wID = u32::from(id);
-        }
-        Sep => mii.fType = MFT_SEPARATOR,
-        Greyed(label) => {
-            text = wz(label);
-            mii.fMask |= MIIM_STRING | MIIM_STATE;
-            mii.fType = MFT_STRING;
-            mii.fState = MFS_GRAYED;
-        }
-        Sub(label, sub) => {
-            text = wz(label);
-            mii.fMask |= MIIM_STRING | MIIM_SUBMENU;
-            mii.fType = MFT_STRING;
-            mii.hSubMenu = sub;
-        }
-    }
-    if !text.is_empty() {
-        mii.dwTypeData = text.as_mut_ptr();
-    }
-    // SAFETY: appends to a menu this module made; Windows copies the text.
-    unsafe { InsertMenuItemW(menu, pos, 1, &mii) };
+    let new = match *item {
+        Cmd(id, label) => NewItem::command(u32::from(id), label),
+        Radio(id, label) => NewItem::command(u32::from(id), label).radio(),
+        Sep => NewItem::separator(),
+        Greyed(label) => NewItem::text(label).state(MFS_GRAYED),
+        Sub(label, sub) => NewItem::submenu(label, sub),
+    };
+    // Windows copies the text.
+    wmenu::insert(menu, pos, &new);
 }
 
 fn popup(items: &[Item<'_>]) -> HMENU {
-    // SAFETY: a new, empty menu.
-    let menu = unsafe { CreatePopupMenu() };
+    let menu = wmenu::create_popup();
     for item in items {
         append(menu, item);
     }
@@ -279,13 +246,10 @@ fn popup(items: &[Item<'_>]) -> HMENU {
 
 /// Deletes the items of `menu` from position `keep` on; submenus go too.
 fn truncate(menu: HMENU, keep: usize) {
-    // SAFETY: deletes items of a menu of this window by position.
-    unsafe {
-        let mut n = GetMenuItemCount(menu).max(0) as usize;
-        while n > keep {
-            n -= 1;
-            DeleteMenu(menu, n as u32, MF_BYPOSITION);
-        }
+    let mut n = wmenu::count(menu).max(0) as usize;
+    while n > keep {
+        n -= 1;
+        wmenu::delete(menu, By::Position(n as u32));
     }
 }
 
@@ -400,8 +364,7 @@ pub fn menu_bar(run_history: bool) -> Bar {
         Sep,
         Cmd(ABOUT, "&About goz-gui\tCtrl+F1"),
     ]);
-    // SAFETY: a new, empty menu bar.
-    let bar = unsafe { CreateMenu() };
+    let bar = wmenu::create_bar();
     let menus = [
         file, edit, view, search, index, history, bookmarks, tools, help,
     ];
@@ -457,22 +420,13 @@ pub fn has_item(menu: HMENU, cmd: u16) -> bool {
 
 /// The position of the item that runs `cmd` in `menu` (not its submenus).
 fn position_of(menu: HMENU, cmd: u16) -> Option<u32> {
-    // SAFETY: reads the items of a menu of this thread.
-    unsafe {
-        let n = GetMenuItemCount(menu).max(0) as u32;
-        (0..n).find(|&i| GetMenuItemID(menu, i as i32) == u32::from(cmd))
-    }
+    let n = wmenu::count(menu).max(0) as u32;
+    (0..n).find(|&i| wmenu::item_id(menu, i as i32) == u32::from(cmd))
 }
 
 /// Whether the item at `pos` of `menu` is a separator.
 fn is_separator(menu: HMENU, pos: u32) -> bool {
-    // SAFETY: reads one item of a menu of this thread into a plain struct.
-    unsafe {
-        let mut mii: MENUITEMINFOW = core::mem::zeroed();
-        mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
-        mii.fMask = MIIM_FTYPE;
-        GetMenuItemInfoW(menu, pos, 1, &mut mii) != 0 && mii.fType & MFT_SEPARATOR != 0
-    }
+    wmenu::is_separator(menu, By::Position(pos))
 }
 
 /// Puts the panes' items (`items`: command and label, in order) in the
@@ -482,16 +436,15 @@ pub fn set_pane_items(view: HMENU, items: &[(u16, &str)]) {
     // The group as it was goes first: its items, then its separator, which
     // leaves two separators in a row after Status Bar.
     for cmd in VIEW_PANE_FOLDERS..=VIEW_PANE_PREVIEW {
-        // SAFETY: deletes an item of this menu by command; a missing one
-        // is reported and ignored.
-        unsafe { DeleteMenu(view, u32::from(cmd), MF_BYCOMMAND) };
+        // By command; a missing one is reported and ignored.
+        wmenu::delete(view, By::Command(u32::from(cmd)));
     }
     let Some(at) = position_of(view, STATUS_BAR).map(|p| p + 1) else {
         return;
     };
     if is_separator(view, at) && is_separator(view, at + 1) {
-        // SAFETY: deletes the group's separator by position.
-        unsafe { DeleteMenu(view, at, MF_BYPOSITION) };
+        // The group's separator, by position.
+        wmenu::delete(view, By::Position(at));
     }
     if items.is_empty() {
         return;
@@ -656,8 +609,7 @@ fn add_marks(menu: HMENU, marks: &[Mark], next: &mut usize) {
             Mark::Folder(name, inside) => {
                 let sub = popup(&[]);
                 add_marks(sub, inside, next);
-                // SAFETY: counts the items of the menu just made.
-                if unsafe { GetMenuItemCount(sub) } <= 0 {
+                if wmenu::count(sub) <= 0 {
                     append(sub, &Greyed("(Empty)"));
                 }
                 append(menu, &Sub(&label(&name.replace(['\r', '\n'], " ")), sub));
@@ -693,26 +645,13 @@ pub struct State {
 }
 
 fn check(menu: HMENU, id: u16, on: bool) {
-    // SAFETY: an item of a menu of this window, by command; a missing one
-    // is reported and ignored.
-    unsafe {
-        CheckMenuItem(
-            menu,
-            u32::from(id),
-            MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED },
-        )
-    };
+    // By command; a missing one is reported and ignored.
+    wmenu::check(menu, By::Command(u32::from(id)), on);
 }
 
 fn enable(menu: HMENU, id: u16, on: bool) {
-    // SAFETY: as in `check`.
-    unsafe {
-        EnableMenuItem(
-            menu,
-            u32::from(id),
-            MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED },
-        )
-    };
+    // As in `check`.
+    wmenu::enable(menu, By::Command(u32::from(id)), on);
 }
 
 fn radio(menu: HMENU, ids: &[u16], on: u16) {
@@ -789,8 +728,7 @@ pub fn empty() -> HMENU {
 
 /// Makes `id` the menu's default item, in bold.
 pub fn set_default(menu: HMENU, id: u16) {
-    // SAFETY: an item of a menu of this thread, by command.
-    unsafe { SetMenuDefaultItem(menu, u32::from(id), 0) };
+    wmenu::set_default(menu, By::Command(u32::from(id)));
 }
 
 /// The menu for the list's empty space (or Shift+F10 with nothing
@@ -822,9 +760,8 @@ pub fn filter_menu(current: Filter) -> HMENU {
 pub fn set_custom_filters(search: HMENU, filters: &[(u16, &str)]) {
     let range = CUSTOM_FILTER_FIRST..CUSTOM_FILTER_FIRST + CUSTOM_FILTERS as u16;
     for cmd in range {
-        // SAFETY: deletes an item of this menu by command; a missing one
-        // is reported and ignored.
-        unsafe { DeleteMenu(search, u32::from(cmd), MF_BYCOMMAND) };
+        // By command; a missing one is reported and ignored.
+        wmenu::delete(search, By::Command(u32::from(cmd)));
     }
     let Some(at) = position_of(search, Filter::Video.menu_id()).map(|p| p + 1) else {
         return;
@@ -940,20 +877,13 @@ mod tests {
 
     /// The labels of a menu's items, a separator as "-".
     fn labels(menu: HMENU) -> Vec<String> {
-        use windows_sys::Win32::UI::WindowsAndMessaging::GetMenuStringW;
-        // SAFETY: reads the items of a menu this test made.
-        let n = unsafe { GetMenuItemCount(menu) }.max(0) as u32;
+        let n = wmenu::count(menu).max(0) as u32;
         (0..n)
             .map(|i| {
                 if is_separator(menu, i) {
                     return "-".to_owned();
                 }
-                let mut buf = [0u16; 128];
-                // SAFETY: the buffer and its length.
-                let len = unsafe {
-                    GetMenuStringW(menu, i, buf.as_mut_ptr(), buf.len() as i32, MF_BYPOSITION)
-                };
-                String::from_utf16_lossy(&buf[..len.max(0) as usize])
+                String::from_utf16_lossy(&wmenu::text_units(menu, By::Position(i)))
             })
             .collect()
     }

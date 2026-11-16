@@ -1056,24 +1056,7 @@ mod tests {
 
     /// How `CommandLineToArgvW` splits `line`, as the new process will.
     fn argv(line: &str) -> Vec<String> {
-        use windows_sys::Win32::Foundation::LocalFree;
-        use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
-        let w = crate::wide::wz(line);
-        let mut n = 0;
-        // SAFETY: a NUL-terminated line; the array is read for its `n`
-        // strings, then freed with LocalFree as documented.
-        unsafe {
-            let list = CommandLineToArgvW(w.as_ptr(), &mut n);
-            let out = (0..n as usize)
-                .map(|i| {
-                    let p = *list.add(i);
-                    let len = (0..).take_while(|&j| *p.add(j) != 0).count();
-                    String::from_utf16_lossy(core::slice::from_raw_parts(p, len))
-                })
-                .collect();
-            LocalFree(list.cast());
-            out
-        }
+        crate::win::shell::command_line_to_argv(line)
     }
 
     #[test]

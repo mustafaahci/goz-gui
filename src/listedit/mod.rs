@@ -530,38 +530,18 @@ impl Export {
 /// `text` in the system's ANSI code page; a character it has not got is
 /// its default character (`?`).
 fn ansi(text: &str) -> Vec<u8> {
-    use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
+    use crate::win::locale::wide_to_multi_byte;
+    use windows_sys::Win32::Globalization::CP_ACP;
     let wide: Vec<u16> = text.encode_utf16().collect();
     if wide.is_empty() {
         return Vec::new();
     }
-    // SAFETY: two calls on buffers of the lengths given: the first asks
-    // how many bytes, the second writes them.
-    unsafe {
-        let n = WideCharToMultiByte(
-            CP_ACP,
-            0,
-            wide.as_ptr(),
-            wide.len() as i32,
-            core::ptr::null_mut(),
-            0,
-            core::ptr::null(),
-            core::ptr::null_mut(),
-        );
-        let mut out = vec![0u8; n.max(0) as usize];
-        let written = WideCharToMultiByte(
-            CP_ACP,
-            0,
-            wide.as_ptr(),
-            wide.len() as i32,
-            out.as_mut_ptr(),
-            n,
-            core::ptr::null(),
-            core::ptr::null_mut(),
-        );
-        out.truncate(written.max(0) as usize);
-        out
-    }
+    // Two calls: the first asks how many bytes, the second writes them.
+    let n = wide_to_multi_byte(CP_ACP, &wide, &mut []);
+    let mut out = vec![0u8; n.max(0) as usize];
+    let written = wide_to_multi_byte(CP_ACP, &wide, &mut out);
+    out.truncate(written.max(0) as usize);
+    out
 }
 
 /// The folders above `path`, nearest first: `c:\a\b.txt` gives `c:\a` and

@@ -1,0 +1,669 @@
+//! GDI: device contexts and the objects drawn with them. GDI checks every
+//! handle it is given, so handles are plain values here; what a call reads
+//! or writes through a pointer is a Rust reference or slice.
+//!
+//! What GDI makes for goz-gui is owned: a DC ([`MemDc`], [`WindowDc`]) or
+//! an object ([`Owned`]: a font, brush, pen or bitmap) is a type that lets
+//! it go when it drops, and no function here deletes or releases a raw
+//! handle (which could be another part of the process's, a DIB section
+//! whose bits it still uses, say). Selecting an object into a DC
+//! ([`Selected`]) borrows it; the object a selection replaced comes back
+//! as a [`Previous`], only to be selected again.
+
+use windows_sys::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
+use windows_sys::Win32::Graphics::Gdi::{
+    AlphaBlend, BITMAP, BLENDFUNCTION, BeginPaint, BitBlt, CreateCompatibleBitmap,
+    CreateCompatibleDC, CreateFontIndirectW, CreatePen, CreateSolidBrush, DRAW_TEXT_FORMAT,
+    DT_MODIFYSTRING, DeleteDC, DeleteObject, DrawFocusRect, DrawTextW, ETO_OPTIONS, EndPaint,
+    ExtTextOutW, FillRect, GET_STOCK_OBJECT_FLAGS, GetDC, GetObjectW, GetStockObject, GetSysColor,
+    GetSysColorBrush, GetTextExtentPoint32W, GetTextMetricsW, GetWindowDC, HBITMAP, HBRUSH, HDC,
+    HFONT, HGDIOBJ, LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PEN_STYLE, ROP_CODE, ReleaseDC,
+    SYS_COLOR_INDEX, SelectObject, SetBkColor, SetBkMode, SetDCBrushColor, SetTextColor,
+    SetViewportOrgEx, StretchBlt, TEXTMETRICW,
+};
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateBitmap, EnumFontFamiliesExW, GetPixel, GetTextColor, GetTextExtentExPointW, RoundRect,
+    STRETCH_BLT_MODE, SetBrushOrgEx, SetDCPenColor, SetPixelV, SetStretchBltMode,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{DI_FLAGS, DrawIconEx, HICON};
+
+/// A window's painting, from BeginPaint to EndPaint (when this drops).
+pub struct Paint {
+    hwnd: HWND,
+    ps: PAINTSTRUCT,
+}
+
+impl Paint {
+    /// Starts painting the window's invalid area (WM_PAINT).
+    pub fn begin(hwnd: HWND) -> Paint {
+        let mut ps = PAINTSTRUCT::default();
+        // SAFETY: an out-struct, kept until EndPaint.
+        unsafe { BeginPaint(hwnd, &mut ps) };
+        Paint { hwnd, ps }
+    }
+
+    /// The DC to paint with (null if BeginPaint failed).
+    pub fn hdc(&self) -> HDC {
+        self.ps.hdc
+    }
+
+    /// The area to paint.
+    pub fn area(&self) -> RECT {
+        self.ps.rcPaint
+    }
+}
+
+impl Drop for Paint {
+    fn drop(&mut self) {
+        // SAFETY: the PAINTSTRUCT BeginPaint filled.
+        unsafe { EndPaint(self.hwnd, &self.ps) };
+    }
+}
+
+/// A window's DC (GetDC, GetWindowDC), released when this drops.
+pub struct WindowDc {
+    hwnd: HWND,
+    hdc: HDC,
+}
+
+impl WindowDc {
+    /// The window's client-area DC (null: the screen's).
+    pub fn get(hwnd: HWND) -> WindowDc {
+        WindowDc {
+            hwnd,
+            hdc: get_dc(hwnd),
+        }
+    }
+
+    /// The whole window's DC, frame included (GetWindowDC).
+    pub fn whole(hwnd: HWND) -> WindowDc {
+        WindowDc {
+            hwnd,
+            hdc: window_dc(hwnd),
+        }
+    }
+
+    /// The DC, to draw with (it stays this one's).
+    pub fn hdc(&self) -> HDC {
+        self.hdc
+    }
+}
+
+impl Drop for WindowDc {
+    fn drop(&mut self) {
+        release_dc(self.hwnd, self.hdc);
+    }
+}
+
+/// A memory DC (CreateCompatibleDC), deleted when this drops.
+pub struct MemDc(HDC);
+
+impl MemDc {
+    /// A memory DC compatible with `hdc` (null: the screen); its DC null if
+    /// it could not be made.
+    pub fn compatible(hdc: HDC) -> MemDc {
+        // SAFETY: no pointers.
+        MemDc(unsafe { CreateCompatibleDC(hdc) })
+    }
+
+    /// The DC, to draw with (it stays this one's).
+    pub fn hdc(&self) -> HDC {
+        self.0
+    }
+}
+
+impl Drop for MemDc {
+    fn drop(&mut self) {
+        // SAFETY: no pointers; the DC this made, deleted once.
+        unsafe { DeleteDC(self.0) };
+    }
+}
+
+/// A GDI object goz-gui made (a font, brush, pen or bitmap: only the
+/// functions here that make one give one), deleted when this drops.
+pub struct Owned(HGDIOBJ);
+
+impl Owned {
+    /// `obj`, made for the caller (not null), to delete when this drops.
+    fn own(obj: HGDIOBJ) -> Option<Owned> {
+        (!obj.is_null()).then_some(Owned(obj))
+    }
+
+    /// Takes `obj`, a GDI object made for the caller by a call of this
+    /// layer's (a shell image's bitmap, say), to delete when this drops;
+    /// `None` for null.
+    ///
+    /// # Safety
+    /// `obj` is the caller's own, which nothing else deletes.
+    pub(crate) unsafe fn take(obj: HGDIOBJ) -> Option<Owned> {
+        Owned::own(obj)
+    }
+
+    /// The object, to draw with (it stays this one's).
+    pub fn get(&self) -> HGDIOBJ {
+        self.0
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        // SAFETY: no pointers; the object this owns, deleted once (GDI
+        // refuses a bitmap still selected into a DC, and deletes a pen, a
+        // brush or a font once it is no longer selected).
+        unsafe { DeleteObject(self.0) };
+    }
+}
+
+/// An object selected into a DC until this drops, when the one it replaced
+/// goes back. One goz-gui owns is borrowed meanwhile.
+pub struct Selected<'a> {
+    hdc: HDC,
+    old: HGDIOBJ,
+    _object: core::marker::PhantomData<&'a Owned>,
+}
+
+impl<'a> Selected<'a> {
+    /// Selects `obj` into `hdc` until this drops, borrowing it.
+    pub fn new(hdc: HDC, obj: &'a Owned) -> Selected<'a> {
+        Selected::of(hdc, obj.get())
+    }
+
+    /// Selects `obj`, an object goz-gui does not own here (a stock object,
+    /// a window's font, a section's bitmap), into `hdc` until this drops.
+    pub fn of(hdc: HDC, obj: HGDIOBJ) -> Selected<'a> {
+        Selected {
+            hdc,
+            // SAFETY: no pointers.
+            old: unsafe { SelectObject(hdc, obj) },
+            _object: core::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for Selected<'_> {
+    fn drop(&mut self) {
+        if !self.old.is_null() {
+            // SAFETY: no pointers.
+            unsafe { SelectObject(self.hdc, self.old) };
+        }
+    }
+}
+
+/// The object a selection replaced in a DC: it is only selected again
+/// ([`Previous::restore`]), never deleted (it is not goz-gui's).
+pub struct Previous(HGDIOBJ);
+
+impl Previous {
+    /// Selects the object back into `hdc`.
+    pub fn restore(self, hdc: HDC) {
+        if !self.0.is_null() {
+            // SAFETY: no pointers.
+            unsafe { SelectObject(hdc, self.0) };
+        }
+    }
+}
+
+/// The window's client-area DC (GetDC), to give back with [`release_dc`].
+fn get_dc(hwnd: HWND) -> HDC {
+    // SAFETY: no pointers.
+    unsafe { GetDC(hwnd) }
+}
+
+/// The whole window's DC (GetWindowDC), to give back with [`release_dc`].
+fn window_dc(hwnd: HWND) -> HDC {
+    // SAFETY: no pointers.
+    unsafe { GetWindowDC(hwnd) }
+}
+
+/// Gives back a DC [`get_dc`] or [`window_dc`] gave.
+fn release_dc(hwnd: HWND, hdc: HDC) {
+    // SAFETY: no pointers.
+    unsafe { ReleaseDC(hwnd, hdc) };
+}
+
+/// A `cx` × `cy` bitmap of `hdc`'s format, deleted when it drops; `None` if
+/// it could not be made.
+pub fn create_compatible_bitmap(hdc: HDC, cx: i32, cy: i32) -> Option<Owned> {
+    // SAFETY: no pointers.
+    Owned::own(unsafe { CreateCompatibleBitmap(hdc, cx, cy) })
+}
+
+/// Selects `obj` into `hdc` (an object goz-gui owns stays its owner's: the
+/// caller selects the previous one back before it goes); the object it
+/// replaced, to select back.
+pub fn select(hdc: HDC, obj: HGDIOBJ) -> Previous {
+    // SAFETY: no pointers.
+    Previous(unsafe { SelectObject(hdc, obj) })
+}
+
+/// One of the stock objects (DC_BRUSH, DEFAULT_GUI_FONT…), never deleted.
+pub fn stock_object(which: GET_STOCK_OBJECT_FLAGS) -> HGDIOBJ {
+    // SAFETY: no pointers.
+    unsafe { GetStockObject(which) }
+}
+
+/// A system colour (COLOR_*).
+pub fn sys_color(index: SYS_COLOR_INDEX) -> COLORREF {
+    // SAFETY: no pointers.
+    unsafe { GetSysColor(index) }
+}
+
+/// The system's brush of a colour (not to be deleted).
+pub fn sys_color_brush(index: SYS_COLOR_INDEX) -> HBRUSH {
+    // SAFETY: no pointers.
+    unsafe { GetSysColorBrush(index) }
+}
+
+/// The DC's text colour; the one before.
+pub fn set_text_color(hdc: HDC, c: COLORREF) -> COLORREF {
+    // SAFETY: no pointers.
+    unsafe { SetTextColor(hdc, c) }
+}
+
+/// The DC's background colour; the one before.
+pub fn set_bk_color(hdc: HDC, c: COLORREF) -> COLORREF {
+    // SAFETY: no pointers.
+    unsafe { SetBkColor(hdc, c) }
+}
+
+/// TRANSPARENT or OPAQUE; the mode before.
+pub fn set_bk_mode(hdc: HDC, mode: i32) -> i32 {
+    // SAFETY: no pointers.
+    unsafe { SetBkMode(hdc, mode) }
+}
+
+/// The colour of the DC's DC_BRUSH stock brush; the one before.
+pub fn set_dc_brush_color(hdc: HDC, c: COLORREF) -> COLORREF {
+    // SAFETY: no pointers.
+    unsafe { SetDCBrushColor(hdc, c) }
+}
+
+/// DrawTextW of `text` (no NUL needed) in `rc`; the text's height. With
+/// DT_CALCRECT, `rc` comes back as the text's extent. DT_MODIFYSTRING is
+/// ignored: `text` is not written to.
+pub fn draw_text(hdc: HDC, text: &[u16], rc: &mut RECT, format: DRAW_TEXT_FORMAT) -> i32 {
+    let len = i32::try_from(text.len()).unwrap_or(i32::MAX);
+    // SAFETY: `len` units of `text`, read only (DT_MODIFYSTRING is masked
+    // off); the rectangle is in-out.
+    unsafe {
+        DrawTextW(
+            hdc,
+            super::units_ptr(text),
+            len,
+            rc,
+            format & !DT_MODIFYSTRING,
+        )
+    }
+}
+
+/// DrawTextW of `text` in `rc` with DT_MODIFYSTRING added to `format`: the
+/// text as drawn, with the ellipsis DT_END_ELLIPSIS or DT_PATH_ELLIPSIS
+/// put in, written in a buffer of its own. With DT_CALCRECT nothing is
+/// drawn and `rc` comes back as the text's extent.
+pub fn draw_text_modified(
+    hdc: HDC,
+    text: &[u16],
+    rc: &mut RECT,
+    format: DRAW_TEXT_FORMAT,
+) -> Vec<u16> {
+    // DT_MODIFYSTRING may write up to four units more than the text, and a
+    // NUL after them.
+    let mut buf = text.to_vec();
+    buf.extend_from_slice(&[0; 5]);
+    let len = super::len_i32(text.len());
+    // SAFETY: `len` units of the buffer, which has five more after them, as
+    // DT_MODIFYSTRING needs; the rectangle is in-out.
+    unsafe { DrawTextW(hdc, buf.as_mut_ptr(), len, rc, format | DT_MODIFYSTRING) };
+    let end = super::until_nul(&buf).len();
+    buf.truncate(end);
+    buf
+}
+
+/// `draw_text` of a `&str`.
+pub fn draw_str(hdc: HDC, text: &str, rc: &mut RECT, format: DRAW_TEXT_FORMAT) -> i32 {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    draw_text(hdc, &units, rc, format)
+}
+
+/// ExtTextOutW of `text` at `x, y`, clipped or filled to `rc` as `options`
+/// say.
+pub fn ext_text_out(
+    hdc: HDC,
+    (x, y): (i32, i32),
+    options: ETO_OPTIONS,
+    rc: Option<&RECT>,
+    text: &[u16],
+) -> bool {
+    let rc = rc.map_or(core::ptr::null(), |r| r as *const RECT);
+    let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
+    // SAFETY: `len` units of `text` and a rectangle or null, read during the
+    // call; no spacing array.
+    unsafe {
+        ExtTextOutW(
+            hdc,
+            x,
+            y,
+            options,
+            rc,
+            super::units_ptr(text),
+            len,
+            core::ptr::null(),
+        ) != 0
+    }
+}
+
+/// The size of `text` in the DC's font.
+pub fn text_extent(hdc: HDC, text: &[u16]) -> SIZE {
+    let mut size = SIZE::default();
+    let len = i32::try_from(text.len()).unwrap_or(i32::MAX);
+    // SAFETY: `len` units of `text`; an out-struct.
+    unsafe { GetTextExtentPoint32W(hdc, super::units_ptr(text), len, &mut size) };
+    size
+}
+
+/// GetTextExtentExPointW of `text` in the DC's font: how many of its units
+/// fit in `max` pixels, and the size of all of it.
+pub fn text_fit(hdc: HDC, text: &[u16], max: i32) -> (i32, SIZE) {
+    let (mut fit, mut size) = (0, SIZE::default());
+    let len = super::len_i32(text.len());
+    // SAFETY: `len` units of `text`, read; two out-values; no array of
+    // partial extents.
+    unsafe {
+        GetTextExtentExPointW(
+            hdc,
+            super::units_ptr(text),
+            len,
+            max,
+            &mut fit,
+            core::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    (fit, size)
+}
+
+/// The DC's text colour.
+pub fn text_color(hdc: HDC) -> COLORREF {
+    // SAFETY: no pointers.
+    unsafe { GetTextColor(hdc) }
+}
+
+/// The colour of the DC's DC_PEN stock pen; the one before.
+pub fn set_dc_pen_color(hdc: HDC, c: COLORREF) -> COLORREF {
+    // SAFETY: no pointers.
+    unsafe { SetDCPenColor(hdc, c) }
+}
+
+/// The colour of the pixel at `x, y` of the DC (CLR_INVALID outside its
+/// clip).
+pub fn get_pixel(hdc: HDC, x: i32, y: i32) -> COLORREF {
+    // SAFETY: no pointers.
+    unsafe { GetPixel(hdc, x, y) }
+}
+
+/// SetPixelV: paints one pixel of `hdc` in colour `c`.
+pub fn set_pixel(hdc: HDC, x: i32, y: i32, c: COLORREF) -> bool {
+    // SAFETY: no pointers; GDI checks the DC.
+    unsafe { SetPixelV(hdc, x, y, c) != 0 }
+}
+
+/// A rectangle with corners rounded by an ellipse of `cx` × `cy`, outlined
+/// in the DC's pen and filled with its brush.
+pub fn round_rect(hdc: HDC, rc: &RECT, cx: i32, cy: i32) {
+    // SAFETY: no pointers.
+    unsafe { RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, cx, cy) };
+}
+
+/// A new `cx` × `cy` bitmap of `planes` planes of `bits_per_pixel`, its
+/// pixels not set, deleted when it drops; `None` if it could not be made.
+pub fn create_bitmap(cx: i32, cy: i32, planes: u32, bits_per_pixel: u32) -> Option<Owned> {
+    // SAFETY: no initial pixels (null).
+    Owned::own(unsafe { CreateBitmap(cx, cy, planes, bits_per_pixel, core::ptr::null()) })
+}
+
+/// The font faces the screen has, as EnumFontFamiliesExW gives them for a
+/// LOGFONTW of `charset` and no face (DEFAULT_CHARSET: each face once per
+/// charset it has), in its order.
+pub fn font_faces(charset: u8) -> Vec<String> {
+    use windows_sys::Win32::Foundation::LPARAM;
+
+    /// Adds each face to the vector `l` points at.
+    unsafe extern "system" fn each(
+        lf: *const LOGFONTW,
+        _tm: *const TEXTMETRICW,
+        _kind: u32,
+        l: LPARAM,
+    ) -> i32 {
+        // SAFETY: `l` is `font_faces`' vector, alive and borrowed by nothing
+        // else for the enumeration; `lf` the face Windows enumerates, read
+        // during the call (its name copied out).
+        unsafe {
+            let out = &mut *(l as *mut Vec<String>);
+            let face = &(*lf).lfFaceName;
+            out.push(String::from_utf16_lossy(super::until_nul(face)));
+        }
+        1
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let dc = WindowDc::get(core::ptr::null_mut());
+    let lf = LOGFONTW {
+        lfCharSet: charset,
+        ..Default::default()
+    };
+    // SAFETY: the screen's DC (released when `dc` drops); the callback
+    // above with `out`, which outlives the call and is not touched during
+    // it but through the callback.
+    unsafe { EnumFontFamiliesExW(dc.hdc(), &lf, Some(each), (&raw mut out) as LPARAM, 0) };
+    out
+}
+
+/// The DC's font's metrics.
+pub fn text_metrics(hdc: HDC) -> TEXTMETRICW {
+    let mut tm = TEXTMETRICW::default();
+    // SAFETY: an out-struct.
+    unsafe { GetTextMetricsW(hdc, &mut tm) };
+    tm
+}
+
+/// Fills `rc` with `brush`.
+pub fn fill_rect(hdc: HDC, rc: &RECT, brush: HBRUSH) {
+    // SAFETY: an in-struct.
+    unsafe { FillRect(hdc, rc, brush) };
+}
+
+/// Draws (or, again, takes away) the dotted focus rectangle.
+pub fn draw_focus_rect(hdc: HDC, rc: &RECT) {
+    // SAFETY: an in-struct.
+    unsafe { DrawFocusRect(hdc, rc) };
+}
+
+/// BitBlt of `cx` × `cy` from `src` at `sx, sy` to `dst` at `x, y`.
+pub fn bit_blt(
+    dst: HDC,
+    (x, y, cx, cy): (i32, i32, i32, i32),
+    src: HDC,
+    (sx, sy): (i32, i32),
+    rop: ROP_CODE,
+) -> bool {
+    // SAFETY: no pointers.
+    unsafe { BitBlt(dst, x, y, cx, cy, src, sx, sy, rop) != 0 }
+}
+
+/// Copies `src`'s rectangle into `dst`'s, stretched to fit, as `rop` says.
+pub fn stretch_blt(
+    dst: HDC,
+    (x, y, cx, cy): (i32, i32, i32, i32),
+    src: HDC,
+    (sx, sy, scx, scy): (i32, i32, i32, i32),
+    rop: ROP_CODE,
+) -> bool {
+    // SAFETY: no pointers.
+    unsafe { StretchBlt(dst, x, y, cx, cy, src, sx, sy, scx, scy, rop) != 0 }
+}
+
+/// Blends `src`'s rectangle onto `dst`'s (AlphaBlend) as `blend` says.
+pub fn alpha_blend(
+    dst: HDC,
+    (x, y, cx, cy): (i32, i32, i32, i32),
+    src: HDC,
+    (sx, sy, scx, scy): (i32, i32, i32, i32),
+    blend: BLENDFUNCTION,
+) -> bool {
+    // SAFETY: no pointers.
+    unsafe { AlphaBlend(dst, x, y, cx, cy, src, sx, sy, scx, scy, blend) != 0 }
+}
+
+/// Moves the DC's viewport origin; the one before.
+pub fn set_viewport_org(hdc: HDC, x: i32, y: i32) -> POINT {
+    let mut old = POINT::default();
+    // SAFETY: an out-struct.
+    unsafe { SetViewportOrgEx(hdc, x, y, &mut old) };
+    old
+}
+
+/// Moves the DC's pen position.
+pub fn move_to(hdc: HDC, x: i32, y: i32) {
+    // SAFETY: no out-point asked for.
+    unsafe { MoveToEx(hdc, x, y, core::ptr::null_mut()) };
+}
+
+/// Draws a line from the pen position to `x, y` in the DC's pen.
+pub fn line_to(hdc: HDC, x: i32, y: i32) {
+    // SAFETY: no pointers.
+    unsafe { LineTo(hdc, x, y) };
+}
+
+/// A font as `lf` describes it, deleted when it drops; `None` if it could
+/// not be made. Its face name is read up to its last unit, which is made a
+/// NUL.
+pub fn create_font(lf: &LOGFONTW) -> Option<Owned> {
+    let lf = LOGFONTW {
+        lfFaceName: face_name_ended(lf.lfFaceName),
+        ..*lf
+    };
+    // SAFETY: an in-struct whose face name ends with a NUL within its
+    // array.
+    Owned::own(unsafe { CreateFontIndirectW(&lf) })
+}
+
+/// A LOGFONTW's face name with its last unit a NUL, so a call reading it as
+/// a string stops within the array.
+pub(crate) fn face_name_ended(face: [u16; 32]) -> [u16; 32] {
+    let mut face = face;
+    face[31] = 0;
+    face
+}
+
+/// A brush of colour `c`, deleted when it drops; `None` if it could not be
+/// made.
+pub fn create_solid_brush(c: COLORREF) -> Option<Owned> {
+    // SAFETY: no pointers.
+    Owned::own(unsafe { CreateSolidBrush(c) })
+}
+
+/// A pen of `style`, `width` and colour `c`, deleted when it drops; `None`
+/// if it could not be made.
+pub fn create_pen(style: PEN_STYLE, width: i32, c: COLORREF) -> Option<Owned> {
+    // SAFETY: no pointers.
+    Owned::own(unsafe { CreatePen(style, width, c) })
+}
+
+/// A font's LOGFONTW.
+pub fn font_info(font: HFONT) -> Option<LOGFONTW> {
+    let mut lf = LOGFONTW::default();
+    // SAFETY: an out-struct and its size.
+    let n = unsafe { GetObjectW(font, size_of::<LOGFONTW>() as i32, (&raw mut lf).cast()) };
+    (n != 0).then_some(lf)
+}
+
+/// A bitmap's BITMAP (its size and format; `bmBits` is not to be read).
+pub fn bitmap_info(bmp: HBITMAP) -> Option<BITMAP> {
+    let mut bm = BITMAP::default();
+    // SAFETY: an out-struct and its size.
+    let n = unsafe { GetObjectW(bmp, size_of::<BITMAP>() as i32, (&raw mut bm).cast()) };
+    (n != 0).then_some(bm)
+}
+
+/// How the DC stretches bitmaps (HALFTONE, COLORONCOLOR…); the mode
+/// before.
+pub fn set_stretch_blt_mode(hdc: HDC, mode: STRETCH_BLT_MODE) -> i32 {
+    // SAFETY: no pointers.
+    unsafe { SetStretchBltMode(hdc, mode) }
+}
+
+/// Moves the DC's brush origin (the one before is not asked for).
+pub fn set_brush_org(hdc: HDC, x: i32, y: i32) {
+    // SAFETY: no out-point asked for.
+    unsafe { SetBrushOrgEx(hdc, x, y, core::ptr::null_mut()) };
+}
+
+/// DrawIconEx of `icon` at `x, y`, `cx` × `cy`.
+pub fn draw_icon(
+    hdc: HDC,
+    (x, y, cx, cy): (i32, i32, i32, i32),
+    icon: HICON,
+    flags: DI_FLAGS,
+) -> bool {
+    // SAFETY: no pointers.
+    unsafe { DrawIconEx(hdc, x, y, icon, cx, cy, 0, core::ptr::null_mut(), flags) != 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_text_is_drawn_and_measured_without_a_dangling_pointer() {
+        use windows_sys::Win32::Graphics::Gdi::{DT_CALCRECT, DT_END_ELLIPSIS, DT_SINGLELINE};
+        // An empty slice's own pointer is dangling; DrawTextW reads the
+        // first unit even when told the text is empty (an empty column of
+        // a dialog's list crashed it so).
+        let dc = MemDc::compatible(core::ptr::null_mut());
+        let mut rc = RECT {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 20,
+        };
+        draw_text(dc.hdc(), &[], &mut rc, DT_SINGLELINE | DT_END_ELLIPSIS);
+        draw_text(dc.hdc(), &[], &mut rc, DT_CALCRECT | DT_SINGLELINE);
+        assert_eq!(text_extent(dc.hdc(), &[]).cx, 0);
+        assert_eq!(text_fit(dc.hdc(), &[], 50).0, 0);
+        // Drawn or not, nothing is read past the text.
+        let _ = ext_text_out(dc.hdc(), (0, 0), 0, None, &[]);
+    }
+
+    #[test]
+    fn a_long_path_is_shortened_in_its_own_buffer() {
+        use windows_sys::Win32::Graphics::Gdi::{
+            DT_CALCRECT, DT_NOPREFIX, DT_PATH_ELLIPSIS, DT_SINGLELINE,
+        };
+        let dc = MemDc::compatible(core::ptr::null_mut());
+        let path: Vec<u16> = r"C:\Users\someone\Documents\Projects\goz\src\window.rs"
+            .encode_utf16()
+            .collect();
+        let (all, size) = text_fit(dc.hdc(), &path, i32::MAX);
+        assert_eq!(all, path.len() as i32);
+        assert_eq!(size.cx, text_extent(dc.hdc(), &path).cx);
+        let mut rc = RECT {
+            right: size.cx / 2,
+            bottom: 1,
+            ..Default::default()
+        };
+        let format = DT_SINGLELINE | DT_NOPREFIX | DT_PATH_ELLIPSIS | DT_CALCRECT;
+        let short = draw_text_modified(dc.hdc(), &path, &mut rc, format);
+        assert!(short.len() < path.len());
+        let dots = [0x2e; 3];
+        assert!(
+            short.windows(3).any(|w| w == dots),
+            "an ellipsis in the middle"
+        );
+        assert!(short.ends_with(&path[path.len() - 9..]), "the name kept");
+    }
+
+    #[test]
+    fn the_screen_has_fonts() {
+        assert!(!font_faces(1).is_empty());
+    }
+}

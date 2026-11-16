@@ -20,8 +20,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::LPARAM;
-use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
-use windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu;
 
 use super::bookmarks_pane::BookmarksPane;
 use super::filters_pane::FiltersPane;
@@ -32,6 +30,7 @@ use crate::menu::{self, Item};
 use crate::pane::{PaneContent, PaneSpec};
 use crate::sidebars;
 use crate::status::{self, Indicator};
+use crate::win;
 
 // F2's commands (`menu::F2_FIRST`, 3100..=3199). The first two are
 // Everything's "Folders | Clear Selection" and "Folders | Up One Dir",
@@ -332,9 +331,7 @@ impl App {
             return false;
         }
         let screen = point(l);
-        let mut pt = screen;
-        // SAFETY: converts a screen point to this thread's window's.
-        unsafe { ScreenToClient(self.hwnd, &mut pt) };
+        let pt = win::screen_to_client(self.hwnd, screen);
         if !in_rect(&self.status_rc.get(), pt) {
             return false;
         }
@@ -366,8 +363,8 @@ impl App {
         let popup = menu::submenu(&items);
         // The window readies the checks as it opens (WM_INITMENUPOPUP).
         let id = self.track_with_shell(popup, screen, "status bar menu", None);
-        // SAFETY: the menu made above.
-        unsafe { DestroyMenu(popup) };
+        // The menu made above.
+        win::menu::destroy(popup);
         match id as u16 {
             0 => {}
             CLEAR_SELECTION => self.clear_folder(),

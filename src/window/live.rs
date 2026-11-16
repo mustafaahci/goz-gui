@@ -18,13 +18,11 @@
 
 use std::time::Duration;
 
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, GetKeyState, IsWindowEnabled, VK_LBUTTON, VK_RBUTTON,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::SetTimer;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LBUTTON, VK_RBUTTON};
 
 use super::w9b::{LiveStep, WATCH_MIN_MS};
 use super::{App, TIMER_LIVE};
+use crate::win::{self, sys};
 
 /// The longest wait a slow search stretches the interval to (ms).
 const SLOW_MAX_MS: u32 = 60_000;
@@ -63,8 +61,8 @@ impl App {
     /// search, `live_delay`).
     fn arm_live_in(&self, wait: u32) {
         let delay = live_delay(wait, self.model.borrow().elapsed);
-        // SAFETY: a timer of this window; setting it again restarts it.
-        unsafe { SetTimer(self.hwnd, TIMER_LIVE, delay, None) };
+        // Setting the timer again restarts it.
+        win::set_timer(self.hwnd, TIMER_LIVE, delay);
     }
 
     /// The live update's timer: the search runs again if the user is not
@@ -130,14 +128,12 @@ impl App {
         {
             return false;
         }
-        // SAFETY: reads this thread's window and input state.
-        let (modal, captured, pressed) = unsafe {
-            (
-                IsWindowEnabled(self.hwnd) == 0,
-                !GetCapture().is_null(),
-                GetKeyState(i32::from(VK_LBUTTON)) < 0 || GetKeyState(i32::from(VK_RBUTTON)) < 0,
-            )
-        };
+        // This thread's window and input state.
+        let (modal, captured, pressed) = (
+            !win::is_enabled(self.hwnd),
+            !win::capture().is_null(),
+            sys::key_down(VK_LBUTTON) || sys::key_down(VK_RBUTTON),
+        );
         !(modal
             || captured
             || pressed

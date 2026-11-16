@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::win;
 use goz_core::proto::{ConfigChange, feature};
 
 /// The settings, as Everything's keys name them, in the page's order.
@@ -281,39 +282,13 @@ fn goz_exe() -> Option<PathBuf> {
 
 /// The goz service's program, from its configuration.
 fn service_binary() -> Option<PathBuf> {
-    use windows_sys::Win32::System::Services::{
-        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
-        QueryServiceConfigW, SC_MANAGER_CONNECT, SERVICE_QUERY_CONFIG,
-    };
-    let name = crate::wide::wz(goz_core::proto::SERVICE_NAME);
-    // SAFETY: handles opened here are closed here; the buffer is sized by
-    // the first call and u64-aligned for QUERY_SERVICE_CONFIGW, whose
-    // strings point into it.
-    unsafe {
-        let scm = OpenSCManagerW(core::ptr::null(), core::ptr::null(), SC_MANAGER_CONNECT);
-        if scm.is_null() {
-            return None;
-        }
-        let svc = OpenServiceW(scm, name.as_ptr(), SERVICE_QUERY_CONFIG);
-        let mut out = None;
-        if !svc.is_null() {
-            let mut needed = 0u32;
-            QueryServiceConfigW(svc, core::ptr::null_mut(), 0, &mut needed);
-            let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
-            let cfg = buf.as_mut_ptr().cast::<QUERY_SERVICE_CONFIGW>();
-            if QueryServiceConfigW(svc, cfg, (buf.len() * 8) as u32, &mut needed) != 0 {
-                let p = (*cfg).lpBinaryPathName;
-                if !p.is_null() {
-                    let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-                    let text = String::from_utf16_lossy(core::slice::from_raw_parts(p, len));
-                    out = Some(PathBuf::from(program_of(&text)));
-                }
-            }
-            CloseServiceHandle(svc);
-        }
-        CloseServiceHandle(scm);
-        out
-    }
+    use crate::win::process::ServiceHandle;
+    use windows_sys::Win32::System::Services::{SC_MANAGER_CONNECT, SERVICE_QUERY_CONFIG};
+    // Each handle is closed as it drops: the service's, then the manager's.
+    let scm = ServiceHandle::manager(SC_MANAGER_CONNECT)?;
+    let svc = scm.service(goz_core::proto::SERVICE_NAME, SERVICE_QUERY_CONFIG)?;
+    let text = svc.binary_path()?;
+    Some(PathBuf::from(program_of(&text)))
 }
 
 /// The program of a service's command line: quoted, or up to `.exe`.
@@ -331,45 +306,29 @@ fn program_of(command: &str) -> &str {
 /// Runs `exe args` as administrator (Windows asks the user), hidden, and
 /// waits for it: an error when the prompt was refused or it failed.
 fn run_elevated(exe: &Path, args: &str) -> Result<(), String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, GetLastError};
-    use windows_sys::Win32::System::Com::{
-        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
-    };
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-    use windows_sys::Win32::UI::Shell::{
-        SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
-    };
+    use crate::win::com::Apartment;
+    use crate::win::shell::Execute;
+    use windows_sys::Win32::Foundation::ERROR_CANCELLED;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
     let shown = format!("{} {args}", exe.display());
     if crate::store::location::dry_run_instead("config-set", &[shown]) {
         return Err("a dry run: goz.exe was not run".into());
     }
-    let verb = crate::wide::wz("runas");
-    let file = crate::wide::wz(&exe.to_string_lossy());
-    let params = crate::wide::wz(args);
-    let mut info = SHELLEXECUTEINFOW {
-        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS,
-        lpVerb: verb.as_ptr(),
-        lpFile: file.as_ptr(),
-        lpParameters: params.as_ptr(),
-        nShow: SW_HIDE,
-        ..Default::default()
-    };
-    // SAFETY: COM for this thread (the page's own), undone below; every
-    // string is NUL-terminated and outlives the call; the process handle
-    // is closed once waited on.
-    unsafe {
-        let com = CoInitializeEx(
-            core::ptr::null(),
-            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        );
-        let ran = ShellExecuteExW(&mut info);
-        let err = GetLastError();
-        if com >= 0 {
-            CoUninitialize();
-        }
-        if ran == 0 {
+    let file: Vec<u16> = exe.to_string_lossy().encode_utf16().collect();
+    // COM for this thread (the page's own), for the rest of its life.
+    let _com = Apartment::sta();
+    let ran = win::shell::execute(&Execute {
+        owner: core::ptr::null_mut(),
+        verb: Some("runas"),
+        file: &file,
+        params: Some(args),
+        dir: None,
+        show: SW_HIDE,
+        process: true,
+    });
+    let process = match ran {
+        Ok(process) => process,
+        Err(err) => {
             return Err(if err == ERROR_CANCELLED {
                 "the administrator prompt was cancelled".into()
             } else {
@@ -380,18 +339,17 @@ fn run_elevated(exe: &Path, args: &str) -> Result<(), String> {
                 )
             });
         }
-        if info.hProcess.is_null() {
-            return Ok(());
-        }
-        let done = WaitForSingleObject(info.hProcess, 60_000) == 0;
-        let mut code = 1u32;
-        GetExitCodeProcess(info.hProcess, &mut code);
-        CloseHandle(info.hProcess);
-        match (done, code) {
-            (false, _) => Err("goz.exe --config set did not finish in a minute".into()),
-            (true, 0) => Ok(()),
-            (true, c) => Err(format!("goz.exe --config set ended with code {c}")),
-        }
+    };
+    let Some(process) = process else {
+        return Ok(());
+    };
+    // The process handle is closed as it drops, once waited on.
+    let done = process.wait(60_000);
+    let code = process.exit_code().unwrap_or(1);
+    match (done, code) {
+        (false, _) => Err("goz.exe --config set did not finish in a minute".into()),
+        (true, 0) => Ok(()),
+        (true, c) => Err(format!("goz.exe --config set ended with code {c}")),
     }
 }
 

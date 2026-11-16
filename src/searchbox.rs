@@ -11,21 +11,17 @@
 //! and the same shape at every scale.
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{HDC, InvalidateRect, PtInRect, SetPixelV};
+use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::UI::Controls::{
-    NMTTDISPINFOW, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW,
-    TTM_SETMAXTIPWIDTH, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+    NMTTDISPINFOW, TTF_SUBCLASS, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, GetWindowTextLengthW, SendMessageW, WS_EX_TOPMOST, WS_POPUP,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{CW_USEDEFAULT, WS_EX_TOPMOST, WS_POPUP};
 
 use crate::colors::{Item, State};
 use crate::paint::fill;
 use crate::theme::{self, Palette};
+use crate::win::class::{Create, create_plain};
+use crate::win::{self, View, gdi, tip};
 use crate::window::App;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,8 +145,9 @@ pub fn enabled(app: &App, button: Button) -> bool {
 
 pub fn hit(app: &App, pt: POINT) -> Option<Button> {
     let f = frame_of(app);
-    // SAFETY: reads two plain structs.
-    let inside = |rc: &RECT| unsafe { PtInRect(rc, pt) } != 0;
+    // As PtInRect: the left and top edges in, the right and bottom out.
+    let inside =
+        |rc: &RECT| pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
     if let Some((back, forward)) = nav_of(app) {
         if inside(&back) {
             return Some(Button::Back);
@@ -177,8 +174,7 @@ pub fn invalidate(app: &App) {
         right: f.history.right,
         ..f.clear
     };
-    // SAFETY: invalidates part of this thread's window.
-    unsafe { InvalidateRect(app.hwnd, &rc, 0) };
+    win::invalidate(app.hwnd, Some(&rc), false);
     invalidate_nav(app);
 }
 
@@ -189,8 +185,7 @@ pub fn invalidate_nav(app: &App) {
             right: forward.right,
             ..back
         };
-        // SAFETY: invalidates part of this thread's window.
-        unsafe { InvalidateRect(app.hwnd, &rc, 0) };
+        win::invalidate(app.hwnd, Some(&rc), false);
     }
 }
 
@@ -209,14 +204,8 @@ pub fn mouse_move(app: &App, pt: POINT) {
         Some(pressed) => (over == Some(pressed)).then_some(pressed),
         None => {
             if over.is_some() {
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: app.hwnd,
-                    dwHoverTime: 0,
-                };
-                // SAFETY: asks for WM_MOUSELEAVE on this thread's window.
-                unsafe { TrackMouseEvent(&mut tme) };
+                // WM_MOUSELEAVE, when it goes.
+                win::track_leave(app.hwnd);
             }
             over
         }
@@ -241,8 +230,7 @@ pub fn button_down(app: &App, pt: POINT) -> bool {
         return true;
     }
     app.search_pressed.set(Some(button));
-    // SAFETY: captures the mouse for this thread's window.
-    unsafe { SetCapture(app.hwnd) };
+    win::set_capture(app.hwnd);
     set_hot(app, Some(button));
     true
 }
@@ -251,11 +239,9 @@ pub fn button_down(app: &App, pt: POINT) -> bool {
 /// that same button.
 pub fn button_up(app: &App, pt: POINT) -> Option<Button> {
     let pressed = app.search_pressed.take()?;
-    // SAFETY: releases the capture `button_down` took, if it is still ours.
-    unsafe {
-        if GetCapture() == app.hwnd {
-            ReleaseCapture();
-        }
+    // The capture `button_down` took, if it is still ours.
+    if win::capture() == app.hwnd {
+        win::release_capture();
     }
     // Hovering again: lit while the mouse stays on a button, which needs
     // its leaving tracked anew.
@@ -274,8 +260,7 @@ pub fn capture_lost(app: &App) {
 pub fn paint(app: &App, hdc: HDC) {
     let pal = app.pal.get();
     let f = frame_of(app);
-    // SAFETY: reads the length of this thread's search box.
-    let empty = unsafe { GetWindowTextLengthW(app.edit) } == 0;
+    let empty = win::text_len(app.edit) == 0;
     let scale = app.dpi.get() as f32 / 96.0;
     let hot = app.search_hot.get();
     let open = app.dropdown.is_open();
@@ -553,8 +538,7 @@ fn draw(hdc: HDC, cx: i32, cy: i32, strokes: &[Stroke], fg: u32, bg: u32) {
             // The glyph's centre is the middle of pixel (cx, cy).
             let c = coverage(strokes, dx as f32 - 0.5, dy as f32 - 0.5);
             if c > 0.0 {
-                // SAFETY: sets one pixel of the paint buffer.
-                unsafe { SetPixelV(hdc, cx + dx, cy + dy, blend(bg, fg, c)) };
+                win::gdi::set_pixel(hdc, cx + dx, cy + dy, blend(bg, fg, c));
             }
         }
     }
@@ -580,38 +564,27 @@ fn triangle(hdc: HDC, cx: i32, cy: i32, scale: f32, colour: u32) {
 /// The tooltips of both buttons, as one tooltip control over the main
 /// window; their texts are asked for as they show (`tooltip_text`).
 pub fn create_tooltip(app: &App) -> HWND {
-    // SAFETY: creates a tooltip control owned by this thread's window and
-    // registers two tools with it; the structs live across the calls.
-    unsafe {
-        let tip = CreateWindowExW(
-            WS_EX_TOPMOST,
-            TOOLTIPS_CLASSW,
-            core::ptr::null(),
-            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            app.hwnd,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            core::ptr::null(),
-        );
-        if tip.is_null() {
-            return tip;
-        }
-        SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, app.scale(400) as isize);
-        for button in Button::ALL {
-            let info = tool(app, button);
-            SendMessageW(tip, TTM_ADDTOOLW, 0, (&raw const info) as isize);
-        }
-        tip
+    let tip = create_plain(&Create {
+        ex_style: WS_EX_TOPMOST,
+        class: tip::CLASS,
+        title: "",
+        style: WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        rect: (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
+        parent: app.hwnd,
+        menu: core::ptr::null_mut(),
+    });
+    if tip.is_null() {
+        return tip;
     }
+    tip::set_max_width(tip, app.scale(400));
+    for button in Button::ALL {
+        // The tooltip asks for the text each time it shows.
+        tip::add_tool(tip, &tool(app, button), tip::Text::Callback);
+    }
+    tip
 }
 
-/// LPSTR_TEXTCALLBACKW: the tooltip asks for the text each time it shows.
-const TEXT_CALLBACK: *mut u16 = -1isize as *mut u16;
-
+/// A button's tool (its text is set where the tool goes in).
 fn tool(app: &App, button: Button) -> TTTOOLINFOW {
     let f = frame_of(app);
     TTTOOLINFOW {
@@ -626,9 +599,7 @@ fn tool(app: &App, button: Button) -> TTTOOLINFOW {
             Button::Back => nav_of(app).map_or_else(RECT::default, |n| n.0),
             Button::Forward => nav_of(app).map_or_else(RECT::default, |n| n.1),
         },
-        lpszText: TEXT_CALLBACK,
-        // SAFETY: the rest of TTTOOLINFOW is plain data.
-        ..unsafe { core::mem::zeroed() }
+        ..Default::default()
     }
 }
 
@@ -639,9 +610,7 @@ pub fn place_tooltip(app: &App) {
         return;
     }
     for button in Button::ALL {
-        let info = tool(app, button);
-        // SAFETY: the struct lives across the synchronous call.
-        unsafe { SendMessageW(tip, TTM_NEWTOOLRECTW, 0, (&raw const info) as isize) };
+        tip::new_tool_rect(tip, &tool(app, button));
     }
 }
 
@@ -664,9 +633,8 @@ pub fn theme_tooltip(app: &App, dark: bool) {
 
 /// The text of a button's tooltip about to show: none over the magnifier,
 /// which has nothing to clear.
-pub fn tooltip_text(app: &App, info: &mut NMTTDISPINFOW) {
-    // SAFETY: reads the length of this thread's search box.
-    let empty = unsafe { GetWindowTextLengthW(app.edit) } == 0;
+pub fn tooltip_text(app: &App, info: &mut View<'_, NMTTDISPINFOW>) {
+    let empty = win::text_len(app.edit) == 0;
     let text = match info.hdr.idFrom {
         1 if !empty => "Clear",
         2 => "Search History",
@@ -674,13 +642,9 @@ pub fn tooltip_text(app: &App, info: &mut NMTTDISPINFOW) {
         4 => "Go forward one search",
         _ => "",
     };
-    info.szText = [0; 80];
-    for (dst, src) in info.szText.iter_mut().zip(text.encode_utf16()) {
-        *dst = src;
-    }
-    // The tooltip shows what this points at; the buffer is in `info`, which
-    // the tooltip reads before it goes.
-    info.lpszText = info.szText.as_mut_ptr();
+    // Into the notification's own buffer, which the tooltip shows.
+    let units: Vec<u16> = text.encode_utf16().collect();
+    info.set_text(&units);
 }
 
 /// The filter bar (View > Filter Bar) right of the search frame, `rc`: a
@@ -690,8 +654,7 @@ pub fn tooltip_text(app: &App, info: &mut NMTTDISPINFOW) {
 /// menus do.
 pub fn paint_filter_bar(app: &App, hdc: HDC, rc: RECT, name: &str, open: bool) {
     use windows_sys::Win32::Graphics::Gdi::{
-        DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, SelectObject,
-        SetBkMode, SetTextColor, TRANSPARENT,
+        DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
     };
     if rc.right - rc.left < 3 {
         return;
@@ -723,27 +686,24 @@ pub fn paint_filter_bar(app: &App, hdc: HDC, rc: RECT, name: &str, open: bool) {
     } else {
         draw(hdc, cx, cy, &chevron(scale), fg, bg);
     }
-    let mut text: Vec<u16> = name.encode_utf16().collect();
+    let text: Vec<u16> = name.encode_utf16().collect();
     let mut room = RECT {
         left: inner.left + app.scale(4),
         right: button.left - app.scale(2),
         ..inner
     };
     let font = app.part_font(Item::FilterBar, pal.is_bold(Item::FilterBar, State::Normal));
-    // SAFETY: draws into the paint buffer; the old font is put back.
-    unsafe {
-        let old = SelectObject(hdc, font);
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, ink.fg);
-        DrawTextW(
-            hdc,
-            text.as_mut_ptr(),
-            text.len() as i32,
-            &mut room,
-            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
-        SelectObject(hdc, old);
-    }
+    // Into the paint buffer; the old font is put back.
+    let old = gdi::select(hdc, font);
+    gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+    gdi::set_text_color(hdc, ink.fg);
+    gdi::draw_text(
+        hdc,
+        &text,
+        &mut room,
+        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+    );
+    old.restore(hdc);
 }
 
 /// A button's glyph and background colours on a field of `bg`, lit (under

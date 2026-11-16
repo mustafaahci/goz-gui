@@ -13,20 +13,11 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
-use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
-use windows::core::{Interface, PCWSTR};
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
-    RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegGetValueW,
-    RegSetValueExW,
-};
-use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs};
 use windows_sys::core::GUID;
 
-use crate::wide::wz;
+use crate::win::reg::{self, Hive};
+use crate::win::shell::{self, ShellLink};
 
 /// The test override of where the keys go.
 pub const REG_ROOT_VAR: &str = "GOZ_GUI_REG_ROOT";
@@ -44,8 +35,19 @@ const RUN_VALUE: &str = "goz-gui";
 const VERB: &str = "goz-gui";
 const VERB_LABEL: &str = "Search goz...";
 
+/// A test hook's value (`REG_ROOT_VAR`, `SHORTCUT_DIR_VAR`), unless it is
+/// empty: the environment's, or in a unit test the one the test gave its
+/// own thread (the environment is the process's, for every test at once).
+fn hook(name: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(v) = tests::HOOKS.with(|h| h.borrow().get(name).cloned()) {
+        return Some(v).filter(|v| !v.is_empty());
+    }
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
 fn root() -> Option<String> {
-    std::env::var(REG_ROOT_VAR).ok().filter(|v| !v.is_empty())
+    hook(REG_ROOT_VAR)
 }
 
 fn run_key() -> String {
@@ -90,63 +92,19 @@ fn verb_command(arg: &str) -> Option<String> {
 }
 
 fn get(key: &str, value: Option<&str>) -> Option<String> {
-    let key = wz(key);
-    let value = value.map(wz);
-    let mut buf = vec![0u16; 2048];
-    let mut size = (buf.len() * 2) as u32;
-    // SAFETY: NUL-terminated names and a buffer whose byte size is passed.
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            key.as_ptr(),
-            value.as_ref().map_or(core::ptr::null(), |v| v.as_ptr()),
-            RRF_RT_REG_SZ,
-            core::ptr::null_mut(),
-            buf.as_mut_ptr().cast(),
-            &mut size,
-        )
-    };
-    if rc != ERROR_SUCCESS {
-        return None;
-    }
-    let len = (size as usize / 2).saturating_sub(1).min(buf.len());
-    buf.truncate(len);
-    Some(String::from_utf16_lossy(&buf))
+    reg::get_string(Hive::CurrentUser, key, value)
 }
 
+/// Creates or opens a key under HKCU and writes a REG_SZ there.
 fn set(key: &str, value: Option<&str>, data: &str) -> bool {
-    let k = wz(key);
-    let value = value.map(wz);
-    let data = wz(data);
-    // SAFETY: creates or opens a key under HKCU, writes a REG_SZ of the
-    // NUL-terminated data's byte length, and closes the key.
-    unsafe {
-        let mut h: HKEY = core::ptr::null_mut();
-        if RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            k.as_ptr(),
-            0,
-            core::ptr::null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_WRITE,
-            core::ptr::null(),
-            &mut h,
-            core::ptr::null_mut(),
-        ) != ERROR_SUCCESS
-        {
-            return false;
-        }
-        let rc = RegSetValueExW(
-            h,
-            value.as_ref().map_or(core::ptr::null(), |v| v.as_ptr()),
-            0,
-            REG_SZ,
-            data.as_ptr().cast(),
-            (data.len() * 2) as u32,
-        );
-        RegCloseKey(h);
-        rc == ERROR_SUCCESS
-    }
+    reg::set_string(Hive::CurrentUser, key, value, data)
+}
+
+/// Deletes a key under HKCU: its subkeys and values, then the key itself
+/// (an error for a key already gone is fine).
+fn delete_key_tree(key: &str) {
+    reg::delete_tree(Hive::CurrentUser, key);
+    reg::delete_key(Hive::CurrentUser, key);
 }
 
 /// Whether Windows starts this goz-gui at sign-in.
@@ -159,11 +117,7 @@ pub fn set_starts_with_windows(on: bool) -> bool {
     if on {
         startup_command().is_some_and(|cmd| set(&run_key(), Some(RUN_VALUE), &cmd))
     } else {
-        let key = wz(&run_key());
-        let value = wz(RUN_VALUE);
-        // SAFETY: NUL-terminated names under HKCU.
-        let rc = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) };
-        rc == ERROR_SUCCESS || !starts_with_windows()
+        reg::delete_value(Hive::CurrentUser, &run_key(), RUN_VALUE) || !starts_with_windows()
     }
 }
 
@@ -181,14 +135,8 @@ pub fn set_folder_item(on: bool) -> bool {
             ok &= set(&key, None, VERB_LABEL)
                 && verb_command(arg).is_some_and(|cmd| set(&format!(r"{key}\command"), None, &cmd));
         } else {
-            let k = wz(&key);
-            // SAFETY: NUL-terminated paths under HKCU: the verb's subkeys
-            // and values, then the verb's key itself (an error for a key
-            // already gone is fine).
-            unsafe {
-                RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr());
-                RegDeleteKeyW(HKEY_CURRENT_USER, k.as_ptr());
-            }
+            // The verb's subkeys and values, then the verb's key itself.
+            delete_key_tree(&key);
         }
     }
     ok && has_folder_item() == on
@@ -235,13 +183,8 @@ pub fn set_url_protocol(on: bool) -> bool {
             && has_url_protocol()
     } else {
         if has_url_protocol() {
-            let k = wz(&key);
-            // SAFETY: NUL-terminated paths under HKCU: the protocol's
-            // subkeys and values, then its key.
-            unsafe {
-                RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr());
-                RegDeleteKeyW(HKEY_CURRENT_USER, k.as_ptr());
-            }
+            // The protocol's subkeys and values, then its key.
+            delete_key_tree(&key);
         }
         !has_url_protocol()
     }
@@ -285,16 +228,7 @@ fn associations_changed() {
     if root().is_some() {
         return;
     }
-    use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
-    // SAFETY: a notification with no items.
-    unsafe {
-        SHChangeNotify(
-            SHCNE_ASSOCCHANGED as i32,
-            SHCNF_IDLIST,
-            core::ptr::null(),
-            core::ptr::null(),
-        )
-    };
+    shell::notify_associations_changed();
 }
 
 /// Makes `.efu` files (Everything File Lists) open in this goz-gui as file
@@ -325,22 +259,14 @@ pub fn set_efu_association(on: bool) -> bool {
         if get(&ext, None).as_deref() == Some(EFU_PROG_ID) {
             let previous = get(&ext, Some(EFU_PREVIOUS)).unwrap_or_default();
             set(&ext, None, &previous);
-            let k = wz(&ext);
-            let v = wz(EFU_PREVIOUS);
-            // SAFETY: NUL-terminated names under HKCU; a value already gone
-            // is fine.
-            unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), v.as_ptr()) };
+            // A value already gone is fine.
+            reg::delete_value(Hive::CurrentUser, &ext, EFU_PREVIOUS);
         }
         let is_ours =
             get(&format!(r"{prog}\shell\open\command"), None).is_some_and(|c| is_efu_command(&c));
         if is_ours {
-            let k = wz(&prog);
-            // SAFETY: NUL-terminated paths under HKCU: the key's subkeys
-            // and values, then the key.
-            unsafe {
-                RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr());
-                RegDeleteKeyW(HKEY_CURRENT_USER, k.as_ptr());
-            }
+            // The key's subkeys and values, then the key.
+            delete_key_tree(&prog);
         }
         associations_changed();
         !has_efu_association()
@@ -358,29 +284,12 @@ pub enum Shortcut {
 
 /// A known folder's path (`FOLDERID_*`).
 fn known_folder(id: &GUID) -> Option<PathBuf> {
-    let mut raw: *mut u16 = core::ptr::null_mut();
-    // SAFETY: the shell allocates the string, which is read up to its NUL
-    // and freed with CoTaskMemFree as documented (also on failure).
-    unsafe {
-        let hr = SHGetKnownFolderPath(id, 0, core::ptr::null_mut(), &mut raw);
-        let path = if hr >= 0 && !raw.is_null() {
-            let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
-            Some(PathBuf::from(OsString::from_wide(
-                core::slice::from_raw_parts(raw, len),
-            )))
-        } else {
-            None
-        };
-        CoTaskMemFree(raw.cast());
-        path
-    }
+    shell::known_folder(id).map(|path| PathBuf::from(OsString::from_wide(&path)))
 }
 
 /// Where shortcut `which` goes.
 fn shortcut_path(which: Shortcut) -> Option<PathBuf> {
-    let test = std::env::var(SHORTCUT_DIR_VAR)
-        .ok()
-        .filter(|v| !v.is_empty());
+    let test = hook(SHORTCUT_DIR_VAR);
     let folder = match (test, which) {
         (Some(dir), Shortcut::StartMenu) => PathBuf::from(dir).join("Programs"),
         (Some(dir), Shortcut::Desktop) => PathBuf::from(dir).join("Desktop"),
@@ -420,38 +329,49 @@ pub fn set_shortcut(which: Shortcut, on: bool) -> bool {
 
 /// Writes a shortcut at `link` that starts `exe` in its own folder.
 fn write_link(exe: &std::path::Path, link: &std::path::Path) -> windows::core::Result<()> {
-    let target = wz(&exe.to_string_lossy());
-    let dir = wz(&exe
+    let target = exe.to_string_lossy();
+    let dir = exe
         .parent()
-        .map_or(String::new(), |d| d.to_string_lossy().into_owned()));
-    let tip = wz(SHORTCUT_TIP);
-    let file = wz(&link.to_string_lossy());
-    // SAFETY: COM is ready on this thread; every string is NUL-terminated
-    // and outlives the calls that read it.
-    unsafe {
-        let shell_link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
-        shell_link.SetPath(PCWSTR(target.as_ptr()))?;
-        shell_link.SetWorkingDirectory(PCWSTR(dir.as_ptr()))?;
-        shell_link.SetDescription(PCWSTR(tip.as_ptr()))?;
-        shell_link.SetIconLocation(PCWSTR(target.as_ptr()), 0)?;
-        shell_link
-            .cast::<IPersistFile>()?
-            .Save(PCWSTR(file.as_ptr()), true)
-    }
+        .map_or(String::new(), |d| d.to_string_lossy().into_owned());
+    // COM is ready on this thread.
+    let shell_link = ShellLink::new()?;
+    shell_link.set_path(&target)?;
+    shell_link.set_working_directory(&dir)?;
+    shell_link.set_description(SHORTCUT_TIP)?;
+    shell_link.set_icon_location(&target, 0)?;
+    shell_link.save(&link.to_string_lossy())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
     use super::*;
+
+    thread_local! {
+        /// The test hooks a test set for its own thread, read in place of
+        /// the environment's (`hook`).
+        pub(super) static HOOKS: RefCell<HashMap<&'static str, String>> =
+            RefCell::new(HashMap::new());
+    }
+
+    /// Sets test hook `name` for this thread (`None`: the environment's
+    /// again).
+    fn set_hook(name: &'static str, value: Option<&str>) {
+        HOOKS.with(|h| match value {
+            Some(v) => h.borrow_mut().insert(name, v.to_owned()),
+            None => h.borrow_mut().remove(name),
+        });
+    }
 
     /// Turns both on and off again under a throwaway key, never the
     /// user's real ones.
     #[test]
     fn registry_round_trip_under_a_test_root() {
         let root = format!(r"Software\goz-gui-test-{}", std::process::id());
-        // SAFETY: only this module reads the variable, and only this test
-        // sets it.
-        unsafe { std::env::set_var(REG_ROOT_VAR, &root) };
+        // For this test's thread only.
+        set_hook(REG_ROOT_VAR, Some(&root));
         assert!(!starts_with_windows() && !has_folder_item() && !has_url_protocol());
         assert!(set_starts_with_windows(true) && starts_with_windows());
         assert!(set_folder_item(true) && has_folder_item());
@@ -496,26 +416,21 @@ mod tests {
             "the program before is back"
         );
         assert_eq!(get(&efu_prog_key(), None), None);
-        let k = wz(&root);
-        // SAFETY: deletes the throwaway key made above.
-        unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr()) };
-        unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, k.as_ptr()) };
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(REG_ROOT_VAR) };
+        // The throwaway key made above.
+        delete_key_tree(&root);
+        set_hook(REG_ROOT_VAR, None);
     }
 
     /// Makes and deletes both shortcuts under a throwaway folder, never the
     /// user's own Start menu or desktop.
     #[test]
     fn shortcuts_round_trip_under_a_test_folder() {
-        use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
-        // SAFETY: COM for this test thread (the window's thread has it).
-        unsafe { CoInitializeEx(core::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        // COM for this test thread (the window's thread has it).
+        let _com = crate::win::com::Apartment::sta();
         let dir = std::env::temp_dir().join(format!("goz-gui-shortcuts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // SAFETY: only this test sets the variable, and only this module
-        // reads it.
-        unsafe { std::env::set_var(SHORTCUT_DIR_VAR, &dir) };
+        // For this test's thread only.
+        set_hook(SHORTCUT_DIR_VAR, Some(&dir.to_string_lossy()));
         for which in [Shortcut::StartMenu, Shortcut::Desktop] {
             assert!(!has_shortcut(which));
             assert!(
@@ -534,8 +449,7 @@ mod tests {
             assert!(set_shortcut(which, false));
         }
         assert!(dir.join("Programs").is_dir() && dir.join("Desktop").is_dir());
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(SHORTCUT_DIR_VAR) };
+        set_hook(SHORTCUT_DIR_VAR, None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

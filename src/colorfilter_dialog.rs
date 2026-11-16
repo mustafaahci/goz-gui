@@ -8,24 +8,19 @@
 
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
-use windows_sys::Win32::UI::Controls::Dialogs::{
-    CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW,
-};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows_sys::Win32::UI::Controls::Dialogs::{CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, EN_CHANGE,
-    ES_AUTOHSCROLL, EndDialog, GWLP_USERDATA, GetDlgItem, IDCANCEL, IDOK, LB_ADDSTRING,
-    LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
-    SendMessageW, SetWindowLongPtrW, SetWindowTextW, WM_COMMAND, WM_INITDIALOG, WS_BORDER,
+    BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, EN_CHANGE, ES_AUTOHSCROLL, IDCANCEL, IDOK,
+    LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, WM_COMMAND, WM_INITDIALOG, WS_BORDER,
     WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::colorfilter::ColorFilter;
 use crate::colors::{format_color, parse_color};
-use crate::dialog::{Class, LIST_BOX, Look, Template, apply_theme, center_on_owner, common, state};
-use crate::wide::{window_text, wz};
+use crate::dialog::{Class, LIST_BOX, Look, Template, apply_theme, center_on_owner, common};
+use crate::win::{self, Msg, button, dlg, listbox};
 
 const STATIC: u16 = 0xffff;
 const LIST: u16 = 1000;
@@ -83,17 +78,8 @@ pub fn pick_color(owner: HWND, initial: Option<u32>, custom: &mut [u32; 16]) -> 
     if let Ok(v) = std::env::var("GOZ_GUI_PICK_COLOR") {
         return parse_color(&v);
     }
-    let mut cc = CHOOSECOLORW {
-        lStructSize: size_of::<CHOOSECOLORW>() as u32,
-        hwndOwner: owner,
-        rgbResult: initial.unwrap_or(0),
-        lpCustColors: custom.as_mut_ptr(),
-        Flags: CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR,
-        ..Default::default()
-    };
-    // SAFETY: a modal dialog over this thread's window; the struct and the
-    // custom colours outlive it. Nothing of the caller's is borrowed.
-    (unsafe { ChooseColorW(&mut cc) } != 0).then_some(cc.rgbResult & 0x00ff_ffff)
+    let flags = CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR;
+    win::dlg::choose_color(owner, initial.unwrap_or(0), custom, flags).map(|c| c & 0x00ff_ffff)
 }
 
 /// Edits `rules`; the new rules at OK, `None` at Cancel.
@@ -169,41 +155,28 @@ pub fn edit(owner: HWND, rules: Vec<ColorFilter>, look: Look) -> Option<Vec<Colo
         (187, 178, 50, 14),
     )
     .control(Class::Button, "Cancel", CANCEL, WS_TABSTOP, 0, (243, 178, 50, 14));
-    t.run(owner, Some(proc), (&raw const s) as LPARAM);
+    t.show(owner, &|m| proc(&s, m));
     s.done.get().then(|| s.rules.into_inner())
 }
 
-fn item(dlg: HWND, id: u16) -> HWND {
-    // SAFETY: looks up a child of this thread's dialog.
-    unsafe { GetDlgItem(dlg, i32::from(id)) }
-}
-
-fn send(dlg: HWND, id: u16, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: a message to a control of this thread's dialog; a pointer in
-    // `l` is the caller's and outlives the call.
-    unsafe { SendMessageW(item(dlg, id), msg, w, l) }
-}
-
 fn set_text(dlg: HWND, id: u16, text: &str) {
-    // SAFETY: a NUL-terminated string for a control of this dialog.
-    unsafe { SetWindowTextW(item(dlg, id), wz(text).as_ptr()) };
+    dlg::set_item_text(dlg, id, text);
 }
 
 fn enable(dlg: HWND, id: u16, on: bool) {
-    // SAFETY: a control of this thread's dialog.
-    unsafe { EnableWindow(item(dlg, id), on.into()) };
+    win::enable(dlg::item(dlg, id), on);
 }
 
 impl Edit {
     fn fill_list(&self, dlg: HWND) {
         self.filling.set(true);
-        send(dlg, LIST, LB_RESETCONTENT, 0, 0);
+        let list = dlg::item(dlg, LIST);
+        listbox::reset(list);
         for r in self.rules.borrow().iter() {
-            let w = wz(&line(r));
-            send(dlg, LIST, LB_ADDSTRING, 0, w.as_ptr() as isize);
+            listbox::add(list, &line(r));
         }
         if let Some(i) = self.current.get() {
-            send(dlg, LIST, LB_SETCURSEL, i, 0);
+            listbox::set_cur_sel(list, i as i32);
         }
         self.filling.set(false);
         self.fill_fields(dlg);
@@ -217,8 +190,8 @@ impl Edit {
         self.filling.set(true);
         let r = rule.clone().unwrap_or_default();
         set_text(dlg, FILTER, &r.filter);
-        send(dlg, FILES, BM_SETCHECK, usize::from(r.files), 0);
-        send(dlg, FOLDERS, BM_SETCHECK, usize::from(r.folders), 0);
+        button::set_checked(dlg::item(dlg, FILES), r.files);
+        button::set_checked(dlg::item(dlg, FOLDERS), r.folders);
         let c = |c: Option<u32>| c.map_or_else(|| "(none)".to_owned(), format_color);
         set_text(dlg, COLOR_TEXT, &c(r.color));
         set_text(dlg, DARK_TEXT, &c(r.dark_color));
@@ -253,22 +226,10 @@ impl Edit {
         let text = line(&self.rules.borrow()[i]);
         self.filling.set(true);
         // The list's line again, in place.
-        send(
-            dlg,
-            LIST,
-            windows_sys::Win32::UI::WindowsAndMessaging::LB_DELETESTRING,
-            i,
-            0,
-        );
-        let w = wz(&text);
-        send(
-            dlg,
-            LIST,
-            windows_sys::Win32::UI::WindowsAndMessaging::LB_INSERTSTRING,
-            i,
-            w.as_ptr() as isize,
-        );
-        send(dlg, LIST, LB_SETCURSEL, i, 0);
+        let list = dlg::item(dlg, LIST);
+        listbox::delete(list, i as i32);
+        listbox::insert(list, i as i32, &text);
+        listbox::set_cur_sel(list, i as i32);
         self.filling.set(false);
     }
 
@@ -298,24 +259,20 @@ impl Edit {
         match (id, code) {
             (OK, _) => {
                 self.done.set(true);
-                // SAFETY: ends this modal dialog.
-                unsafe { EndDialog(dlg, 1) };
+                dlg::end(dlg, 1);
             }
-            // SAFETY: ends this modal dialog.
-            (CANCEL, _) => unsafe {
-                EndDialog(dlg, 0);
-            },
+            (CANCEL, _) => dlg::end(dlg, 0),
             (LIST, LBN_SELCHANGE) if !self.filling.get() => {
-                let at = send(dlg, LIST, LB_GETCURSEL, 0, 0);
+                let at = listbox::cur_sel(dlg::item(dlg, LIST));
                 self.current.set(usize::try_from(at).ok());
                 self.fill_fields(dlg);
             }
             (FILTER, EN_CHANGE) if !self.filling.get() => {
-                let text = window_text(item(dlg, FILTER));
+                let text = dlg::item_text(dlg, FILTER);
                 self.change(dlg, |r| r.filter = text);
             }
             (FILES | FOLDERS, BN_CLICKED) => {
-                let on = send(dlg, id, BM_GETCHECK, 0, 0) == 1;
+                let on = button::is_checked(dlg::item(dlg, id));
                 self.change(dlg, |r| {
                     if id == FILES {
                         r.files = on;
@@ -347,8 +304,7 @@ impl Edit {
                 };
                 self.current.set(Some(n - 1));
                 self.fill_list(dlg);
-                // SAFETY: a control of this thread's dialog.
-                unsafe { SetFocus(item(dlg, FILTER)) };
+                win::set_focus(dlg::item(dlg, FILTER));
             }
             (REMOVE, BN_CLICKED) => {
                 if let Some(i) = self.current.get() {
@@ -393,20 +349,12 @@ impl Edit {
     }
 }
 
-unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Edit` that `edit` keeps alive until the
-        // dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Edit` from `edit`, or null.
-    let Some(s) = (unsafe { state::<Edit>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn proc(s: &Edit, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.fill_list(dlg);
             apply_theme(dlg, s.look.get().dark);
@@ -414,7 +362,7 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isi
             1
         }
         WM_COMMAND => {
-            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
             isize::from(s.command(dlg, id, code))
         }
         _ => 0,

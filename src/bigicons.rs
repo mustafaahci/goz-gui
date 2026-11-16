@@ -28,23 +28,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
-use windows_sys::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateCompatibleDC, DeleteDC, GdiFlush, HGDIOBJ, SelectObject,
-};
-use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
-};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForSingleObject,
-};
-use windows_sys::Win32::UI::Controls::{
-    HIMAGELIST, ILD_ASYNC, ILD_TRANSPARENT, IMAGELISTDRAWPARAMS, ImageList_Draw,
-    ImageList_DrawIndirect, ImageList_GetIconSize,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::System::Threading::INFINITE;
+use windows_sys::Win32::UI::Controls::{ILD_ASYNC, ILD_TRANSPARENT, IMAGELISTDRAWPARAMS};
 
-use crate::thumbs::{Bitmap, dib};
+use crate::thumbs::Bitmap;
+use crate::win::com::Apartment;
+use crate::win::dib::Canvas;
+use crate::win::imagelist::SystemList;
+use crate::win::imagelist::draw_indirect;
+use crate::win::sync::Event;
+use crate::win::{self, gdi, imagelist};
 
 /// Icons waiting at most; older ones have scrolled away.
 const MAX_QUEUED: usize = 256;
@@ -56,9 +50,19 @@ const TELL_EVERY: Duration = Duration::from_millis(40);
 /// (Large at 100 %), 28 at 192 px (Large at 150 %).
 const SHRUNK_BUDGET: usize = 4 << 20;
 
-/// An icon of one of the system's image lists: the list (its handle) and
-/// the icon's index in it.
+/// An icon of one of the system's image lists: the list (its SHIL_*, see
+/// [`key_of`]) and the icon's index in it.
 pub type Key = (usize, i32);
+
+/// A system list as a key's first half: which of the lists it is.
+fn key_of(list: SystemList) -> usize {
+    list.which() as usize
+}
+
+/// The system list a key names.
+fn list_of(key: usize) -> Option<SystemList> {
+    imagelist::system(i32::try_from(key).ok()?)
+}
 
 /// An icon of a system list (as `Key`) shrunk to a cell's side, in pixels.
 pub type Shrink = (usize, i32, i32);
@@ -175,7 +179,8 @@ struct Shared {
     shrunk: Mutex<Vec<(Shrink, Option<Bitmap>)>>,
     /// Set while the window has a message about loaded icons not yet taken.
     told: AtomicBool,
-    work: usize,
+    /// Set while there is work (`None` if the system could not make one).
+    work: Option<Event>,
     hwnd: usize,
     msg: u32,
 }
@@ -191,8 +196,8 @@ impl BigIcons {
     /// Icons loaded are told to `hwnd` as `msg` (no parameters). The thread
     /// starts with the first icon to load.
     pub fn new(hwnd: HWND, msg: u32) -> BigIcons {
-        // SAFETY: an unnamed manual-reset event.
-        let work = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) } as usize;
+        // A manual-reset event.
+        let work = Event::new(true, false);
         BigIcons {
             shared: Arc::new(Shared {
                 queue: Mutex::new(Vec::new()),
@@ -210,40 +215,40 @@ impl BigIcons {
         }
     }
 
-    /// Draws as `params` says if the icon is loaded; else it is loaded on
-    /// the thread (when `ask`) and false is given. An icon the thread
-    /// loaded that still does not draw this way is drawn as it comes.
-    pub fn draw(&self, params: &IMAGELISTDRAWPARAMS, ask: bool) -> bool {
+    /// Draws image `params.i` of `list` as `params` says if the icon is
+    /// loaded; else it is loaded on the thread (when `ask`) and false is
+    /// given. An icon the thread loaded that still does not draw this way
+    /// is drawn as it comes.
+    pub fn draw(&self, list: SystemList, params: &IMAGELISTDRAWPARAMS, ask: bool) -> bool {
         let quick = IMAGELISTDRAWPARAMS {
             fStyle: params.fStyle | ILD_ASYNC,
             ..*params
         };
-        // SAFETY: the caller's parameters, for a system image list.
-        if unsafe { ImageList_DrawIndirect(&quick) } != 0 {
+        // The caller's parameters, for a system image list.
+        if draw_indirect(&list, &quick) {
             return true;
         }
-        let key = (params.himl as usize, params.i);
+        let key = (key_of(list), params.i);
         if self.book.borrow().was_loaded(key) {
-            // SAFETY: as above.
-            return unsafe { ImageList_DrawIndirect(params) } != 0;
+            return draw_indirect(&list, params);
         }
         if ask {
-            self.load(params.himl, params.i);
+            self.load(list, params.i);
         }
         false
     }
 
     /// Whether icon `icon` of `list` was asked of the thread and is not
     /// loaded yet.
-    pub fn waiting(&self, list: HIMAGELIST, icon: i32) -> bool {
-        self.book.borrow().waiting((list as usize, icon))
+    pub fn waiting(&self, list: SystemList, icon: i32) -> bool {
+        self.book.borrow().waiting((key_of(list), icon))
     }
 
     /// Icon `icon` of `list` is to be loaded on the thread, unless it was
     /// asked for already.
-    pub fn load(&self, list: HIMAGELIST, icon: i32) {
-        let key = (list as usize, icon);
-        if icon < 0 || list == 0 || !self.book.borrow().wants(key) {
+    pub fn load(&self, list: SystemList, icon: i32) {
+        let key = (key_of(list), icon);
+        if icon < 0 || !self.book.borrow().wants(key) {
             return;
         }
         let dropped = {
@@ -266,8 +271,9 @@ impl BigIcons {
                 return;
             }
         }
-        // SAFETY: a live event handle.
-        unsafe { SetEvent(self.shared.work as HANDLE) };
+        if let Some(work) = &self.shared.work {
+            work.set();
+        }
     }
 
     /// Draws (`draw`) icon `icon` of `list` shrunk with a filter to `side`
@@ -276,15 +282,15 @@ impl BigIcons {
     /// meanwhile, or for good if it could not be made.
     pub fn draw_shrunk(
         &self,
-        list: HIMAGELIST,
+        list: SystemList,
         icon: i32,
         side: i32,
         draw: impl FnOnce(&Bitmap),
     ) -> bool {
-        if icon < 0 || list == 0 || side <= 0 {
+        if icon < 0 || side <= 0 {
             return false;
         }
-        let key = (list as usize, icon, side);
+        let key = (key_of(list), icon, side);
         {
             // Drawn while borrowed: GDI only, nothing that can call back.
             let pictures = self.pictures.borrow();
@@ -367,34 +373,30 @@ impl BigIcons {
 }
 
 fn load_thread(shared: &Shared) {
-    // SAFETY: the shell wants COM on a thread that loads its icons.
-    unsafe {
-        CoInitializeEx(
-            core::ptr::null(),
-            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        )
-    };
-    // SAFETY: a memory DC with a 1 × 1 bitmap, kept for the thread's life
-    // (which ends with the process's, as the icon thread's does): drawing
-    // an icon there is what makes the list load it.
-    let dc = unsafe {
-        let dc = CreateCompatibleDC(core::ptr::null_mut());
-        let bitmap = CreateBitmap(1, 1, 1, 32, core::ptr::null());
-        SelectObject(dc, bitmap);
-        dc
-    };
+    // The shell wants COM on a thread that loads its icons, for the
+    // thread's life.
+    let _com = Apartment::sta();
+    // A memory DC with a 1 × 1 bitmap, kept for the thread's life (which
+    // ends with the process's, as the icon thread's does): drawing an icon
+    // there is what makes the list load it.
+    let dc = gdi::MemDc::compatible(core::ptr::null_mut());
+    let bitmap = gdi::create_bitmap(1, 1, 1, 32);
+    let _selected = bitmap.as_ref().map(|b| gdi::Selected::new(dc.hdc(), b));
     let mut last_told = Instant::now();
     loop {
         match next_job(shared) {
             None => {
-                // SAFETY: a live event handle.
-                unsafe { WaitForSingleObject(shared.work as HANDLE, INFINITE) };
+                if let Some(work) = &shared.work {
+                    work.wait(INFINITE);
+                }
                 continue;
             }
             Some(Job::Load((list, icon))) => {
-                // SAFETY: the system image list lives as long as the
-                // process, and takes draws from any thread.
-                unsafe { ImageList_Draw(list as HIMAGELIST, icon, dc, 0, 0, ILD_TRANSPARENT) };
+                // The system image list lives as long as the process, and
+                // takes draws from any thread.
+                if let Some(list) = list_of(list) {
+                    imagelist::draw(&list, icon, dc.hdc(), (0, 0), ILD_TRANSPARENT);
+                }
                 shared
                     .done
                     .lock()
@@ -403,7 +405,7 @@ fn load_thread(shared: &Shared) {
             }
             Some(Job::Shrink(key)) => {
                 let (list, icon, side) = key;
-                let picture = make_shrunk(list as HIMAGELIST, icon, side);
+                let picture = list_of(list).and_then(|list| make_shrunk(list, icon, side));
                 shared
                     .shrunk
                     .lock()
@@ -424,8 +426,8 @@ fn load_thread(shared: &Shared) {
         if (idle || last_told.elapsed() >= TELL_EVERY) && !shared.told.swap(true, Ordering::SeqCst)
         {
             last_told = Instant::now();
-            // SAFETY: posts to the window; if it is gone, nothing is owed.
-            if unsafe { PostMessageW(shared.hwnd as HWND, shared.msg, 0, 0) } == 0 {
+            // If the window is gone, nothing is owed.
+            if !win::post_app(shared.hwnd as HWND, shared.msg, 0, 0) {
                 shared.told.store(false, Ordering::SeqCst);
             }
         }
@@ -450,8 +452,9 @@ fn next_job(shared: &Shared) -> Option<Job> {
     if let Some(key) = s.pop() {
         return Some(Job::Shrink(key));
     }
-    // SAFETY: a live event handle.
-    unsafe { ResetEvent(shared.work as HANDLE) };
+    if let Some(work) = &shared.work {
+        work.reset();
+    }
     None
 }
 
@@ -461,49 +464,36 @@ fn next_job(shared: &Shared) -> Option<Job> {
 /// `bigicon::render` does), then shrunk. `None` if the list's icons are
 /// not bigger than `side`, or it could not be drawn. Loads the icon if the
 /// list has not.
-fn make_shrunk(list: HIMAGELIST, icon: i32, side: i32) -> Option<Bitmap> {
-    let (mut cx, mut cy) = (0, 0);
-    // SAFETY: reads the size of a system image list.
-    unsafe { ImageList_GetIconSize(list, &mut cx, &mut cy) };
+fn make_shrunk(list: SystemList, icon: i32, side: i32) -> Option<Bitmap> {
+    // The size of a system image list.
+    let (cx, cy) = imagelist::icon_size(&list).unwrap_or((0, 0));
     if cx != cy || cx <= side || side <= 0 {
         return None;
     }
-    let (scratch, bits) = dib(cx, cx)?;
-    let count = (cx * cx) as usize;
-    // SAFETY: a memory DC made and deleted here holds the scratch DIB; its
-    // `count` pixels are touched only through slices made after GdiFlush,
-    // between the draws, while `scratch` keeps them alive. The system
-    // image list takes draws from any thread.
-    let full = unsafe {
-        let dc = CreateCompatibleDC(core::ptr::null_mut());
-        if dc.is_null() {
-            return None;
-        }
-        let old = SelectObject(dc, scratch.handle() as HGDIOBJ);
-        let pixels = bits.cast::<[u8; 4]>();
+    // A scratch canvas made and deleted here, whose pixels are copied out
+    // after the draws. The system image list takes draws from any thread.
+    let full = {
+        let scratch = Canvas::new(cx, cx)?;
         let mut black = Vec::new();
         let mut drawn = true;
         for back in [[0, 0, 0, 0], [255, 255, 255, 0]] {
-            core::slice::from_raw_parts_mut(pixels, count).fill(back);
-            if ImageList_Draw(list, icon, dc, 0, 0, ILD_TRANSPARENT) == 0 {
+            scratch.fill(back);
+            if !imagelist::draw(&list, icon, scratch.hdc(), (0, 0), ILD_TRANSPARENT) {
                 drawn = false;
                 break;
             }
-            GdiFlush();
             if black.is_empty() {
-                black = core::slice::from_raw_parts(pixels, count).to_vec();
+                black = scratch.pixels()?;
             }
         }
-        let full = drawn.then(|| {
-            core::slice::from_raw_parts(pixels, count)
+        let white = if drawn { scratch.pixels() } else { None };
+        white.map(|white| {
+            white
                 .iter()
                 .zip(&black)
                 .map(|(white, black)| crate::bigicon::premultiplied(*black, *white))
                 .collect::<Vec<_>>()
-        });
-        SelectObject(dc, old);
-        DeleteDC(dc);
-        full
+        })
     }?;
     let small = shrink(&full, cx as usize, side as usize);
     Bitmap::with_pixels(side, side, |px| {
@@ -567,13 +557,6 @@ fn shrink(src: &[[u8; 4]], from: usize, to: usize) -> Vec<[u8; 4]> {
         }
     }
     out
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // SAFETY: the event is owned by `Shared` and closed once.
-        unsafe { CloseHandle(self.work as HANDLE) };
-    }
 }
 
 #[cfg(test)]

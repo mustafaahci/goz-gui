@@ -26,46 +26,39 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, COLOR_WINDOWTEXT, DT_CALCRECT, DT_NOPREFIX, DT_WORDBREAK, DrawTextW, FillRect,
-    GetSysColor, GetSysColorBrush, HBRUSH, HDC, HFONT, InvalidateRect, SelectObject, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    COLOR_BTNFACE, COLOR_WINDOWTEXT, DT_CALCRECT, DT_NOPREFIX, DT_WORDBREAK, HBRUSH, HDC,
+    TRANSPARENT,
 };
 use windows_sys::Win32::System::SystemServices::SS_OWNERDRAW;
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_SUBITEM, CDRF_NEWFONT, CDRF_NOTIFYSUBITEMDRAW, DRAWITEMSTRUCT,
-    EM_GETSEL, EM_REPLACESEL, EM_SETSEL, LVIF_TEXT, LVIS_SELECTED, LVM_GETITEMSTATE,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVN_GETDISPINFOW, LVN_ODFINDITEMW,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT,
-    LVS_SHOWSELALWAYS, NM_CUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW, NMLVDISPINFOW,
+    LVIF_TEXT, LVIS_SELECTED, LVN_GETDISPINFOW, LVN_ODFINDITEMW, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
+    NM_CUSTOMDRAW, NMLVCUSTOMDRAW, NMLVDISPINFOW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_CONTROL, VK_SPACE,
-};
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_SPACE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN,
-    CBN_EDITCHANGE, CBN_SELCHANGE, CBS_AUTOHSCROLL, CBS_DROPDOWN, DWLP_MSGRESULT, EN_CHANGE,
-    ES_AUTOHSCROLL, EndDialog, FindWindowExW, GWLP_USERDATA, GetWindowRect, IDCANCEL, IDOK, IDYES,
-    KillTimer, MB_ICONQUESTION, MB_YESNO, MINMAXINFO, PostMessageW, SendMessageW, SetTimer,
-    SetWindowLongPtrW, SetWindowTextW, WM_APP, WM_CHAR, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY,
-    WM_DRAWITEM, WM_GETFONT, WM_GETMINMAXINFO, WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY, WM_NOTIFY,
-    WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
+    BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CBN_EDITCHANGE, CBN_SELCHANGE, CBS_AUTOHSCROLL,
+    CBS_DROPDOWN, EN_CHANGE, ES_AUTOHSCROLL, IDCANCEL, IDOK, IDYES, MB_ICONQUESTION, MB_YESNO,
+    WM_APP, WM_CHAR, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_GETMINMAXINFO,
+    WM_INITDIALOG, WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WM_TIMER, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX,
+    WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use super::name_of;
 use super::rename::{self, FormatError, Options, Problem, Subject};
 use super::settings::{PRESETS, Preset};
-use super::ui::{self, checked, copy_text, enable, error_colour, item, send, set_check};
+use super::ui::{self, checked, enable, error_colour, item, set_check};
 use crate::dialog::{
     self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner, common,
-    fill_last_column, list_custom_draw, state,
+    fill_last_column, list_custom_draw,
 };
 use crate::fileops::parent;
 use crate::places::{self, Which};
 use crate::theme::Palette;
-use crate::wide::{window_text, wz};
+use crate::win::{self, Msg, View, combo, dlg, edit, gdi, lv, parcel, subclass, sys};
 use crate::{menu, msgbox, popup};
 
 /// What the dialog does with the new names.
@@ -149,7 +142,7 @@ const STATIC: u16 = 0xffff;
 const OK: u16 = IDOK as u16;
 const CANCEL: u16 = IDCANCEL as u16;
 
-/// The folders' names came: lParam is a `Box<Scanned>`.
+/// The folders' names came: a parcel of `Scanned`.
 const WM_SCANNED: u32 = WM_APP + 2;
 /// Make the new names again (after a pick in a format's list, which sets
 /// the box's text only once its notification is done).
@@ -173,8 +166,8 @@ const TIMER_FOLDER: usize = 3;
 const FOLDER_MS: u32 = 300;
 /// More files than this are renamed in preview after the typing stops.
 const MANY: usize = 1000;
-/// The subclass id of the format boxes.
-const FORMAT_BOX: usize = 0x5246;
+/// The subclass of the format boxes.
+static FORMAT_BOX: subclass::Key = subclass::Key::new("rename format box");
 
 /// Dialog units: its size, and each control's place, with how it follows
 /// the dialog's size.
@@ -446,7 +439,7 @@ pub fn run(
         places[9].1,
     )
     .control(Class::Button, "Cancel", CANCEL, WS_TABSTOP, 0, places[10].1);
-    t.run(owner, Some(dialog_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| dialog_proc(&state, m));
     let presets = state
         .presets_changed
         .get()
@@ -476,27 +469,12 @@ fn scan(mut folders: Vec<String>) -> Scan {
 
 /// The text of a list's item `i` of combo box `combo`.
 fn combo_item(combo: HWND, i: usize) -> String {
-    let len = send(combo, CB_GETLBTEXTLEN, i, 0);
-    let Ok(len) = usize::try_from(len) else {
-        return String::new();
-    };
-    let mut buf = vec![0u16; len + 1];
-    send(combo, CB_GETLBTEXT, i, buf.as_mut_ptr() as isize);
-    String::from_utf16_lossy(&buf[..len])
+    combo::text(combo, i as i32)
 }
 
 /// The edit box of a drop-down combo box.
 fn combo_edit(combo: HWND) -> HWND {
-    let class = wz("Edit");
-    // SAFETY: looks up a child of this thread's combo box by class.
-    unsafe {
-        FindWindowExW(
-            combo,
-            core::ptr::null_mut(),
-            class.as_ptr(),
-            core::ptr::null(),
-        )
-    }
+    win::find_child(combo, core::ptr::null_mut(), Some("Edit"), None)
 }
 
 /// A format menu's item: what it puts in the box (`wrap`: around the
@@ -655,30 +633,22 @@ impl Dlg {
             // A themed list takes half a millisecond an item (20 formats
             // kept for each box): put in once the dialog shows.
             dialog::fill_later(combo, history.clone(), None);
-            // SAFETY: subclasses this thread's box (Ctrl+Space); the
-            // dialog outlives it, and the subclass removes itself.
-            unsafe {
-                SetWindowSubclass(
-                    combo_edit(combo),
-                    Some(format_box_proc),
-                    FORMAT_BOX,
-                    dlg as usize,
-                )
-            };
+            // Ctrl+Space in the box (the subclass goes with it).
+            subclass::set(combo_edit(combo), &FORMAT_BOX, move |m| {
+                format_box_proc(m, dlg)
+            });
         }
         let list = item(dlg, ID_LIST);
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
-        send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
+        lv::set_extended_style(list, ex, ex);
         ui::columns(list, &[("Name", 170), ("New Name", 200), ("Path", 120)]);
-        send(list, LVM_SETITEMCOUNT, self.files.len(), 0);
+        lv::set_item_count(list, self.files.len(), 0);
         // The last column (Path) takes the room the others leave, sized
         // once the rows are in (they may bring the vertical scroll bar).
         fill_last_column(list);
         dialog::theme_new(dlg, self.look.get().dark);
         center_on_owner(dlg);
-        let mut wr = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetWindowRect(dlg, &mut wr) };
+        let wr = win::window_rect(dlg);
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
         places::restore(
             dlg,
@@ -693,26 +663,19 @@ impl Dlg {
             let folders: Vec<String> = self.files.iter().map(|f| f.folder.clone()).collect();
             self.start_scan(dlg, folders, None);
         } else {
-            let z = wz(&self.start.folder);
-            // SAFETY: NUL-terminated text for this thread's box; its
-            // EN_CHANGE comes before the dialog is shown, and the names
+            // Its EN_CHANGE comes before the dialog is shown, and the names
             // are read below.
-            unsafe { SetWindowTextW(item(dlg, ID_FOLDER), z.as_ptr()) };
-            // SAFETY: a timer of this thread's dialog (set by EN_CHANGE).
-            unsafe { KillTimer(dlg, TIMER_FOLDER) };
+            win::set_text(item(dlg, ID_FOLDER), &self.start.folder);
+            // The timer EN_CHANGE set.
+            win::kill_timer(dlg, TIMER_FOLDER);
             self.scan_folder(dlg);
         }
         if self.files.len() > MANY {
             // Many files: the formats and names are made from a message of
             // their own, the status line saying so meanwhile.
             self.regenerating.set(true);
-            let z = wz("Working...");
-            // SAFETY: NUL-terminated text for this thread's static, and a
-            // post to this thread's dialog.
-            unsafe {
-                SetWindowTextW(item(dlg, ID_STATUS), z.as_ptr());
-                PostMessageW(dlg, WM_REGENERATE, 0, 0);
-            }
+            win::set_text(item(dlg, ID_STATUS), "Working...");
+            win::post_app(dlg, WM_REGENERATE, 0, 0);
             enable(dlg, OK, false);
         } else {
             self.regenerate(dlg);
@@ -734,28 +697,21 @@ impl Dlg {
                     exists,
                     scan: scan(folders),
                 };
-                let raw = Box::into_raw(Box::new(scanned));
-                // SAFETY: posts to the dialog; when it is gone the box is
-                // taken back.
-                unsafe {
-                    if PostMessageW(to as HWND, WM_SCANNED, 0, raw as isize) == 0 {
-                        drop(Box::from_raw(raw));
-                    }
-                }
+                // When the dialog is gone, the names are dropped.
+                parcel::post(to as HWND, WM_SCANNED, 0, scanned);
             });
         if spawned.is_err() {
             // Without the names, nothing is said to be taken.
             *self.scan.borrow_mut() = Some(Scan::new());
             self.dest.set(Some(true));
         } else {
-            // SAFETY: a timer of this thread's dialog.
-            unsafe { SetTimer(dlg, TIMER_SCAN, SCAN_MS, None) };
+            win::set_timer(dlg, TIMER_SCAN, SCAN_MS);
         }
     }
 
     /// The To folder as typed.
     fn folder(dlg: HWND) -> String {
-        window_text(item(dlg, ID_FOLDER)).trim().to_owned()
+        win::text(item(dlg, ID_FOLDER)).trim().to_owned()
     }
 
     /// Reads the To folder's names again (it changed): OK waits meanwhile.
@@ -781,8 +737,7 @@ impl Dlg {
             // The folder changed since: its own scan comes.
             return;
         }
-        // SAFETY: a timer of this thread's dialog.
-        unsafe { KillTimer(dlg, TIMER_SCAN) };
+        win::kill_timer(dlg, TIMER_SCAN);
         self.dest.set(Some(s.folder.is_none() || s.exists));
         *self.scan.borrow_mut() = Some(s.scan);
         // The first names, still to be made, take the scan into account
@@ -797,9 +752,7 @@ impl Dlg {
     fn regenerate(&self, dlg: HWND) {
         let (old, new) = rename::generate(&self.subjects, Dlg::options(dlg));
         for (id, text) in [(ID_OLD, &old), (ID_NEW, &new)] {
-            let z = wz(text);
-            // SAFETY: NUL-terminated text for this thread's combo box.
-            unsafe { SetWindowTextW(item(dlg, id), z.as_ptr()) };
+            win::set_text(item(dlg, id), text);
         }
         self.recompute(dlg);
     }
@@ -807,23 +760,22 @@ impl Dlg {
     /// Puts the keyboard in New format with its name, without the
     /// extension, selected (as Everything opens).
     fn focus_new(&self, dlg: HWND) {
-        let new = window_text(item(dlg, ID_NEW));
+        let new = win::text(item(dlg, ID_NEW));
         let stem = match new.rfind('.') {
             Some(i) if i > 0 && !Dlg::options(dlg).ignore_extension => {
                 new[..i].encode_utf16().count()
             }
             _ => new.encode_utf16().count(),
         };
-        let edit = combo_edit(item(dlg, ID_NEW));
-        // SAFETY: focuses this thread's box.
-        unsafe { SetFocus(edit) };
-        send(edit, EM_SETSEL, 0, stem as isize);
+        let field = combo_edit(item(dlg, ID_NEW));
+        win::set_focus(field);
+        edit::set_sel(field, 0, stem as i32);
     }
 
     /// The text of a format box; a pick in its list is the list's item
     /// until the box shows it.
     fn format(dlg: HWND, id: u16) -> String {
-        window_text(item(dlg, id))
+        win::text(item(dlg, id))
     }
 
     /// Makes the new names, finds what is wrong, and shows them.
@@ -886,8 +838,7 @@ impl Dlg {
             },
         };
         *self.preview.borrow_mut() = preview;
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(item(dlg, ID_LIST), core::ptr::null(), 0) };
+        win::invalidate(item(dlg, ID_LIST), None, false);
         self.show_status(dlg);
     }
 
@@ -906,9 +857,7 @@ impl Dlg {
                 ),
             }
         };
-        let z = wz(&text);
-        // SAFETY: NUL-terminated text for this thread's static.
-        unsafe { SetWindowTextW(item(dlg, ID_STATUS), z.as_ptr()) };
+        win::set_text(item(dlg, ID_STATUS), &text);
         enable(dlg, OK, ok);
     }
 
@@ -927,8 +876,8 @@ impl Dlg {
         if self.regenerating.get() {
             return false;
         }
-        // SAFETY: a timer of this thread's dialog; a missing one is fine.
-        unsafe { KillTimer(dlg, TIMER_RECOMPUTE) };
+        // A missing timer is fine.
+        win::kill_timer(dlg, TIMER_RECOMPUTE);
         self.recompute(dlg);
         let (options, old_format, new_format) = (
             Dlg::options(dlg),
@@ -1041,16 +990,14 @@ impl Dlg {
                 ID_NEW_MENU
             },
         );
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's button.
-        unsafe { GetWindowRect(button, &mut rc) };
+        let rc = win::window_rect(button);
         let pt = POINT {
             x: rc.left,
             y: rc.bottom,
         };
         let id = popup::track(popup_menu, dlg, pt, "rename format menu", &|_| None);
-        // SAFETY: the menu this function made.
-        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu(popup_menu) };
+        // The menu this function made.
+        win::menu::destroy(popup_menu);
         let Some((text, wrap, _)) = usize::try_from(id)
             .ok()
             .and_then(|i| i.checked_sub(1))
@@ -1064,26 +1011,18 @@ impl Dlg {
     /// Puts `text` in a format box at its caret (or around its selected
     /// text, as `<text:...>`, for a case function).
     fn insert(&self, dlg: HWND, combo_id: u16, text: &str, wrap: bool) {
-        let edit = combo_edit(item(dlg, combo_id));
+        let field = combo_edit(item(dlg, combo_id));
         let put = if wrap {
-            let (mut start, mut end) = (0u32, 0u32);
-            send(
-                edit,
-                EM_GETSEL,
-                (&raw mut start) as usize,
-                (&raw mut end) as isize,
-            );
-            let all: Vec<u16> = window_text(edit).encode_utf16().collect();
+            let (start, end) = edit::sel(field);
+            let all: Vec<u16> = win::text(field).encode_utf16().collect();
             let (a, b) = (start.min(end) as usize, start.max(end) as usize);
             let selected = String::from_utf16_lossy(all.get(a..b.min(all.len())).unwrap_or(&[]));
             format!("<{text}:{selected}>")
         } else {
             text.to_owned()
         };
-        let z = wz(&put);
-        // SAFETY: focuses this thread's box; the text outlives the call.
-        unsafe { SetFocus(edit) };
-        send(edit, EM_REPLACESEL, 1, z.as_ptr() as isize);
+        win::set_focus(field);
+        edit::replace_sel(field, &put, true);
         self.recompute(dlg);
     }
 
@@ -1098,10 +1037,8 @@ impl Dlg {
         let Some(folder) = super::folder_pick::pick(dlg, title, "Select Folder", Some(&now)) else {
             return;
         };
-        let z = crate::wide::nul(&folder);
-        // SAFETY: NUL-terminated text for this thread's box (its EN_CHANGE
-        // reads the folder's names again).
-        unsafe { SetWindowTextW(item(dlg, ID_FOLDER), z.as_ptr()) };
+        // Its EN_CHANGE reads the folder's names again.
+        win::set_text_wide(item(dlg, ID_FOLDER), &folder);
     }
 
     /// The Presets button's menu: each preset (puts its formats in the
@@ -1135,8 +1072,8 @@ impl Dlg {
         );
         if list.is_empty() {
             menu::add_items(m, Some(u16::MAX), &[menu::Item::Greyed("&Delete Preset")]);
-            // SAFETY: a menu this function made and put nowhere.
-            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu(delete) };
+            // A menu this function made and put nowhere.
+            win::menu::destroy(delete);
         } else {
             menu::add_items(
                 m,
@@ -1144,16 +1081,14 @@ impl Dlg {
                 &[menu::Item::Sub("&Delete Preset", delete)],
             );
         }
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's button.
-        unsafe { GetWindowRect(item(dlg, ID_PRESETS), &mut rc) };
+        let rc = win::window_rect(item(dlg, ID_PRESETS));
         let pt = POINT {
             x: rc.left,
             y: rc.bottom,
         };
         let id = popup::track(m, dlg, pt, "rename presets menu", &|_| None);
-        // SAFETY: the menu this function made (its submenu goes with it).
-        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu(m) };
+        // The menu this function made (its submenu goes with it).
+        win::menu::destroy(m);
         match id {
             0 => {}
             SAVE => self.save_preset(dlg),
@@ -1172,9 +1107,7 @@ impl Dlg {
                     return;
                 };
                 for (id, text) in [(ID_OLD, &p.old_format), (ID_NEW, &p.new_format)] {
-                    let z = wz(text);
-                    // SAFETY: NUL-terminated text for this thread's box.
-                    unsafe { SetWindowTextW(item(dlg, id), z.as_ptr()) };
+                    win::set_text(item(dlg, id), text);
                 }
                 // And its switches, as Everything's presets keep them.
                 let o = p.options;
@@ -1224,7 +1157,7 @@ impl Dlg {
     }
 
     /// The text of a cell, for the list.
-    fn disp_info(&self, info: &mut NMLVDISPINFOW) {
+    fn disp_info(&self, info: &mut View<'_, NMLVDISPINFOW>) {
         if info.item.mask & LVIF_TEXT == 0 {
             return;
         }
@@ -1246,20 +1179,18 @@ impl Dlg {
             }
         };
         let text: Vec<u16> = text.encode_utf16().collect();
-        // SAFETY: the list gave a buffer of `cchTextMax` code units.
-        unsafe { copy_text(&text, info.item.pszText, info.item.cchTextMax) };
+        // Into the list's buffer of `cchTextMax` code units.
+        info.set_text(&text);
     }
 
     /// The list's drawing: a new name the old format does not match dim, one
     /// with a problem red; the rest as dialog lists draw.
-    fn custom_draw(&self, list: HWND, cd: &mut NMLVCUSTOMDRAW) -> isize {
+    fn custom_draw(&self, list: HWND, cd: &mut View<'_, NMLVCUSTOMDRAW>) -> isize {
         let dark = self.look.get().dark;
         let stage = cd.nmcd.dwDrawStage;
         if stage == CDDS_ITEMPREPAINT {
             let row = cd.nmcd.dwItemSpec;
-            let selected = send(list, LVM_GETITEMSTATE, row, LVIS_SELECTED as isize) as u32
-                & LVIS_SELECTED
-                != 0;
+            let selected = lv::item_state(list, row as i32, LVIS_SELECTED) & LVIS_SELECTED != 0;
             if dark && selected {
                 return list_custom_draw(list, cd, dark);
             }
@@ -1278,9 +1209,9 @@ impl Dlg {
             } else {
                 pal.fg
             };
-            cd.clrText = colour;
+            cd.set_text_color(colour);
             if dark {
-                cd.clrTextBk = pal.bg;
+                cd.set_text_bk_color(pal.bg);
             }
             return CDRF_NEWFONT as isize;
         }
@@ -1407,35 +1338,22 @@ fn status(files: &[File], p: &Preview, scanned: bool) -> (String, bool) {
     (text, bad.is_empty() && scanned && renamed > 0)
 }
 
-/// A format box: Ctrl+Space shows its menu (Everything's key).
-unsafe extern "system" fn format_box_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    dlg: usize,
-) -> LRESULT {
-    // SAFETY: reads the keyboard; posts to this thread's dialog; the
-    // subclass goes with the box.
-    unsafe {
-        let ctrl = || GetKeyState(i32::from(VK_CONTROL)) < 0;
-        match msg {
-            WM_KEYDOWN if w as u16 == VK_SPACE && ctrl() => {
-                // The box's combo box: which format.
-                let combo = windows_sys::Win32::UI::WindowsAndMessaging::GetParent(hwnd);
-                let id = windows_sys::Win32::UI::WindowsAndMessaging::GetDlgCtrlID(combo);
-                PostMessageW(dlg as HWND, WM_FORMAT_MENU, id as usize, 0);
-                return 0;
-            }
-            WM_CHAR if w == 0x20 && ctrl() => return 0,
-            WM_NCDESTROY => {
-                RemoveWindowSubclass(hwnd, Some(format_box_proc), FORMAT_BOX);
-            }
-            _ => {}
+/// A format box (its dialog `dlg`): Ctrl+Space shows its menu
+/// (Everything's key).
+fn format_box_proc(m: &Msg, dlg: HWND) -> isize {
+    let ctrl = || sys::key_down(VK_CONTROL);
+    match m.id {
+        WM_KEYDOWN if m.w as u16 == VK_SPACE && ctrl() => {
+            // The box's combo box: which format.
+            let combo = win::parent(m.hwnd);
+            let id = win::ctrl_id(combo);
+            win::post_app(dlg, WM_FORMAT_MENU, id as usize, 0);
+            return 0;
         }
-        DefSubclassProc(hwnd, msg, w, l)
+        WM_CHAR if m.w == 0x20 && ctrl() => return 0,
+        _ => {}
     }
+    m.def()
 }
 
 /// The status line in red while something is wrong.
@@ -1446,38 +1364,30 @@ unsafe extern "system" fn format_box_proc(
 fn paint_status(s: &Dlg, dis: &DRAWITEMSTRUCT) {
     let dark = s.look.get().dark;
     let hdc = dis.hDC;
-    let text: Vec<u16> = window_text(dis.hwndItem).encode_utf16().collect();
+    let text: Vec<u16> = win::text(dis.hwndItem).encode_utf16().collect();
     let format = DT_WORDBREAK | DT_NOPREFIX;
-    // SAFETY: draws on the DC the static gave for this paint, with its own
-    // font, which is put back; the brushes are kept ones, not to be freed.
-    unsafe {
-        let brush = dialog::ctl_color(WM_CTLCOLORSTATIC, hdc, dark)
-            .map_or_else(|| GetSysColorBrush(COLOR_BTNFACE), |b| b as HBRUSH);
-        FillRect(hdc, &dis.rcItem, brush);
-        let font = SendMessageW(dis.hwndItem, WM_GETFONT, 0, 0) as HFONT;
-        let old = SelectObject(hdc, font);
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(
-            hdc,
-            match (s.status_is_bad(), dark) {
-                (true, _) => error_colour(dark),
-                (false, true) => Palette::new(true).fg,
-                (false, false) => GetSysColor(COLOR_WINDOWTEXT),
-            },
-        );
-        let mut measured = dis.rcItem;
-        DrawTextW(
-            hdc,
-            text.as_ptr(),
-            text.len() as i32,
-            &mut measured,
-            format | DT_CALCRECT,
-        );
-        let mut rc = dis.rcItem;
-        rc.top = centred_top(rc.top, rc.bottom, measured.bottom - measured.top);
-        DrawTextW(hdc, text.as_ptr(), text.len() as i32, &mut rc, format);
-        SelectObject(hdc, old);
-    }
+    // On the DC the static gave for this paint, with its own font, which is
+    // put back; the brushes are kept ones, not to be freed.
+    let brush = dialog::ctl_color(WM_CTLCOLORSTATIC, hdc, dark)
+        .map_or_else(|| gdi::sys_color_brush(COLOR_BTNFACE), |b| b as HBRUSH);
+    gdi::fill_rect(hdc, &dis.rcItem, brush);
+    let font = win::font(dis.hwndItem);
+    let old = gdi::select(hdc, font);
+    gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+    gdi::set_text_color(
+        hdc,
+        match (s.status_is_bad(), dark) {
+            (true, _) => error_colour(dark),
+            (false, true) => Palette::new(true).fg,
+            (false, false) => gdi::sys_color(COLOR_WINDOWTEXT),
+        },
+    );
+    let mut measured = dis.rcItem;
+    gdi::draw_text(hdc, &text, &mut measured, format | DT_CALCRECT);
+    let mut rc = dis.rcItem;
+    rc.top = centred_top(rc.top, rc.bottom, measured.bottom - measured.top);
+    gdi::draw_text(hdc, &text, &mut rc, format);
+    old.restore(hdc);
 }
 
 /// The top of `height` centred between `top` and `bottom` (at `top` when
@@ -1488,37 +1398,28 @@ fn centred_top(top: i32, bottom: i32, height: i32) -> i32 {
 
 fn status_colour(s: &Dlg, hdc: HDC, msg: u32) -> isize {
     let dark = s.look.get().dark;
+    // A system brush, not to be freed.
     let brush = dialog::ctl_color(msg, hdc, dark)
-        // SAFETY: a system brush, not to be freed.
-        .unwrap_or_else(|| unsafe { GetSysColorBrush(COLOR_BTNFACE) } as isize);
-    // SAFETY: the DC the static is about to draw with.
-    unsafe {
-        SetTextColor(hdc, error_colour(dark));
-        SetBkMode(hdc, TRANSPARENT as i32);
-    }
+        .unwrap_or_else(|| gdi::sys_color_brush(COLOR_BTNFACE) as isize);
+    // The DC the static is about to draw with.
+    gdi::set_text_color(hdc, error_colour(dark));
+    gdi::set_bk_mode(hdc, TRANSPARENT as i32);
     brush
 }
 
-unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Dlg` that `run` keeps alive until the dialog
-        // has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Dlg` from `run`, or null before.
-    let Some(s) = (unsafe { state::<Dlg>(dlg) }) else {
-        return 0;
-    };
-    if msg == WM_CTLCOLORSTATIC && l as HWND == item(dlg, ID_STATUS) && s.status_is_bad() {
+fn dialog_proc(s: &Dlg, m: &Msg) -> isize {
+    let (dlg, msg, w) = (m.hwnd, m.id, m.w);
+    if msg == WM_CTLCOLORSTATIC && m.l as HWND == item(dlg, ID_STATUS) && s.status_is_bad() {
         return status_colour(s, w as HDC, msg);
     }
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
     match msg {
         WM_DRAWITEM if w == usize::from(ID_STATUS) => {
-            // SAFETY: WM_DRAWITEM's lParam is a DRAWITEMSTRUCT.
-            paint_status(s, unsafe { &*(l as *const DRAWITEMSTRUCT) });
+            if let Some(dis) = m.draw_item() {
+                paint_status(s, &dis);
+            }
             1
         }
         WM_INITDIALOG => {
@@ -1528,9 +1429,10 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
             0
         }
         WM_SCANNED => {
-            // SAFETY: the box the scanning thread posted, taken once.
-            let scanned = unsafe { Box::from_raw(l as *mut Scanned) };
-            s.scanned(dlg, *scanned);
+            // The names the scanning thread posted, taken once.
+            if let Some(scanned) = parcel::take::<Scanned>(m) {
+                s.scanned(dlg, scanned);
+            }
             1
         }
         WM_RECOMPUTE => {
@@ -1549,8 +1451,7 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
             1
         }
         WM_TIMER => {
-            // SAFETY: a timer of this thread's dialog.
-            unsafe { KillTimer(dlg, w) };
+            win::kill_timer(dlg, w);
             if w == TIMER_RECOMPUTE {
                 s.recompute(dlg);
             } else if w == TIMER_SCAN && s.scan.borrow().is_none() {
@@ -1574,26 +1475,27 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
         }
         WM_GETMINMAXINFO => {
             let (w, h) = s.min.get();
-            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
-            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = w;
-            mmi.ptMinTrackSize.y = h;
+            if let Some(mut mmi) = m.min_max_info() {
+                mmi.ptMinTrackSize.x = w;
+                mmi.ptMinTrackSize.y = h;
+            }
             1
         }
         WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR.
-            let hdr = unsafe { &*(l as *const NMHDR) };
-            if hdr.idFrom != usize::from(ID_LIST) {
+            let Some(n) = m.notify() else {
+                return 0;
+            };
+            if n.id() != usize::from(ID_LIST) {
                 return 0;
             }
-            let answer = match hdr.code {
-                // SAFETY: the list's custom draw structure, as it sent it.
-                NM_CUSTOMDRAW => {
-                    Some(s.custom_draw(hdr.hwndFrom, unsafe { &mut *(l as *mut NMLVCUSTOMDRAW) }))
-                }
+            let answer = match n.code() {
+                NM_CUSTOMDRAW => n
+                    .get::<NMLVCUSTOMDRAW>()
+                    .map(|mut cd| s.custom_draw(n.from(), &mut cd)),
                 LVN_GETDISPINFOW => {
-                    // SAFETY: the list's display info, as it sent it.
-                    s.disp_info(unsafe { &mut *(l as *mut NMLVDISPINFOW) });
+                    if let Some(mut info) = n.get::<NMLVDISPINFOW>() {
+                        s.disp_info(&mut info);
+                    }
                     None
                 }
                 // No type-ahead in this list.
@@ -1601,29 +1503,23 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 _ => None,
             };
             if let Some(answer) = answer {
-                // SAFETY: the answer of this dialog's WM_NOTIFY.
-                unsafe { SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, answer) };
+                dlg::set_result(dlg, answer);
             }
             1
         }
         WM_COMMAND => {
-            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            let (id, code) = (win::loword(w), u32::from(win::hiword(w)));
             match (id, code) {
                 (OK, _) => {
                     if s.ok(dlg) {
-                        // SAFETY: ends this modal dialog.
-                        unsafe { EndDialog(dlg, 1) };
+                        dlg::end(dlg, 1);
                     }
                 }
-                // SAFETY: ends this modal dialog.
-                (CANCEL, _) => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                (CANCEL, _) => dlg::end(dlg, 0),
                 (ID_OLD | ID_NEW, CBN_EDITCHANGE) => {
                     if s.files.len() > MANY {
-                        // SAFETY: a timer of this thread's dialog; set
-                        // again, it starts again.
-                        unsafe { SetTimer(dlg, TIMER_RECOMPUTE, RECOMPUTE_MS, None) };
+                        // Set again, the timer starts again.
+                        win::set_timer(dlg, TIMER_RECOMPUTE, RECOMPUTE_MS);
                     } else {
                         s.recompute(dlg);
                     }
@@ -1632,19 +1528,14 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
                     // The box shows the pick once this returns: its text
                     // now, then the names.
                     let combo = item(dlg, id);
-                    if let Ok(i) = usize::try_from(send(combo, CB_GETCURSEL, 0, 0)) {
-                        let z = wz(&combo_item(combo, i));
-                        // SAFETY: NUL-terminated text for this thread's
-                        // combo box.
-                        unsafe { SetWindowTextW(combo, z.as_ptr()) };
+                    if let Ok(i) = usize::try_from(combo::cur_sel(combo)) {
+                        win::set_text(combo, &combo_item(combo, i));
                     }
-                    // SAFETY: posts to this thread's dialog.
-                    unsafe { PostMessageW(dlg, WM_RECOMPUTE, 0, 0) };
+                    win::post_app(dlg, WM_RECOMPUTE, 0, 0);
                 }
                 (ID_FOLDER, EN_CHANGE) => {
-                    // SAFETY: a timer of this thread's dialog; set again,
-                    // it starts again.
-                    unsafe { SetTimer(dlg, TIMER_FOLDER, FOLDER_MS, None) };
+                    // Set again, the timer starts again.
+                    win::set_timer(dlg, TIMER_FOLDER, FOLDER_MS);
                     s.dest.set(None);
                     s.show_status(dlg);
                 }
@@ -1707,51 +1598,38 @@ fn ask_name(owner: HWND, look: Look) -> Option<String> {
             0,
             (129, 41, 50, 14),
         );
-    t.run(owner, Some(name_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| name_proc(&state, m));
     state.name.into_inner()
 }
 
-unsafe extern "system" fn name_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `AskName` that `ask_name` keeps alive until
-        // the dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `AskName` from `ask_name`, or null.
-    let Some(s) = (unsafe { state::<AskName>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn name_proc(s: &AskName, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             dialog::apply_theme(dlg, s.look.get().dark);
             center_on_owner(dlg);
             enable(dlg, OK, false);
-            // SAFETY: focuses this thread's box.
-            unsafe { SetFocus(item(dlg, ID_NAME)) };
+            win::set_focus(item(dlg, ID_NAME));
             0
         }
         WM_COMMAND => {
-            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
             match (id, code) {
                 (ID_NAME, EN_CHANGE) => {
-                    let typed = !window_text(item(dlg, ID_NAME)).trim().is_empty();
+                    let typed = !win::text(item(dlg, ID_NAME)).trim().is_empty();
                     enable(dlg, OK, typed);
                 }
                 (OK, _) => {
-                    let name = window_text(item(dlg, ID_NAME)).trim().to_owned();
+                    let name = win::text(item(dlg, ID_NAME)).trim().to_owned();
                     if !name.is_empty() {
                         *s.name.borrow_mut() = Some(name);
-                        // SAFETY: ends this modal dialog.
-                        unsafe { EndDialog(dlg, 1) };
+                        dlg::end(dlg, 1);
                     }
                 }
-                // SAFETY: ends this modal dialog.
-                (CANCEL, _) => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                (CANCEL, _) => dlg::end(dlg, 0),
                 _ => return 0,
             }
             1

@@ -13,9 +13,8 @@
 
 use std::cell::Cell;
 
-use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
-
 use super::{App, TIMER_REST, runs};
+use crate::win;
 
 /// How long the window rests (no thumbnail made, no pane closed) before
 /// what is not in view goes.
@@ -32,8 +31,7 @@ impl App {
     /// (one timer, never repeating).
     pub(super) fn memory_settles(&self) {
         SECOND_REST.set(false);
-        // SAFETY: a timer of this thread's window.
-        unsafe { SetTimer(self.hwnd, TIMER_REST, REST_MS, None) };
+        win::set_timer(self.hwnd, TIMER_REST, REST_MS);
     }
 
     /// The window rested: thumbnails of items out of view go, and the
@@ -44,8 +42,7 @@ impl App {
         self.thumbs.trim();
         runs::give_back_memory();
         if !SECOND_REST.replace(true) {
-            // SAFETY: a timer of this thread's window.
-            unsafe { SetTimer(self.hwnd, TIMER_REST, REST_MS, None) };
+            win::set_timer(self.hwnd, TIMER_REST, REST_MS);
         }
     }
 
@@ -56,8 +53,8 @@ impl App {
         if shown {
             return;
         }
-        // SAFETY: a timer of this thread's window (set or not).
-        unsafe { KillTimer(self.hwnd, TIMER_REST) };
+        // A timer of this window, set or not.
+        win::kill_timer(self.hwnd, TIMER_REST);
         self.thumbs.release();
         self.big_loads.forget_shrunk();
         runs::give_back_memory();

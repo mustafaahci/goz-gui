@@ -14,39 +14,28 @@ use std::ops::Range;
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, DrawFocusRect,
-    GdiFlush, GetTextExtentExPointW, HDC, InvalidateRect, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_POSTPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
-    CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, CLR_DEFAULT, CLR_NONE, HIMAGELIST, ILC_COLOR32,
-    ILD_ASYNC, ILD_SCALE, ILD_TRANSPARENT, IMAGELISTDRAWPARAMS, ImageList_Create,
-    ImageList_Destroy, ImageList_Draw, ImageList_DrawIndirect, ImageList_GetIconSize, LVA_DEFAULT,
-    LVIR_ICON, LVIS_FOCUSED, LVIS_SELECTED, LVM_ARRANGE, LVM_ENSUREVISIBLE, LVM_GETCOUNTPERPAGE,
-    LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETITEMSPACING, LVM_GETITEMSTATE, LVM_GETNEXTITEM,
-    LVM_GETTOPINDEX, LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETICONSPACING, LVM_SETIMAGELIST,
-    LVNI_FOCUSED, LVS_AUTOARRANGE, LVS_ICON, LVS_OWNERDRAWFIXED, LVS_REPORT, LVS_TYPEMASK,
-    LVSIL_NORMAL, NMCUSTOMDRAW,
+    CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, CLR_DEFAULT, CLR_NONE, ILC_COLOR32, ILD_ASYNC,
+    ILD_SCALE, ILD_TRANSPARENT, IMAGELISTDRAWPARAMS, LVA_DEFAULT, LVIR_ICON, LVIS_FOCUSED,
+    LVIS_SELECTED, LVNI_FOCUSED, LVS_AUTOARRANGE, LVS_ICON, LVS_OWNERDRAWFIXED, LVS_REPORT,
+    LVS_TYPEMASK, LVSIL_NORMAL, NMCUSTOMDRAW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-use windows_sys::Win32::UI::Shell::SHGetImageList;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GWL_STYLE, GetClientRect, GetWindowLongPtrW, SetWindowLongPtrW, WM_APP, WM_SETFONT,
-};
-use windows_sys::core::GUID;
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_APP;
 
-use super::{App, send};
+use super::App;
 use crate::highlight::Span;
 use crate::paint::{self, RowState};
 use crate::status::ViewButton;
 use crate::thumbs::{Bitmap, Picture, ThumbReply};
 use crate::view::{self, View};
+use crate::win::dib::Canvas;
+use crate::win::imagelist::{ImageList, SystemList};
+use crate::win::{self, gdi, imagelist, lv};
 use crate::window::Fonts;
 
-/// `IID_IImageList`, which `SHGetImageList` hands the system lists out as.
-const IID_IMAGE_LIST: GUID = GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0950);
 /// `SHIL_LARGE` (32 px), `SHIL_SMALL` (16 px), `SHIL_EXTRALARGE` (48 px)
 /// and `SHIL_JUMBO` (256 px).
 const SHIL_LARGE: i32 = 0;
@@ -96,31 +85,26 @@ impl App {
         if !old.thumbnails && !view.thumbnails {
             return;
         }
-        let focused = send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        );
+        let focused = lv::next_item(self.list, -1, LVNI_FOCUSED);
         let anchor = usize::try_from(focused)
             .ok()
             .filter(|f| shown.contains(f))
             .unwrap_or(shown.start);
         self.put_view();
-        if send(self.list, LVM_GETITEMCOUNT, 0, 0) <= 0 {
+        if lv::item_count(self.list) == 0 {
             return;
         }
         if view.thumbnails {
-            send(self.list, LVM_ENSUREVISIBLE, anchor, 0);
+            lv::ensure_visible(self.list, anchor as i32, false);
         } else {
             // The anchor at the top, as the rows' own scroll puts it
             // (ensure-visible right after the switch would leave the list
             // at its old row).
-            let top = send(self.list, LVM_GETTOPINDEX, 0, 0).max(0) as usize;
+            let top = lv::top_index(self.list).max(0) as usize;
             let rows = anchor as i64 - top as i64;
             let dy = (rows * i64::from(self.row_height())).clamp(-(1 << 30), 1 << 30);
             if dy != 0 {
-                send(self.list, LVM_SCROLL, 0, dy as isize);
+                lv::scroll(self.list, 0, dy as i32);
             }
         }
     }
@@ -144,54 +128,35 @@ impl App {
             let side = view::side(v.size, dpi);
             let line = self.fonts.borrow().height;
             let (cx, cy) = view::spacing(v.size, dpi, line);
-            // SAFETY: an empty image list the list owns from here on; the
-            // one it gives back was made here before and is not used.
-            unsafe {
-                let images = ImageList_Create(side, side, ILC_COLOR32, 0, 1);
-                let old = send(
-                    self.list,
-                    LVM_SETIMAGELIST,
-                    LVSIL_NORMAL as usize,
-                    images as isize,
-                );
-                if old != 0 {
-                    ImageList_Destroy(old as HIMAGELIST);
-                }
-            }
-            send(
-                self.list,
-                LVM_SETICONSPACING,
-                0,
-                (cx as u16 as isize) | ((cy as u16 as isize) << 16),
-            );
+            // An empty image list the list owns from here on; the one it
+            // had, made here before, is destroyed (`lv::set_image_list`).
+            let images = ImageList::create(side, side, ILC_COLOR32, 0, 1);
+            lv::set_image_list(self.list, LVSIL_NORMAL, images);
+            win::lv::set_icon_spacing(self.list, cx, cy);
             // Icon view, its items in rows in order (auto-arranged), and not
             // owner-drawn: owner draw is Details' only, and left on it
             // keeps the list from drawing (or placing) its icons.
             self.set_list_style(LVS_ICON | LVS_AUTOARRANGE);
             // Lays the items out on the new spacing.
-            send(self.list, LVM_ARRANGE, LVA_DEFAULT as usize, 0);
+            lv::arrange(self.list, LVA_DEFAULT);
         } else {
             self.set_list_style(LVS_REPORT | LVS_OWNERDRAWFIXED);
             // The rows are measured again (WM_MEASUREITEM) for their height.
             let font = self.fonts.borrow().normal;
-            send(self.list, WM_SETFONT, font as usize, 1);
+            win::set_font(self.list, font, true);
         }
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(self.list, core::ptr::null(), 1) };
+        win::invalidate(self.list, None, true);
     }
 
     /// Sets the list's view style bits (the view, its arrangement, owner
     /// draw) to `bits`, which the list takes as a change of view.
     fn set_list_style(&self, bits: u32) {
-        let mask = (LVS_TYPEMASK | LVS_AUTOARRANGE | LVS_OWNERDRAWFIXED) as isize;
-        // SAFETY: changes the style of this thread's list, which answers
-        // with WM_STYLECHANGED.
-        unsafe {
-            let style = GetWindowLongPtrW(self.list, GWL_STYLE);
-            let new = (style & !mask) | bits as isize;
-            if new != style {
-                SetWindowLongPtrW(self.list, GWL_STYLE, new);
-            }
+        let mask = LVS_TYPEMASK | LVS_AUTOARRANGE | LVS_OWNERDRAWFIXED;
+        // The list answers with WM_STYLECHANGED.
+        let style = win::style(self.list);
+        let new = (style & !mask) | bits;
+        if new != style {
+            win::set_style(self.list, new);
         }
     }
 
@@ -223,10 +188,10 @@ impl App {
 
     /// The items in view, in either view.
     pub fn visible_items(&self) -> Range<usize> {
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
+        let count = lv::item_count(self.list);
         if !self.view.get().thumbnails {
-            let top = send(self.list, LVM_GETTOPINDEX, 0, 0).max(0) as usize;
-            let page = send(self.list, LVM_GETCOUNTPERPAGE, 0, 0).max(0) as usize;
+            let top = lv::top_index(self.list).max(0) as usize;
+            let page = lv::count_per_page(self.list).max(0) as usize;
             return top.min(count)..(top + page + 1).min(count);
         }
         // While the list paints, the grid it started with: rows fetched
@@ -239,30 +204,22 @@ impl App {
     }
 
     fn list_client(&self) -> RECT {
-        let mut client = RECT::default();
-        // SAFETY: reads the size of this thread's list.
-        unsafe { GetClientRect(self.list, &mut client) };
-        client
+        win::client_rect(self.list)
     }
 
     /// Item `index`'s icon rectangle as the list has it.
     fn icon_rect(&self, index: usize) -> Option<RECT> {
-        let mut icon = RECT {
-            left: LVIR_ICON as i32,
-            ..RECT::default()
-        };
-        (send(self.list, LVM_GETITEMRECT, index, (&raw mut icon) as isize) != 0).then_some(icon)
+        lv::item_rect(self.list, index as i32, LVIR_ICON as i32)
     }
 
     /// The icon view's grid as the list laid it out now, scrolled: asked
     /// of the list item by item, which makes it measure their names (and
     /// send custom draws for that), so never while it paints items.
     fn grid(&self) -> Option<Grid> {
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
+        let count = lv::item_count(self.list);
         let first = self.icon_rect(0)?;
-        let spacing = send(self.list, LVM_GETITEMSPACING, 0, 0) as usize;
-        let cx = ((spacing & 0xffff) as i32).max(1);
-        let cy = (((spacing >> 16) & 0xffff) as i32).max(1);
+        let (cx, cy) = lv::item_spacing(self.list, false);
+        let (cx, cy) = (cx.max(1), cy.max(1));
         let client = self.list_client();
         // As many as the width holds, checked against where the list put
         // the end of the first row.
@@ -294,7 +251,7 @@ impl App {
                 // draws in the middle of its paint.
                 let grid = self.grid();
                 self.thumb_grid.set(grid);
-                let count = send(self.list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
+                let count = lv::item_count(self.list);
                 // Requests for items not in view now are dropped.
                 let shown = grid.map_or(0..0, |g| g.visible(&self.list_client(), count));
                 self.thumbs.set_visible(shown);
@@ -326,8 +283,8 @@ impl App {
     /// coordinates). Not while the list paints.
     pub(super) fn thumb_cell(&self, index: usize) -> Option<view::Cell> {
         let icon = self.icon_rect(index)?;
-        let spacing = send(self.list, LVM_GETITEMSPACING, 0, 0) as usize;
-        Some(self.cell_of(&icon, (spacing & 0xffff) as i32))
+        let (cx, _) = lv::item_spacing(self.list, false);
+        Some(self.cell_of(&icon, cx))
     }
 
     /// Draws item `index`: the cell's background as the row's would be,
@@ -337,15 +294,9 @@ impl App {
         let geo = self.cell_of(&grid.icon(index), grid.cx);
         // The list is asked first: nothing is borrowed while it may call
         // back.
-        let bits = send(
-            self.list,
-            LVM_GETITEMSTATE,
-            index,
-            (LVIS_SELECTED | LVIS_FOCUSED) as isize,
-        ) as u32;
+        let bits = lv::item_state(self.list, index as i32, LVIS_SELECTED | LVIS_FOCUSED);
         let pal = self.pal.get();
-        // SAFETY: reads this thread's focus.
-        let list_focused = unsafe { GetFocus() } == self.list;
+        let list_focused = win::focus() == self.list;
         let state = RowState {
             selected: bits & LVIS_SELECTED != 0,
             focused: list_focused,
@@ -414,8 +365,7 @@ impl App {
         let fonts = self.fonts.borrow();
         name_lines(hdc, &geo.text, &name, &spans, &fonts, text);
         if bits & LVIS_FOCUSED != 0 && list_focused {
-            // SAFETY: draws into the list's paint DC.
-            unsafe { DrawFocusRect(hdc, &geo.cell) };
+            gdi::draw_focus_rect(hdc, &geo.cell);
         }
     }
 
@@ -441,8 +391,7 @@ impl App {
         // Whether the icon drawn is the one wanted, to be loaded if it is
         // not, or a stand-in, drawn only if it is.
         let mut wanted = true;
-        if jumbo {
-            let list = self.big_icons(true);
+        if jumbo && let Some(list) = self.big_icons(true) {
             // A type with no icon that big (.cfg, .md, .toml) is in
             // Windows' jumbo list as its 48 px icon in the top left corner
             // of an empty 256 px square: shrunk to the cell, it would be a
@@ -464,13 +413,10 @@ impl App {
             }
         }
         let which = if jumbo { SHIL_JUMBO } else { SHIL_EXTRALARGE };
-        let list = self.big_icons(jumbo);
-        if list == 0 {
+        let Some(list) = self.big_icons(jumbo) else {
             return;
-        }
-        let (mut cx, mut cy) = (0, 0);
-        // SAFETY: reads the size of a system image list.
-        unsafe { ImageList_GetIconSize(list, &mut cx, &mut cy) };
+        };
+        let (cx, cy) = imagelist::icon_size(&list).unwrap_or((0, 0));
         let (x, y, w, h, style) = if cx <= side && cy <= side {
             let x = square.left + (side - cx) / 2;
             let y = square.top + (side - cy) / 2;
@@ -499,8 +445,6 @@ impl App {
             )
         };
         let params = IMAGELISTDRAWPARAMS {
-            cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
-            himl: list,
             i: icon,
             hdcDst: hdc,
             x,
@@ -510,10 +454,9 @@ impl App {
             rgbBk: CLR_NONE as u32,
             rgbFg: CLR_DEFAULT as u32,
             fStyle: style,
-            // SAFETY: the rest of the struct is plain data.
-            ..unsafe { core::mem::zeroed() }
+            ..Default::default()
         };
-        if !self.big_loads.draw(&params, wanted) {
+        if !self.big_loads.draw(list, &params, wanted) {
             self.stand_in(hdc, icon, square, which);
         }
     }
@@ -526,19 +469,14 @@ impl App {
     fn stand_in(&self, hdc: HDC, icon: i32, square: &RECT, wanted: i32) {
         let side = square.right - square.left;
         for which in stand_ins(wanted) {
-            let list = self.system_list(which);
-            if list == 0 {
+            let Some(list) = self.system_list(which) else {
                 continue;
-            }
-            let (mut cx, mut cy) = (0, 0);
-            // SAFETY: reads the size of a system image list.
-            unsafe { ImageList_GetIconSize(list, &mut cx, &mut cy) };
+            };
+            let (cx, cy) = imagelist::icon_size(&list).unwrap_or((0, 0));
             if cx > side || cy > side {
                 continue;
             }
             let params = IMAGELISTDRAWPARAMS {
-                cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
-                himl: list,
                 i: icon,
                 hdcDst: hdc,
                 x: square.left + (side - cx) / 2,
@@ -546,10 +484,9 @@ impl App {
                 rgbBk: CLR_NONE as u32,
                 rgbFg: CLR_DEFAULT as u32,
                 fStyle: ILD_TRANSPARENT,
-                // SAFETY: the rest of the struct is plain data.
-                ..unsafe { core::mem::zeroed() }
+                ..Default::default()
             };
-            if self.big_loads.draw(&params, false) {
+            if self.big_loads.draw(list, &params, false) {
                 return;
             }
         }
@@ -565,13 +502,10 @@ impl App {
         let side = square.right - square.left;
         let mut chosen = None;
         for which in [SHIL_SMALL, SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO] {
-            let list = self.system_list(which);
-            if list == 0 {
+            let Some(list) = self.system_list(which) else {
                 continue;
-            }
-            let (mut cx, mut cy) = (0, 0);
-            // SAFETY: reads the size of a system image list.
-            unsafe { ImageList_GetIconSize(list, &mut cx, &mut cy) };
+            };
+            let (cx, _) = imagelist::icon_size(&list).unwrap_or((0, 0));
             if cx >= side {
                 chosen = Some((list, cx));
                 break;
@@ -589,8 +523,6 @@ impl App {
             return;
         }
         let params = IMAGELISTDRAWPARAMS {
-            cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
-            himl: list,
             i: icon,
             hdcDst: hdc,
             x: square.left,
@@ -604,26 +536,21 @@ impl App {
             } else {
                 ILD_TRANSPARENT
             },
-            // SAFETY: the rest of the struct is plain data.
-            ..unsafe { core::mem::zeroed() }
+            ..Default::default()
         };
-        if !self.big_loads.draw(&params, true) {
+        if !self.big_loads.draw(list, &params, true)
+            && let Some(small) = self.icons.list
+        {
             // The small icon meanwhile, centred, drawn as Details draws it
             // at 100 % (the icons' thread has loaded it already).
-            let (mut cx, mut cy) = (0, 0);
-            // SAFETY: reads the small list's icon size and draws one of its
-            // icons on this paint's DC.
-            unsafe {
-                ImageList_GetIconSize(self.icons.list, &mut cx, &mut cy);
-                ImageList_Draw(
-                    self.icons.list,
-                    icon,
-                    hdc,
-                    square.left + (side - cx) / 2,
-                    square.top + (side - cy) / 2,
-                    ILD_TRANSPARENT,
-                );
-            }
+            let (cx, cy) = imagelist::icon_size(&small).unwrap_or((0, 0));
+            imagelist::draw(
+                &small,
+                icon,
+                hdc,
+                (square.left + (side - cx) / 2, square.top + (side - cy) / 2),
+                ILD_TRANSPARENT,
+            );
         }
     }
 
@@ -631,33 +558,20 @@ impl App {
     /// again, with them (the thumbnails, or Details' rows at a UI scale).
     pub(super) fn big_icons_loaded(&self) {
         if self.big_loads.arrived() {
-            // SAFETY: repaints this thread's list.
-            unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
+            win::invalidate(self.list, None, false);
         }
     }
 
     /// The system image list of 48 px icons, or of 256 px ones (`jumbo`),
     /// asked for once.
-    fn big_icons(&self, jumbo: bool) -> HIMAGELIST {
+    fn big_icons(&self, jumbo: bool) -> Option<SystemList> {
         self.system_list(if jumbo { SHIL_JUMBO } else { SHIL_EXTRALARGE })
     }
 
-    /// The system image list `which` (`SHIL_*`), asked for once.
-    fn system_list(&self, which: i32) -> HIMAGELIST {
-        let mut lists = self.big_icons.get();
-        let Some(slot) = usize::try_from(which).ok().filter(|&s| s < lists.len()) else {
-            return 0;
-        };
-        if lists[slot] == 0 {
-            let mut ppv: *mut core::ffi::c_void = core::ptr::null_mut();
-            // SAFETY: the shell hands out its own image list, which lives as
-            // long as the process; it is kept, never released.
-            if unsafe { SHGetImageList(which, &IID_IMAGE_LIST, &mut ppv) } >= 0 {
-                lists[slot] = ppv as usize;
-                self.big_icons.set(lists);
-            }
-        }
-        lists[slot] as HIMAGELIST
+    /// The system image list `which` (`SHIL_*`), asked of the shell once:
+    /// it lives as long as the process (`win::imagelist::system`).
+    fn system_list(&self, which: i32) -> Option<SystemList> {
+        win::imagelist::system(which)
     }
 
     /// A thumbnail came from the thread: kept, and its item redrawn if it
@@ -676,7 +590,7 @@ impl App {
             .peek(index)
             .is_some_and(|r| *r.path == *path);
         if same {
-            send(self.list, LVM_REDRAWITEMS, index, index as isize);
+            lv::redraw_items(self.list, index as i32, index as i32);
         }
         true
     }
@@ -743,39 +657,33 @@ fn draw_bitmap(hdc: HDC, bitmap: &Bitmap, square: &RECT) {
         SourceConstantAlpha: 255,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
-    // SAFETY: a memory DC made and deleted here holds the bitmap, which the
-    // cache keeps alive across the call and selects nowhere else.
-    unsafe {
-        let mem = CreateCompatibleDC(hdc);
-        let old = SelectObject(mem, bitmap.handle());
-        AlphaBlend(
-            hdc,
+    // A memory DC made and deleted here holds the bitmap, which the cache
+    // keeps alive across the call and selects nowhere else.
+    let mem = gdi::MemDc::compatible(hdc);
+    let selected = gdi::Selected::of(mem.hdc(), bitmap.handle());
+    gdi::alpha_blend(
+        hdc,
+        (
             dst.left,
             dst.top,
             dst.right - dst.left,
             dst.bottom - dst.top,
-            mem,
-            0,
-            0,
-            bitmap.width,
-            bitmap.height,
-            blend,
-        );
-        SelectObject(mem, old);
-        DeleteDC(mem);
-    }
+        ),
+        mem.hdc(),
+        (0, 0, bitmap.width, bitmap.height),
+        blend,
+    );
+    drop(selected);
+    drop(mem);
 }
 
 /// Whether the system jumbo list's icon `icon` is a small icon in the top
 /// left corner of an otherwise empty square; `None` while the icon is not
 /// loaded. Worked out once per icon (two draws into a scratch bitmap) and
 /// kept: the system list's indexes last as long as the process.
-fn jumbo_is_padded(list: HIMAGELIST, icon: i32) -> Option<bool> {
+fn jumbo_is_padded(list: SystemList, icon: i32) -> Option<bool> {
     thread_local! {
         static PADDED: RefCell<HashMap<i32, bool>> = RefCell::new(HashMap::new());
-    }
-    if list == 0 {
-        return Some(false);
     }
     if let Some(known) = PADDED.with(|p| p.borrow().get(&icon).copied()) {
         return Some(known);
@@ -809,85 +717,52 @@ enum Extent {
 /// list's icon side. It is drawn twice into a scratch bitmap, on black and
 /// on white, so that no colour of its own can hide one of its pixels; only
 /// if it is loaded (`ILD_ASYNC`).
-fn drawn_extent(list: HIMAGELIST, icon: i32) -> Extent {
-    let (mut cx, mut cy) = (0, 0);
-    // SAFETY: a DIB section and a memory DC made, used and deleted here.
-    // The pixels are touched only through slices made between the draws
-    // (after GdiFlush), each covering exactly the section's cx × cy 32-bit
-    // pixels.
-    unsafe {
-        ImageList_GetIconSize(list, &mut cx, &mut cy);
-        if cx <= 0 || cy <= 0 {
+fn drawn_extent(list: SystemList, icon: i32) -> Extent {
+    // A DIB section and a memory DC made, used and deleted here
+    // (`dib::Canvas`): its pixels are copied out between the draws, once
+    // what was drawn is in them.
+    let (cx, cy) = imagelist::icon_size(&list).unwrap_or((0, 0));
+    if cx <= 0 || cy <= 0 {
+        return Extent::Unknown;
+    }
+    let Some(canvas) = Canvas::new(cx, cy) else {
+        return Extent::Unknown;
+    };
+    let params = IMAGELISTDRAWPARAMS {
+        hdcDst: canvas.hdc(),
+        i: icon,
+        rgbBk: CLR_NONE as u32,
+        rgbFg: CLR_DEFAULT as u32,
+        fStyle: ILD_TRANSPARENT | ILD_ASYNC,
+        ..Default::default()
+    };
+    let (mut right, mut bottom) = (0, 0);
+    let mut loaded = true;
+    for back in [0u32, 0x00ff_ffff] {
+        canvas.fill(back.to_le_bytes());
+        if !imagelist::draw_indirect(&list, &params) {
+            loaded = false;
+            break;
+        }
+        let Some(pixels) = canvas.pixels() else {
             return Extent::Unknown;
-        }
-        let mut bi: BITMAPINFO = core::mem::zeroed();
-        bi.bmiHeader = BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: cx,
-            // Top-down.
-            biHeight: -cy,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            ..core::mem::zeroed()
         };
-        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
-        let dib = CreateDIBSection(
-            core::ptr::null_mut(),
-            &bi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            core::ptr::null_mut(),
-            0,
-        );
-        if dib.is_null() || bits.is_null() {
-            if !dib.is_null() {
-                DeleteObject(dib);
-            }
-            return Extent::Unknown;
-        }
-        let count = (cx * cy) as usize;
-        let dc = CreateCompatibleDC(core::ptr::null_mut());
-        let old = SelectObject(dc, dib);
-        let params = IMAGELISTDRAWPARAMS {
-            cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
-            himl: list,
-            i: icon,
-            hdcDst: dc,
-            rgbBk: CLR_NONE as u32,
-            rgbFg: CLR_DEFAULT as u32,
-            fStyle: ILD_TRANSPARENT | ILD_ASYNC,
-            ..core::mem::zeroed()
-        };
-        let (mut right, mut bottom) = (0, 0);
-        let mut loaded = true;
-        for back in [0u32, 0x00ff_ffff] {
-            core::slice::from_raw_parts_mut(bits.cast::<u32>(), count).fill(back);
-            if ImageList_DrawIndirect(&params) == 0 {
-                loaded = false;
-                break;
-            }
-            GdiFlush();
-            let pixels = core::slice::from_raw_parts(bits.cast::<u32>(), count);
-            for (i, p) in pixels.iter().enumerate() {
-                if p & 0x00ff_ffff != back {
-                    let (x, y) = (i as i32 % cx, i as i32 / cx);
-                    right = right.max(x + 1);
-                    bottom = bottom.max(y + 1);
-                }
+        for (i, p) in pixels.iter().enumerate() {
+            if u32::from_le_bytes(*p) & 0x00ff_ffff != back {
+                let (x, y) = (i as i32 % cx, i as i32 / cx);
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
             }
         }
-        SelectObject(dc, old);
-        DeleteDC(dc);
-        DeleteObject(dib);
-        if !loaded {
-            return Extent::NotLoaded;
-        }
-        Extent::Drawn {
-            right,
-            bottom,
-            side: cx.min(cy),
-        }
+    }
+    drop(canvas);
+    if !loaded {
+        return Extent::NotLoaded;
+    }
+    Extent::Drawn {
+        right,
+        bottom,
+        side: cx.min(cy),
     }
 }
 
@@ -918,54 +793,42 @@ fn name_lines(hdc: HDC, rc: &RECT, name: &[u16], spans: &[Span], fonts: &Fonts, 
     if name.is_empty() || avail <= 0 {
         return;
     }
-    // SAFETY: measures and draws into the list's paint DC; the font set
-    // here is put back by `runs` (the normal one, the DC's own).
-    unsafe {
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, colour);
-        // The bold font where there are matches: what fits in it fits.
-        SelectObject(
-            hdc,
-            if spans.is_empty() {
-                fonts.normal
-            } else {
-                fonts.bold
-            },
-        );
-        let mut fit = 0;
-        let mut size = Default::default();
-        GetTextExtentExPointW(
-            hdc,
-            name.as_ptr(),
-            name.len() as i32,
-            avail,
-            &mut fit,
-            core::ptr::null_mut(),
-            &mut size,
-        );
-        let cut = view::line_break(name, fit.max(0) as usize);
-        let line = |from: usize, to: usize, top: i32| {
-            if from >= to {
-                return;
-            }
-            let part = spans_in(spans, from, to);
-            let w = runs_width(hdc, &name[from..to], &part, fonts);
-            let left = if w < avail {
-                rc.left + (avail - w) / 2
-            } else {
-                rc.left
-            };
-            let r = RECT {
-                left,
-                top,
-                right: rc.right,
-                bottom: top + fonts.height,
-            };
-            paint::runs(hdc, &r, &name[from..to], &part, fonts, false);
+    // Measures and draws into the list's paint DC; the font set here is
+    // put back by `runs` (the normal one, the DC's own).
+    gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+    gdi::set_text_color(hdc, colour);
+    // The bold font where there are matches: what fits in it fits.
+    gdi::select(
+        hdc,
+        if spans.is_empty() {
+            fonts.normal
+        } else {
+            fonts.bold
+        },
+    );
+    let (fit, _) = win::gdi::text_fit(hdc, name, avail);
+    let cut = view::line_break(name, fit.max(0) as usize);
+    let line = |from: usize, to: usize, top: i32| {
+        if from >= to {
+            return;
+        }
+        let part = spans_in(spans, from, to);
+        let w = runs_width(hdc, &name[from..to], &part, fonts);
+        let left = if w < avail {
+            rc.left + (avail - w) / 2
+        } else {
+            rc.left
         };
-        line(0, cut, rc.top);
-        line(cut, name.len(), rc.top + fonts.height);
-    }
+        let r = RECT {
+            left,
+            top,
+            right: rc.right,
+            bottom: top + fonts.height,
+        };
+        paint::runs(hdc, &r, &name[from..to], &part, fonts, false);
+    };
+    line(0, cut, rc.top);
+    line(cut, name.len(), rc.top + fonts.height);
 }
 
 /// The width of `text` drawn with its `spans` in bold.
@@ -974,8 +837,8 @@ fn runs_width(hdc: HDC, text: &[u16], spans: &[Span], fonts: &Fonts) -> i32 {
     let mut at = 0;
     let mut part = |s: usize, e: usize, bold: bool| {
         if e > s {
-            // SAFETY: selects one of the window's fonts into the DC.
-            unsafe { SelectObject(hdc, if bold { fonts.bold } else { fonts.normal }) };
+            // One of the window's fonts into the DC.
+            gdi::select(hdc, if bold { fonts.bold } else { fonts.normal });
             total += paint::width(hdc, &text[s..e]);
         }
     };

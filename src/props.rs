@@ -23,18 +23,12 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND};
-use windows_sys::Win32::Storage::FileSystem::{
-    GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA,
-};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForSingleObject,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows_sys::Win32::Foundation::{FILETIME, HWND};
+use windows_sys::Win32::System::Threading::INFINITE;
 
 use crate::client::Row;
 use crate::columns::{COL_ACCESSED, COL_ATTRIB, COL_CREATED, COL_RECENT};
-use crate::wide::nul;
+use crate::win::sync::Event;
 
 /// Reads waiting at most; older ones have scrolled away.
 const MAX_QUEUED: usize = 256;
@@ -195,14 +189,8 @@ fn filetime(ft: FILETIME) -> i64 {
 /// The attributes and dates of the file at `path` (no NUL), read with the
 /// process's own token; `None` when it cannot be (gone, no access).
 pub fn read_disk(path: &[u16]) -> Option<Disk> {
-    let z = nul(path);
-    // SAFETY: WIN32_FILE_ATTRIBUTE_DATA is plain data.
-    let mut data: WIN32_FILE_ATTRIBUTE_DATA = unsafe { core::mem::zeroed() };
-    // SAFETY: a NUL-terminated path and an out-struct of the level's type.
-    let ok =
-        unsafe { GetFileAttributesExW(z.as_ptr(), GetFileExInfoStandard, (&raw mut data).cast()) }
-            != 0;
-    ok.then(|| Disk {
+    let data = crate::win::file::attribute_data(path)?;
+    Some(Disk {
         attrib: data.dwFileAttributes,
         ctime: filetime(data.ftCreationTime),
         atime: filetime(data.ftLastAccessTime),
@@ -227,16 +215,9 @@ struct Shared {
     answers: Mutex<Vec<Answer>>,
     /// Set while the window has a message about answers not yet taken.
     told: AtomicBool,
-    work: usize,
+    work: Event,
     hwnd: usize,
     msg: u32,
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // SAFETY: the event is owned by `Shared` and closed once.
-        unsafe { CloseHandle(self.work as HANDLE) };
-    }
 }
 
 /// The window's disk reader.
@@ -263,8 +244,8 @@ impl Reader {
 
     fn shared(&self) -> &Arc<Shared> {
         self.shared.get_or_init(|| {
-            // SAFETY: an unnamed manual-reset event.
-            let work = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) } as usize;
+            // A manual-reset event.
+            let work = Event::new(true, false).expect("CreateEventW failed");
             let shared = Arc::new(Shared {
                 queue: Mutex::new(Queue {
                     epoch: self.epoch.load(Ordering::Relaxed),
@@ -316,8 +297,7 @@ impl Reader {
         }
         q.items.push((index, row.path.clone()));
         row.more.set(row.more.get().asked());
-        // SAFETY: a live event handle.
-        unsafe { SetEvent(shared.work as HANDLE) };
+        shared.work.set();
         dropped
     }
 
@@ -344,15 +324,13 @@ fn run(shared: &Shared) {
             match q.items.pop() {
                 Some((index, path)) => Some((q.epoch, index, path)),
                 None => {
-                    // SAFETY: a live event handle.
-                    unsafe { ResetEvent(shared.work as HANDLE) };
+                    shared.work.reset();
                     None
                 }
             }
         };
         let Some((epoch, index, path)) = next else {
-            // SAFETY: a live event handle.
-            unsafe { WaitForSingleObject(shared.work as HANDLE, INFINITE) };
+            shared.work.wait(INFINITE);
             continue;
         };
         let disk = read_disk(&path);
@@ -362,8 +340,8 @@ fn run(shared: &Shared) {
             .unwrap_or_else(|e| e.into_inner())
             .push(Answer { epoch, index, disk });
         if !shared.told.swap(true, Ordering::AcqRel) {
-            // SAFETY: a plain post (no payload) to the window that asked.
-            unsafe { PostMessageW(shared.hwnd as HWND, shared.msg, 0, 0) };
+            // A plain post (no payload) to the window that asked.
+            crate::win::post_app(shared.hwnd as HWND, shared.msg, 0, 0);
         }
     }
 }

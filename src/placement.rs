@@ -3,18 +3,14 @@
 //! was saved at, and moved into the nearest work area when that monitor is
 //! gone or the title bar would be out of reach.
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
-use windows_sys::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromRect,
-};
-use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONEAREST};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetWindowPlacement, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
+    SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
 };
-use windows_sys::core::BOOL;
 
 use crate::settings::WindowPos;
+use crate::win::{self, sys};
 
 /// A rectangle as left, top, width, height.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,46 +135,19 @@ pub fn fit(saved: &WindowPos, monitors: &[Monitor]) -> Option<Rect> {
 
 /// The monitors as Windows has them now.
 pub fn monitors() -> Vec<Monitor> {
-    unsafe extern "system" fn each(mon: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
-        // SAFETY: `data` is the Vec passed to EnumDisplayMonitors below,
-        // which outlives the enumeration.
-        let out = unsafe { &mut *(data as *mut Vec<Monitor>) };
-        if let Some(m) = monitor(mon) {
-            out.push(m);
-        }
-        1
-    }
-    let mut out: Vec<Monitor> = Vec::new();
-    // SAFETY: the callback only pushes to `out`, alive across the call.
-    unsafe {
-        EnumDisplayMonitors(
-            core::ptr::null_mut(),
-            core::ptr::null(),
-            Some(each),
-            (&raw mut out) as LPARAM,
-        );
-    }
-    out
+    win::sys::display_monitors()
+        .into_iter()
+        .filter_map(monitor)
+        .collect()
 }
 
 fn monitor(mon: HMONITOR) -> Option<Monitor> {
-    // SAFETY: plain out-structs for a monitor handle Windows gave.
-    unsafe {
-        let mut info: MONITORINFO = core::mem::zeroed();
-        info.cbSize = size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(mon, &mut info) == 0 {
-            return None;
-        }
-        let (mut dx, mut dy) = (96u32, 96u32);
-        if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) < 0 {
-            dx = 96;
-        }
-        Some(Monitor {
-            area: Rect::from_win(&info.rcMonitor),
-            work: Rect::from_win(&info.rcWork),
-            dpi: dx,
-        })
-    }
+    let info = sys::monitor_info(mon)?;
+    Some(Monitor {
+        area: Rect::from_win(&info.rcMonitor),
+        work: Rect::from_win(&info.rcWork),
+        dpi: win::sys::monitor_dpi(mon).unwrap_or(96),
+    })
 }
 
 /// `r` (screen pixels) in workspace coordinates, which WINDOWPLACEMENT
@@ -200,8 +169,8 @@ pub fn screen_to_workspace(r: Rect, monitors: &[Monitor]) -> Rect {
 
 /// The DPI of the monitor `rc` (screen pixels) is mostly on.
 pub fn dpi_at(rc: &RECT) -> u32 {
-    // SAFETY: MonitorFromRect never fails with DEFAULTTONEAREST.
-    let mon = unsafe { MonitorFromRect(rc, MONITOR_DEFAULTTONEAREST) };
+    // MonitorFromRect never fails with DEFAULTTONEAREST.
+    let mon = sys::monitor_from_rect(rc, MONITOR_DEFAULTTONEAREST);
     monitor(mon).map_or(96, |m| m.dpi)
 }
 
@@ -226,16 +195,7 @@ pub fn workspace_to_screen(ws: Rect, monitors: &[Monitor]) -> Rect {
 /// screen pixels, with the DPI there, and whether it is maximized (or
 /// minimized from maximized). `None` when it has no placement or no size.
 pub fn normal_place(hwnd: HWND) -> Option<(WindowPos, bool)> {
-    let mut wp = WINDOWPLACEMENT {
-        length: size_of::<WINDOWPLACEMENT>() as u32,
-        // SAFETY: the rest of WINDOWPLACEMENT is plain data.
-        ..unsafe { core::mem::zeroed() }
-    };
-    // SAFETY: reads a window's placement into `wp`.
-    if unsafe { GetWindowPlacement(hwnd, &mut wp) } == 0 {
-        return None;
-    }
-    place_of(&wp)
+    place_of(&win::placement(hwnd)?)
 }
 
 /// [`normal_place`] of a placement read before (the window's before it

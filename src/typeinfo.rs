@@ -32,18 +32,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_TIMEOUT};
-use windows_sys::Win32::Graphics::Gdi::{CreateBitmap, CreateCompatibleDC, SelectObject};
-use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
-};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForSingleObject,
-};
-use windows_sys::Win32::UI::Controls::{HIMAGELIST, ILD_TRANSPARENT, ImageList_Draw};
-use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::System::Threading::INFINITE;
+use windows_sys::Win32::UI::Controls::ILD_TRANSPARENT;
 
 use crate::filetype::{self, Key};
+use crate::win::com::Apartment;
+use crate::win::imagelist::SystemList;
+use crate::win::sync::Event;
+use crate::win::{self, gdi, imagelist};
 
 /// While answers keep coming, the window hears of them at most this often.
 const TELL_EVERY: Duration = Duration::from_millis(40);
@@ -117,11 +114,11 @@ struct Shared {
     answers: Mutex<Vec<Answer>>,
     /// Set while the window has a message about answers not yet taken.
     told: AtomicBool,
-    work: usize,
+    work: Event,
     hwnd: usize,
     msg: u32,
     /// The system image list of small icons, which the window draws from.
-    list: usize,
+    list: Option<SystemList>,
 }
 
 pub struct TypeInfo {
@@ -141,9 +138,15 @@ impl TypeInfo {
     /// system image list the window draws the answers' icons from; the
     /// thread starts now and loads `first` from it (the icons drawn before
     /// any answer comes).
-    pub fn new(hwnd: HWND, msg: u32, ask_msg: u32, list: HIMAGELIST, first: Vec<i32>) -> TypeInfo {
-        // SAFETY: an unnamed manual-reset event.
-        let work = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) } as usize;
+    pub fn new(
+        hwnd: HWND,
+        msg: u32,
+        ask_msg: u32,
+        list: Option<SystemList>,
+        first: Vec<i32>,
+    ) -> TypeInfo {
+        // A manual-reset event.
+        let work = Event::new(true, false).expect("CreateEventW failed");
         let info = TypeInfo {
             shared: Arc::new(Shared {
                 queue: Mutex::new(Vec::new()),
@@ -152,7 +155,7 @@ impl TypeInfo {
                 work,
                 hwnd: hwnd as usize,
                 msg,
-                list: list as usize,
+                list,
             }),
             book: RefCell::new(Book::default()),
             ask_msg,
@@ -195,10 +198,10 @@ impl TypeInfo {
     fn ask(&self, key: &Key) {
         let post = self.book.borrow_mut().ask(key);
         if post {
-            // SAFETY: posts to this thread's window; the batch goes once
-            // the paint asking is over (`send`).
-            let posted = unsafe { PostMessageW(self.shared.hwnd as HWND, self.ask_msg, 0, 0) };
-            self.book.borrow_mut().posted(posted != 0);
+            // Posts to this thread's window; the batch goes once the paint
+            // asking is over (`send`).
+            let posted = win::post_app(self.shared.hwnd as HWND, self.ask_msg, 0, 0);
+            self.book.borrow_mut().posted(posted);
         }
     }
 
@@ -224,8 +227,7 @@ impl TypeInfo {
             &mut self.shared.queue.lock().unwrap_or_else(|e| e.into_inner()),
             batch,
         );
-        // SAFETY: a live event handle.
-        unsafe { SetEvent(self.shared.work as HANDLE) };
+        self.shared.work.set();
     }
 
     /// The thread's message came: its answers are kept (the names where
@@ -251,30 +253,28 @@ impl TypeInfo {
 }
 
 fn lookup_thread(shared: &Shared, first: Vec<i32>) {
-    // SAFETY: the shell wants COM on a thread that asks it about types.
-    unsafe {
-        CoInitializeEx(
-            core::ptr::null(),
-            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        )
-    };
-    // SAFETY: a memory DC with a 1 x 1 bitmap, kept for the thread's life
-    // (which ends with the process's, as the icon threads' do): drawing an
-    // icon there is what makes the list load it (as `bigicons.rs` does for
-    // the big lists).
-    let dc = unsafe {
-        let dc = CreateCompatibleDC(core::ptr::null_mut());
-        let bitmap = CreateBitmap(1, 1, 1, 32, core::ptr::null());
-        SelectObject(dc, bitmap);
-        dc
-    };
+    // The shell wants COM on a thread that asks it about types; the thread
+    // keeps it for its life.
+    if let Some(com) = Apartment::sta() {
+        com.keep();
+    }
+    // A memory DC with a 1 x 1 bitmap, kept for the thread's life (which
+    // ends with the process's, as the icon threads' do): drawing an icon
+    // there is what makes the list load it (as `bigicons.rs` does for the
+    // big lists).
+    let dc = gdi::MemDc::compatible(core::ptr::null_mut());
+    let bitmap = gdi::create_bitmap(1, 1, 1, 32);
+    let _selected = bitmap.as_ref().map(|b| gdi::Selected::new(dc.hdc(), b));
+    let dc = dc.hdc();
     // The icons drawn (so loaded) here: many types share one.
     let mut loaded = HashSet::new();
     let mut load = |icon: i32| {
         if icon >= 0 && loaded.insert(icon) {
-            // SAFETY: the system image list lives as long as the process,
-            // and takes draws from any thread.
-            unsafe { ImageList_Draw(shared.list as HIMAGELIST, icon, dc, 0, 0, ILD_TRANSPARENT) };
+            // The system image list lives as long as the process, and takes
+            // draws from any thread.
+            if let Some(list) = shared.list {
+                imagelist::draw(&list, icon, dc, (0, 0), ILD_TRANSPARENT);
+            }
         }
     };
     for icon in first {
@@ -288,8 +288,7 @@ fn lookup_thread(shared: &Shared, first: Vec<i32>) {
             if next.is_none() {
                 // Reset while the queue is held: a batch sent after this
                 // sets it again.
-                // SAFETY: a live event handle.
-                unsafe { ResetEvent(shared.work as HANDLE) };
+                shared.work.reset();
             }
             next
         };
@@ -308,10 +307,7 @@ fn lookup_thread(shared: &Shared, first: Vec<i32>) {
             } else {
                 INFINITE
             };
-            // SAFETY: a live event handle.
-            if unsafe { WaitForSingleObject(shared.work as HANDLE, wait) } == WAIT_TIMEOUT
-                && tell(shared)
-            {
+            if !shared.work.wait(wait) && tell(shared) {
                 last_told = Instant::now();
             }
             continue;
@@ -349,24 +345,15 @@ fn tell(shared: &Shared) -> bool {
         return false;
     }
     let hwnd = shared.hwnd as HWND;
-    // SAFETY: posts to the window, and asks whether it is one; a window
-    // that is gone fails both, harmlessly.
-    unsafe {
-        if PostMessageW(hwnd, shared.msg, 0, 0) != 0 {
-            return true;
-        }
-        if IsWindow(hwnd) != 0 {
-            shared.told.store(false, Ordering::SeqCst);
-        }
+    // Posts to the window, and asks whether it is one; a window that is
+    // gone fails both, harmlessly.
+    if win::post_app(hwnd, shared.msg, 0, 0) {
+        return true;
+    }
+    if win::is_window(hwnd) {
+        shared.told.store(false, Ordering::SeqCst);
     }
     false
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // SAFETY: the event is owned by `Shared` and closed once.
-        unsafe { CloseHandle(self.work as HANDLE) };
-    }
 }
 
 #[cfg(test)]

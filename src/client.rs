@@ -9,7 +9,8 @@
 
 use std::cell::Cell;
 use std::io;
-use std::os::windows::io::BorrowedHandle;
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsHandle;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -20,22 +21,17 @@ use goz_core::proto::{
 };
 use goz_core::types::{SortDir, SortSpec};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND,
-    ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0,
+    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, HWND,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, SECURITY_IDENTIFICATION,
-    SECURITY_SQOS_PRESENT, WriteFile,
+    FILE_FLAG_OVERLAPPED, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
-use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows_sys::Win32::System::Threading::INFINITE;
 
-use crate::wide::wz;
+use crate::win;
+use crate::win::parcel;
+use crate::win::process::{InFlight, OverlappedFile};
+use crate::win::sync::Event;
 
 mod w9;
 use w9::{Ask, query_request};
@@ -364,35 +360,9 @@ pub enum Reply {
     },
 }
 
-struct Event(HANDLE);
-
-// SAFETY: an event handle may be signalled and waited on from any thread.
-unsafe impl Send for Event {}
-// SAFETY: as above; the handle is never closed while shared.
-unsafe impl Sync for Event {}
-
-impl Event {
-    fn new() -> Event {
-        // SAFETY: an unnamed, manual-reset, initially unsignalled event.
-        let h = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
-        assert!(!h.is_null(), "CreateEventW failed");
-        Event(h)
-    }
-    fn set(&self) {
-        // SAFETY: the handle is a live event.
-        unsafe { SetEvent(self.0) };
-    }
-    fn reset(&self) {
-        // SAFETY: the handle is a live event.
-        unsafe { ResetEvent(self.0) };
-    }
-}
-
-impl Drop for Event {
-    fn drop(&mut self) {
-        // SAFETY: the handle is owned and closed once.
-        unsafe { CloseHandle(self.0) };
-    }
+/// An unnamed, manual-reset, initially unsignalled event.
+fn event() -> Event {
+    Event::new(true, false).expect("CreateEventW failed")
 }
 
 struct Queue {
@@ -424,14 +394,13 @@ impl Shared {
     }
 
     fn post(&self, reply: Reply) {
-        let p = Box::into_raw(Box::new(reply));
-        // SAFETY: the window owns the box once the message is queued; if
-        // posting fails (the window is gone) it is reclaimed here.
-        unsafe {
-            if PostMessageW(self.hwnd as HWND, self.msg, 0, p as isize) == 0 {
-                drop(Box::from_raw(p));
-            }
+        // A [`Stop`]'s has no window (message 0): nothing goes to one.
+        if self.msg == 0 {
+            return;
         }
+        // The window takes it once the message comes; if posting fails (the
+        // window is gone) it is dropped here.
+        parcel::post(self.hwnd as HWND, self.msg, 0, reply);
     }
 }
 
@@ -440,8 +409,8 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Starts the worker; its replies arrive at `hwnd` as message `msg`, with
-    /// a `Box<Reply>` in `lParam`.
+    /// Starts the worker; its replies arrive at `hwnd` as message `msg`, each
+    /// with a [`Reply`] as a parcel (`win::parcel::take`).
     pub fn spawn(hwnd: HWND, msg: u32) -> Worker {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
@@ -449,8 +418,8 @@ impl Worker {
                 jobs: Vec::new(),
                 quit: false,
             }),
-            work: Event::new(),
-            cancel: Event::new(),
+            work: event(),
+            cancel: event(),
             hwnd: hwnd as usize,
             msg,
             syntax: AtomicU8::new(0),
@@ -525,8 +494,8 @@ impl Stop {
                 jobs: Vec::new(),
                 quit: false,
             }),
-            work: Event::new(),
-            cancel: Event::new(),
+            work: event(),
+            cancel: event(),
             hwnd: 0,
             msg: 0,
             syntax: AtomicU8::new(0),
@@ -701,8 +670,7 @@ fn run(shared: &Shared) {
                 }
                 shared.work.reset();
             }
-            // SAFETY: a live event handle.
-            unsafe { WaitForSingleObject(shared.work.0, INFINITE) };
+            shared.work.wait(INFINITE);
         };
         match job {
             Job::Status => {
@@ -1197,24 +1165,15 @@ impl Io {
 }
 
 struct Pipe {
-    handle: HANDLE,
-    /// Signals each overlapped read or write.
-    event: Event,
+    /// The connection, with the event that signals each overlapped read or
+    /// write and the buffer read into.
+    io: OverlappedFile,
     decoder: FrameDecoder,
-    buf: Vec<u8>,
     /// Set once the request in flight went stale: when to stop waiting.
     give_up_at: Cell<Option<Instant>>,
     /// How long gozd may stay silent mid-answer ([`SILENCE_MS`]); a watch,
     /// quiet while nothing changes, waits for ever (W9).
     silence_ms: u32,
-}
-
-impl Drop for Pipe {
-    fn drop(&mut self) {
-        // SAFETY: the handle is owned; no I/O is outstanding once a call
-        // below returns, as each waits for its own completion.
-        unsafe { CloseHandle(self.handle) };
-    }
 }
 
 impl Pipe {
@@ -1238,60 +1197,49 @@ impl Pipe {
     /// (W9R-1). At the identification level a server learns who the
     /// client is but cannot act as it.
     fn open_as(identify: bool) -> Result<Pipe, Failure> {
-        let name = wz(PIPE_NAME);
         let level = Pipe::level(identify);
         let mut tries = 0;
-        let handle = loop {
-            // SAFETY: `name` is NUL-terminated. SECURITY_SQOS_PRESENT with an
-            // anonymous level (or identification, `identify`) keeps a
-            // squatting server from impersonating us.
-            let h = unsafe {
-                CreateFileW(
-                    name.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    0,
-                    core::ptr::null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED | level,
-                    core::ptr::null_mut(),
-                )
+        let file = loop {
+            // Read and write, shared with no one, overlapped.
+            // SECURITY_SQOS_PRESENT with an anonymous level (or
+            // identification, `identify`) keeps a squatting server from
+            // impersonating us.
+            let opened = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .security_qos_flags(level)
+                .open(PIPE_NAME);
+            let e = match opened {
+                Ok(file) => break file,
+                Err(e) => e,
             };
-            if h != INVALID_HANDLE_VALUE {
-                break h;
-            }
-            // SAFETY: reads this thread's last error.
-            match unsafe { GetLastError() } {
-                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => return Err(Failure::NotRunning),
+            match e.raw_os_error().map(|code| code as u32) {
+                Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => {
+                    return Err(Failure::NotRunning);
+                }
                 // gozd keeps one listening instance; another client may hold
                 // it for a moment.
-                ERROR_PIPE_BUSY if tries < 8 => {
+                Some(ERROR_PIPE_BUSY) if tries < 8 => {
                     tries += 1;
-                    // SAFETY: `name` is NUL-terminated.
-                    unsafe { WaitNamedPipeW(name.as_ptr(), 250) };
+                    win::process::wait_named_pipe(PIPE_NAME, 250);
                 }
-                e => {
-                    return Err(Failure::Other(format!(
-                        "cannot open {PIPE_NAME}: {}",
-                        io::Error::from_raw_os_error(e as i32)
-                    )));
+                _ => {
+                    return Err(Failure::Other(format!("cannot open {PIPE_NAME}: {e}")));
                 }
             }
         };
         // Only the elevated daemon may answer: a non-elevated process can
         // create the pipe name first and serve made-up results.
-        // SAFETY: `handle` is open for the duration of the call.
-        let trusted =
-            goz_winfs::pipe_server_is_trusted(unsafe { BorrowedHandle::borrow_raw(handle) });
+        let trusted = goz_winfs::pipe_server_is_trusted(file.as_handle());
         if !matches!(trusted, Ok(true)) {
-            // SAFETY: closing the handle just opened.
-            unsafe { CloseHandle(handle) };
+            // The handle just opened is closed as it drops.
             return Err(Failure::Untrusted);
         }
         Ok(Pipe {
-            handle,
-            event: Event::new(),
+            io: OverlappedFile::new(file, 256 * 1024).expect("CreateEventW failed"),
             decoder: FrameDecoder::new(MAX_SERVER_FRAME),
-            buf: vec![0; 256 * 1024],
             give_up_at: Cell::new(None),
             silence_ms: SILENCE_MS,
         })
@@ -1302,26 +1250,11 @@ impl Pipe {
         encode_request(request, &mut out);
         let mut sent = 0;
         while sent < out.len() {
-            // SAFETY: `ov` and `out` outlive the write, whose completion is
-            // awaited before either is touched again.
-            unsafe {
-                let mut ov: OVERLAPPED = core::mem::zeroed();
-                ov.hEvent = self.event.0;
-                let ok = WriteFile(
-                    self.handle,
-                    out[sent..].as_ptr(),
-                    (out.len() - sent) as u32,
-                    core::ptr::null_mut(),
-                    &mut ov,
-                );
-                if ok == 0 && GetLastError() != ERROR_IO_PENDING {
-                    return Err(Io::Lost(last_error("cannot write to gozd")));
-                }
-                let mut n = 0;
-                if GetOverlappedResult(self.handle, &ov, &mut n, 1) == 0 || n == 0 {
-                    return Err(Io::Lost(last_error("cannot write to gozd")));
-                }
-                sent += n as usize;
+            // Each write is finished before the next is started.
+            match self.io.write(&out[sent..]) {
+                Ok(0) => return Err(Io::Lost(last_error("cannot write to gozd"))),
+                Ok(n) => sent += n,
+                Err(e) => return Err(Io::Lost(format!("cannot write to gozd: {e}"))),
             }
         }
         Ok(())
@@ -1339,71 +1272,47 @@ impl Pipe {
                 Err(e) => return Err(Io::Lost(e.to_string())),
             }
             let n = self.read_some(shared, epoch)?;
-            self.decoder.feed(&self.buf[..n]);
+            self.decoder.feed(&self.io.buffer()[..n]);
         }
     }
 
     fn read_some(&mut self, shared: &Shared, epoch: Option<u64>) -> Result<usize, Io> {
-        // SAFETY: `ov` and `self.buf` stay put until the read completes or is
-        // cancelled, and every path below waits for that before returning.
-        unsafe {
-            let mut ov: OVERLAPPED = core::mem::zeroed();
-            ov.hEvent = self.event.0;
-            let ok = ReadFile(
-                self.handle,
-                self.buf.as_mut_ptr(),
-                self.buf.len() as u32,
-                core::ptr::null_mut(),
-                &mut ov,
-            );
-            if ok == 0 {
-                match GetLastError() {
-                    ERROR_IO_PENDING => self.wait(&mut ov, shared, epoch)?,
-                    ERROR_MORE_DATA => {}
-                    _ => return Err(Io::Lost(last_error("gozd closed the connection"))),
-                }
-            }
-            let mut n = 0;
-            if GetOverlappedResult(self.handle, &ov, &mut n, 0) == 0
-                && GetLastError() != ERROR_MORE_DATA
-            {
-                return Err(Io::Lost(last_error("gozd closed the connection")));
-            }
-            if n == 0 {
-                return Err(Io::Lost("gozd closed the connection".into()));
-            }
-            Ok(n as usize)
+        let (give_up_at, silence_ms) = (&self.give_up_at, self.silence_ms);
+        // A read given up on is cancelled and waited for before this
+        // returns.
+        let read = self
+            .io
+            .read(|io| wait(io, give_up_at, silence_ms, shared, epoch))?;
+        match read {
+            Err(e) => Err(Io::Lost(format!("gozd closed the connection: {e}"))),
+            Ok(0) => Err(Io::Lost("gozd closed the connection".into())),
+            Ok(n) => Ok(n),
         }
     }
+}
 
-    /// Waits for the pending I/O on `ov`. Once its search goes stale it gets
-    /// [`STALE_GRACE`] more to finish before it is abandoned; gozd going
-    /// silent abandons it too.
-    unsafe fn wait(
-        &self,
-        ov: &mut OVERLAPPED,
-        shared: &Shared,
-        epoch: Option<u64>,
-    ) -> Result<(), Io> {
-        let handles = [self.event.0, shared.cancel.0];
-        loop {
-            if let Some(deadline) = self.give_up_at.get() {
-                let left = deadline.saturating_duration_since(Instant::now());
-                // SAFETY: a live event handle.
-                let w = unsafe { WaitForSingleObject(self.event.0, left.as_millis() as u32) };
-                if w == WAIT_OBJECT_0 {
-                    return Ok(());
-                }
-                // SAFETY: `ov` is the pending request on this handle.
-                unsafe { self.abort(ov) };
-                return Err(Io::Cancelled);
-            }
-            // SAFETY: both handles are live events.
-            let w = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, self.silence_ms) };
-            if w == WAIT_OBJECT_0 {
+/// Waits for the read in flight on a [`Pipe`] (whose `give_up_at` and
+/// `silence_ms` these are). Once its search goes stale it gets
+/// [`STALE_GRACE`] more to finish before it is abandoned; gozd going silent
+/// abandons it too.
+fn wait(
+    io: &InFlight,
+    give_up_at: &Cell<Option<Instant>>,
+    silence_ms: u32,
+    shared: &Shared,
+    epoch: Option<u64>,
+) -> Result<(), Io> {
+    loop {
+        if let Some(deadline) = give_up_at.get() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if io.wait(&[], left.as_millis() as u32) == Some(0) {
                 return Ok(());
             }
-            if w == WAIT_OBJECT_0 + 1 {
+            return Err(Io::Cancelled);
+        }
+        match io.wait(&[&shared.cancel], silence_ms) {
+            Some(0) => return Ok(()),
+            Some(1) => {
                 if !shared.is_stale(epoch) {
                     // Raised for an older request; take it down and look again
                     // in case a newer search raised it meanwhile.
@@ -1412,22 +1321,9 @@ impl Pipe {
                         continue;
                     }
                 }
-                self.give_up_at.set(Some(Instant::now() + STALE_GRACE));
-                continue;
+                give_up_at.set(Some(Instant::now() + STALE_GRACE));
             }
-            // SAFETY: as above.
-            unsafe { self.abort(ov) };
-            return Err(Io::Lost("gozd did not reply in time".into()));
-        }
-    }
-
-    unsafe fn abort(&self, ov: &mut OVERLAPPED) {
-        let mut n = 0;
-        // SAFETY: cancels and then waits for the one request using `ov`, so
-        // the kernel is done with it and its buffer on return.
-        unsafe {
-            CancelIoEx(self.handle, ov);
-            GetOverlappedResult(self.handle, ov, &mut n, 1);
+            _ => return Err(Io::Lost("gozd did not reply in time".into())),
         }
     }
 }

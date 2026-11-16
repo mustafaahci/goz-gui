@@ -4,18 +4,13 @@
 //! delay), the search box's text selected by a click or when the window is
 //! activated, one-click opening, closing on execute, and new windows.
 
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
-use windows_sys::Win32::UI::Controls::{
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_FULLROWSELECT, LVS_EX_TRACKSELECT,
-};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
-use windows_sys::Win32::UI::Shell::{SHELLFLAGSTATE, SHGetSettings, SSF_DOUBLECLICKINWEBVIEW};
-use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer, WM_CLOSE};
+use windows_sys::Win32::UI::Controls::{LVS_EX_FULLROWSELECT, LVS_EX_TRACKSELECT};
+use windows_sys::Win32::UI::Shell::SSF_DOUBLECLICKINWEBVIEW;
 
-use super::{App, send, slots};
+use super::{App, slots};
 use crate::highlight::Highlight;
 use crate::ui_options::UiOptions;
-use crate::wide::window_text;
+use crate::win::{self, lv};
 
 /// The search delay's timer (`search_delay`): the text typed is searched
 /// when it goes off.
@@ -28,12 +23,7 @@ pub(super) const WM_FOCUS_SEARCH: u32 = slots::F6_MSG;
 /// Explorer's "Single-click to open an item (point to select)" (Folder
 /// Options), which Everything's "Use system settings" follows.
 fn explorer_single_click() -> bool {
-    // SAFETY: fills a plain struct with the flag asked for.
-    let state = unsafe {
-        let mut s: SHELLFLAGSTATE = core::mem::zeroed();
-        SHGetSettings(&mut s, SSF_DOUBLECLICKINWEBVIEW);
-        s
-    };
+    let state = win::shell::settings(SSF_DOUBLECLICKINWEBVIEW);
     // fDoubleClickInWebView is the sixth bit of the flags (after
     // fShowAllObjects, fShowExtensions, fNoConfirmRecycle, fShowSysFiles
     // and fShowCompColor): set for double-click, Windows' default.
@@ -70,10 +60,7 @@ impl App {
             self.start_search(false);
         }
         // What the rows, the header and the status bar show.
-        // SAFETY: repaints this thread's windows.
-        unsafe {
-            InvalidateRect(self.list, core::ptr::null(), 0);
-        }
+        win::invalidate(self.list, None, false);
         self.invalidate_status();
         self.settings_changed();
     }
@@ -93,12 +80,7 @@ impl App {
             ex |= LVS_EX_TRACKSELECT;
         }
         let mask = LVS_EX_FULLROWSELECT | LVS_EX_TRACKSELECT;
-        send(
-            self.list,
-            LVM_SETEXTENDEDLISTVIEWSTYLE,
-            mask as usize,
-            ex as isize,
-        );
+        lv::set_extended_style(self.list, mask, ex);
     }
 
     /// Whether one click on a result opens it (Options > Results).
@@ -114,7 +96,7 @@ impl App {
         if self.search_dirty.get() {
             return;
         }
-        let text = window_text(self.edit);
+        let text = win::text(self.edit);
         let o = self.opts.get();
         let mut m = self.model.borrow_mut();
         if let Some(p) = m.pending.as_mut() {
@@ -127,8 +109,7 @@ impl App {
     /// syntax changed what the search's terms are).
     pub(super) fn rehighlight_now(&self) {
         self.rehighlight();
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
+        win::invalidate(self.list, None, false);
     }
 
     /// What a search for `text` highlights: nothing while highlighted
@@ -156,13 +137,11 @@ impl App {
             return true;
         }
         self.search_dirty.set(true);
-        // SAFETY: timers of this window; setting one again restarts it.
-        unsafe {
-            if ui.search_as_you_type {
-                SetTimer(self.hwnd, TIMER_SEARCH_DELAY, ui.search_delay, None);
-            } else {
-                KillTimer(self.hwnd, TIMER_SEARCH_DELAY);
-            }
+        // Setting the timer again restarts it.
+        if ui.search_as_you_type {
+            win::set_timer(self.hwnd, TIMER_SEARCH_DELAY, ui.search_delay);
+        } else {
+            win::kill_timer(self.hwnd, TIMER_SEARCH_DELAY);
         }
         false
     }
@@ -170,8 +149,7 @@ impl App {
     /// A search starts: the text typed is searched now.
     pub(super) fn search_started(&self) {
         if self.search_dirty.replace(false) {
-            // SAFETY: a timer of this window.
-            unsafe { KillTimer(self.hwnd, TIMER_SEARCH_DELAY) };
+            win::kill_timer(self.hwnd, TIMER_SEARCH_DELAY);
         }
     }
 
@@ -184,8 +162,7 @@ impl App {
     /// WM_FOCUS_SEARCH: the window is active (still): the keyboard goes to
     /// the search box with its text selected, as Alt+D puts it there.
     pub(super) fn focus_search_activated(&self) {
-        // SAFETY: reads this thread's active window.
-        if unsafe { GetActiveWindow() } == self.hwnd {
+        if win::active() == self.hwnd {
             self.command(crate::menu::FOCUS_SEARCH);
         }
     }
@@ -202,8 +179,7 @@ impl App {
     /// goz-gui runs there).
     pub(super) fn executed(&self) {
         if self.ui.get().close_on_execute {
-            // SAFETY: posts to this thread's window.
-            unsafe { PostMessageW(self.hwnd, WM_CLOSE, 0, 0) };
+            win::post_close(self.hwnd);
         }
     }
 }

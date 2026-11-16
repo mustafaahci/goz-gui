@@ -592,10 +592,9 @@ impl FileList {
 }
 
 fn post(n: Notify, ok: bool, id: u64) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
-    // SAFETY: a plain post to the window that asked; nothing is passed by
-    // pointer, and a window gone since just drops it.
-    unsafe { PostMessageW(n.hwnd as _, n.msg, usize::from(ok), id as isize) };
+    // A plain post to the window that asked; a window gone since just
+    // drops it.
+    crate::win::post_app(n.hwnd as _, n.msg, usize::from(ok), id as isize);
 }
 
 /// The list file at `path`, opened to read; an error for a folder.

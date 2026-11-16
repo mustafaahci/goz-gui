@@ -10,15 +10,8 @@
 use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient};
-use windows_sys::Win32::UI::Controls::EM_SETSEL;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, GetFocus, ReleaseCapture, SetCapture, SetFocus,
-};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, DestroyWindow, EndDeferWindowPos, GetClassNameW,
-    GetCursorPos, HMENU, IDC_SIZENS, IDC_SIZEWE, IsChild, IsWindow, LoadCursorW, MSG, SW_SHOWNA,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, ShowWindow,
+    HMENU, IDC_SIZENS, IDC_SIZEWE, MSG, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOZORDER,
 };
 
 use super::App;
@@ -26,6 +19,7 @@ use crate::dock::{self, DockSettings, PaneId, PaneLayout, Side};
 use crate::layout::{self, Regions};
 use crate::pane::{self, PaneContent, PaneEvent, PaneSpec};
 use crate::strip::{Strip, StripSlot};
+use crate::win::{self, Msg, edit, sys};
 use crate::{columns, menu};
 
 /// A registered pane.
@@ -292,9 +286,9 @@ impl App {
             p.layout.visible = true;
         }
         self.layout();
-        // SAFETY: shows this thread's pane, now in its place, without
-        // taking the keyboard or activating anything.
-        unsafe { ShowWindow(hwnd, SW_SHOWNA) };
+        // Shown now it is in its place, without taking the keyboard or
+        // activating anything.
+        win::show(hwnd, SW_SHOWNA);
         self.update_pane_menu_checks();
         self.settings_changed();
     }
@@ -312,21 +306,18 @@ impl App {
             p.open.take()
         };
         let Some(open) = open else { return };
-        // SAFETY: reads and moves the focus within this thread's windows.
-        unsafe {
-            let focus = GetFocus();
-            if focus == open.hwnd || IsChild(open.hwnd, focus) != 0 {
-                // The keyboard goes to the results, as Everything's does.
-                SetFocus(self.list);
-            }
-            let last = self.last_focus.get();
-            if last == open.hwnd || IsChild(open.hwnd, last) != 0 {
-                self.last_focus.set(self.list);
-            }
+        let focus = win::focus();
+        if focus == open.hwnd || win::is_child(open.hwnd, focus) {
+            // The keyboard goes to the results, as Everything's does.
+            win::set_focus(self.list);
+        }
+        let last = self.last_focus.get();
+        if last == open.hwnd || win::is_child(open.hwnd, last) {
+            self.last_focus.set(self.list);
         }
         open.content.destroy(self);
-        // SAFETY: destroys this thread's pane window and its children.
-        unsafe { DestroyWindow(open.hwnd) };
+        // The pane window and its children.
+        win::destroy(open.hwnd);
         drop(open);
         // What it held is handed back once the window rests.
         self.memory_settles();
@@ -361,8 +352,7 @@ impl App {
             .focus()
             .filter(|&h| !h.is_null())
             .unwrap_or(open.hwnd);
-        // SAFETY: focuses a window of this thread.
-        unsafe { SetFocus(target) };
+        win::set_focus(target);
     }
 
     fn open_of(&self, id: PaneId) -> Option<Open> {
@@ -431,8 +421,7 @@ impl App {
             .collect();
         for o in open {
             o.content.place(self, pane::content_rect(self, o.hwnd));
-            // SAFETY: repaints this thread's pane.
-            unsafe { InvalidateRect(o.hwnd, core::ptr::null(), 0) };
+            win::invalidate(o.hwnd, None, false);
         }
     }
 
@@ -474,8 +463,7 @@ impl App {
     pub fn invalidate_strip(&self, slot: StripSlot) {
         let rc = self.strip_rect(slot);
         if !layout::is_empty(&rc) {
-            // SAFETY: repaints part of this thread's window.
-            unsafe { InvalidateRect(self.hwnd, &rc, 0) };
+            win::invalidate(self.hwnd, Some(&rc), false);
         }
     }
 
@@ -488,26 +476,23 @@ impl App {
     /// A message from a strip's own control (`WM_COMMAND`, `WM_NOTIFY`,
     /// `WM_CTLCOLOR*`, `WM_DRAWITEM`), for that strip: its answer, or
     /// `None` when no strip owns the control or the strip leaves it.
-    pub(super) fn strip_message(&self, msg: u32, w: usize, l: isize) -> Option<isize> {
-        use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, NMHDR};
+    pub(super) fn strip_message(&self, m: &Msg) -> Option<isize> {
         use windows_sys::Win32::UI::WindowsAndMessaging::{WM_DRAWITEM, WM_NOTIFY};
-        if self.strips.borrow().iter().all(Option::is_none) || l == 0 {
+        if self.strips.borrow().iter().all(Option::is_none) || m.l == 0 {
             return None;
         }
-        // SAFETY: each message's lParam as it defines it: a control's
-        // window, an NMHDR from a control, a DRAWITEMSTRUCT.
-        let from = unsafe {
-            match msg {
-                WM_NOTIFY => (*(l as *const NMHDR)).hwndFrom,
-                WM_DRAWITEM => (*(l as *const DRAWITEMSTRUCT)).hwndItem,
-                _ => l as HWND,
-            }
+        // The control it came from: a notification's sender, the item
+        // drawn, or (WM_COMMAND, WM_CTLCOLOR*) the control lParam names.
+        let from = match m.id {
+            WM_NOTIFY => m.notify()?.from(),
+            WM_DRAWITEM => m.draw_item()?.hwndItem,
+            _ => m.l as HWND,
         };
         [StripSlot::Tabs, StripSlot::FindBar]
             .into_iter()
             .filter_map(|slot| self.strip(slot))
             .find(|s| s.contains(from))
-            .and_then(|s| s.message(self, msg, w, l))
+            .and_then(|s| s.message(self, m))
     }
 
     /// Lays the window out again: a strip's height or a pane's content
@@ -540,14 +525,15 @@ impl App {
     }
 
     /// A mouse message of the main window for the strips: the one holding
-    /// the mouse gets them all, else the one under `pt`; moves and leaves
-    /// go to each. True when a strip took a button message.
-    pub(super) fn strip_mouse(&self, msg: u32, w: usize, pt: POINT) -> bool {
+    /// the mouse gets them all, else the one under its point; moves and
+    /// leaves go to each. True when a strip took a button message.
+    pub(super) fn strip_mouse(&self, m: &Msg) -> bool {
         use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
         use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CAPTURECHANGED, WM_MOUSEMOVE};
         if self.strips.borrow().iter().all(Option::is_none) {
             return false;
         }
+        let (msg, w, pt) = (m.id, m.w, m.point());
         let captured = self.strip_capture.get();
         if msg == WM_CAPTURECHANGED {
             self.strip_capture.set(None);
@@ -662,8 +648,7 @@ impl App {
     /// Repaints the dividers (the main window draws them).
     fn invalidate_main_area(&self) {
         let r = self.regions.get();
-        // SAFETY: repaints part of this thread's window.
-        unsafe { InvalidateRect(self.hwnd, &r.main, 0) };
+        win::invalidate(self.hwnd, Some(&r.main), false);
     }
 
     /// Every divider's rectangle now: the docks' and the splits between
@@ -736,12 +721,7 @@ impl App {
     pub(super) fn divider_cursor(&self) -> bool {
         let dragging = self.docks.borrow().drag.as_ref().map(|d| d.divider);
         let divider = dragging.or_else(|| {
-            let mut pt = POINT::default();
-            // SAFETY: reads the cursor and maps it into this window.
-            unsafe {
-                GetCursorPos(&mut pt);
-                ScreenToClient(self.hwnd, &mut pt);
-            }
+            let pt = win::screen_to_client(self.hwnd, sys::cursor_pos().unwrap_or_default());
             self.divider_at(pt)
         });
         let Some(divider) = divider else {
@@ -751,8 +731,8 @@ impl App {
             Divider::Dock(_) => IDC_SIZEWE,
             Divider::Split(..) => IDC_SIZENS,
         };
-        // SAFETY: a system cursor, shared and never freed.
-        unsafe { SetCursor(LoadCursorW(core::ptr::null_mut(), shape)) };
+        // A system cursor, shared and never freed.
+        sys::set_cursor(sys::system_cursor(shape));
         true
     }
 
@@ -780,8 +760,8 @@ impl App {
             width,
             heights,
         });
-        // SAFETY: the mouse stays with this window until the drag ends.
-        unsafe { SetCapture(self.hwnd) };
+        // The mouse stays with this window until the drag ends.
+        win::set_capture(self.hwnd);
         self.divider_cursor();
         true
     }
@@ -876,11 +856,9 @@ impl App {
     pub(super) fn divider_up(&self) -> bool {
         let ended = self.docks.borrow_mut().drag.take().is_some();
         if ended {
-            // SAFETY: lets go of the mouse this window took for the drag.
-            unsafe {
-                if GetCapture() == self.hwnd {
-                    ReleaseCapture();
-                }
+            // Lets go of the mouse this window took for the drag.
+            if win::capture() == self.hwnd {
+                win::release_capture();
             }
             self.invalidate_main_area();
             self.settings_changed();
@@ -965,8 +943,7 @@ impl App {
             let d = self.docks.borrow();
             for p in &d.panes {
                 if let Some(o) = &p.open
-                    // SAFETY: asks about this thread's windows.
-                    && (o.hwnd == hwnd || unsafe { IsChild(o.hwnd, hwnd) } != 0)
+                    && (o.hwnd == hwnd || win::is_child(o.hwnd, hwnd))
                 {
                     return Some(Frame::Pane(p.id));
                 }
@@ -1010,8 +987,7 @@ impl App {
     /// Moves the keyboard to the next (`forward`) or previous frame: all
     /// of them for F6, the tab stops for Tab (`tab`).
     pub(super) fn cycle_frame(&self, forward: bool, tab: bool) {
-        // SAFETY: reads this thread's focus.
-        let current = self.frame_of(unsafe { GetFocus() });
+        let current = self.frame_of(win::focus());
         let all = self.frames(false);
         let stops = if tab { self.frames(true) } else { all.clone() };
         let next = next_frame(&all, &stops, current, forward);
@@ -1025,18 +1001,16 @@ impl App {
     fn focus_frame(&self, frame: Frame, select: bool) {
         match frame {
             Frame::Search => {
-                // SAFETY: focuses a child of this thread's window.
-                unsafe { SetFocus(self.edit) };
+                win::set_focus(self.edit);
                 if select {
-                    super::send(self.edit, EM_SETSEL, 0, -1);
+                    edit::select_all(self.edit);
                 }
             }
             Frame::List => self.focus_list(),
             Frame::Pane(id) => self.focus_pane(id),
             Frame::Strip(slot) => {
                 if let Some(h) = self.strip(slot).and_then(|s| s.focus()) {
-                    // SAFETY: focuses a window of this thread.
-                    unsafe { SetFocus(h) };
+                    win::set_focus(h);
                 }
             }
         }
@@ -1079,17 +1053,13 @@ impl App {
         if !matches!(self.frame_of(hwnd), Some(Frame::Pane(_) | Frame::Strip(_))) {
             return false;
         }
-        let mut class = [0u16; 16];
-        // SAFETY: the buffer and its length.
-        let n = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
-        String::from_utf16_lossy(&class[..n.max(0) as usize]).eq_ignore_ascii_case("Edit")
+        win::class_is(hwnd, "Edit")
     }
 
     /// Shift+Esc: closes the pane with the keyboard, which goes to the
     /// results.
     fn close_focused_pane(&self) {
-        // SAFETY: reads this thread's focus.
-        if let Some(Frame::Pane(id)) = self.frame_of(unsafe { GetFocus() }) {
+        if let Some(Frame::Pane(id)) = self.frame_of(win::focus()) {
             self.show_pane(id, false);
         }
     }
@@ -1097,8 +1067,7 @@ impl App {
     /// The window to give the keyboard back to as it is activated again:
     /// `last` if it is still one of the window's own, else the search box.
     pub(super) fn focus_to_restore(&self, last: HWND) -> HWND {
-        // SAFETY: asks about this thread's windows.
-        let alive = unsafe { IsWindow(last) != 0 && IsChild(self.hwnd, last) != 0 };
+        let alive = win::is_window(last) && win::is_child(self.hwnd, last);
         if alive { last } else { self.edit }
     }
 }
@@ -1158,37 +1127,23 @@ impl Defer {
         if self.moves.is_empty() {
             return;
         }
-        // SAFETY: moves this thread's child windows; a failed deferral
-        // falls back to moving each on its own.
-        unsafe {
-            let mut hdwp = BeginDeferWindowPos(self.moves.len() as i32);
-            for &(hwnd, rc) in &self.moves {
-                if hdwp.is_null() {
-                    break;
-                }
-                hdwp = DeferWindowPos(
-                    hdwp,
-                    hwnd,
-                    core::ptr::null_mut(),
-                    rc.left,
-                    rc.top,
-                    (rc.right - rc.left).max(0),
-                    (rc.bottom - rc.top).max(0),
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-            if hdwp.is_null() || EndDeferWindowPos(hdwp) == 0 {
-                use windows_sys::Win32::UI::WindowsAndMessaging::MoveWindow;
-                for &(hwnd, rc) in &self.moves {
-                    MoveWindow(
-                        hwnd,
-                        rc.left,
-                        rc.top,
-                        (rc.right - rc.left).max(0),
-                        (rc.bottom - rc.top).max(0),
-                        1,
-                    );
-                }
+        // A failed deferral falls back to moving each on its own.
+        let size = |rc: &RECT| {
+            (
+                rc.left,
+                rc.top,
+                (rc.right - rc.left).max(0),
+                (rc.bottom - rc.top).max(0),
+            )
+        };
+        let moves: Vec<win::WindowMove> = self
+            .moves
+            .iter()
+            .map(|(hwnd, rc)| (*hwnd, size(rc)))
+            .collect();
+        if !win::defer_pos(&moves, SWP_NOZORDER | SWP_NOACTIVATE) {
+            for &(hwnd, (x, y, cx, cy)) in &moves {
+                win::move_window(hwnd, x, y, cx, cy, true);
             }
         }
     }

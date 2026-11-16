@@ -19,16 +19,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, IsWindowVisible, PostMessageW, WM_CLOSE,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::MB_OK;
 
 use super::App;
 use super::results::{Act, Then};
 use crate::filelist::slots::{self, Func, Slots, Term, cmd};
 use crate::places::{self, Which};
 use crate::slotedit;
+use crate::win::{self, Msg, parcel, sys};
 
 use crate::filelist::slots::SAVE_MAX;
 
@@ -50,8 +48,7 @@ fn slots_text(saves: &[usize]) -> String {
 }
 
 fn beep() {
-    // SAFETY: plays a system sound.
-    unsafe { windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(0) };
+    sys::beep(MB_OK);
 }
 
 impl App {
@@ -114,7 +111,7 @@ impl App {
         now.set(n, names);
         *self.data_tools.slots.borrow_mut() = Arc::new(now);
         // A search that reads the slot finds what it holds now.
-        let text = crate::wide::window_text(self.edit);
+        let text = crate::win::text(self.edit);
         if slots::terms(&text)
             .iter()
             .any(|t| t.slot == Some(n) && t.func != Func::Save)
@@ -125,19 +122,19 @@ impl App {
     }
 
     /// W7's WM_APP messages (`WM_APP + 380..390`).
-    pub(super) fn w7_message(&self, msg: u32, w: WPARAM, l: LPARAM) {
-        match msg {
+    pub(super) fn w7_message(&self, m: &Msg) {
+        match m.id {
             slotedit::WM_EDIT_TERM_AT => {
-                let text = crate::wide::window_text(self.edit);
-                if let Some(term) = slots::term_at(&text, w) {
+                let text = crate::win::text(self.edit);
+                if let Some(term) = slots::term_at(&text, m.w) {
                     self.edit_file_list_term(term);
                 }
             }
-            slotedit::WM_SLOT_SAVED if l != 0 => {
-                // SAFETY: the box the save thread posted, ours once
-                // delivered.
-                let saved = unsafe { Box::from_raw(l as *mut Saved) };
-                self.slots_saved(*saved);
+            slotedit::WM_SLOT_SAVED if m.l != 0 => {
+                // What the save thread posted.
+                if let Some(saved) = parcel::take::<Saved>(m) {
+                    self.slots_saved(saved);
+                }
             }
             _ => {}
         }
@@ -154,7 +151,7 @@ impl App {
             self.pick_term_file(&term);
             return;
         }
-        let text = crate::wide::window_text(self.edit);
+        let text = crate::win::text(self.edit);
         let (title, names) = match term.slot {
             Some(n) => (
                 format!("Edit File List {n}"),
@@ -237,7 +234,7 @@ impl App {
         };
         let Some(path) = path else { return };
         let path = std::path::absolute(&path).unwrap_or(path);
-        let text = crate::wide::window_text(self.edit);
+        let text = crate::win::text(self.edit);
         // The box may have changed while the dialog was up: the term is
         // looked for again where it was.
         let Some(now) = slots::terms(&text)
@@ -322,18 +319,13 @@ impl App {
                         crate::client::Failure::Refused(m) | crate::client::Failure::Other(m) => m,
                     }),
                 };
-                let raw = Box::into_raw(Box::new(Saved {
+                let saved = Saved {
                     query: search.query.clone(),
                     slots: saves,
                     names,
-                }));
-                // SAFETY: posts to the window, which takes the box; if it is
-                // gone the box is taken back.
-                unsafe {
-                    if PostMessageW(hwnd as _, slotedit::WM_SLOT_SAVED, 0, raw as isize) == 0 {
-                        drop(Box::from_raw(raw));
-                    }
-                }
+                };
+                // The window takes it; if it is gone it is freed again.
+                parcel::post(hwnd as _, slotedit::WM_SLOT_SAVED, 0, saved);
             });
         if spawned.is_err() {
             self.data_tools.saving.borrow_mut().take();
@@ -409,8 +401,8 @@ impl App {
     }
 
     /// Wave 6's WM_APP messages (`WM_APP + 360..370`).
-    pub(super) fn lists_message(&self, msg: u32, _w: WPARAM, _l: LPARAM) {
-        if msg == crate::listedit::WM_EDITOR_CLOSED {
+    pub(super) fn lists_message(&self, m: &Msg) {
+        if m.id == crate::listedit::WM_EDITOR_CLOSED {
             self.editor_closed();
         }
     }
@@ -419,9 +411,7 @@ impl App {
     /// `-filelist-editor`: the editor, where it was last, in the window's
     /// look; one open comes to the front (and opens `file`).
     pub(super) fn open_list_editor(&self, file: Option<&str>) {
-        let mut near = RECT::default();
-        // SAFETY: reads this thread's window's place.
-        unsafe { GetWindowRect(self.hwnd, &mut near) };
+        let near = win::window_rect(self.hwnd);
         let (export_type, export_selection) = {
             let p = self.prefs.borrow();
             let f = &p.base.file_lists;
@@ -444,12 +434,11 @@ impl App {
     /// for it alone, whose window was never shown, ends with it.
     fn editor_closed(&self) {
         self.take_editor_kept();
-        // SAFETY: reads whether this thread's window shows.
-        let shown = unsafe { IsWindowVisible(self.hwnd) } != 0;
+        let shown = win::is_visible(self.hwnd);
         if self.data_tools.editor_alone.get() && !shown && !crate::listedit::ui::is_open() {
-            // SAFETY: posts to this thread's window; with "run in the
-            // background" WM_CLOSE keeps goz-gui running, as -startup does.
-            unsafe { PostMessageW(self.hwnd, WM_CLOSE, 0, 0) };
+            // With "run in the background" WM_CLOSE keeps goz-gui running,
+            // as -startup does.
+            win::post_close(self.hwnd);
         }
     }
 

@@ -4,12 +4,10 @@
 
 use std::time::Instant;
 
-use windows_sys::Win32::UI::Controls::{
-    LVIS_FOCUSED, LVIS_SELECTED, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_SETSELECTIONMARK,
-    LVNI_FOCUSED,
-};
+use windows_sys::Win32::UI::Controls::{LVIS_FOCUSED, LVIS_SELECTED, LVNI_FOCUSED};
 
-use super::{App, send};
+use super::App;
+use crate::win::lv;
 use crate::{celltip, hover, typeahead};
 
 impl App {
@@ -22,13 +20,7 @@ impl App {
         if ch == u16::from(b' ') && !self.type_ahead.borrow().typing(now) {
             return;
         }
-        let focus = usize::try_from(send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        ))
-        .ok();
+        let focus = usize::try_from(lv::next_item(self.list, -1, LVNI_FOCUSED)).ok();
         // Both borrows end before the list is told anything.
         let found = {
             let mut typed = self.type_ahead.borrow_mut();
@@ -51,8 +43,8 @@ impl App {
             LVIS_SELECTED | LVIS_FOCUSED,
             LVIS_SELECTED | LVIS_FOCUSED,
         );
-        send(self.list, LVM_SETSELECTIONMARK, 0, index as isize);
-        send(self.list, LVM_ENSUREVISIBLE, index, 0);
+        lv::set_selection_mark(self.list, index as i32);
+        lv::ensure_visible(self.list, index as i32, false);
         hover::scrolled(self);
     }
 

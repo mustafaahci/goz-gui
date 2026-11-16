@@ -15,35 +15,22 @@
 //! the renamed row (and those of what a renamed folder holds) shows the new
 //! path in place until that search confirms it.
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
-};
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::UI::Controls::{
-    EM_GETMARGINS, EM_SETSEL, LVIR_BOUNDS, LVIS_FOCUSED, LVIS_SELECTED, LVM_EDITLABELW,
-    LVM_ENSUREVISIBLE, LVM_GETEDITCONTROL, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT,
-    LVM_REDRAWITEMS, LVM_SETSELECTIONMARK, LVNI_FOCUSED,
-};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetFocus, SetFocus, VK_SHIFT,
-};
-use windows_sys::Win32::UI::Shell::{
-    DefSubclassProc, DragFinish, HDROP, RemoveWindowSubclass, SetWindowSubclass,
-};
+use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+use windows_sys::Win32::UI::Controls::{LVIR_BOUNDS, LVIS_FOCUSED, LVIS_SELECTED, LVNI_FOCUSED};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MB_ICONWARNING, MB_OK, PostMessageW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SetTimer, SetWindowPos, SetWindowTextW, WINDOWPOS, WM_NCDESTROY, WM_WINDOWPOSCHANGING,
+    MB_ICONWARNING, MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    WM_WINDOWPOSCHANGING,
 };
 
 use super::{
     App, COL_NAME, TIMER_SETTLE, WM_DRAG_DONE, WM_RENAME_AGAIN, key_down,
     results::{Act, Then},
-    send,
 };
 use crate::dialog::Quiet;
 use crate::fileops::{self, Done, Job, Outcome};
-use crate::wide::{nul, window_text, wz};
+use crate::win::{self, Msg, edit, lv, subclass, sys};
 use crate::{clipboard, filename, msgbox, paint, shell, theme};
 
 const BACKSLASH: u16 = b'\\' as u16;
@@ -54,8 +41,8 @@ const SETTLE_FIRST_MS: u32 = 700;
 /// ...and once more this long after that, for a change it saw late.
 const SETTLE_AGAIN_MS: u32 = 2000;
 
-/// The subclass id of Rename's box.
-const RENAME_BOX: usize = 0x524e;
+/// The subclass of Rename's box.
+static RENAME_BOX: subclass::Key = subclass::Key::new("Rename's box");
 
 // What Rename says of a name taken (those Windows refuses are
 // `crate::filename`'s): Explorer's words.
@@ -185,10 +172,7 @@ fn all_gone(paths: &[Vec<u16>]) -> bool {
 
 /// The file system's attributes of `path`; `None` when it is gone.
 fn attributes(path: &[u16]) -> Option<u32> {
-    let path = nul(path);
-    // SAFETY: a NUL-terminated path.
-    let attrs = unsafe { GetFileAttributesW(path.as_ptr()) };
-    (attrs != INVALID_FILE_ATTRIBUTES).then_some(attrs)
+    win::file::attributes(path).ok()
 }
 
 fn is_dir(path: &[u16]) -> bool {
@@ -196,8 +180,7 @@ fn is_dir(path: &[u16]) -> bool {
 }
 
 fn beep() {
-    // SAFETY: plays a system sound.
-    unsafe { MessageBeep(MB_OK) };
+    sys::beep(MB_OK);
 }
 
 /// A rename in progress, or about to start: the file, and after a refused
@@ -221,7 +204,7 @@ impl App {
         if held.is_empty() {
             return;
         }
-        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize;
+        let selected = lv::selected_count(self.list);
         let (paths, next) = {
             let m = self.model.borrow();
             let path = |i: usize| m.peek(i).map(|r| &*r.path);
@@ -252,17 +235,12 @@ impl App {
     /// selected row. `None` with nothing selected.
     fn paste_target(&self) -> Option<Vec<u16>> {
         let held = self.selected_held();
-        let focused = send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        );
+        let focused = lv::next_item(self.list, -1, LVNI_FOCUSED);
         let at = usize::try_from(focused)
             .ok()
             .filter(|i| held.contains(i))
             .or_else(|| held.first().copied())?;
-        let only = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0) == 1;
+        let only = lv::selected_count(self.list) == 1;
         let m = self.model.borrow();
         let row = m.peek(at)?;
         paste_folder(&row.path, row.is_dir, only)
@@ -368,7 +346,7 @@ impl App {
                     if let (Some(&first), Some(&last)) =
                         (changed.iter().min(), changed.iter().max())
                     {
-                        send(self.list, LVM_REDRAWITEMS, first, last as isize);
+                        lv::redraw_items(self.list, first as i32, last as i32);
                     }
                     // The search runs again: the row takes its place in the
                     // order, and gozd's own rows confirm the new paths.
@@ -417,9 +395,9 @@ impl App {
                 LVIS_SELECTED | LVIS_FOCUSED,
                 LVIS_SELECTED | LVIS_FOCUSED,
             );
-            send(self.list, LVM_SETSELECTIONMARK, 0, i as isize);
+            lv::set_selection_mark(self.list, i as i32);
         });
-        send(self.list, LVM_ENSUREVISIBLE, i, 0);
+        lv::ensure_visible(self.list, i as i32, false);
     }
 
     /// Files changed: the search runs again once gozd has had a moment to
@@ -427,8 +405,8 @@ impl App {
     /// on the same files.
     pub(super) fn settle_refresh(&self) {
         self.settle.set(2);
-        // SAFETY: a timer of this window; setting it again restarts it.
-        unsafe { SetTimer(self.hwnd, TIMER_SETTLE, SETTLE_FIRST_MS, None) };
+        // Setting the timer again restarts it.
+        win::set_timer(self.hwnd, TIMER_SETTLE, SETTLE_FIRST_MS);
     }
 
     /// TIMER_SETTLE: one of `settle_refresh`'s refreshes.
@@ -437,14 +415,13 @@ impl App {
         let left = self.settle.get().saturating_sub(1);
         self.settle.set(left);
         if left > 0 {
-            // SAFETY: as above.
-            unsafe { SetTimer(self.hwnd, TIMER_SETTLE, SETTLE_AGAIN_MS, None) };
+            win::set_timer(self.hwnd, TIMER_SETTLE, SETTLE_AGAIN_MS);
         }
     }
 
     /// The list's rename box is open.
     pub(super) fn renaming(&self) -> bool {
-        send(self.list, LVM_GETEDITCONTROL, 0, 0) != 0
+        !lv::edit_control(self.list).is_null()
     }
 
     /// F2 (and File > Rename, the Explorer menu's Rename): renames the
@@ -455,12 +432,7 @@ impl App {
             return;
         }
         let held = self.selected_held();
-        let focused = send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        );
+        let focused = lv::next_item(self.list, -1, LVNI_FOCUSED);
         let at = usize::try_from(focused)
             .ok()
             .filter(|i| held.contains(i))
@@ -488,12 +460,9 @@ impl App {
     /// foreground from the program the user is in.
     fn edit_label(&self, index: usize) {
         let _quiet = Quiet::begin();
-        // SAFETY: focuses this thread's list, and reads where the focus is.
-        let focused = unsafe {
-            SetFocus(self.list);
-            GetFocus() == self.list
-        };
-        if !focused || send(self.list, LVM_EDITLABELW, index, 0) == 0 {
+        win::set_focus(self.list);
+        let focused = win::focus() == self.list;
+        if !focused || lv::edit_label(self.list, index as i32).is_null() {
             self.renaming.borrow_mut().take();
         }
     }
@@ -517,13 +486,7 @@ impl App {
 
     /// Row `index`'s Name cell, in the list's coordinates.
     fn name_cell(&self, index: usize) -> Option<RECT> {
-        let mut row = RECT {
-            left: LVIR_BOUNDS as i32,
-            ..RECT::default()
-        };
-        if send(self.list, LVM_GETITEMRECT, index, (&raw mut row) as isize) == 0 {
-            return None;
-        }
+        let row = lv::item_rect(self.list, index as i32, LVIR_BOUNDS as i32)?;
         let cells = self.column_rects(&row);
         cells
             .iter()
@@ -541,7 +504,7 @@ impl App {
         }
         let cell = self.name_cell(index)?;
         // The box's border and its own margin come before its text.
-        let margin = (send(edit, EM_GETMARGINS, 0, 0) & 0xffff) as i32;
+        let margin = i32::from(edit::margins(edit).0);
         let left = cell.left + paint::name_text_offset(self) - margin - 1;
         let height = self.fonts.borrow().height + 2;
         let top = cell.top + (cell.bottom - cell.top - height) / 2;
@@ -590,7 +553,7 @@ impl App {
             }
             None => return true,
         }
-        let edit = send(self.list, LVM_GETEDITCONTROL, 0, 0) as HWND;
+        let edit = lv::edit_control(self.list);
         if edit.is_null() {
             return false;
         }
@@ -604,35 +567,24 @@ impl App {
             .and_then(|r| r.text.take());
         let name = match again {
             Some(text) => {
-                let z = nul(&text);
-                // SAFETY: a NUL-terminated text for the box of this thread.
-                unsafe { SetWindowTextW(edit, z.as_ptr()) };
+                win::set_text_wide(edit, &text);
                 text
             }
             None => path[name_start(&path)..].to_vec(),
         };
         if let Some(rc) = self.rename_box(index, edit) {
             self.rename_rect.set(rc);
-            // SAFETY: the box is the list's child, on this thread; `self`
-            // is leaked, so the subclass data stays valid. The list moves
-            // it as its text grows; the subclass keeps it here.
-            unsafe {
-                SetWindowSubclass(
-                    edit,
-                    Some(rename_box_proc),
-                    RENAME_BOX,
-                    self as *const App as usize,
-                );
-                SetWindowPos(
-                    edit,
-                    core::ptr::null_mut(),
-                    rc.left,
-                    rc.top,
-                    rc.right - rc.left,
-                    rc.bottom - rc.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
+            // The list moves the box as its text grows; the subclass keeps
+            // it here. The window's `App` lives as long as the process.
+            if let Some(app) = super::app_of(self.hwnd) {
+                subclass::set(edit, &RENAME_BOX, move |m| rename_box_proc(app, m));
             }
+            win::set_pos(
+                edit,
+                core::ptr::null_mut(),
+                (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
         // After the list selects all of it, which it does once this returns:
         // the name without its extension, unless Options > Results' "Do
@@ -642,27 +594,21 @@ impl App {
         } else {
             name.len()
         };
-        // SAFETY: posts to the box of this thread.
-        unsafe { PostMessageW(edit, EM_SETSEL, 0, selected as isize) };
+        win::edit::post_set_sel(edit, 0, selected as i32);
         false
     }
 
-    /// LVN_ENDLABELEDIT: `text` is the name typed (null: Esc). A name
+    /// LVN_ENDLABELEDIT: `text` is the name typed (`None`: Esc). A name
     /// Windows would refuse, or one taken in that folder, is said why and
     /// the box opens again with it; a good one is renamed on the file
     /// operations thread. The list's own text is never set (the row
     /// changes once the rename is done).
-    pub(super) fn end_rename(&self, text: *const u16) {
+    pub(super) fn end_rename(&self, text: Option<Vec<u16>>) {
         let Some(mut r) = self.renaming.borrow_mut().take() else {
             return;
         };
-        if text.is_null() {
+        let Some(new) = text else {
             return;
-        }
-        // SAFETY: the list's NUL-terminated text, read before this returns.
-        let new: Vec<u16> = unsafe {
-            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-            core::slice::from_raw_parts(text, len).to_vec()
         };
         let start = name_start(&r.path);
         let old = &r.path[start..];
@@ -686,8 +632,7 @@ impl App {
             r.problem = Some(problem);
             *self.renaming.borrow_mut() = Some(r);
             // Once the list has closed this box.
-            // SAFETY: posts to this thread's window.
-            unsafe { PostMessageW(self.hwnd, WM_RENAME_AGAIN, 0, 0) };
+            win::post_app(self.hwnd, WM_RENAME_AGAIN, 0, 0);
             return;
         }
         self.record_search();
@@ -746,8 +691,7 @@ impl App {
         let effect = shell::drag(self.hwnd, &data);
         // A drop on goz-gui's own window came as a WM_DROPFILES posted
         // during the drag: this comes after it, and ends the drag for it.
-        // SAFETY: posts to this thread's window.
-        unsafe { PostMessageW(self.hwnd, WM_DRAG_DONE, 0, 0) };
+        win::post_app(self.hwnd, WM_DRAG_DONE, 0, 0);
         if effect == 0 && shell::performed_effect(&data) == 0 {
             return;
         }
@@ -787,13 +731,7 @@ impl App {
     /// a gozd that reads OR; an older one searches one path at a time, so
     /// of several items the first is taken and the status bar says so. A
     /// drop of goz-gui's own rows on itself does nothing.
-    pub(super) fn drop_files(&self, drop: HDROP) {
-        // SAFETY: the HDROP WM_DROPFILES brought, read whole, then freed.
-        let paths = unsafe {
-            let paths = clipboard::dropped_files(drop);
-            DragFinish(drop);
-            paths
-        };
+    pub(super) fn drop_files(&self, paths: Vec<Vec<u16>>) {
         let Some(first) = paths.first() else {
             return;
         };
@@ -807,8 +745,7 @@ impl App {
         }
         // Shift as the drop came: this thread's keys, or the keyboard's own
         // when another program's drag had it.
-        // SAFETY: reads the keyboard's state.
-        let append = key_down(VK_SHIFT) || unsafe { GetAsyncKeyState(i32::from(VK_SHIFT)) } < 0;
+        let append = key_down(VK_SHIFT) || sys::key_down_now(VK_SHIFT);
         // A shortcut stands for its target.
         let target_of = |path: &Vec<u16>| {
             let lnk = String::from_utf16_lossy(path)
@@ -824,17 +761,16 @@ impl App {
         let any = paths.len() > 1 && crate::client::boolean_syntax();
         let text = if any {
             let items: Vec<(String, bool)> = paths.iter().map(target_of).collect();
-            drop_search_any(&window_text(self.edit), &items, append)
+            drop_search_any(&win::text(self.edit), &items, append)
         } else {
             let (target, dir) = target_of(first);
-            drop_search(&window_text(self.edit), &target, dir, append)
+            drop_search(&win::text(self.edit), &target, dir, append)
         };
-        let z = wz(&text);
-        // SAFETY: a NUL-terminated text for this thread's box; EN_CHANGE
-        // searches.
-        unsafe { SetWindowTextW(self.edit, z.as_ptr()) };
+        let z = win::wz(&text);
+        // EN_CHANGE searches.
+        win::set_text_wide(self.edit, &z);
         let end = z.len() - 1;
-        send(self.edit, EM_SETSEL, end, end as isize);
+        edit::set_sel(self.edit, end as i32, end as i32);
         if paths.len() > 1 && !any {
             self.show_note(format!(
                 "{} items dropped; goz searches one path at a time, so this is the first",
@@ -845,36 +781,19 @@ impl App {
 }
 
 /// Rename's box: kept where `begin_rename` put it, over the name, however
-/// the list moves it as the text changes.
-unsafe extern "system" fn rename_box_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    data: usize,
-) -> LRESULT {
-    // SAFETY: `data` is the leaked `App`; `l` is read as each message
-    // defines it; the subclass goes with the box.
-    unsafe {
-        let app = &*(data as *const App);
-        match msg {
-            WM_WINDOWPOSCHANGING if l != 0 => {
-                let pos = &mut *(l as *mut WINDOWPOS);
-                let rc = app.rename_rect.get();
-                pos.x = rc.left;
-                pos.y = rc.top;
-                pos.cx = rc.right - rc.left;
-                pos.cy = rc.bottom - rc.top;
-                pos.flags &= !(SWP_NOMOVE | SWP_NOSIZE);
-            }
-            WM_NCDESTROY => {
-                RemoveWindowSubclass(hwnd, Some(rename_box_proc), RENAME_BOX);
-            }
-            _ => {}
-        }
-        DefSubclassProc(hwnd, msg, w, l)
+/// the list moves it as the text changes. The subclass goes with the box.
+fn rename_box_proc(app: &App, m: &Msg) -> isize {
+    if m.id == WM_WINDOWPOSCHANGING
+        && let Some(mut pos) = m.window_pos()
+    {
+        let rc = app.rename_rect.get();
+        pos.x = rc.left;
+        pos.y = rc.top;
+        pos.cx = rc.right - rc.left;
+        pos.cy = rc.bottom - rc.top;
+        pos.flags &= !(SWP_NOMOVE | SWP_NOSIZE);
     }
+    m.def()
 }
 
 #[cfg(test)]

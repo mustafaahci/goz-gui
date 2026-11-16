@@ -19,10 +19,9 @@
 
 use std::io::Read;
 
+use crate::win;
 use memchr::memmem::Finder;
-use windows_sys::Win32::Globalization::{
-    CP_ACP, CPINFO, GetCPInfo, IsDBCSLeadByteEx, MultiByteToWideChar,
-};
+use windows_sys::Win32::Globalization::CP_ACP;
 
 /// How much of a file is read at a time.
 const PIECE: usize = 1 << 20;
@@ -111,10 +110,7 @@ fn is_word(u: u16) -> bool {
 
 /// The system's ANSI code page: whether it has two-byte characters.
 fn ansi_is_dbcs() -> bool {
-    // SAFETY: CPINFO is plain data, filled by the call.
-    let mut info: CPINFO = unsafe { core::mem::zeroed() };
-    // SAFETY: an out-struct of the right type.
-    (unsafe { GetCPInfo(CP_ACP, &mut info) }) != 0 && info.MaxCharSize > 1
+    win::locale::code_page_info(CP_ACP).is_some_and(|info| info.MaxCharSize > 1)
 }
 
 /// Appends `bytes` decoded from the ANSI code page.
@@ -122,14 +118,12 @@ fn ansi_into(bytes: &[u8], out: &mut Vec<u16>) {
     if bytes.is_empty() {
         return;
     }
-    let len = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
     let at = out.len();
+    // Room for as many UTF-16 units as there are bytes, which a code page
+    // never exceeds.
     out.resize(at + bytes.len(), 0);
-    // SAFETY: the source and its length; the room for as many UTF-16
-    // units as there are bytes, which a code page never exceeds.
-    let n =
-        unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, out[at..].as_mut_ptr(), len) };
-    out.truncate(at + usize::try_from(n).unwrap_or(0));
+    let n = win::locale::multi_byte_to_wide(CP_ACP, 0, bytes, &mut out[at..]);
+    out.truncate(at + n);
 }
 
 enum Decoder {
@@ -168,9 +162,8 @@ impl Decoder {
                 if *dbcs && !eof {
                     // A lead byte at the very end waits for its trail.
                     let mut i = 0;
-                    // SAFETY (each call): a plain query of the code page.
                     while i < b.len() {
-                        i += if unsafe { IsDBCSLeadByteEx(CP_ACP, b[i]) } != 0 {
+                        i += if win::locale::is_dbcs_lead_byte(CP_ACP, b[i]) {
                             2
                         } else {
                             1
@@ -195,8 +188,9 @@ impl Decoder {
                         }
                         Err(e) => {
                             let good = e.valid_up_to();
-                            // SAFETY: from_utf8 said these bytes are UTF-8.
-                            let s = unsafe { std::str::from_utf8_unchecked(&b[..good]) };
+                            // `from_utf8` said these bytes are UTF-8: this
+                            // never fails.
+                            let s = std::str::from_utf8(&b[..good]).unwrap_or_default();
                             out.extend(s.encode_utf16());
                             match e.error_len() {
                                 Some(bad) => {
@@ -276,8 +270,7 @@ struct Stream {
 
 /// The bytes of `units`, as memmem searches them.
 fn bytes_of(units: &[u16]) -> &[u8] {
-    // SAFETY: u16 has no padding, and u8's alignment is 1.
-    unsafe { core::slice::from_raw_parts(units.as_ptr().cast::<u8>(), units.len() * 2) }
+    win::units_as_bytes(units)
 }
 
 /// The needle's bytes, folded as `f` says, in native order.

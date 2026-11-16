@@ -9,30 +9,19 @@
 
 use std::cell::Cell;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows_sys::Win32::System::ProcessStatus::{
-    K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
-};
-use windows_sys::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
-};
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
-use windows_sys::Win32::UI::Controls::{EM_SETSEL, EM_SETTABSTOPS};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_NOHIDESEL, ES_READONLY,
-    EndDialog, GWLP_USERDATA, GetWindowRect, IDCANCEL, MINMAXINFO, SendMessageW, SetWindowLongPtrW,
-    SetWindowTextW, WM_COMMAND, WM_GETMINMAXINFO, WM_INITDIALOG, WM_SIZE, WS_EX_CLIENTEDGE,
-    WS_HSCROLL, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
+    IDCANCEL, WM_COMMAND, WM_GETMINMAXINFO, WM_INITDIALOG, WM_SIZE, WS_EX_CLIENTEDGE, WS_HSCROLL,
+    WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
 use crate::dialog::{
     self, Class, GROW_X, GROW_Y, Look, MOVE_X, MOVE_Y, Template, Units, center_on_owner, common,
-    state,
 };
-use crate::filetools::ui::item;
 use crate::store::location::Source;
-use crate::wide::wz;
+use crate::win::reg::Hive;
+use crate::win::{self, Msg, dlg, edit};
 
 /// What the text tells, gathered by the window.
 pub struct Facts {
@@ -61,47 +50,9 @@ pub struct Facts {
 /// update and the release (`24H2`) when the registry says.
 pub fn os_version() -> String {
     const KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
-    let dword = |name: &str| -> Option<u32> {
-        let (key, name) = (wz(KEY), wz(name));
-        let mut v = 0u32;
-        let mut size = 4u32;
-        // SAFETY: NUL-terminated names and a 4-byte buffer whose size is
-        // passed; reads HKLM only.
-        let rc = unsafe {
-            RegGetValueW(
-                HKEY_LOCAL_MACHINE,
-                key.as_ptr(),
-                name.as_ptr(),
-                RRF_RT_REG_DWORD,
-                core::ptr::null_mut(),
-                (&raw mut v).cast(),
-                &mut size,
-            )
-        };
-        (rc == 0).then_some(v)
-    };
-    let string = |name: &str| -> Option<String> {
-        let (key, name) = (wz(KEY), wz(name));
-        let mut buf = vec![0u16; 256];
-        let mut size = (buf.len() * 2) as u32;
-        // SAFETY: as above, with a buffer whose byte size is passed.
-        let rc = unsafe {
-            RegGetValueW(
-                HKEY_LOCAL_MACHINE,
-                key.as_ptr(),
-                name.as_ptr(),
-                RRF_RT_REG_SZ,
-                core::ptr::null_mut(),
-                buf.as_mut_ptr().cast(),
-                &mut size,
-            )
-        };
-        if rc != 0 {
-            return None;
-        }
-        buf.truncate((size as usize / 2).saturating_sub(1));
-        Some(String::from_utf16_lossy(&buf))
-    };
+    // HKLM only.
+    let dword = |name: &str| win::reg::get_dword(Hive::LocalMachine, KEY, name);
+    let string = |name: &str| win::reg::get_string(Hive::LocalMachine, KEY, Some(name));
     let major = dword("CurrentMajorVersionNumber").unwrap_or(10);
     let minor = dword("CurrentMinorVersionNumber").unwrap_or(0);
     let build = string("CurrentBuild").unwrap_or_default();
@@ -118,17 +69,7 @@ pub fn os_version() -> String {
 
 /// This process's private bytes and working set.
 pub fn memory() -> Option<(u64, u64)> {
-    // SAFETY: a plain out-struct whose size is passed, for this process.
-    unsafe {
-        let mut c: PROCESS_MEMORY_COUNTERS_EX = core::mem::zeroed();
-        c.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        let ok = K32GetProcessMemoryInfo(
-            GetCurrentProcess(),
-            (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(),
-            c.cb,
-        );
-        (ok != 0).then_some((c.PrivateUsage as u64, c.WorkingSetSize as u64))
-    }
+    win::process::memory().map(|c| (c.PrivateUsage as u64, c.WorkingSetSize as u64))
 }
 
 fn megabytes(bytes: u64) -> String {
@@ -274,45 +215,28 @@ pub fn show(owner: HWND, text: &str, look: Look) {
         0,
         PLACES[2].1,
     );
-    t.run(owner, Some(proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| proc(&state, m));
 }
 
-unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Window` that `show` keeps alive until the
-        // dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Window` from `show`, or null.
-    let Some(s) = (unsafe { state::<Window>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn proc(s: &Window, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
-            let edit = item(dlg, ID_TEXT);
-            let z = wz(&s.text);
+            let text = dlg::item(dlg, ID_TEXT);
             // One tab stop past the longest label ("Search syntax:"), in
             // dialog units, so the values line up.
-            let stop: u32 = 64;
-            // SAFETY: NUL-terminated text, and a tab stop the box copies,
-            // for this thread's text box.
-            unsafe {
-                SendMessageW(edit, EM_SETTABSTOPS, 1, (&raw const stop) as isize);
-                SetWindowTextW(edit, z.as_ptr());
-                SendMessageW(edit, EM_SETSEL, 0, 0);
-            }
+            edit::set_tab_stops(text, &[64]);
+            win::set_text(text, &s.text);
+            edit::set_sel(text, 0, 0);
             dialog::theme_new(dlg, s.look.get().dark);
             center_on_owner(dlg);
-            let mut wr = RECT::default();
-            // SAFETY: reads this thread's dialog.
-            unsafe { GetWindowRect(dlg, &mut wr) };
+            let wr = win::window_rect(dlg);
             s.min
                 .set(((wr.right - wr.left) / 2, (wr.bottom - wr.top) / 2));
-            // SAFETY: focuses this thread's text box.
-            unsafe { SetFocus(edit) };
+            win::set_focus(text);
             0
         }
         WM_SIZE => {
@@ -321,22 +245,19 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isi
         }
         WM_GETMINMAXINFO => {
             let (w, h) = s.min.get();
-            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
-            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = w;
-            mmi.ptMinTrackSize.y = h;
+            if let Some(mut mmi) = m.min_max_info() {
+                mmi.ptMinTrackSize.x = w;
+                mmi.ptMinTrackSize.y = h;
+            }
             1
         }
         WM_COMMAND => {
-            match (w & 0xffff) as u16 {
+            match win::loword(m.w) {
                 ID_COPY => {
                     let units: Vec<u16> = s.text.encode_utf16().collect();
                     crate::clipboard::put_text(dlg, &units);
                 }
-                // SAFETY: ends this modal dialog.
-                CLOSE => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                CLOSE => dlg::end(dlg, 0),
                 _ => return 0,
             }
             1

@@ -1,31 +1,23 @@
 //! Drawing: result rows with their matches in bold, the search band, the
 //! main window's own surface, and the dark menu bar.
 
-use windows_sys::Win32::Foundation::{HWND, RECT, SIZE};
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DC_BRUSH, DT_CENTER,
-    DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC, DeleteObject, DrawFocusRect,
-    DrawTextW, ETO_CLIPPED, EndPaint, ExtTextOutW, FillRect, GetDC, GetStockObject, GetTextColor,
-    GetTextExtentExPointW, GetTextExtentPoint32W, GetWindowDC, HDC, HFONT, MapWindowPoints,
-    OffsetRect, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetDCBrushColor,
-    SetTextColor, SetViewportOrgEx, TRANSPARENT,
+    DC_BRUSH, DT_CENTER, DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, ETO_CLIPPED, HDC,
+    HFONT, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, ILD_TRANSPARENT, ImageList_Draw, ImageList_GetIconSize, LVIR_BOUNDS,
-    LVM_GETITEMCOUNT, LVM_GETITEMRECT, ODS_DISABLED, ODS_FOCUS, ODS_GRAYED, ODS_HOTLIGHT,
-    ODS_INACTIVE, ODS_NOACCEL, ODS_SELECTED,
+    DRAWITEMSTRUCT, ILD_TRANSPARENT, LVIR_BOUNDS, ODS_DISABLED, ODS_FOCUS, ODS_GRAYED,
+    ODS_HOTLIGHT, ODS_INACTIVE, ODS_NOACCEL, ODS_SELECTED,
 };
-use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetMenuBarInfo, GetMenuItemInfoW, GetWindowRect, HMENU, MENUBARINFO,
-    MENUITEMINFOW, MIIM_STRING, OBJID_MENU, SM_CXSMICON, SendMessageW,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{OBJID_MENU, SM_CXSMICON};
 
 use crate::format;
 use crate::highlight::Span;
 use crate::icons::{PENDING, UNSET};
 use crate::theme::Palette;
+use crate::win::menubar::{UahDrawMenuItem, UahMenu};
+use crate::win::{self, gdi, imagelist, lv, sys};
 use crate::window::{App, COL_EXT, COL_NAME, COL_PATH, COL_SIZE, COL_TYPE, Fonts};
 use crate::{copytext, filetype, searchbox, status};
 
@@ -44,23 +36,21 @@ pub fn name_text_offset(app: &App) -> i32 {
 /// Options > UI's Scale, at least the shell's small icons' (made at the
 /// system's DPI, so smaller at a UI scale or on a monitor of more DPI).
 pub fn row_icon_side(app: &App) -> i32 {
-    let (mut cx, mut cy) = (0, 0);
-    // SAFETY: reads the size of the system image list's icons, and a
-    // metric.
-    let wanted = unsafe {
-        ImageList_GetIconSize(app.icons.list, &mut cx, &mut cy);
-        GetSystemMetricsForDpi(SM_CXSMICON, app.dpi.get())
-    };
+    // The size of the system image list's icons, and a metric.
+    let cx = app
+        .icons
+        .list
+        .and_then(|l| imagelist::icon_size(&l))
+        .map_or(0, |(cx, _)| cx);
+    let wanted = sys::metric_for_dpi(SM_CXSMICON, app.dpi.get());
     cx.max(wanted)
 }
 
 /// Fills `rc` with `colour` through the DC's own brush, so no brush is made.
 pub fn fill(hdc: HDC, rc: &RECT, colour: u32) {
-    // SAFETY: the stock DC brush paints in the colour last set on this DC.
-    unsafe {
-        SetDCBrushColor(hdc, colour);
-        FillRect(hdc, rc, GetStockObject(DC_BRUSH));
-    }
+    // The stock DC brush paints in the colour last set on this DC.
+    gdi::set_dc_brush_color(hdc, colour);
+    gdi::fill_rect(hdc, rc, gdi::stock_object(DC_BRUSH));
 }
 
 /// How a row's state looks.
@@ -157,8 +147,7 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
     let cols = app.column_rects(&rc);
     let state = RowState {
         selected: dis.itemState & ODS_SELECTED != 0,
-        // SAFETY: reads this thread's focus.
-        focused: unsafe { GetFocus() } == app.list,
+        focused: win::focus() == app.list,
         hot: app.row_is_hot(index),
         alternate: ui.alternate_rows && index % 2 == 1,
     };
@@ -236,126 +225,120 @@ pub fn row(app: &App, dis: &DRAWITEMSTRUCT) {
     // A color filter's colour for the row's text (not under a selection,
     // which keeps its own).
     let filtered = app.color_filter_colour(row);
-    // SAFETY: draws into the list's DC; the old font is put back at the end.
-    unsafe {
-        let old_font = SelectObject(hdc, fonts.normal);
-        SetBkMode(hdc, TRANSPARENT as i32);
-        for &(col, cell) in cols.iter() {
-            if cell.right - cell.left <= 2 * pad {
-                continue;
-            }
-            let st = cell_state(state, col, ui.full_row_select);
-            let (mut fg, base_bold) = cell_text_colour(&pal, st, col == sorted);
-            if let Some(c) = filtered
-                && !st.selected
-            {
-                fg = c;
-            }
-            SetTextColor(hdc, fg);
-            let hl = Hl {
-                fg: pal.hl_fg,
-                bg: pal.hl_bg,
-                bold: pal.hl_bold,
-                base_bold,
-            };
-            let mut inner = RECT {
-                left: cell.left + pad,
-                right: cell.right - pad,
-                ..cell
-            };
-            match col {
-                COL_NAME => {
-                    let (icon, dropped) = app.icons.for_row(row, m.shown, index);
-                    // A lookup pushed out of the full queue is asked for
-                    // again when its row is drawn again, not left pending.
-                    if let Some(other) = dropped.and_then(|i| m.peek(i))
-                        && other.icon.get() == PENDING
-                    {
-                        other.icon.set(UNSET);
-                    }
-                    let (mut cx, mut cy) = (0, 0);
-                    ImageList_GetIconSize(app.icons.list, &mut cx, &mut cy);
-                    let side = row_icon_side(app);
-                    if inner.right - inner.left > side {
-                        let y = rc.top + (rc.bottom - rc.top - side) / 2;
-                        if side > cx {
-                            // Bigger than the shell's small icons: from a
-                            // bigger list, never loaded on this thread.
-                            let square = RECT {
-                                left: inner.left,
-                                top: y,
-                                right: inner.left + side,
-                                bottom: y + side,
-                            };
-                            app.draw_row_icon(hdc, icon, &square);
-                        } else {
-                            ImageList_Draw(
-                                app.icons.list,
-                                icon,
-                                hdc,
-                                inner.left,
-                                y,
-                                ILD_TRANSPARENT,
-                            );
-                        }
-                    }
-                    inner.left += side + app.scale(ICON_GAP);
-                    // The find bar's Highlight All, behind the text.
-                    app.paint_find_matches(hdc, &inner, row.name(), &scratch.name_spans, &fonts);
-                    runs_hl(
-                        hdc,
-                        &inner,
-                        row.name(),
-                        &scratch.name_spans,
-                        &fonts,
-                        false,
-                        hl,
-                    );
+    // Draws into the list's DC; the old font is put back at the end.
+    let old_font = gdi::Selected::of(hdc, fonts.normal);
+    gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+    for &(col, cell) in cols.iter() {
+        if cell.right - cell.left <= 2 * pad {
+            continue;
+        }
+        let st = cell_state(state, col, ui.full_row_select);
+        let (mut fg, base_bold) = cell_text_colour(&pal, st, col == sorted);
+        if let Some(c) = filtered
+            && !st.selected
+        {
+            fg = c;
+        }
+        gdi::set_text_color(hdc, fg);
+        let hl = Hl {
+            fg: pal.hl_fg,
+            bg: pal.hl_bg,
+            bold: pal.hl_bold,
+            base_bold,
+        };
+        let mut inner = RECT {
+            left: cell.left + pad,
+            right: cell.right - pad,
+            ..cell
+        };
+        match col {
+            COL_NAME => {
+                let (icon, dropped) = app.icons.for_row(row, m.shown, index);
+                // A lookup pushed out of the full queue is asked for
+                // again when its row is drawn again, not left pending.
+                if let Some(other) = dropped.and_then(|i| m.peek(i))
+                    && other.icon.get() == PENDING
+                {
+                    other.icon.set(UNSET);
                 }
-                COL_PATH => runs_hl(
+                let cx = app
+                    .icons
+                    .list
+                    .and_then(|l| imagelist::icon_size(&l))
+                    .map_or(0, |(cx, _)| cx);
+                let side = row_icon_side(app);
+                if inner.right - inner.left > side {
+                    let y = rc.top + (rc.bottom - rc.top - side) / 2;
+                    if side > cx {
+                        // Bigger than the shell's small icons: from a
+                        // bigger list, never loaded on this thread.
+                        let square = RECT {
+                            left: inner.left,
+                            top: y,
+                            right: inner.left + side,
+                            bottom: y + side,
+                        };
+                        app.draw_row_icon(hdc, icon, &square);
+                    } else if let Some(list) = app.icons.list {
+                        imagelist::draw(&list, icon, hdc, (inner.left, y), ILD_TRANSPARENT);
+                    }
+                }
+                inner.left += side + app.scale(ICON_GAP);
+                // The find bar's Highlight All, behind the text.
+                app.paint_find_matches(hdc, &inner, row.name(), &scratch.name_spans, &fonts);
+                runs_hl(
                     hdc,
                     &inner,
-                    row.parent(),
-                    &scratch.parent_spans,
+                    row.name(),
+                    &scratch.name_spans,
                     &fonts,
                     false,
                     hl,
-                ),
-                COL_SIZE => {
-                    // W9: a folder's too, when gozd sums folder sizes or the
-                    // list has one.
-                    if let Some(size) = row.size {
-                        let text: Vec<u16> = format::size_cell(size).encode_utf16().collect();
-                        runs_hl(hdc, &inner, &text, &[], &fonts, true, hl);
-                    }
-                }
-                COL_EXT => runs_hl(hdc, &inner, filetype::of_row(row), &[], &fonts, false, hl),
-                // Looked up once per extension, off this thread
-                // (`typeinfo`): empty until then.
-                COL_TYPE => {
-                    if let Some(name) = app.icons.type_name(row) {
-                        runs_hl(hdc, &inner, &name, &[], &fonts, false, hl);
-                    }
-                }
-                // W9: Date Created, Date Accessed, Attributes and Date
-                // Recently Changed, as the row's source gave them or (rows
-                // of the index) as the disk says, read off this thread.
-                c if crate::columns::is_date(c) || c == crate::columns::COL_ATTRIB => {
-                    app.wanted_props(&m, row, c, index);
-                    scratch.text.clear();
-                    copytext::push(row, copytext::Field::of_column(c), &mut scratch.text);
-                    if !scratch.text.is_empty() {
-                        runs_hl(hdc, &inner, &scratch.text, &[], &fonts, false, hl);
-                    }
-                }
-                _ => {}
+                );
             }
+            COL_PATH => runs_hl(
+                hdc,
+                &inner,
+                row.parent(),
+                &scratch.parent_spans,
+                &fonts,
+                false,
+                hl,
+            ),
+            COL_SIZE => {
+                // W9: a folder's too, when gozd sums folder sizes or the
+                // list has one.
+                if let Some(size) = row.size {
+                    let text: Vec<u16> = format::size_cell(size).encode_utf16().collect();
+                    runs_hl(hdc, &inner, &text, &[], &fonts, true, hl);
+                }
+            }
+            COL_EXT => runs_hl(hdc, &inner, filetype::of_row(row), &[], &fonts, false, hl),
+            // Looked up once per extension, off this thread
+            // (`typeinfo`): empty until then.
+            COL_TYPE => {
+                if let Some(name) = app.icons.type_name(row) {
+                    runs_hl(hdc, &inner, &name, &[], &fonts, false, hl);
+                }
+            }
+            // W9: Date Created, Date Accessed, Attributes and Date
+            // Recently Changed, as the row's source gave them or (rows
+            // of the index) as the disk says, read off this thread.
+            c if crate::columns::is_date(c) || c == crate::columns::COL_ATTRIB => {
+                app.wanted_props(&m, row, c, index);
+                scratch.text.clear();
+                copytext::push(row, copytext::Field::of_column(c), &mut scratch.text);
+                if !scratch.text.is_empty() {
+                    runs_hl(hdc, &inner, &scratch.text, &[], &fonts, false, hl);
+                }
+            }
+            _ => {}
         }
-        if dis.itemState & ODS_FOCUS != 0 && state.focused && focus_rc.right > focus_rc.left {
-            DrawFocusRect(hdc, &focus_rc);
-        }
-        SelectObject(hdc, old_font);
     }
+    if dis.itemState & ODS_FOCUS != 0 && state.focused && focus_rc.right > focus_rc.left {
+        gdi::draw_focus_rect(hdc, &focus_rc);
+    }
+    drop(old_font);
 }
 
 /// Appends the text of cell `col` of `row` to `out`, as it is drawn now:
@@ -372,10 +355,8 @@ pub fn push_cell(app: &App, row: &crate::client::Row, col: usize, out: &mut Vec<
 }
 
 pub fn width(hdc: HDC, text: &[u16]) -> i32 {
-    let mut size = SIZE::default();
-    // SAFETY: measures `text` in the DC's current font.
-    unsafe { GetTextExtentPoint32W(hdc, text.as_ptr(), text.len() as i32, &mut size) };
-    size.cx
+    // `text` measured in the DC's current font.
+    gdi::text_extent(hdc, text).cx
 }
 
 /// A cell's text in full: what it says, and where it goes in the list's
@@ -420,20 +401,21 @@ pub fn cell_text(
         _ => &[],
     };
     let fonts = app.fonts.borrow();
-    // SAFETY: a DC of this thread's list, measured in and given back; the
-    // old font is put back first.
-    let w = unsafe {
-        let hdc = GetDC(app.list);
-        let old = SelectObject(hdc, fonts.normal);
+    // A DC of this thread's list, measured in and given back; the old font
+    // is put back first.
+    let w = {
+        let dc = gdi::WindowDc::get(app.list);
+        let hdc = dc.hdc();
+        let old = gdi::Selected::of(hdc, fonts.normal);
         let w = parts(&text, spans, &fonts)
             .iter()
             .map(|&(s, e, f, _)| {
-                SelectObject(hdc, f);
+                gdi::select(hdc, f);
                 width(hdc, &text[s..e])
             })
             .sum::<i32>();
-        SelectObject(hdc, old);
-        ReleaseDC(app.list, hdc);
+        drop(old);
+        drop(dc);
         w
     };
     let pad = app.scale(CELL_PAD);
@@ -515,104 +497,83 @@ pub fn runs_hl(
     }
     let parts = parts_hl(text, spans, fonts, hl);
     let y = rc.top + (rc.bottom - rc.top - fonts.height) / 2;
-    // SAFETY: draws into `hdc`, clipped to `rc`.
-    unsafe {
-        let draw = |x: i32, s: &[u16]| {
-            ExtTextOutW(
-                hdc,
-                x,
-                y,
-                ETO_CLIPPED,
-                rc,
-                s.as_ptr(),
-                s.len() as u32,
-                core::ptr::null(),
-            );
-        };
-        let widths: Vec<i32> = parts
-            .iter()
-            .map(|&(s, e, f, _)| {
-                SelectObject(hdc, f);
-                width(hdc, &text[s..e])
-            })
-            .collect();
-        // A match in a colour of its own, on a background of its own: the
-        // DC's colour is the cell's, put back after each match.
-        let normal_fg = GetTextColor(hdc);
-        let mark = |x: i32, w: i32, matched: bool| {
-            if !matched {
-                return;
-            }
-            if let Some(bg) = hl.bg {
-                let r = RECT {
-                    left: x.max(rc.left),
-                    right: (x + w).min(rc.right),
-                    top: y,
-                    bottom: (y + fonts.height).min(rc.bottom),
-                };
-                if r.right > r.left {
-                    fill(hdc, &r, bg);
-                }
-            }
-            SetTextColor(hdc, hl.fg.unwrap_or(normal_fg));
-        };
-        let total: i32 = widths.iter().sum();
-        let avail = rc.right - rc.left;
-        if total <= avail {
-            let mut x = if right { rc.right - total } else { rc.left };
-            for (&(s, e, f, matched), w) in parts.iter().zip(&widths) {
-                SelectObject(hdc, f);
-                mark(x, *w, matched);
-                draw(x, &text[s..e]);
-                SetTextColor(hdc, normal_fg);
-                x += w;
-            }
-        } else {
-            const ELLIPSIS: [u16; 1] = [0x2026];
-            let base = if hl.base_bold {
-                fonts.bold
-            } else {
-                fonts.normal
-            };
-            SelectObject(hdc, base);
-            let limit = rc.right - width(hdc, &ELLIPSIS);
-            let mut x = rc.left;
-            for (&(s, e, f, matched), &w) in parts.iter().zip(&widths) {
-                SelectObject(hdc, f);
-                if x + w <= limit {
-                    mark(x, w, matched);
-                    draw(x, &text[s..e]);
-                    SetTextColor(hdc, normal_fg);
-                    x += w;
-                    continue;
-                }
-                let room = limit - x;
-                if room > 0 {
-                    let mut fit = 0;
-                    let mut size = SIZE::default();
-                    GetTextExtentExPointW(
-                        hdc,
-                        text[s..e].as_ptr(),
-                        (e - s) as i32,
-                        room,
-                        &mut fit,
-                        core::ptr::null_mut(),
-                        &mut size,
-                    );
-                    let fit = &text[s..s + fit.max(0) as usize];
-                    let fw = width(hdc, fit);
-                    mark(x, fw, matched);
-                    draw(x, fit);
-                    SetTextColor(hdc, normal_fg);
-                    x += fw;
-                }
-                break;
-            }
-            SelectObject(hdc, base);
-            draw(x, &ELLIPSIS);
+    // Draws into `hdc`, clipped to `rc`.
+    let draw = |x: i32, s: &[u16]| {
+        gdi::ext_text_out(hdc, (x, y), ETO_CLIPPED, Some(rc), s);
+    };
+    let widths: Vec<i32> = parts
+        .iter()
+        .map(|&(s, e, f, _)| {
+            gdi::select(hdc, f);
+            width(hdc, &text[s..e])
+        })
+        .collect();
+    // A match in a colour of its own, on a background of its own: the
+    // DC's colour is the cell's, put back after each match.
+    let normal_fg = win::gdi::text_color(hdc);
+    let mark = |x: i32, w: i32, matched: bool| {
+        if !matched {
+            return;
         }
-        SelectObject(hdc, fonts.normal);
+        if let Some(bg) = hl.bg {
+            let r = RECT {
+                left: x.max(rc.left),
+                right: (x + w).min(rc.right),
+                top: y,
+                bottom: (y + fonts.height).min(rc.bottom),
+            };
+            if r.right > r.left {
+                fill(hdc, &r, bg);
+            }
+        }
+        gdi::set_text_color(hdc, hl.fg.unwrap_or(normal_fg));
+    };
+    let total: i32 = widths.iter().sum();
+    let avail = rc.right - rc.left;
+    if total <= avail {
+        let mut x = if right { rc.right - total } else { rc.left };
+        for (&(s, e, f, matched), w) in parts.iter().zip(&widths) {
+            gdi::select(hdc, f);
+            mark(x, *w, matched);
+            draw(x, &text[s..e]);
+            gdi::set_text_color(hdc, normal_fg);
+            x += w;
+        }
+    } else {
+        const ELLIPSIS: [u16; 1] = [0x2026];
+        let base = if hl.base_bold {
+            fonts.bold
+        } else {
+            fonts.normal
+        };
+        gdi::select(hdc, base);
+        let limit = rc.right - width(hdc, &ELLIPSIS);
+        let mut x = rc.left;
+        for (&(s, e, f, matched), &w) in parts.iter().zip(&widths) {
+            gdi::select(hdc, f);
+            if x + w <= limit {
+                mark(x, w, matched);
+                draw(x, &text[s..e]);
+                gdi::set_text_color(hdc, normal_fg);
+                x += w;
+                continue;
+            }
+            let room = limit - x;
+            if room > 0 {
+                let (fit, _) = gdi::text_fit(hdc, &text[s..e], room);
+                let fit = &text[s..s + fit.max(0) as usize];
+                let fw = width(hdc, fit);
+                mark(x, fw, matched);
+                draw(x, fit);
+                gdi::set_text_color(hdc, normal_fg);
+                x += fw;
+            }
+            break;
+        }
+        gdi::select(hdc, base);
+        draw(x, &ELLIPSIS);
     }
+    gdi::select(hdc, fonts.normal);
 }
 
 /// Whether two rectangles share any pixel.
@@ -628,102 +589,92 @@ fn overlaps(a: &RECT, b: &RECT) -> bool {
 /// buffer of the whole client (tens of MB on a large screen) made for each
 /// of those would cost milliseconds apiece.
 pub fn window(app: &App) {
-    // SAFETY: a standard double-buffered WM_PAINT; every GDI object made
-    // here is released before returning. The buffer's origin is moved to
-    // the invalid rectangle's corner, so drawing stays in client
-    // coordinates.
-    unsafe {
-        let mut ps: PAINTSTRUCT = core::mem::zeroed();
-        let hdc = BeginPaint(app.hwnd, &mut ps);
-        let dirty = ps.rcPaint;
-        let (w, h) = (dirty.right - dirty.left, dirty.bottom - dirty.top);
-        if w <= 0 || h <= 0 {
-            EndPaint(app.hwnd, &ps);
-            return;
-        }
-        let mem = CreateCompatibleDC(hdc);
-        let bmp = CreateCompatibleBitmap(hdc, w, h);
-        let old_bmp = SelectObject(mem, bmp);
-        SetViewportOrgEx(mem, -dirty.left, -dirty.top, core::ptr::null_mut());
-
-        let pal = app.pal.get();
-        fill(mem, &dirty, pal.chrome);
-        let search = app.search_rc.get();
-        if overlaps(&search, &dirty) {
-            fill(mem, &search, pal.border);
-            let inner = RECT {
-                left: search.left + 1,
-                top: search.top + 1,
-                right: search.right - 1,
-                bottom: search.bottom - 1,
-            };
-            let search_ink = pal.ink(
-                crate::colors::Item::SearchEdit,
-                crate::colors::State::Normal,
-            );
-            fill(mem, &inner, search_ink.bg);
-            searchbox::paint(app, mem);
-        }
-        if let Some((rc, name, open)) = app.filter_bar()
-            && overlaps(&rc, &dirty)
-        {
-            searchbox::paint_filter_bar(app, mem, rc, name, open);
-        }
-        if let Some((back, forward)) = searchbox::nav_of(app)
-            && overlaps(
-                &RECT {
-                    right: forward.right,
-                    ..back
-                },
-                &dirty,
-            )
-        {
-            searchbox::paint_nav(app, mem);
-        }
-        if overlaps(&app.status_rc.get(), &dirty) {
-            status::paint(app, mem);
-        }
-        // The docks' dividers, and the tab strip's and find bar's rows.
-        app.paint_dividers(mem, &dirty);
-        app.paint_strips(mem, &dirty);
-
-        BitBlt(
-            hdc, dirty.left, dirty.top, w, h, mem, dirty.left, dirty.top, SRCCOPY,
-        );
-        SelectObject(mem, old_bmp);
-        DeleteObject(bmp);
-        DeleteDC(mem);
-        EndPaint(app.hwnd, &ps);
+    // A standard double-buffered WM_PAINT; every GDI object made here is
+    // released before returning (the guards drop in the reverse of their
+    // order: the bitmap deselected, deleted, the buffer's DC deleted, the
+    // paint ended). The buffer's origin is moved to the invalid
+    // rectangle's corner, so drawing stays in client coordinates.
+    let ps = gdi::Paint::begin(app.hwnd);
+    let hdc = ps.hdc();
+    let dirty = ps.area();
+    let (w, h) = (dirty.right - dirty.left, dirty.bottom - dirty.top);
+    if w <= 0 || h <= 0 {
+        return;
     }
+    let mem_dc = gdi::MemDc::compatible(hdc);
+    let mem = mem_dc.hdc();
+    let Some(bmp) = gdi::create_compatible_bitmap(hdc, w, h) else {
+        return;
+    };
+    let old_bmp = gdi::Selected::new(mem, &bmp);
+    gdi::set_viewport_org(mem, -dirty.left, -dirty.top);
+
+    let pal = app.pal.get();
+    fill(mem, &dirty, pal.chrome);
+    let search = app.search_rc.get();
+    if overlaps(&search, &dirty) {
+        fill(mem, &search, pal.border);
+        let inner = RECT {
+            left: search.left + 1,
+            top: search.top + 1,
+            right: search.right - 1,
+            bottom: search.bottom - 1,
+        };
+        let search_ink = pal.ink(
+            crate::colors::Item::SearchEdit,
+            crate::colors::State::Normal,
+        );
+        fill(mem, &inner, search_ink.bg);
+        searchbox::paint(app, mem);
+    }
+    if let Some((rc, name, open)) = app.filter_bar()
+        && overlaps(&rc, &dirty)
+    {
+        searchbox::paint_filter_bar(app, mem, rc, name, open);
+    }
+    if let Some((back, forward)) = searchbox::nav_of(app)
+        && overlaps(
+            &RECT {
+                right: forward.right,
+                ..back
+            },
+            &dirty,
+        )
+    {
+        searchbox::paint_nav(app, mem);
+    }
+    if overlaps(&app.status_rc.get(), &dirty) {
+        status::paint(app, mem);
+    }
+    // The docks' dividers, and the tab strip's and find bar's rows.
+    app.paint_dividers(mem, &dirty);
+    app.paint_strips(mem, &dirty);
+
+    gdi::bit_blt(
+        hdc,
+        (dirty.left, dirty.top, w, h),
+        mem,
+        (dirty.left, dirty.top),
+        SRCCOPY,
+    );
+    drop(old_bmp);
+    drop(bmp);
+    drop(mem_dc);
+    drop(ps);
 }
 
 /// Clears the list below its last row, where the visual style would draw
 /// each column's edge on down to the bottom. Called at the list's
 /// post-paint stage, so it draws into the list's own paint buffer.
 pub fn below_rows(app: &App, hdc: HDC) {
-    let mut client = RECT::default();
-    let mut header = RECT::default();
-    // SAFETY: reads the sizes of this thread's list and header.
-    unsafe {
-        GetClientRect(app.list, &mut client);
-        GetWindowRect(app.header, &mut header);
-    }
+    // The sizes of this thread's list and header.
+    let client = win::client_rect(app.list);
+    let header = win::window_rect(app.header);
     let mut top = header.bottom - header.top;
-    let count = send(app.list, LVM_GETITEMCOUNT);
+    let count = lv::item_count(app.list);
     if count > 0 {
-        let mut last = RECT {
-            left: LVIR_BOUNDS as i32,
-            ..RECT::default()
-        };
-        // SAFETY: LVM_GETITEMRECT fills the RECT passed for an existing row.
-        unsafe {
-            SendMessageW(
-                app.list,
-                LVM_GETITEMRECT,
-                (count - 1) as usize,
-                (&raw mut last) as isize,
-            )
-        };
+        let last =
+            lv::item_rect(app.list, (count - 1) as i32, LVIR_BOUNDS as i32).unwrap_or_default();
         top = top.max(last.bottom);
     }
     if top < client.bottom {
@@ -733,86 +684,48 @@ pub fn below_rows(app: &App, hdc: HDC) {
 
 /// When the list is empty because of a failure, says why in the middle of it.
 pub fn empty_list(app: &App) {
-    if send(app.list, LVM_GETITEMCOUNT) != 0 {
+    if lv::item_count(app.list) != 0 {
         return;
     }
     let text = match &app.model.borrow().failure {
         Some((_, text)) => text.clone(),
         None => return,
     };
-    let mut t: Vec<u16> = text.encode_utf16().collect();
+    let t: Vec<u16> = text.encode_utf16().collect();
     let fonts = app.fonts.borrow();
-    // SAFETY: draws on the list after its own paint; the DC is released.
-    unsafe {
-        let mut rc = RECT::default();
-        GetClientRect(app.list, &mut rc);
-        let mut header = RECT::default();
-        GetWindowRect(app.header, &mut header);
-        rc.top += header.bottom - header.top + app.scale(24);
-        rc.left += app.scale(24);
-        rc.right -= app.scale(24);
-        let hdc = GetDC(app.list);
-        let old = SelectObject(hdc, fonts.normal);
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, app.pal.get().dim);
-        DrawTextW(
-            hdc,
-            t.as_mut_ptr(),
-            t.len() as i32,
-            &mut rc,
-            DT_CENTER | DT_WORDBREAK,
-        );
-        SelectObject(hdc, old);
-        ReleaseDC(app.list, hdc);
+    // Draws on the list after its own paint; the DC is released.
+    let mut rc = win::client_rect(app.list);
+    let header = win::window_rect(app.header);
+    rc.top += header.bottom - header.top + app.scale(24);
+    rc.left += app.scale(24);
+    rc.right -= app.scale(24);
+    let dc = gdi::WindowDc::get(app.list);
+    let hdc = dc.hdc();
+    let old = gdi::Selected::of(hdc, fonts.normal);
+    gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+    gdi::set_text_color(hdc, app.pal.get().dim);
+    gdi::draw_text(hdc, &t, &mut rc, DT_CENTER | DT_WORDBREAK);
+    drop(old);
+    drop(dc);
+}
+
+/// `rc` moved by `dx`, `dy` (OffsetRect).
+fn offset(rc: RECT, dx: i32, dy: i32) -> RECT {
+    RECT {
+        left: rc.left + dx,
+        top: rc.top + dy,
+        right: rc.right + dx,
+        bottom: rc.bottom + dy,
     }
-}
-
-fn send(hwnd: windows_sys::Win32::Foundation::HWND, msg: u32) -> isize {
-    // SAFETY: a parameterless query message to a window of this thread.
-    unsafe { SendMessageW(hwnd, msg, 0, 0) }
-}
-
-// The menu bar has no dark theme of its own. Windows draws it through these
-// undocumented messages, which let the app paint the bar and its items; the
-// layout of their structs has held since Windows 10 1809.
-
-pub const WM_UAHDRAWMENU: u32 = 0x0091;
-pub const WM_UAHDRAWMENUITEM: u32 = 0x0092;
-
-#[repr(C)]
-pub struct UahMenu {
-    pub hmenu: HMENU,
-    pub hdc: HDC,
-    pub flags: u32,
-}
-
-#[repr(C)]
-pub struct UahMenuItem {
-    pub position: i32,
-    pub metrics: [u32; 8],
-    pub popup: [u32; 5],
-}
-
-#[repr(C)]
-pub struct UahDrawMenuItem {
-    pub dis: DRAWITEMSTRUCT,
-    pub um: UahMenu,
-    pub umi: UahMenuItem,
 }
 
 /// The menu bar's rectangle in window coordinates.
 fn menubar_rect(hwnd: HWND) -> RECT {
-    // SAFETY: plain out-structs for this thread's window.
-    unsafe {
-        let mut mbi: MENUBARINFO = core::mem::zeroed();
-        mbi.cbSize = size_of::<MENUBARINFO>() as u32;
-        GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mut mbi);
-        let mut wr = RECT::default();
-        GetWindowRect(hwnd, &mut wr);
-        let mut rc = mbi.rcBar;
-        OffsetRect(&mut rc, -wr.left, -wr.top);
-        rc
-    }
+    let bar = win::menu::bar_info(hwnd, OBJID_MENU, 0)
+        .map(|mbi| mbi.rcBar)
+        .unwrap_or_default();
+    let wr = win::window_rect(hwnd);
+    offset(bar, -wr.left, -wr.top)
 }
 
 /// The menu bar's colours: Options > Fonts and Colors' Menu.
@@ -861,32 +774,24 @@ pub fn menubar_text(ink: crate::theme::Ink, dim: bool) -> u32 {
 
 /// Paints one item of a menu bar in `pal`'s colours.
 pub fn menubar_item_of(pal: &Palette, item: &UahDrawMenuItem) {
-    let mut buf = [0u16; 256];
-    // SAFETY: reads the item's text into `buf`, whose length is passed; then
-    // paints into the DC Windows handed over.
-    unsafe {
-        let mut mii: MENUITEMINFOW = core::mem::zeroed();
-        mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
-        mii.fMask = MIIM_STRING;
-        mii.dwTypeData = buf.as_mut_ptr();
-        mii.cch = buf.len() as u32 - 1;
-        GetMenuItemInfoW(item.um.hmenu, item.umi.position as u32, 1, &mut mii);
-        let state = item.dis.itemState;
-        let hot = state & (ODS_HOTLIGHT | ODS_SELECTED) != 0;
-        let mut rc = item.dis.rcItem;
-        let ink = menu_ink(pal);
-        fill(item.um.hdc, &rc, if hot { pal.hot } else { ink.bg });
-        // Dimmed as Windows' own menu bar dims its items, in either theme
-        // and in Fonts and Colors' Menu colours.
-        let dim = state & (ODS_INACTIVE | ODS_GRAYED | ODS_DISABLED) != 0;
-        SetBkMode(item.um.hdc, TRANSPARENT as i32);
-        SetTextColor(item.um.hdc, menubar_text(ink, dim));
-        let mut flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
-        if state & ODS_NOACCEL != 0 {
-            flags |= DT_HIDEPREFIX;
-        }
-        DrawTextW(item.um.hdc, buf.as_mut_ptr(), -1, &mut rc, flags);
+    // The item's text; then paints into the DC Windows handed over.
+    let by = win::menu::By::Position(item.umi.position as u32);
+    let text = win::menu::text_units(item.um.hmenu, by);
+    let state = item.dis.itemState;
+    let hot = state & (ODS_HOTLIGHT | ODS_SELECTED) != 0;
+    let mut rc = item.dis.rcItem;
+    let ink = menu_ink(pal);
+    fill(item.um.hdc, &rc, if hot { pal.hot } else { ink.bg });
+    // Dimmed as Windows' own menu bar dims its items, in either theme and
+    // in Fonts and Colors' Menu colours.
+    let dim = state & (ODS_INACTIVE | ODS_GRAYED | ODS_DISABLED) != 0;
+    gdi::set_bk_mode(item.um.hdc, TRANSPARENT as i32);
+    gdi::set_text_color(item.um.hdc, menubar_text(ink, dim));
+    let mut flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
+    if state & ODS_NOACCEL != 0 {
+        flags |= DT_HIDEPREFIX;
     }
+    gdi::draw_text(item.um.hdc, &text, &mut rc, flags);
 }
 
 /// Covers the light line Windows draws under the menu bar.
@@ -896,23 +801,18 @@ pub fn menubar_line(app: &App) {
 
 /// [`menubar_line`] for window `hwnd`, in `pal`'s colours.
 pub fn menubar_line_of(hwnd: HWND, pal: &Palette) {
-    // SAFETY: paints one line of this window's frame; the DC is released.
-    unsafe {
-        let mut client = RECT::default();
-        GetClientRect(hwnd, &mut client);
-        MapWindowPoints(hwnd, core::ptr::null_mut(), (&raw mut client).cast(), 2);
-        let mut wr = RECT::default();
-        GetWindowRect(hwnd, &mut wr);
-        OffsetRect(&mut client, -wr.left, -wr.top);
-        let line = RECT {
-            top: client.top - 1,
-            bottom: client.top,
-            ..client
-        };
-        let hdc = GetWindowDC(hwnd);
-        fill(hdc, &line, menu_ink(pal).bg);
-        ReleaseDC(hwnd, hdc);
-    }
+    // Paints one line of this window's frame; the DC is released.
+    let client = win::map_rect(hwnd, core::ptr::null_mut(), win::client_rect(hwnd));
+    let wr = win::window_rect(hwnd);
+    let client = offset(client, -wr.left, -wr.top);
+    let line = RECT {
+        top: client.top - 1,
+        bottom: client.top,
+        ..client
+    };
+    let dc = gdi::WindowDc::whole(hwnd);
+    fill(dc.hdc(), &line, menu_ink(pal).bg);
+    drop(dc);
 }
 
 #[cfg(test)]

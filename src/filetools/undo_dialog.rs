@@ -10,41 +10,30 @@
 
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Controls::{
-    HDF_SORTDOWN, HDF_SORTUP, HDI_FORMAT, HDITEMW, HDM_GETITEMW, HDM_SETITEMW, LVIF_TEXT,
-    LVIS_FOCUSED, LVIS_SELECTED, LVM_GETHEADER, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVN_COLUMNCLICK,
-    LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW, LVN_ODSTATECHANGED,
-    LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP,
-    LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NM_CUSTOMDRAW, NMHDR,
-    NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN,
+    HDF_SORTDOWN, HDF_SORTUP, HDI_FORMAT, HDITEMW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED,
+    LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW,
+    LVN_ODSTATECHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_HEADERDRAGDROP, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
+    NM_CUSTOMDRAW, NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, IsWindowEnabled, VK_CONTROL,
-};
-use windows_sys::Win32::UI::Shell::SetWindowSubclass;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST,
-    DM_SETDEFID, DWLP_MSGRESULT, EN_CHANGE, ES_AUTOHSCROLL, EndDialog, GWLP_USERDATA,
-    GetClientRect, GetWindowRect, IDCANCEL, IDOK, MINMAXINFO, MoveWindow, SM_CXVSCROLL,
-    SetWindowLongPtrW, SetWindowTextW, WM_APP, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO,
-    WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETREDRAW, WM_SIZE, WS_EX_CLIENTEDGE,
-    WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
+    BS_DEFPUSHBUTTON, CBN_SELCHANGE, CBS_DROPDOWNLIST, EN_CHANGE, ES_AUTOHSCROLL, IDCANCEL, IDOK,
+    SM_CXVSCROLL, WM_APP, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_NOTIFY,
+    WM_SIZE, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME, WS_VSCROLL,
 };
 
-use super::ui::{copy_text, enable, item, send, set_state, units};
+use super::ui::{enable, item, set_state, units};
 use super::undo::{Action, Record};
 use super::{name_of, ui};
 use crate::dialog::{
-    Class, Look, Template, apply_theme, center_on_owner, common, list_custom_draw, state,
+    Class, Look, Template, apply_theme, center_on_owner, common, list_custom_draw,
 };
 use crate::fileops::parent;
-use crate::history_dialogs::filter_proc;
 use crate::places::{self, Which};
-use crate::wide::{window_text, wz};
+use crate::win::{self, Msg, View, combo, dlg, header, lv, sys};
 
 const TITLE: &str = "Undo History";
 
@@ -232,22 +221,18 @@ pub fn run(owner: HWND, host: &dyn Host, look: Look) {
             (cx - 57, 40, 50, 14),
         )
         .control(Class::Static, "", ID_COUNT, 0, 0, (7, cy - 14, 200, 8));
-    t.run(owner, Some(dialog_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| dialog_proc(&state, m));
 }
 
 /// Gives `list`'s columns [`fitted_widths`] for its width now, leaving
 /// room for the vertical scroll bar that rows bring.
 fn fit_columns(list: HWND) {
-    let mut rc = RECT::default();
-    // SAFETY: reads this thread's list's size, DPI and the scroll bar's
-    // width at that DPI.
-    let (dpi, bar) = unsafe {
-        GetClientRect(list, &mut rc);
-        let dpi = crate::custom::window_dpi(list);
-        (dpi as i32, GetSystemMetricsForDpi(SM_CXVSCROLL, dpi))
-    };
+    // The list's size, DPI and the scroll bar's width at that DPI.
+    let rc = win::client_rect(list);
+    let dpi = crate::custom::window_dpi(list);
+    let (dpi, bar) = (dpi as i32, sys::metric_for_dpi(SM_CXVSCROLL, dpi));
     for (i, w) in fitted_widths(rc.right - bar, dpi).into_iter().enumerate() {
-        send(list, LVM_SETCOLUMNWIDTH, i, w as isize);
+        lv::set_column_width(list, i as i32, w);
     }
 }
 
@@ -261,26 +246,23 @@ impl Dlg<'_> {
         let list = Dlg::list(dlg);
         let ex =
             LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_HEADERDRAGDROP;
-        send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
+        lv::set_extended_style(list, ex, ex);
         ui::columns(list, &COLUMNS);
-        let combo = item(dlg, ID_ACTION);
+        let actions = item(dlg, ID_ACTION);
         // A themed list redraws for each item added (a few ms each): filled
         // unseen, as the dialog is not shown yet.
-        send(combo, WM_SETREDRAW, 0, 0);
+        win::set_redraw(actions, false);
         for label in std::iter::once("All actions").chain(Action::ALL.iter().map(|a| a.label())) {
-            let text = wz(label);
-            send(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
+            combo::add(actions, label);
         }
-        send(combo, CB_SETCURSEL, 0, 0);
-        send(combo, WM_SETREDRAW, 1, 0);
-        // SAFETY: subclasses this thread's search box; the list outlives
-        // it (both go with the dialog), and the subclass removes itself.
-        unsafe { SetWindowSubclass(item(dlg, ID_SEARCH), Some(filter_proc), 1, list as usize) };
+        combo::set_cur_sel(actions, 0);
+        win::set_redraw(actions, true);
+        // The search box's keys that move in the list (the subclass goes
+        // with the box).
+        crate::history_dialogs::filter_keys(item(dlg, ID_SEARCH), list);
         apply_theme(dlg, self.look.get().dark);
         center_on_owner(dlg);
-        let mut wr = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetWindowRect(dlg, &mut wr) };
+        let wr = win::window_rect(dlg);
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
         let kept = places::columns_kept(Which::UndoHistory);
         places::restore(dlg, Which::UndoHistory, list, self.min.get());
@@ -288,7 +270,7 @@ impl Dlg<'_> {
         if !kept {
             fit_columns(list);
         }
-        send(dlg, DM_SETDEFID, usize::from(ID_UNDO), 0);
+        dlg::set_def_id(dlg, ID_UNDO);
         self.show_arrow(dlg);
         self.refill(dlg);
     }
@@ -296,9 +278,7 @@ impl Dlg<'_> {
     /// The controls for the dialog's size: Action and Search across the
     /// top, the list taking the room, Undo at its right, the count under.
     fn layout(&self, dlg: HWND) {
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetClientRect(dlg, &mut rc) };
+        let rc = win::client_rect(dlg);
         let (w, h) = (rc.right, rc.bottom);
         let (m, _) = units(dlg, 7, 0);
         let (label, row) = units(dlg, 31, 16);
@@ -309,8 +289,7 @@ impl Dlg<'_> {
         let place = |id: u16, x: i32, y: i32, cw: i32, ch: i32| {
             let hwnd = item(dlg, id);
             if !hwnd.is_null() {
-                // SAFETY: moves a control of this thread's dialog.
-                unsafe { MoveWindow(hwnd, x, y, cw.max(0), ch.max(0), 1) };
+                win::move_window(hwnd, x, y, cw.max(0), ch.max(0), true);
             }
         };
         let (_, list_combo_h) = units(dlg, 0, 150);
@@ -325,7 +304,7 @@ impl Dlg<'_> {
 
     /// The Action list's choice: `None` for all actions.
     fn action(dlg: HWND) -> Option<Action> {
-        let i = send(item(dlg, ID_ACTION), CB_GETCURSEL, 0, 0);
+        let i = combo::cur_sel(item(dlg, ID_ACTION));
         usize::try_from(i - 1)
             .ok()
             .and_then(|i| Action::ALL.get(i).copied())
@@ -341,7 +320,7 @@ impl Dlg<'_> {
     /// sort; the selection goes back to the first row.
     fn reshow(&self, dlg: HWND) {
         let (column, ascending) = self.sort.get();
-        let search = window_text(item(dlg, ID_SEARCH));
+        let search = win::text(item(dlg, ID_SEARCH));
         let shown = view(
             &self.all.borrow(),
             Dlg::action(dlg),
@@ -353,50 +332,47 @@ impl Dlg<'_> {
         *self.shown.borrow_mut() = shown;
         // The list's notifications come back here: nothing is borrowed.
         let list = Dlg::list(dlg);
-        send(list, LVM_SETITEMCOUNT, n, 0);
+        lv::set_item_count(list, n, 0);
         set_state(list, usize::MAX, 0, LVIS_SELECTED | LVIS_FOCUSED);
         if n > 0 {
             set_state(list, 0, LVIS_FOCUSED, LVIS_FOCUSED);
         }
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(list, core::ptr::null(), 1) };
+        win::invalidate(list, None, true);
         let count = if n == 1 {
             "1 item".to_owned()
         } else {
             format!("{} items", crate::format::grouped(n as u64))
         };
-        let text = wz(&count);
-        // SAFETY: NUL-terminated text for this thread's static.
-        unsafe { SetWindowTextW(item(dlg, ID_COUNT), text.as_ptr()) };
+        win::set_text(item(dlg, ID_COUNT), &count);
         self.update_buttons(dlg);
     }
 
     fn update_buttons(&self, dlg: HWND) {
-        let selected = send(Dlg::list(dlg), LVM_GETSELECTEDCOUNT, 0, 0) > 0;
+        let selected = lv::selected_count(Dlg::list(dlg)) > 0;
         enable(dlg, ID_UNDO, selected);
         // A button greyed while it had the keyboard hands it to the list.
-        // SAFETY: reads this thread's focus and one of its windows.
-        let focus = unsafe { GetFocus() };
-        if !focus.is_null() && unsafe { IsWindowEnabled(focus) } == 0 {
-            send(dlg, WM_NEXTDLGCTL, Dlg::list(dlg) as usize, 1);
+        let focus = win::focus();
+        if !focus.is_null() && !win::is_enabled(focus) {
+            dlg::focus_ctl(dlg, Dlg::list(dlg));
         }
     }
 
     fn show_arrow(&self, dlg: HWND) {
-        let header = send(Dlg::list(dlg), LVM_GETHEADER, 0, 0) as HWND;
+        let columns = lv::header(Dlg::list(dlg));
         let (column, ascending) = self.sort.get();
         for i in 0..COLUMNS.len() {
-            let mut hd = HDITEMW {
-                mask: HDI_FORMAT,
-                // SAFETY: the rest of HDITEMW is plain data.
-                ..unsafe { core::mem::zeroed() }
-            };
-            send(header, HDM_GETITEMW, i, (&raw mut hd) as isize);
+            let mut hd = header::get_item(columns, i as i32, HDI_FORMAT).map_or(
+                HDITEMW {
+                    mask: HDI_FORMAT,
+                    ..Default::default()
+                },
+                |(hd, _)| hd,
+            );
             hd.fmt &= !(HDF_SORTUP | HDF_SORTDOWN);
             if i == usize::from(column) {
                 hd.fmt |= if ascending { HDF_SORTUP } else { HDF_SORTDOWN };
             }
-            send(header, HDM_SETITEMW, i, (&raw const hd) as isize);
+            header::set_item(columns, i as i32, hd, None);
         }
     }
 
@@ -424,7 +400,7 @@ impl Dlg<'_> {
             let shown = self.shown.borrow();
             let all = self.all.borrow();
             loop {
-                let next = send(list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize);
+                let next = lv::next_item(list, at as i32, LVNI_SELECTED);
                 let Ok(row) = usize::try_from(next) else {
                     break;
                 };
@@ -441,7 +417,7 @@ impl Dlg<'_> {
         self.refill(dlg);
     }
 
-    fn disp_info(&self, info: &mut NMLVDISPINFOW) {
+    fn disp_info(&self, info: &mut View<'_, NMLVDISPINFOW>) {
         if info.item.mask & LVIF_TEXT == 0 {
             return;
         }
@@ -463,63 +439,52 @@ impl Dlg<'_> {
                 _ => Vec::new(),
             }
         };
-        // SAFETY: the list gave a buffer of `cchTextMax` code units.
-        unsafe { copy_text(&text, info.item.pszText, info.item.cchTextMax) };
+        // Into the list's buffer of `cchTextMax` code units.
+        info.set_text(&text);
     }
 
     /// Answers the list's notifications; `Some` is DWLP_MSGRESULT's value.
-    ///
-    /// # Safety
-    /// `l` is a WM_NOTIFY's lParam from the list.
-    unsafe fn notify(&self, dlg: HWND, l: LPARAM) -> Option<isize> {
-        // SAFETY: as the caller promises; each code's struct is read as
-        // the list sends it.
-        unsafe {
-            let hdr = &*(l as *const NMHDR);
-            match hdr.code {
-                NM_CUSTOMDRAW => {
-                    let cd = &*(l as *const NMLVCUSTOMDRAW);
-                    return Some(list_custom_draw(hdr.hwndFrom, cd, self.look.get().dark));
-                }
-                LVN_GETDISPINFOW => self.disp_info(&mut *(l as *mut NMLVDISPINFOW)),
-                LVN_ODFINDITEMW => return Some(-1),
-                LVN_ITEMCHANGED | LVN_ODSTATECHANGED => self.update_buttons(dlg),
-                LVN_COLUMNCLICK => {
-                    let nm = &*(l as *const NMLISTVIEW);
-                    if let Ok(c) = u8::try_from(nm.iSubItem)
-                        && usize::from(c) < COLUMNS.len()
-                    {
-                        self.sort_by(dlg, c);
-                    }
-                }
-                LVN_KEYDOWN => {
-                    let vk = (*(l as *const NMLVKEYDOWN)).wVKey;
-                    let ctrl = GetKeyState(i32::from(VK_CONTROL)) < 0;
-                    if ctrl && vk == u16::from(b'A') {
-                        set_state(Dlg::list(dlg), usize::MAX, LVIS_SELECTED, LVIS_SELECTED);
-                    }
-                }
-                _ => {}
+    fn notify(&self, dlg: HWND, m: &Msg) -> Option<isize> {
+        let n = m.notify()?;
+        match n.code() {
+            NM_CUSTOMDRAW => {
+                let cd = n.get::<NMLVCUSTOMDRAW>()?;
+                return Some(list_custom_draw(n.from(), &cd, self.look.get().dark));
             }
-            None
+            LVN_GETDISPINFOW => {
+                if let Some(mut info) = n.get::<NMLVDISPINFOW>() {
+                    self.disp_info(&mut info);
+                }
+            }
+            LVN_ODFINDITEMW => return Some(-1),
+            LVN_ITEMCHANGED | LVN_ODSTATECHANGED => self.update_buttons(dlg),
+            LVN_COLUMNCLICK => {
+                let sub = n.get::<NMLISTVIEW>().map(|nm| nm.iSubItem);
+                if let Some(Ok(c)) = sub.map(u8::try_from)
+                    && usize::from(c) < COLUMNS.len()
+                {
+                    self.sort_by(dlg, c);
+                }
+            }
+            LVN_KEYDOWN => {
+                let vk = n.get::<NMLVKEYDOWN>()?.wVKey;
+                let ctrl = sys::key_down(VK_CONTROL);
+                if ctrl && vk == u16::from(b'A') {
+                    set_state(Dlg::list(dlg), usize::MAX, LVIS_SELECTED, LVIS_SELECTED);
+                }
+            }
+            _ => {}
         }
+        None
     }
 }
 
-unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Dlg` that `run` keeps alive until the dialog
-        // has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Dlg` from `run`, or null before.
-    let Some(s) = (unsafe { state::<Dlg<'_>>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn dialog_proc(s: &Dlg<'_>, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.init(dlg);
             1
@@ -534,35 +499,29 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
         }
         WM_GETMINMAXINFO => {
             let (w, h) = s.min.get();
-            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
-            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = w;
-            mmi.ptMinTrackSize.y = h;
+            if let Some(mut mmi) = m.min_max_info() {
+                mmi.ptMinTrackSize.x = w;
+                mmi.ptMinTrackSize.y = h;
+            }
             1
         }
         WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR.
-            let from_list = unsafe { (*(l as *const NMHDR)).idFrom } == usize::from(ID_LIST);
+            let from_list = m.notify().is_some_and(|n| n.id() == usize::from(ID_LIST));
             if !from_list {
                 return 0;
             }
-            // SAFETY: a notification from the list.
-            if let Some(answer) = unsafe { s.notify(dlg, l) } {
-                // SAFETY: the answer of this dialog's WM_NOTIFY.
-                unsafe { SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, answer) };
+            if let Some(answer) = s.notify(dlg, m) {
+                dlg::set_result(dlg, answer);
             }
             1
         }
         WM_COMMAND => {
-            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
             match id {
                 ID_UNDO | OK => s.undo(dlg),
                 ID_SEARCH if code == EN_CHANGE => s.reshow(dlg),
                 ID_ACTION if code == CBN_SELCHANGE => s.reshow(dlg),
-                // SAFETY: ends this modal dialog.
-                CANCEL => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                CANCEL => dlg::end(dlg, 0),
                 _ => {}
             }
             1

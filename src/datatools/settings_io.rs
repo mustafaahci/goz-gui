@@ -16,15 +16,15 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, EndDialog, GWLP_USERDATA, IDCANCEL, IDOK,
-    SetWindowLongPtrW, WM_COMMAND, WM_INITDIALOG, WS_GROUP, WS_TABSTOP,
+    BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, IDCANCEL, IDOK, WM_COMMAND, WM_INITDIALOG, WS_GROUP,
+    WS_TABSTOP,
 };
 
-use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common, state};
-use crate::filetools::ui::{checked, set_check};
+use crate::dialog::{Class, Look, Template, apply_theme, center_on_owner, common};
 use crate::store::location::SETTINGS_FILE;
+use crate::win::{self, Msg, dlg};
 
 /// The files that go, in the data folder.
 pub const FILES: [&str; 6] = [
@@ -246,48 +246,36 @@ pub fn ask(owner: HWND, look: Look) -> Option<Action> {
         0,
         (203, 111, 50, 14),
     );
-    t.run(owner, Some(proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| proc(&state, m));
     state.chosen.into_inner()
 }
 
-unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Wizard` that `ask` keeps alive until the
-        // dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Wizard` from `ask`, or null.
-    let Some(s) = (unsafe { state::<Wizard>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn proc(s: &Wizard, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
-            set_check(dlg, ID_EXPORT, true);
+            dlg::set_checked(dlg, ID_EXPORT, true);
             apply_theme(dlg, s.look.get().dark);
             center_on_owner(dlg);
             1
         }
         WM_COMMAND => {
-            match (w & 0xffff) as u16 {
+            match win::loword(m.w) {
                 OK => {
-                    let action = if checked(dlg, ID_IMPORT) {
+                    let action = if dlg::is_checked(dlg, ID_IMPORT) {
                         Action::Import
-                    } else if checked(dlg, ID_RESET) {
+                    } else if dlg::is_checked(dlg, ID_RESET) {
                         Action::Reset
                     } else {
                         Action::Export
                     };
                     *s.chosen.borrow_mut() = Some(action);
-                    // SAFETY: ends this modal dialog.
-                    unsafe { EndDialog(dlg, 1) };
+                    dlg::end(dlg, 1);
                 }
-                // SAFETY: ends this modal dialog.
-                CANCEL => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                CANCEL => dlg::end(dlg, 0),
                 _ => return 0,
             }
             1

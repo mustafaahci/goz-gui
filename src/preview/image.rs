@@ -7,22 +7,14 @@
 
 use std::collections::HashSet;
 
-use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY, GENERIC_READ};
+use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY};
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_ContainerFormatIco, GUID_ContainerFormatJpeg,
-    GUID_ContainerFormatTiff, GUID_WICPixelFormat32bppPBGRA, IWICBitmapCodecInfo,
-    IWICBitmapDecoder, IWICBitmapFrameDecode, IWICBitmapSource, IWICImagingFactory, IWICPalette,
-    WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom,
-    WICComponentEnumerateDefault, WICDecodeMetadataCacheOnDemand, WICDecoder,
+    GUID_ContainerFormatIco, GUID_ContainerFormatJpeg, GUID_ContainerFormatTiff,
 };
-use windows::Win32::System::Com::StructuredStorage::{
-    PROPVARIANT, PropVariantClear, PropVariantToUInt16,
-};
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-use windows::core::{GUID, Interface, PCWSTR};
+use windows::core::GUID;
 
 use crate::thumbs::Bitmap;
-use crate::wide::{nul, wz};
+use crate::win::wic::{Decoder, Factory, Frame};
 
 /// `size` drawn in `bounds`: as it is when it fits (or bigger, filling the
 /// bounds, with `enlarge`), else shrunk to fit; the aspect is kept and no
@@ -85,7 +77,7 @@ pub struct Decoded {
 
 /// WIC on the preview's thread (COM is initialized there).
 pub struct Wic {
-    factory: IWICImagingFactory,
+    factory: Factory,
     /// The extensions WIC's decoders take (`.jpg`, lower case), listed
     /// the first time they are asked for.
     extensions: Option<HashSet<Vec<u16>>>,
@@ -93,11 +85,8 @@ pub struct Wic {
 
 impl Wic {
     pub fn new() -> Option<Wic> {
-        // SAFETY: COM is initialized on this thread; WIC's factory is an
-        // in-process server.
-        let factory: IWICImagingFactory =
-            unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
-                .ok()?;
+        // WIC's factory is an in-process server.
+        let factory = Factory::new()?;
         Some(Wic {
             factory,
             extensions: None,
@@ -115,45 +104,11 @@ impl Wic {
 
     fn list_extensions(&self) -> HashSet<Vec<u16>> {
         let mut out = HashSet::new();
-        // SAFETY: walks WIC's decoders with live COM objects; each buffer is
-        // passed with its length.
-        unsafe {
-            let Ok(list) = self.factory.CreateComponentEnumerator(
-                WICDecoder.0 as u32,
-                WICComponentEnumerateDefault.0 as u32,
-            ) else {
-                return out;
-            };
-            loop {
-                let mut item = [None];
-                let mut fetched = 0u32;
-                if list.Next(&mut item, Some(&mut fetched)).is_err() || fetched == 0 {
-                    break;
-                }
-                let Some(info) = item[0]
-                    .take()
-                    .and_then(|u| u.cast::<IWICBitmapCodecInfo>().ok())
-                else {
-                    continue;
-                };
-                let mut buf = vec![0u16; 1024];
-                let mut len = 0u32;
-                if info.GetFileExtensions(&mut buf, &mut len).is_err() {
-                    if len as usize <= buf.len() {
-                        continue;
-                    }
-                    buf = vec![0u16; len as usize];
-                    if info.GetFileExtensions(&mut buf, &mut len).is_err() {
-                        continue;
-                    }
-                }
-                let text = &buf[..(len as usize).min(buf.len())];
-                let text = text.split(|&c| c == 0).next().unwrap_or_default();
-                for ext in String::from_utf16_lossy(text).split(',') {
-                    let ext = ext.trim().to_lowercase();
-                    if ext.starts_with('.') && ext.len() > 1 {
-                        out.insert(ext.encode_utf16().collect());
-                    }
+        for text in self.factory.decoder_extensions() {
+            for ext in String::from_utf16_lossy(&text).split(',') {
+                let ext = ext.trim().to_lowercase();
+                if ext.starts_with('.') && ext.len() > 1 {
+                    out.insert(ext.encode_utf16().collect());
                 }
             }
         }
@@ -163,113 +118,85 @@ impl Wic {
     /// Decodes `path` into a box `side` pixels square (never bigger than
     /// the file's own size), upright.
     pub fn decode(&self, path: &[u16], side: i32) -> windows::core::Result<Decoded> {
-        let file = nul(path);
-        // SAFETY: COM calls on live objects of this thread; the pixel
-        // buffers are passed with their lengths.
-        unsafe {
-            let decoder = self.factory.CreateDecoderFromFilename(
-                PCWSTR(file.as_ptr()),
-                None,
-                GENERIC_READ,
-                WICDecodeMetadataCacheOnDemand,
-            )?;
-            let container = decoder.GetContainerFormat()?;
-            let frame = best_frame(&decoder, container)?;
-            let (mut w, mut h) = (0u32, 0u32);
-            frame.GetSize(&mut w, &mut h)?;
-            if w == 0 || h == 0 || w > i32::MAX as u32 || h > i32::MAX as u32 {
+        let decoder = self.factory.decoder(path)?;
+        let container = decoder.container()?;
+        let frame = best_frame(&decoder, container)?;
+        let (w, h) = frame.size()?;
+        if w == 0 || h == 0 || w > i32::MAX as u32 || h > i32::MAX as u32 {
+            return Err(E_FAIL.into());
+        }
+        let o = orientation(&frame, container);
+        let stored = (w as i32, h as i32);
+        let upright = if swaps(o) {
+            (stored.1, stored.0)
+        } else {
+            stored
+        };
+        let shown = fit(upright, (side, side), false);
+        let (tw, th) = if swaps(o) { (shown.1, shown.0) } else { shown };
+        let source = if (tw, th) == stored {
+            frame.source()?
+        } else {
+            self.factory
+                .scaled(&frame.source()?, tw as u32, th as u32)?
+        };
+        let converter = self.factory.pbgra(&source)?;
+        let (w, h) = (tw as usize, th as usize);
+        let copy = |pixels: &mut [[u8; 4]]| converter.copy_pixels(tw as u32, pixels);
+        // Whether no pixel is see-through, seen as they go into the bitmap.
+        let mut opaque = false;
+        let bitmap = if o <= 1 || o > 8 {
+            Bitmap::with_pixels(tw, th, |pixels| {
+                let copied = copy(pixels);
+                opaque = copied && pixels_opaque(pixels);
+                copied
+            })
+        } else {
+            let mut stored_px = vec![[0u8; 4]; w * h];
+            if !copy(&mut stored_px) {
                 return Err(E_FAIL.into());
             }
-            let o = orientation(&frame, container);
-            let stored = (w as i32, h as i32);
-            let upright = if swaps(o) {
-                (stored.1, stored.0)
-            } else {
-                stored
-            };
-            let shown = fit(upright, (side, side), false);
-            let (tw, th) = if swaps(o) { (shown.1, shown.0) } else { shown };
-            let source: IWICBitmapSource = if (tw, th) == stored {
-                frame.cast()?
-            } else {
-                let scaler = self.factory.CreateBitmapScaler()?;
-                scaler.Initialize(&frame, tw as u32, th as u32, WICBitmapInterpolationModeFant)?;
-                scaler.cast()?
-            };
-            let converter = self.factory.CreateFormatConverter()?;
-            converter.Initialize(
-                &source,
-                &GUID_WICPixelFormat32bppPBGRA,
-                WICBitmapDitherTypeNone,
-                None::<&IWICPalette>,
-                0.0,
-                WICBitmapPaletteTypeCustom,
-            )?;
-            let (w, h) = (tw as usize, th as usize);
-            let stride = (w * 4) as u32;
-            let copy = |pixels: &mut [[u8; 4]]| {
-                let bytes = core::slice::from_raw_parts_mut(
-                    pixels.as_mut_ptr().cast::<u8>(),
-                    pixels.len() * 4,
-                );
-                converter
-                    .CopyPixels(core::ptr::null(), stride, bytes)
-                    .is_ok()
-            };
-            let bitmap = if o <= 1 || o > 8 {
-                Bitmap::with_pixels(tw, th, copy)
-            } else {
-                let mut stored_px = vec![[0u8; 4]; w * h];
-                if !copy(&mut stored_px) {
-                    return Err(E_FAIL.into());
-                }
-                let (ow, oh) = if swaps(o) { (th, tw) } else { (tw, th) };
-                Bitmap::with_pixels(ow, oh, |dst| {
-                    orient_into(&stored_px, w, h, o, dst);
-                    true
-                })
-            }
-            .ok_or(windows::core::Error::from(E_OUTOFMEMORY))?;
-            let opaque = pixels_opaque(&bitmap);
-            Ok(Decoded {
-                bitmap,
-                natural: upright,
-                opaque,
+            let (ow, oh) = if swaps(o) { (th, tw) } else { (tw, th) };
+            Bitmap::with_pixels(ow, oh, |dst| {
+                orient_into(&stored_px, w, h, o, dst);
+                opaque = pixels_opaque(dst);
+                true
             })
         }
+        .ok_or(windows::core::Error::from(E_OUTOFMEMORY))?;
+        Ok(Decoded {
+            bitmap,
+            natural: upright,
+            opaque,
+        })
     }
 }
 
 /// The frame to show: the first, or of an icon file the biggest.
-fn best_frame(
-    decoder: &IWICBitmapDecoder,
-    container: GUID,
-) -> windows::core::Result<IWICBitmapFrameDecode> {
-    // SAFETY: COM calls on a live decoder of this thread.
-    unsafe {
-        if container != GUID_ContainerFormatIco {
-            return decoder.GetFrame(0);
-        }
-        let mut best = decoder.GetFrame(0)?;
-        let mut area = 0u64;
-        for i in 0..decoder.GetFrameCount()?.min(64) {
-            let Ok(frame) = decoder.GetFrame(i) else {
-                continue;
-            };
-            let (mut w, mut h) = (0u32, 0u32);
-            if frame.GetSize(&mut w, &mut h).is_ok() && u64::from(w) * u64::from(h) > area {
-                area = u64::from(w) * u64::from(h);
-                best = frame;
-            }
-        }
-        Ok(best)
+fn best_frame(decoder: &Decoder, container: GUID) -> windows::core::Result<Frame> {
+    if container != GUID_ContainerFormatIco {
+        return decoder.frame(0);
     }
+    let mut best = decoder.frame(0)?;
+    let mut area = 0u64;
+    for i in 0..decoder.frame_count()?.min(64) {
+        let Ok(frame) = decoder.frame(i) else {
+            continue;
+        };
+        if let Ok((w, h)) = frame.size()
+            && u64::from(w) * u64::from(h) > area
+        {
+            area = u64::from(w) * u64::from(h);
+            best = frame;
+        }
+    }
+    Ok(best)
 }
 
 /// The EXIF orientation of a JPEG's or TIFF's frame (1, upright, when it
 /// has none); other formats carry their turn in their own data, which
 /// their decoders apply.
-fn orientation(frame: &IWICBitmapFrameDecode, container: GUID) -> u16 {
+fn orientation(frame: &Frame, container: GUID) -> u16 {
     let query = if container == GUID_ContainerFormatJpeg {
         "/app1/ifd/{ushort=274}"
     } else if container == GUID_ContainerFormatTiff {
@@ -277,46 +204,14 @@ fn orientation(frame: &IWICBitmapFrameDecode, container: GUID) -> u16 {
     } else {
         return 1;
     };
-    let query = wz(query);
-    // SAFETY: COM calls on a live frame of this thread; the PROPVARIANT is
-    // cleared after it is read.
-    unsafe {
-        let Ok(reader) = frame.GetMetadataQueryReader() else {
-            return 1;
-        };
-        let mut value = PROPVARIANT::default();
-        if reader
-            .GetMetadataByName(PCWSTR(query.as_ptr()), &mut value)
-            .is_err()
-        {
-            return 1;
-        }
-        let o = PropVariantToUInt16(&value).unwrap_or(1);
-        let _ = PropVariantClear(&mut value);
-        if (1..=8).contains(&o) { o } else { 1 }
-    }
+    let o = frame.metadata_u16(query).unwrap_or(1);
+    if (1..=8).contains(&o) { o } else { 1 }
 }
 
-/// Whether no pixel of `bitmap` lets the background through.
-fn pixels_opaque(bitmap: &Bitmap) -> bool {
-    use windows_sys::Win32::Graphics::Gdi::{DIBSECTION, GetObjectW};
-    // SAFETY: reads the DIB section's header, then its pixels, which the
-    // bitmap owns and nothing writes meanwhile.
-    unsafe {
-        let mut ds: DIBSECTION = core::mem::zeroed();
-        if GetObjectW(
-            bitmap.handle(),
-            size_of::<DIBSECTION>() as i32,
-            (&raw mut ds).cast(),
-        ) == 0
-            || ds.dsBm.bmBits.is_null()
-        {
-            return false;
-        }
-        let n = (bitmap.width * bitmap.height) as usize;
-        let px = core::slice::from_raw_parts(ds.dsBm.bmBits.cast::<[u8; 4]>(), n);
-        px.iter().all(|p| p[3] == 255)
-    }
+/// Whether no pixel of `pixels` (premultiplied BGRA) lets the background
+/// through.
+fn pixels_opaque(pixels: &[[u8; 4]]) -> bool {
+    pixels.iter().all(|p| p[3] == 255)
 }
 
 #[cfg(test)]

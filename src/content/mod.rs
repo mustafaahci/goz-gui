@@ -47,7 +47,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::client::{
     BLOCK_ROWS, Failure, Reply, Row, RowRange, Search, Stop, Streamed, stream_range,
@@ -303,9 +302,12 @@ impl Run {
         }
         if !self.told.swap(true, Ordering::AcqRel) {
             self.last_told.store(at, Ordering::Relaxed);
-            // SAFETY: a plain post (no payload) to the window that started
-            // the run; a window gone since just drops it.
-            unsafe { PostMessageW(self.hwnd as HWND, self.msg, 0, 0) };
+            // A plain post (no payload) to the window that started the run;
+            // a window gone since just drops it. A run made without one
+            // (the tests', message 0) tells no one.
+            if self.msg != 0 {
+                crate::win::post_app(self.hwnd as HWND, self.msg, 0, 0);
+            }
         }
     }
 

@@ -22,14 +22,12 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::UI::Controls::LVIS_SELECTED;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetInputState, KillTimer, PostMessageW, SetTimer, WM_APP,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_APP;
 
 use super::App;
 use crate::pane::PaneEvent;
+use crate::win;
 
 /// Posted to the main window: the next slice of rows to set.
 pub(super) const WM_SELECTING: u32 = WM_APP + 370;
@@ -133,8 +131,8 @@ impl App {
 
     /// The next slice's message or timer came.
     pub(super) fn selecting_due(&self) {
-        // SAFETY: this window's timer (none set is fine).
-        unsafe { KillTimer(self.hwnd, TIMER_SELECTING) };
+        // This window's timer (none set is fine).
+        win::kill_timer(self.hwnd, TIMER_SELECTING);
         self.selecting.borrow_mut().queued = false;
         self.selecting_slice(Some(SLICE));
     }
@@ -193,22 +191,18 @@ impl App {
             // The user's keys and clicks first, if some are waiting (a
             // posted message would come before them): the timer comes
             // after them.
-            // SAFETY: a plain query, and a timer or a post of this
-            // thread's window.
-            unsafe {
-                if GetInputState() != 0 {
-                    SetTimer(self.hwnd, TIMER_SELECTING, 1, None);
-                } else {
-                    PostMessageW(self.hwnd, WM_SELECTING, 0, 0);
-                }
+            if win::queue::input_waiting() {
+                win::set_timer(self.hwnd, TIMER_SELECTING, 1);
+            } else {
+                win::post_app(self.hwnd, WM_SELECTING, 0, 0);
             }
         }
         if was {
             // Inside another run of rows (`in_bulk`): it reports.
             return;
         }
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
+        // Repaints this thread's list.
+        win::invalidate(self.list, None, false);
         if done && self.bulk_changed.take() {
             self.invalidate_status();
             self.pane_event(PaneEvent::SelectionChanged);

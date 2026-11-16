@@ -17,21 +17,16 @@
 
 use std::cell::RefCell;
 
-use windows_sys::Win32::Foundation::{HWND, RECT};
-use windows_sys::Win32::UI::Controls::{
-    HDM_GETITEMCOUNT, LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNWIDTH, LVM_GETHEADER,
-    LVM_SETCOLUMNORDERARRAY, LVM_SETCOLUMNWIDTH,
-};
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
-    SetWindowPos, ShowWindow,
+    SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
 };
 
 use crate::columns::{scale, unscale};
 use crate::dialog::center_on_owner;
 use crate::placement::{self, Monitor, Rect};
 use crate::settings::WindowPos;
+use crate::win::{self, header, lv, sys};
 
 /// The windows whose place is kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -497,54 +492,35 @@ pub fn put_place(which: Which, place: Place) {
 pub fn restore_at(window: HWND, which: Which, place: &Place, list: HWND, min: (i32, i32)) {
     let place = place.clone();
     let k = which.keys();
-    let mut now = RECT::default();
-    // SAFETY: reads this thread's window and its DPI.
-    let dpi = unsafe {
-        GetWindowRect(window, &mut now);
-        GetDpiForWindow(window).max(96)
-    };
+    let now = win::window_rect(window);
+    let dpi = sys::dpi_for_window(window).max(96);
     let now = Rect::from_win(&now);
     let monitors = placement::monitors();
     let work = placement::monitor_of(&now, &monitors).map(|i| monitors[i].work);
     match opening(&place, k.pos, &monitors, (dpi, work), min) {
         Some(Opening::At(r)) => {
-            // SAFETY: moves this thread's window: first onto the monitor
-            // (which may scale it for that monitor's DPI), then sizes it
-            // for the DPI there.
-            unsafe {
-                SetWindowPos(
-                    window,
-                    core::ptr::null_mut(),
-                    r.x,
-                    r.y,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                SetWindowPos(
-                    window,
-                    core::ptr::null_mut(),
-                    r.x,
-                    r.y,
-                    r.w,
-                    r.h,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
+            // Moves the window first onto the monitor (which may scale it
+            // for that monitor's DPI), then sizes it for the DPI there.
+            win::set_pos(
+                window,
+                core::ptr::null_mut(),
+                (r.x, r.y, 0, 0),
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            win::set_pos(
+                window,
+                core::ptr::null_mut(),
+                (r.x, r.y, r.w, r.h),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
         Some(Opening::Centred(w, h)) => {
-            // SAFETY: sizes this thread's window.
-            unsafe {
-                SetWindowPos(
-                    window,
-                    core::ptr::null_mut(),
-                    now.x,
-                    now.y,
-                    w,
-                    h,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
+            win::set_pos(
+                window,
+                core::ptr::null_mut(),
+                (now.x, now.y, w, h),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
             center_on_owner(window);
         }
         None => {}
@@ -553,9 +529,8 @@ pub fn restore_at(window: HWND, which: Which, place: &Place, list: HWND, min: (i
         restore_columns(list, &place.columns, k.order);
     }
     if place.sized() && place.maximized && k.max {
-        // SAFETY: shows this thread's window maximized; its normal
-        // rectangle is the one just set.
-        unsafe { ShowWindow(window, SW_SHOWMAXIMIZED) };
+        // Its normal rectangle is the one just set.
+        win::show(window, SW_SHOWMAXIMIZED);
     }
 }
 
@@ -564,20 +539,11 @@ fn restore_columns(list: HWND, columns: &[Column], order: bool) {
     let dpi = crate::custom::window_dpi(list);
     for (i, c) in columns.iter().enumerate() {
         if c.width > 0 {
-            // SAFETY: a message to this thread's list.
-            unsafe { SendMessageW(list, LVM_SETCOLUMNWIDTH, i, scale(c.width, dpi) as isize) };
+            lv::set_column_width(list, i as i32, scale(c.width, dpi));
         }
     }
     if order && let Some(at) = order_array(columns) {
-        // SAFETY: the array of the list's column count outlives the call.
-        unsafe {
-            SendMessageW(
-                list,
-                LVM_SETCOLUMNORDERARRAY,
-                at.len(),
-                at.as_ptr() as isize,
-            )
-        };
+        lv::set_column_order(list, &at);
     }
 }
 
@@ -602,29 +568,22 @@ pub fn measured(window: HWND, which: Which, list: HWND, was: Place) -> Place {
         place.maximized = maximized && which.keys().max;
     }
     if !list.is_null() {
-        // SAFETY: reads this thread's list: its DPI, its header's column
-        // count, each width, and the order into an array of that count.
-        unsafe {
-            let dpi = crate::custom::window_dpi(list);
-            let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
-            let n = SendMessageW(header, HDM_GETITEMCOUNT, 0, 0).max(0) as usize;
-            let n = n.min(place.columns.len());
-            let mut at = vec![0i32; n];
-            let ordered =
-                SendMessageW(list, LVM_GETCOLUMNORDERARRAY, n, at.as_mut_ptr() as isize) != 0;
-            for i in 0..n {
-                let width = SendMessageW(list, LVM_GETCOLUMNWIDTH, i, 0) as i32;
-                place.columns[i].width = unscale(width, dpi).clamp(0, MAX_WIDTH);
-            }
-            if ordered {
-                for (slot, &col) in at.iter().enumerate() {
-                    if let Some(c) = usize::try_from(col)
-                        .ok()
-                        .and_then(|col| place.columns.get_mut(col))
-                    {
-                        c.order = slot as i32;
-                    }
-                }
+        // The list's DPI, its header's column count, each width, and the
+        // order (none if the list would not give it).
+        let dpi = crate::custom::window_dpi(list);
+        let n = header::item_count(lv::header(list));
+        let n = n.min(place.columns.len());
+        let at = lv::column_order(list, n);
+        for i in 0..n {
+            let width = lv::column_width(list, i as i32);
+            place.columns[i].width = unscale(width, dpi).clamp(0, MAX_WIDTH);
+        }
+        for (slot, &col) in at.iter().enumerate() {
+            if let Some(c) = usize::try_from(col)
+                .ok()
+                .and_then(|col| place.columns.get_mut(col))
+            {
+                c.order = slot as i32;
             }
         }
     }

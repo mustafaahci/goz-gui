@@ -9,15 +9,15 @@
 //! Ctrl keys: it posts a message when it sees the double press and lets
 //! every key go on.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows_sys::Win32::Foundation::{HWND, LRESULT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, PostMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
+
+use crate::win::hook::{self, Event, Hook, Kind};
+use crate::win::{self, sys};
 
 /// What the keys seen so far add up to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,7 +82,7 @@ impl Detector {
 }
 
 thread_local! {
-    static HOOK: Cell<HHOOK> = const { Cell::new(core::ptr::null_mut()) };
+    static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
     static TARGET: Cell<(HWND, u32)> = const { Cell::new((core::ptr::null_mut(), 0)) };
     static STATE: Cell<Detector> = const {
         Cell::new(Detector { down: None, spoiled: false, tapped: None })
@@ -93,36 +93,37 @@ const VK_CONTROL: u32 = 0x11;
 const VK_LCONTROL: u32 = 0xa2;
 const VK_RCONTROL: u32 = 0xa3;
 
-unsafe extern "system" fn hook_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && l != 0 {
-        // SAFETY: for HC_ACTION, lParam points at the event's struct.
-        let k = unsafe { &*(l as *const KBDLLHOOKSTRUCT) };
-        let ctrl = matches!(k.vkCode, VK_CONTROL | VK_LCONTROL | VK_RCONTROL);
-        let msg = w as u32;
-        let key = match (ctrl, msg) {
-            (true, WM_KEYDOWN | WM_SYSKEYDOWN) => Some(Key::CtrlDown),
-            (true, WM_KEYUP | WM_SYSKEYUP) => Some(Key::CtrlUp),
-            (false, WM_KEYDOWN | WM_SYSKEYDOWN) => Some(Key::Other),
-            _ => None,
-        };
-        if let Some(key) = key {
-            // SAFETY: reads a user setting.
-            let within = unsafe { GetDoubleClickTime() };
-            let fire = STATE.with(|s| {
-                let mut d = s.get();
-                let fire = d.key(key, k.time, within);
-                s.set(d);
-                fire
-            });
-            if fire {
-                let (hwnd, message) = TARGET.with(Cell::get);
-                // SAFETY: posts to this thread's window; nothing waits.
-                unsafe { PostMessageW(hwnd, message, 0, 0) };
-            }
+/// The hook's view of each key: it watches the Ctrl keys and lets every
+/// key go on, as every hook must (`None`).
+fn on_key(event: &Event) -> Option<LRESULT> {
+    let &Event::Key {
+        message, vk, time, ..
+    } = event
+    else {
+        return None;
+    };
+    let ctrl = matches!(vk, VK_CONTROL | VK_LCONTROL | VK_RCONTROL);
+    let key = match (ctrl, message) {
+        (true, WM_KEYDOWN | WM_SYSKEYDOWN) => Some(Key::CtrlDown),
+        (true, WM_KEYUP | WM_SYSKEYUP) => Some(Key::CtrlUp),
+        (false, WM_KEYDOWN | WM_SYSKEYDOWN) => Some(Key::Other),
+        _ => None,
+    };
+    if let Some(key) = key {
+        let within = sys::double_click_ms();
+        let fire = STATE.with(|s| {
+            let mut d = s.get();
+            let fire = d.key(key, time, within);
+            s.set(d);
+            fire
+        });
+        if fire {
+            let (hwnd, message) = TARGET.with(Cell::get);
+            // Posts to this thread's window; nothing waits.
+            win::post_app(hwnd, message, 0, 0);
         }
     }
-    // SAFETY: passes the event on, as every hook must.
-    unsafe { CallNextHookEx(core::ptr::null_mut(), code, w, l) }
+    None
 }
 
 /// Puts the hook in, posting `message` to `hwnd` on a double Ctrl; false
@@ -130,29 +131,19 @@ unsafe extern "system" fn hook_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT 
 pub fn install(hwnd: HWND, message: u32) -> bool {
     TARGET.with(|t| t.set((hwnd, message)));
     STATE.with(|s| s.set(Detector::default()));
-    if !HOOK.with(Cell::get).is_null() {
+    if HOOK.with_borrow(Option::is_some) {
         return true;
     }
-    // SAFETY: a low-level hook needs the module of its procedure, this
-    // exe's; it runs on this thread, which pumps messages.
-    let hook = unsafe {
-        SetWindowsHookExW(
-            WH_KEYBOARD_LL,
-            Some(hook_proc),
-            GetModuleHandleW(core::ptr::null()),
-            0,
-        )
-    };
-    HOOK.with(|h| h.set(hook));
-    !hook.is_null()
+    // A low-level hook, which runs on this thread (which pumps messages).
+    let hook = hook::set(Kind::KeyboardLl, on_key);
+    let set = hook.is_some();
+    HOOK.set(hook);
+    set
 }
 
 pub fn uninstall() {
-    let hook = HOOK.with(|h| h.replace(core::ptr::null_mut()));
-    if !hook.is_null() {
-        // SAFETY: the hook this thread put in.
-        unsafe { UnhookWindowsHookEx(hook) };
-    }
+    // The hook this thread put in, taken out as it drops.
+    drop(HOOK.take());
 }
 
 #[cfg(test)]

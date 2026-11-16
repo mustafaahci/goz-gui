@@ -23,7 +23,6 @@ use goz_core::proto::{
 use goz_core::types::{SortKey, SortSpec};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Threading::INFINITE;
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use super::{Failure, Io, Pipe, Shared, Stop};
 use crate::props::Want;
@@ -224,9 +223,9 @@ impl Watcher {
         let thread = stop.clone();
         let hwnd = hwnd as usize;
         let tell = move |what: usize| {
-            // SAFETY: a plain post (no payload) to the window that started
-            // the watch; a window gone since just drops it.
-            unsafe { PostMessageW(hwnd as HWND, msg, what, 0) };
+            // A plain post (no payload) to the window that started the
+            // watch; a window gone since just drops it.
+            crate::win::post_app(hwnd as HWND, msg, what, 0);
         };
         std::thread::Builder::new()
             .name("goz-watch".into())

@@ -9,18 +9,15 @@
 
 use std::cell::{Cell, RefCell};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, DestroyMenu, EndDialog, GWLP_USERDATA, GetDlgItem, GetWindowRect, IDCANCEL,
-    IDOK, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LBN_DBLCLK, LBN_SELCHANGE,
-    LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, SendMessageW, SetWindowLongPtrW, WM_COMMAND, WM_INITDIALOG,
-    WS_BORDER, WS_TABSTOP, WS_VSCROLL,
+    BS_DEFPUSHBUTTON, IDCANCEL, IDOK, LBN_DBLCLK, LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
+    WM_COMMAND, WM_INITDIALOG, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::columns::{COL_NAME, COLS, Layout};
-use crate::dialog::{Class, LIST_BOX, Look, Template, apply_theme, center_on_owner, common, state};
-use crate::wide::wz;
+use crate::dialog::{Class, LIST_BOX, Look, Template, apply_theme, center_on_owner, common};
+use crate::win::{self, Msg, dlg, listbox};
 
 const LIST: u16 = 1000;
 const ADD: u16 = 1002;
@@ -168,40 +165,28 @@ pub fn show(owner: HWND, layout: Layout, look: Look) -> Option<Layout> {
         0,
         (197, 274, 53, 14),
     );
-    t.run(owner, Some(proc), (&raw const s) as LPARAM);
+    t.show(owner, &|m| proc(&s, m));
     s.done.get().then(|| s.order.into_inner().layout(layout))
 }
 
-fn item(dlg: HWND, id: u16) -> HWND {
-    // SAFETY: looks up a child of this thread's dialog.
-    unsafe { GetDlgItem(dlg, i32::from(id)) }
-}
-
-fn send(dlg: HWND, id: u16, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: a message to a control of this thread's dialog; a pointer in
-    // `l` is the caller's and outlives the call.
-    unsafe { SendMessageW(item(dlg, id), msg, w, l) }
-}
-
 fn enable(dlg: HWND, id: u16, on: bool) {
-    // SAFETY: a control of this thread's dialog.
-    unsafe { EnableWindow(item(dlg, id), on.into()) };
+    win::enable(dlg::item(dlg, id), on);
 }
 
 impl Organize {
     fn selected(&self, dlg: HWND) -> Option<usize> {
-        usize::try_from(send(dlg, LIST, LB_GETCURSEL, 0, 0)).ok()
+        usize::try_from(listbox::cur_sel(dlg::item(dlg, LIST))).ok()
     }
 
     /// The list as the order is, `select` selected.
     fn fill(&self, dlg: HWND, select: Option<usize>) {
-        send(dlg, LIST, LB_RESETCONTENT, 0, 0);
+        let list = dlg::item(dlg, LIST);
+        listbox::reset(list);
         for &id in &self.order.borrow().shown {
-            let text = wz(crate::columns::title(id));
-            send(dlg, LIST, LB_ADDSTRING, 0, text.as_ptr() as isize);
+            listbox::add(list, crate::columns::title(id));
         }
         if let Some(at) = select {
-            send(dlg, LIST, LB_SETCURSEL, at, 0);
+            listbox::set_cur_sel(list, at as i32);
         }
         self.update(dlg);
     }
@@ -223,16 +208,14 @@ impl Organize {
             return;
         }
         let menu = crate::menu::columns_menu(&hidden);
-        let mut rc = RECT::default();
-        // SAFETY: reads this dialog's button.
-        unsafe { GetWindowRect(item(dlg, ADD), &mut rc) };
+        let rc = win::window_rect(dlg::item(dlg, ADD));
         let pt = POINT {
             x: rc.left,
             y: rc.bottom,
         };
         let cmd = crate::popup::track(menu, dlg, pt, "organize columns add", &|_| None);
-        // SAFETY: the menu made above.
-        unsafe { DestroyMenu(menu) };
+        // The menu made above.
+        win::menu::destroy(menu);
         let Some(id) = u16::try_from(cmd).ok().and_then(crate::menu::column_of) else {
             return;
         };
@@ -242,30 +225,21 @@ impl Organize {
     }
 }
 
-unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Organize` that `show` keeps alive until the
-        // dialog has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Organize` from `show`, or null.
-    let Some(s) = (unsafe { state::<Organize>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn proc(s: &Organize, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.fill(dlg, Some(0));
             apply_theme(dlg, s.look.get().dark);
             center_on_owner(dlg);
-            // SAFETY: focuses this dialog's list.
-            unsafe { SetFocus(item(dlg, LIST)) };
+            win::set_focus(dlg::item(dlg, LIST));
             0
         }
         WM_COMMAND => {
-            let (id, code) = ((w & 0xffff) as u16, ((w >> 16) & 0xffff) as u32);
+            let (id, code) = (win::loword(m.w), u32::from(win::hiword(m.w)));
             match id {
                 LIST if code == LBN_SELCHANGE || code == LBN_DBLCLK => s.update(dlg),
                 ADD => s.add(dlg),
@@ -290,13 +264,9 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isi
                 }
                 OK => {
                     s.done.set(true);
-                    // SAFETY: ends this modal dialog.
-                    unsafe { EndDialog(dlg, 1) };
+                    dlg::end(dlg, 1);
                 }
-                // SAFETY: ends this modal dialog.
-                CANCEL => unsafe {
-                    EndDialog(dlg, 0);
-                },
+                CANCEL => dlg::end(dlg, 0),
                 _ => return 0,
             }
             1

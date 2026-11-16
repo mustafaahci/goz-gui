@@ -8,30 +8,23 @@
 //! background for the first with `run_in_background`); Exit closes every
 //! window of this goz-gui.
 
-use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HWND};
-use windows_sys::Win32::System::Threading::{
-    CREATE_DEFAULT_ERROR_MODE, CreateProcessW, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
-    STARTUPINFOW,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, DestroyWindow, GetForegroundWindow, PostMessageW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::System::Threading::CREATE_DEFAULT_ERROR_MODE;
+use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL};
 
 use super::{App, slots};
 use crate::cmdline::Launch;
 use crate::settings::WindowPos;
 use crate::tabs;
-use crate::wide::wz;
+use crate::win::{self, Msg, parcel};
 
 /// A window of the instance asked this one to end (Exit was chosen there).
 pub(super) const WM_EXIT_WINDOW: u32 = slots::F3_MSG;
-/// File > New Window could not start goz-gui: a `Box<String>` in lParam
-/// says why.
+/// File > New Window could not start goz-gui: a `String` that comes with
+/// it as a parcel (`win::parcel`) says why.
 pub(super) const WM_NEW_WINDOW_FAILED: u32 = slots::F3_MSG + 1;
 
 /// The environment variable that starts File > New Window's goz-gui
@@ -77,8 +70,7 @@ impl App {
         // Brought to the front when this window is (the user's Ctrl+N) or
         // the tray asked for it; shown without taking the foreground
         // otherwise.
-        // SAFETY: reads the foreground window.
-        let front = asked || unsafe { GetForegroundWindow() } == self.hwnd;
+        let front = asked || win::foreground() == self.hwnd;
         let show = if std::env::var_os(HIDDEN_VAR).is_some_and(|v| v == "1") {
             SW_HIDE
         } else if front {
@@ -95,16 +87,9 @@ impl App {
             Path::new(&key),
             Box::new(move || {
                 if let Err(why) = spawn(&exe, &args, show as u16, front) {
-                    let text = Box::into_raw(Box::new(format!(
-                        "A new window could not be started: {why}"
-                    )));
-                    // SAFETY: posts to the window; if that fails the box is
-                    // taken back.
-                    unsafe {
-                        if PostMessageW(hwnd as HWND, WM_NEW_WINDOW_FAILED, 0, text as isize) == 0 {
-                            drop(Box::from_raw(text));
-                        }
-                    }
+                    let text = format!("A new window could not be started: {why}");
+                    // Freed again if the window is gone.
+                    parcel::post(hwnd as HWND, WM_NEW_WINDOW_FAILED, 0, text);
                 }
             }),
         );
@@ -132,23 +117,23 @@ impl App {
     }
 
     /// F3's WM_APP messages.
-    pub(super) fn window_message(&self, msg: u32, w: usize, l: isize) -> Option<isize> {
-        match msg {
+    pub(super) fn window_message(&self, m: &Msg) -> Option<isize> {
+        match m.id {
             WM_EXIT_WINDOW => {
-                if w != 0 {
+                if m.w != 0 {
                     // Another window imports or resets the settings: what
                     // this one holds is not written over them.
                     self.writer.close();
                 }
-                // SAFETY: closes this thread's window for good, as -exit
-                // does.
-                unsafe { DestroyWindow(self.hwnd) };
+                // Closes this window for good, as -exit does.
+                win::destroy(self.hwnd);
                 Some(0)
             }
             WM_NEW_WINDOW_FAILED => {
-                // SAFETY: the box the store thread posted.
-                let text = unsafe { Box::from_raw(l as *mut String) };
-                self.show_note(*text);
+                // The text the store thread posted.
+                if let Some(text) = parcel::take::<String>(m) {
+                    self.show_note(text);
+                }
                 Some(0)
             }
             _ => None,
@@ -181,41 +166,7 @@ impl App {
 fn spawn(exe: &Path, args: &[String], show: u16, front: bool) -> Result<(), String> {
     // The program by its exact name; the command line's first argument
     // (which goz-gui does not read) may be a lossy copy.
-    let app: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut line = wz(&tabs::command_line(&exe.to_string_lossy(), args));
-    let si = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        dwFlags: STARTF_USESHOWWINDOW,
-        wShowWindow: show,
-        // SAFETY: the rest of STARTUPINFOW is plain data, zero for none.
-        ..unsafe { core::mem::zeroed() }
-    };
-    // SAFETY: plain out-struct.
-    let mut pi: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
-    // SAFETY: NUL-terminated strings (the command line in a buffer the
-    // call may write to), no handles inherited, this process's environment
-    // and folder; the handles it gives back are closed here.
-    unsafe {
-        if CreateProcessW(
-            app.as_ptr(),
-            line.as_mut_ptr(),
-            core::ptr::null(),
-            core::ptr::null(),
-            0,
-            CREATE_DEFAULT_ERROR_MODE,
-            core::ptr::null(),
-            core::ptr::null(),
-            &si,
-            &mut pi,
-        ) == 0
-        {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        if front {
-            AllowSetForegroundWindow(pi.dwProcessId);
-        }
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-    }
-    Ok(())
+    let line = tabs::command_line(&exe.to_string_lossy(), args);
+    win::process::create(exe, &line, show, CREATE_DEFAULT_ERROR_MODE, front)
+        .map_err(|e| e.to_string())
 }

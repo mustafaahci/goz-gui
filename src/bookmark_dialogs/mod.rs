@@ -25,24 +25,19 @@ pub use organize::organize;
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::UI::Controls::{
-    HIMAGELIST, HTREEITEM, TVE_EXPAND, TVGN_CARET, TVI_LAST, TVI_ROOT, TVIF_IMAGE, TVIF_PARAM,
-    TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMW, TVM_DELETEITEM,
-    TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_INSERTITEMW, TVM_SELECTITEM,
+    TVE_EXPAND, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE, TVITEMEXW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-use windows_sys::Win32::UI::Shell::{
-    SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
-};
+use windows_sys::Win32::UI::Shell::{SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetDlgItem, IDYES, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO,
-    SendMessageW, SetWindowTextW, WM_APP,
+    IDYES, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, WM_APP,
 };
 
 use crate::bookmarks::ops::Op;
 use crate::bookmarks::tree::{Item, TOP, Tree};
 use crate::bookmarks::{Bookmarks, FolderPath, Settings, within};
 use crate::msgbox;
-use crate::wide::wz;
+use crate::win::imagelist::SystemList;
+use crate::win::{self, dlg, tv};
 
 /// Posted to an open Find or Organize dialog when the bookmarks changed
 /// (another goz-gui's, read before a write): it shows them again.
@@ -66,28 +61,11 @@ pub trait Host {
     fn showing(&self, dlg: HWND);
 }
 
-fn item(dlg: HWND, id: u16) -> HWND {
-    // SAFETY: looks up a child of this thread's dialog.
-    unsafe { GetDlgItem(dlg, i32::from(id)) }
-}
-
-fn send(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: a message to a window of this thread; any pointer in `l` is
-    // the caller's and lives across the synchronous call.
-    unsafe { SendMessageW(hwnd, msg, w, l) }
-}
-
 fn enable(dlg: HWND, id: u16, on: bool) {
-    let h = item(dlg, id);
+    let h = dlg::item(dlg, id);
     if !h.is_null() {
-        // SAFETY: a control of this thread's dialog.
-        unsafe { EnableWindow(h, on.into()) };
+        win::enable(h, on);
     }
-}
-
-fn set_text(hwnd: HWND, text: &str) {
-    // SAFETY: a NUL-terminated string for a window of this thread.
-    unsafe { SetWindowTextW(hwnd, wz(text).as_ptr()) };
 }
 
 fn message(owner: HWND, title: &str, text: &str, style: u32) -> i32 {
@@ -117,33 +95,24 @@ fn ask(owner: HWND, title: &str, text: &str) -> bool {
 /// plain file's for a bookmark (Everything's bookmark icon is a page too).
 #[derive(Clone, Copy)]
 struct Icons {
-    /// The system's small image list (shared: never destroyed here).
-    list: HIMAGELIST,
+    /// The system's small image list (`None` if the shell could not say).
+    list: Option<SystemList>,
     folder: i32,
     bookmark: i32,
 }
 
 fn icons() -> Icons {
     let lookup = |name: &str, attributes: u32| {
-        // SAFETY: an attribute-only lookup into a plain out-struct.
-        unsafe {
-            let mut info: SHFILEINFOW = core::mem::zeroed();
-            let list = SHGetFileInfoW(
-                wz(name).as_ptr(),
-                attributes,
-                &mut info,
-                size_of::<SHFILEINFOW>() as u32,
-                SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
-            );
-            (list as HIMAGELIST, info.iIcon)
-        }
+        // An attribute-only lookup by name (no file is read).
+        let name: Vec<u16> = name.encode_utf16().collect();
+        win::icon::sys_icon(&name, attributes, SHGFI_USEFILEATTRIBUTES | SHGFI_SMALLICON)
     };
-    let (list, folder) = lookup("folder", FILE_ATTRIBUTE_DIRECTORY);
-    let (_, bookmark) = lookup("bookmark", FILE_ATTRIBUTE_NORMAL);
+    let folder = lookup("folder", FILE_ATTRIBUTE_DIRECTORY);
+    let bookmark = lookup("bookmark", FILE_ATTRIBUTE_NORMAL);
     Icons {
-        list,
-        folder,
-        bookmark,
+        list: folder.map(|(list, _)| list),
+        folder: folder.map_or(0, |(_, i)| i),
+        bookmark: bookmark.map_or(0, |(_, i)| i),
     }
 }
 
@@ -153,34 +122,22 @@ const TOP_NAME: &str = "Bookmarks";
 /// Fills a tree view with the folders of `tree`, all open: the top as
 /// "Bookmarks", each item's lParam its node. The folders `skip` (and what
 /// is in them) are left out. Returns each node's item.
-fn fill_tree(
-    view: HWND,
-    tree: &Tree,
-    skip: &[FolderPath],
-    icons: Icons,
-) -> Vec<(usize, HTREEITEM)> {
-    send(view, TVM_DELETEITEM, 0, TVI_ROOT);
+fn fill_tree(view: HWND, tree: &Tree, skip: &[FolderPath], icons: Icons) -> Vec<(usize, tv::Item)> {
+    tv::delete_all(view);
     let mut made = Vec::new();
-    let insert = |parent: HTREEITEM, text: &str, node: usize| -> HTREEITEM {
-        let mut text = wz(text);
-        let ins = TVINSERTSTRUCTW {
-            hParent: parent,
-            hInsertAfter: TVI_LAST,
-            Anonymous: TVINSERTSTRUCTW_0 {
-                item: TVITEMW {
-                    mask: TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE | TVIF_SELECTEDIMAGE,
-                    pszText: text.as_mut_ptr(),
-                    iImage: icons.folder,
-                    iSelectedImage: icons.folder,
-                    lParam: node as LPARAM,
-                    // SAFETY: the rest of TVITEMW is plain data.
-                    ..unsafe { core::mem::zeroed() }
-                },
-            },
+    let insert = |parent: Option<tv::Item>, text: &str, node: usize| -> Option<tv::Item> {
+        let item = TVITEMEXW {
+            mask: TVIF_PARAM | TVIF_IMAGE | TVIF_SELECTEDIMAGE,
+            iImage: icons.folder,
+            iSelectedImage: icons.folder,
+            lParam: node as LPARAM,
+            ..Default::default()
         };
-        send(view, TVM_INSERTITEMW, 0, (&raw const ins) as isize) as HTREEITEM
+        tv::insert(view, parent, tv::After::Last, item, Some(text))
     };
-    let top = insert(TVI_ROOT, TOP_NAME, TOP);
+    let Some(top) = insert(None, TOP_NAME, TOP) else {
+        return made;
+    };
     made.push((TOP, top));
     // Each folder after its parent, depth first: a parent is made first.
     for (f, _) in tree.folders_below(TOP) {
@@ -193,37 +150,30 @@ fn fill_tree(
         let Some(&(_, at)) = made.iter().find(|(n, _)| *n == parent) else {
             continue;
         };
-        let h = insert(at, tree.nodes[f].name(), f);
-        made.push((f, h));
+        if let Some(h) = insert(Some(at), tree.nodes[f].name(), f) {
+            made.push((f, h));
+        }
     }
     for &(_, h) in &made {
-        send(view, TVM_EXPAND, TVE_EXPAND as usize, h);
+        tv::expand(h, TVE_EXPAND);
     }
     made
 }
 
 /// Selects `node`'s item in a tree view `fill_tree` filled.
-fn tree_select(view: HWND, made: &[(usize, HTREEITEM)], node: usize) {
+fn tree_select(made: &[(usize, tv::Item)], node: usize) {
     if let Some(&(_, h)) = made.iter().find(|(n, _)| *n == node) {
-        send(view, TVM_SELECTITEM, TVGN_CARET as usize, h);
-        send(view, TVM_ENSUREVISIBLE, 0, h);
+        tv::select(h.tree(), tv::Select::Caret, Some(h));
+        tv::ensure_visible(h);
     }
 }
 
 /// The node of the tree view's selected item.
 fn tree_selected(view: HWND) -> Option<usize> {
-    let h = send(view, TVM_GETNEXTITEM, TVGN_CARET as usize, 0);
-    if h == 0 {
-        return None;
-    }
-    let mut it = TVITEMW {
-        mask: TVIF_PARAM,
-        hItem: h as HTREEITEM,
-        // SAFETY: the rest of TVITEMW is plain data.
-        ..unsafe { core::mem::zeroed() }
-    };
-    send(view, TVM_GETITEMW, 0, (&raw mut it) as isize);
-    usize::try_from(it.lParam).ok()
+    let h = tv::selection(view)?;
+    // An item the tree would not read reads as 0, the top.
+    let param = tv::item_param(h).unwrap_or(0);
+    usize::try_from(param).ok()
 }
 
 /// A name for a new folder in `node` that none there has: `New Folder`,

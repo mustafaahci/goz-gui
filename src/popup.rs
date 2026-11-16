@@ -12,22 +12,16 @@
 //! id, as if it had been clicked.
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{
-    CreateCompatibleBitmap, CreateCompatibleDC, DC_BRUSH, DeleteDC, DeleteObject, FillRect, GetDC,
-    GetPixel, GetStockObject, ReleaseDC, SelectObject, SetDCBrushColor,
-};
-use windows_sys::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODA_DRAWENTIRE, ODT_MENU,
-};
+use windows_sys::Win32::Graphics::Gdi::DC_BRUSH;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetMenuDefaultItem, GetMenuItemCount, GetMenuItemInfoW, HBMMENU_CALLBACK, HMENU, MENUITEMINFOW,
-    MFS_CHECKED, MFS_DISABLED, MFT_OWNERDRAW, MFT_RADIOCHECK, MFT_SEPARATOR, MIIM_BITMAP,
-    MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, SendMessageW,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM, WM_INITMENUPOPUP,
-    WM_MEASUREITEM,
+    HBMMENU_CALLBACK, HMENU, MFS_CHECKED, MFS_DISABLED, MFT_OWNERDRAW, MFT_RADIOCHECK,
+    MFT_SEPARATOR, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_INITMENUPOPUP,
 };
 
 use crate::store::location;
+use crate::win::gdi::get_pixel;
+use crate::win::menu::{self as wmenu, By};
+use crate::win::{self, gdi};
 
 /// Shows `menu` at `pt` (screen) for `owner` until an item is chosen or
 /// the menu closes, and returns the item's id, 0 for none. In a test's
@@ -42,19 +36,9 @@ pub fn track(
     verb: &dyn Fn(u32) -> Option<String>,
 ) -> u32 {
     if !location::menu_dump() {
-        // SAFETY: a menu of this thread shown for a window of it; the menu
-        // loop sends the owner its messages, while the caller holds no
-        // borrow.
-        let id = unsafe {
-            TrackPopupMenuEx(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                pt.x,
-                pt.y,
-                owner,
-                core::ptr::null(),
-            )
-        };
+        // The menu loop sends the owner its messages, while the caller
+        // holds no borrow.
+        let id = wmenu::track(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt, owner);
         return id.max(0) as u32;
     }
     let mut entries = Vec::new();
@@ -195,141 +179,97 @@ fn walk(
     verb: &dyn Fn(u32) -> Option<String>,
     out: &mut Vec<Entry>,
 ) {
-    // SAFETY: a message to a window of this thread about a menu of it, as
-    // the menu loop sends it; the caller holds no borrow.
-    unsafe { SendMessageW(owner, WM_INITMENUPOPUP, menu as usize, pos as isize) };
-    // SAFETY: reads a menu of this thread.
-    let (count, default) = unsafe { (GetMenuItemCount(menu), GetMenuDefaultItem(menu, 0, 0)) };
+    // As the menu loop sends it; the caller holds no borrow.
+    win::send_plain(owner, WM_INITMENUPOPUP, menu as usize, pos as isize);
+    let (count, default) = (wmenu::count(menu), wmenu::default_item(menu, false, 0));
     for i in 0..count.max(0) as u32 {
-        let mut text = [0u16; 512];
-        // SAFETY: the rest of MENUITEMINFOW is plain data.
-        let mut mii: MENUITEMINFOW = unsafe { core::mem::zeroed() };
-        mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
-        mii.fMask = MIIM_FTYPE
-            | MIIM_STATE
-            | MIIM_ID
-            | MIIM_SUBMENU
-            | MIIM_STRING
-            | MIIM_DATA
-            | MIIM_BITMAP;
-        mii.dwTypeData = text.as_mut_ptr();
-        mii.cch = text.len() as u32 - 1;
-        // SAFETY: the struct and the text buffer it points at.
-        if unsafe { GetMenuItemInfoW(menu, i, 1, &mut mii) } == 0 {
+        let Some(item) = wmenu::item_info(menu, By::Position(i)) else {
             continue;
-        }
-        let owner_drawn = mii.fType & MFT_OWNERDRAW != 0;
+        };
+        let owner_drawn = item.kind & MFT_OWNERDRAW != 0;
         let label = if owner_drawn {
             String::new()
         } else {
-            let len = text.iter().position(|&c| c == 0).unwrap_or(0);
-            String::from_utf16_lossy(&text[..len])
+            item.text
         };
-        let submenu = !mii.hSubMenu.is_null();
-        let measure = || drawn(owner, menu, mii.wID, mii.dwItemData);
+        let submenu = !item.submenu.is_null();
+        let measure = || drawn(owner, menu, i);
         let entry = Entry {
             depth,
-            separator: mii.fType & MFT_SEPARATOR != 0,
+            separator: item.kind & MFT_SEPARATOR != 0,
             label,
-            id: if submenu { 0 } else { mii.wID },
+            id: if submenu { 0 } else { item.id },
             submenu,
-            default: default != u32::MAX && default == mii.wID && !submenu,
-            checked: mii.fState & MFS_CHECKED != 0,
-            radio: mii.fType & MFT_RADIOCHECK != 0,
-            greyed: mii.fState & MFS_DISABLED != 0,
+            default: default == Some(item.id) && !submenu,
+            checked: item.state & MFS_CHECKED != 0,
+            radio: item.kind & MFT_RADIOCHECK != 0,
+            greyed: item.state & MFS_DISABLED != 0,
             owner_drawn: owner_drawn.then(measure),
-            callback_bitmap: core::ptr::eq(mii.hbmpItem, HBMMENU_CALLBACK).then(measure),
-            verb: (!submenu && mii.wID != 0).then(|| verb(mii.wID)).flatten(),
+            callback_bitmap: core::ptr::eq(item.bitmap, HBMMENU_CALLBACK).then(measure),
+            verb: (!submenu && item.id != 0).then(|| verb(item.id)).flatten(),
         };
         out.push(entry);
         if submenu {
-            walk(mii.hSubMenu, owner, depth + 1, i as usize, verb, out);
+            walk(item.submenu, owner, depth + 1, i as usize, verb, out);
         }
     }
 }
 
-/// An item its owner draws, as the menu loop would ask for it: measured
-/// (WM_MEASUREITEM), then drawn (WM_DRAWITEM) into a bitmap in memory
-/// filled with a key colour, whose pixels that changed are counted.
-fn drawn(owner: HWND, menu: HMENU, id: u32, data: usize) -> Drawn {
-    let (width, height) = measure(owner, id, data);
-    let ink = draw(owner, menu, id, data, width, height);
+/// An item its owner draws (item `pos` of `menu`), as the menu loop would
+/// ask for it: measured (WM_MEASUREITEM), then drawn (WM_DRAWITEM) into a
+/// bitmap in memory filled with a key colour, whose pixels that changed
+/// are counted.
+fn drawn(owner: HWND, menu: HMENU, pos: u32) -> Drawn {
+    let (width, height) = measure(owner, menu, pos);
+    let ink = draw(owner, menu, pos, width, height);
     Drawn { width, height, ink }
 }
 
 /// Pixels of a `width` × `height` bitmap that the owner's WM_DRAWITEM for
-/// item `id` of `menu` set; 0 for a size that is none or absurd.
-fn draw(owner: HWND, menu: HMENU, id: u32, data: usize, width: u32, height: u32) -> u32 {
+/// item `pos` of `menu` set; 0 for a size that is none or absurd.
+fn draw(owner: HWND, menu: HMENU, pos: u32, width: u32, height: u32) -> u32 {
     /// Magenta, which no menu draws.
     const KEY: u32 = 0x00ff_00ff;
     if width == 0 || height == 0 || width > 4000 || height > 400 {
         return 0;
     }
     let (w, h) = (width as i32, height as i32);
-    // SAFETY: a memory DC and bitmap made, used and deleted here; the
-    // message goes to a window of this thread with a struct that outlives
-    // it.
-    unsafe {
-        let screen = GetDC(core::ptr::null_mut());
-        let dc = CreateCompatibleDC(screen);
-        let bitmap = CreateCompatibleBitmap(screen, w, h);
-        ReleaseDC(core::ptr::null_mut(), screen);
-        if dc.is_null() || bitmap.is_null() {
-            DeleteObject(bitmap);
-            DeleteDC(dc);
-            return 0;
-        }
-        let old = SelectObject(dc, bitmap);
-        let rc = RECT {
-            left: 0,
-            top: 0,
-            right: w,
-            bottom: h,
-        };
-        SetDCBrushColor(dc, KEY);
-        FillRect(dc, &rc, GetStockObject(DC_BRUSH));
-        let dis = DRAWITEMSTRUCT {
-            CtlType: ODT_MENU,
-            CtlID: 0,
-            itemID: id,
-            itemAction: ODA_DRAWENTIRE,
-            itemState: 0,
-            hwndItem: menu as HWND,
-            hDC: dc,
-            rcItem: rc,
-            itemData: data,
-        };
-        SendMessageW(owner, WM_DRAWITEM, 0, (&raw const dis) as isize);
-        let mut ink = 0;
-        for y in 0..h {
-            for x in 0..w {
-                if GetPixel(dc, x, y) != KEY {
-                    ink += 1;
-                }
+    // A memory DC and bitmap made, used and deleted here (in the reverse
+    // order of these, as they drop).
+    let screen = gdi::WindowDc::get(core::ptr::null_mut());
+    let dc = gdi::MemDc::compatible(screen.hdc());
+    let bitmap = gdi::create_compatible_bitmap(screen.hdc(), w, h);
+    drop(screen);
+    let Some(bitmap) = bitmap.filter(|_| !dc.hdc().is_null()) else {
+        return 0;
+    };
+    let _selected = gdi::Selected::new(dc.hdc(), &bitmap);
+    let rc = RECT {
+        left: 0,
+        top: 0,
+        right: w,
+        bottom: h,
+    };
+    gdi::set_dc_brush_color(dc.hdc(), KEY);
+    gdi::fill_rect(dc.hdc(), &rc, gdi::stock_object(DC_BRUSH));
+    // The message goes to a window of this thread, while the caller holds
+    // no borrow.
+    wmenu::draw_item(owner, menu, pos, dc.hdc(), rc);
+    let mut ink = 0;
+    for y in 0..h {
+        for x in 0..w {
+            if get_pixel(dc.hdc(), x, y) != KEY {
+                ink += 1;
             }
         }
-        SelectObject(dc, old);
-        DeleteObject(bitmap);
-        DeleteDC(dc);
-        ink
     }
+    ink
 }
 
-/// What the owner measures an item it draws at (WM_MEASUREITEM, as the
-/// menu loop asks before showing it).
-fn measure(owner: HWND, id: u32, data: usize) -> (u32, u32) {
-    let mut mis = MEASUREITEMSTRUCT {
-        CtlType: ODT_MENU,
-        CtlID: 0,
-        itemID: id,
-        itemWidth: 0,
-        itemHeight: 0,
-        itemData: data,
-    };
-    // SAFETY: a message to a window of this thread with a struct that
-    // outlives it.
-    unsafe { SendMessageW(owner, WM_MEASUREITEM, 0, (&raw mut mis) as isize) };
-    (mis.itemWidth, mis.itemHeight)
+/// What the owner measures item `pos` of `menu` at, which it draws
+/// (WM_MEASUREITEM, as the menu loop asks before showing it).
+fn measure(owner: HWND, menu: HMENU, pos: u32) -> (u32, u32) {
+    wmenu::measure_item(owner, menu, pos).unwrap_or((0, 0))
 }
 
 #[cfg(test)]

@@ -11,26 +11,14 @@
 //! long, and whether it worked or waited. Without the variable nothing is
 //! hooked or kept.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::fmt::Write as _;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
-use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CWPRETSTRUCT, CWPSTRUCT, CallNextHookEx, GetClassNameW, HC_ACTION, HCBT_CREATEWND, HHOOK,
-    HOOKPROC, MSG, PM_REMOVE, SetWindowsHookExW, UnhookWindowsHookEx, WH_CALLWNDPROC,
-    WH_CALLWNDPROCRET, WH_CBT, WH_GETMESSAGE,
-};
+use windows_sys::Win32::Foundation::{HWND, LRESULT};
+use windows_sys::Win32::UI::WindowsAndMessaging::HCBT_CREATEWND;
 
-// kernel32's (windows-sys has it under a feature goz-gui does not build).
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn QueryThreadCycleTime(
-        thread: windows_sys::Win32::Foundation::HANDLE,
-        cycles: *mut u64,
-    ) -> i32;
-}
+use crate::win;
+use crate::win::hook::{self, Event, Hook, Kind};
 
 /// One point of the timeline.
 struct Entry {
@@ -66,7 +54,7 @@ thread_local! {
     /// The timeline while tracing (on the thread that started it).
     static LOG: RefCell<Option<Vec<Entry>>> = const { RefCell::new(None) };
     /// The hooks, removed by [`finish`].
-    static HOOKS: Cell<[HHOOK; 4]> = const { Cell::new([core::ptr::null_mut(); 4]) };
+    static HOOKS: RefCell<Vec<Hook>> = const { RefCell::new(Vec::new()) };
 }
 
 fn tracing() -> bool {
@@ -75,16 +63,10 @@ fn tracing() -> bool {
 
 /// Adds a point stamped now. Whatever it holds was read before.
 fn push(kind: char, hwnd: usize, msg: u32, w: usize, class: String) {
-    let mut cycles = 0u64;
-    // SAFETY: fills plain out-values; the thread's own pseudo-handle.
-    let ft = unsafe {
-        let mut ft = core::mem::zeroed();
-        GetSystemTimePreciseAsFileTime(&mut ft);
-        QueryThreadCycleTime(GetCurrentThread(), &mut cycles);
-        ft
-    };
+    let at = win::time::precise_time();
+    let cycles = win::process::thread_cycles();
     let entry = Entry {
-        at: (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime),
+        at,
         cycles,
         kind,
         msg,
@@ -104,14 +86,16 @@ fn push_window(kind: char, hwnd: HWND, msg: u32, w: usize) {
     if !tracing() {
         return;
     }
-    let mut buf = [0u16; 64];
-    let n = if hwnd.is_null() {
-        0
+    // The name as a 64-unit buffer takes it: 63 units at most.
+    let class = if hwnd.is_null() {
+        String::new()
     } else {
-        // SAFETY: the buffer and its length.
-        unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) }
+        let name: Vec<u16> = crate::win::class_name(hwnd)
+            .encode_utf16()
+            .take(63)
+            .collect();
+        String::from_utf16_lossy(&name)
     };
-    let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
     push(kind, hwnd as usize, msg, w, class);
 }
 
@@ -130,23 +114,14 @@ pub fn start() {
     }
     LOG.set(Some(Vec::with_capacity(1 << 16)));
     let sends = std::env::var_os("GOZ_GUI_TRACE_SENDS").is_some();
-    // SAFETY: hooks of this thread only, removed by `finish`.
-    let hooks = unsafe {
-        let thread = GetCurrentThreadId();
-        let hook = |id, proc: HOOKPROC, on: bool| {
-            if on {
-                SetWindowsHookExW(id, proc, core::ptr::null_mut(), thread)
-            } else {
-                core::ptr::null_mut()
-            }
-        };
-        [
-            hook(WH_GETMESSAGE, Some(got), true),
-            hook(WH_CBT, Some(cbt), true),
-            hook(WH_CALLWNDPROC, Some(sent), sends),
-            hook(WH_CALLWNDPROCRET, Some(returned), sends),
-        ]
-    };
+    // Hooks of this thread only, removed by `finish`.
+    let mut hooks = Vec::new();
+    hooks.extend(hook::set(Kind::GetMessage, got));
+    hooks.extend(hook::set(Kind::Cbt, cbt));
+    if sends {
+        hooks.extend(hook::set(Kind::CallWndProc, sent));
+        hooks.extend(hook::set(Kind::CallWndProcRet, returned));
+    }
     HOOKS.set(hooks);
     mark("trace start");
 }
@@ -155,12 +130,8 @@ pub fn start() {
 /// point a line: time (FILETIME), kind, message, its name, class, window,
 /// wParam, the thread's cycles.
 pub fn finish() {
-    for hook in HOOKS.replace([core::ptr::null_mut(); 4]) {
-        if !hook.is_null() {
-            // SAFETY: a hook `start` set on this thread.
-            unsafe { UnhookWindowsHookEx(hook) };
-        }
-    }
+    // The hooks `start` set on this thread, taken out as they drop.
+    drop(HOOKS.take());
     let Some(log) = LOG.take() else {
         return;
     };
@@ -214,46 +185,47 @@ fn name(msg: u32) -> &'static str {
     }
 }
 
-unsafe extern "system" fn got(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && w == PM_REMOVE as usize && l != 0 {
-        // SAFETY: WH_GETMESSAGE's lParam is the MSG taken.
-        let m = unsafe { &*(l as *const MSG) };
-        push_window('g', m.hwnd, m.message, m.wParam);
+// Each hook only looks, and passes every event on unchanged (`None`).
+
+fn got(event: &Event) -> Option<LRESULT> {
+    if let Event::Got { msg, removed: true } = event {
+        push_window('g', msg.hwnd, msg.message, msg.wParam);
     }
-    // SAFETY: passes the event on unchanged.
-    unsafe { CallNextHookEx(core::ptr::null_mut(), code, w, l) }
+    None
 }
 
-unsafe extern "system" fn cbt(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if code == HCBT_CREATEWND as i32 {
-        push_window('c', w as HWND, 0, 0);
-    }
-    // SAFETY: passes the event on unchanged.
-    unsafe { CallNextHookEx(core::ptr::null_mut(), code, w, l) }
-}
-
-unsafe extern "system" fn sent(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && l != 0 {
-        // SAFETY: WH_CALLWNDPROC's lParam is a CWPSTRUCT.
-        let c = unsafe { &*(l as *const CWPSTRUCT) };
-        if SENDS.contains(&c.message) {
-            push_window('s', c.hwnd, c.message, c.wParam);
+fn cbt(event: &Event) -> Option<LRESULT> {
+    match *event {
+        Event::Create { hwnd, .. } => push_window('c', hwnd, 0, 0),
+        // A window made with no creation data to show.
+        Event::Cbt { code, w, .. } if code == HCBT_CREATEWND as i32 => {
+            push_window('c', w as HWND, 0, 0);
         }
+        _ => {}
     }
-    // SAFETY: passes the event on unchanged.
-    unsafe { CallNextHookEx(core::ptr::null_mut(), code, w, l) }
+    None
 }
 
-unsafe extern "system" fn returned(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && l != 0 {
-        // SAFETY: WH_CALLWNDPROCRET's lParam is a CWPRETSTRUCT.
-        let c = unsafe { &*(l as *const CWPRETSTRUCT) };
-        if SENDS.contains(&c.message) {
-            push_window('r', c.hwnd, c.message, c.wParam);
-        }
+fn sent(event: &Event) -> Option<LRESULT> {
+    if let Event::Sent {
+        hwnd, message, w, ..
+    } = *event
+        && SENDS.contains(&message)
+    {
+        push_window('s', hwnd, message, w);
     }
-    // SAFETY: passes the event on unchanged.
-    unsafe { CallNextHookEx(core::ptr::null_mut(), code, w, l) }
+    None
+}
+
+fn returned(event: &Event) -> Option<LRESULT> {
+    if let Event::Returned {
+        hwnd, message, w, ..
+    } = *event
+        && SENDS.contains(&message)
+    {
+        push_window('r', hwnd, message, w);
+    }
+    None
 }
 
 #[cfg(test)]

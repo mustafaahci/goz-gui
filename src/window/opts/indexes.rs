@@ -16,15 +16,16 @@
 use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_AUTOCHECKBOX, ES_AUTOHSCROLL, ES_NUMBER, PostMessageW, WM_APP, WS_EX_CLIENTEDGE, WS_TABSTOP,
+    BS_AUTOCHECKBOX, ES_AUTOHSCROLL, ES_NUMBER, WM_APP, WS_EX_CLIENTEDGE, WS_TABSTOP,
 };
 
 use crate::dialog::Class;
 use crate::indexes::{IndexConfig, IndexSettings, Key};
 use crate::options::{Page, RESTORE, Rows, checked, enable, order, set_check, set_text};
+use crate::win::{self, Msg, parcel};
 use crate::window::App;
 
 // Everything's control ids.
@@ -122,9 +123,8 @@ impl Indexes {
             .spawn(move || {
                 let got = source.get();
                 *answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(got);
-                // SAFETY: a plain post (no payload); a page gone since
-                // drops it.
-                unsafe { PostMessageW(page as HWND, WM_LOADED, 0, 0) };
+                // No payload; a page gone since drops it.
+                win::post_app(page as HWND, WM_LOADED, 0, 0);
             });
         if spawned.is_err() {
             show(
@@ -418,17 +418,10 @@ impl Page for Indexes {
                 // Read back, so the page shows what gozd has.
                 let got = source.get();
                 *answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(got);
-                // SAFETY: plain posts; the window owns the box once the
-                // message is queued, and it is taken back if not.
-                unsafe {
-                    PostMessageW(page_h as HWND, WM_LOADED, 0, 0);
-                    let text = Box::into_raw(Box::new(said));
-                    if PostMessageW(hwnd as HWND, crate::window::WM_INDEX_SET, 0, text as isize)
-                        == 0
-                    {
-                        drop(Box::from_raw(text));
-                    }
-                }
+                win::post_app(page_h as HWND, WM_LOADED, 0, 0);
+                // The window claims the text with the message; it is
+                // dropped if the message could not be posted.
+                parcel::post(hwnd as HWND, crate::window::WM_INDEX_SET, 0, said);
             });
         if spawned.is_err() {
             problems.push("gozd's index settings could not be changed".into());
@@ -446,8 +439,8 @@ impl Page for Indexes {
         }
     }
 
-    fn message(&self, _app: &App, page: HWND, msg: u32, _w: WPARAM, _l: LPARAM) -> Option<isize> {
-        if msg != WM_LOADED {
+    fn message(&self, _app: &App, page: HWND, m: &Msg) -> Option<isize> {
+        if m.id != WM_LOADED {
             return None;
         }
         let got = self

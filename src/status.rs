@@ -4,20 +4,20 @@
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    DC_BRUSH, DC_PEN, DT_CALCRECT, DT_MODIFYSTRING, DT_NOPREFIX, DT_PATH_ELLIPSIS, DT_SINGLELINE,
-    DrawTextW, ETO_CLIPPED, ExtTextOutW, GetStockObject, HDC, PtInRect, RoundRect, SelectObject,
-    SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
+    DC_BRUSH, DC_PEN, DT_CALCRECT, DT_NOPREFIX, DT_PATH_ELLIPSIS, DT_SINGLELINE, ETO_CLIPPED, HDC,
+    TRANSPARENT,
 };
-use windows_sys::Win32::UI::Controls::LVM_GETSELECTEDCOUNT;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
 
 use crate::colors::{Item, State};
 use crate::format;
 use crate::paint::{fill, width};
+use crate::win::{self, gdi, lv};
 use crate::window::App;
+
+/// Whether `pt` is in `rc` (PtInRect: its right and bottom edges are not).
+fn contains(rc: &RECT, pt: POINT) -> bool {
+    pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
+}
 
 /// The view buttons at the status bar's right end, as in Everything 1.5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,8 +62,7 @@ pub fn view_buttons_now(app: &App) -> Option<[(ViewButton, RECT); 2]> {
 pub fn button_at(buttons: &[(ViewButton, RECT)], pt: POINT) -> Option<ViewButton> {
     buttons
         .iter()
-        // SAFETY: reads two plain structs.
-        .find(|(_, rc)| unsafe { PtInRect(rc, pt) } != 0)
+        .find(|(_, rc)| contains(rc, pt))
         .map(|&(b, _)| b)
 }
 
@@ -77,14 +76,8 @@ pub fn view_button_at(app: &App, pt: POINT) -> Option<ViewButton> {
 pub fn view_hover(app: &App, pt: Option<POINT>) {
     let hot = pt.and_then(|pt| view_button_at(app, pt));
     if hot.is_some() {
-        let mut tme = TRACKMOUSEEVENT {
-            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-            dwFlags: TME_LEAVE,
-            hwndTrack: app.hwnd,
-            dwHoverTime: 0,
-        };
-        // SAFETY: asks for WM_MOUSELEAVE on this thread's window.
-        unsafe { TrackMouseEvent(&mut tme) };
+        // Asks for WM_MOUSELEAVE on this thread's window.
+        win::track_leave(app.hwnd);
     }
     if app.view_hot.replace(hot) != hot {
         app.invalidate_status();
@@ -154,17 +147,15 @@ fn paint_view_buttons(app: &App, hdc: HDC, buttons: &[(ViewButton, RECT)]) {
 
 /// Fills `rc` with `colour`, its corners rounded by `radius`.
 fn round_fill(hdc: HDC, rc: &RECT, colour: u32, radius: i32) {
-    // SAFETY: the stock DC brush and pen paint in the colours set here; the
-    // DC's own are put back.
-    unsafe {
-        SetDCBrushColor(hdc, colour);
-        SetDCPenColor(hdc, colour);
-        let old_brush = SelectObject(hdc, GetStockObject(DC_BRUSH));
-        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN));
-        RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-        SelectObject(hdc, old_pen);
-        SelectObject(hdc, old_brush);
-    }
+    // The stock DC brush and pen paint in the colours set here; the DC's
+    // own are put back.
+    gdi::set_dc_brush_color(hdc, colour);
+    win::gdi::set_dc_pen_color(hdc, colour);
+    let old_brush = gdi::Selected::of(hdc, gdi::stock_object(DC_BRUSH));
+    let old_pen = gdi::Selected::of(hdc, gdi::stock_object(DC_PEN));
+    win::gdi::round_rect(hdc, rc, radius, radius);
+    drop(old_pen);
+    drop(old_brush);
 }
 
 /// A search option the status bar shows while it is on.
@@ -186,30 +177,20 @@ fn elide_path(hdc: HDC, text: &[u16], max: i32) -> Vec<u16> {
     if width(hdc, text) <= max {
         return text.to_vec();
     }
-    // DT_MODIFYSTRING writes the shortened text back, with room for the
-    // ellipsis and its NUL.
-    let mut buf = text.to_vec();
-    buf.extend_from_slice(&[0; 5]);
+    // DT_MODIFYSTRING (which `draw_text_modified` adds) gives the shortened
+    // text back.
     let mut rc = RECT {
         left: 0,
         top: 0,
         right: max.max(1),
         bottom: 1,
     };
-    // SAFETY: the buffer holds the text and five more units, as
-    // DT_MODIFYSTRING needs.
-    unsafe {
-        DrawTextW(
-            hdc,
-            buf.as_mut_ptr(),
-            text.len() as i32,
-            &mut rc,
-            DT_SINGLELINE | DT_NOPREFIX | DT_PATH_ELLIPSIS | DT_MODIFYSTRING | DT_CALCRECT,
-        );
-    }
-    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    buf.truncate(end);
-    buf
+    win::gdi::draw_text_modified(
+        hdc,
+        text,
+        &mut rc,
+        DT_SINGLELINE | DT_NOPREFIX | DT_PATH_ELLIPSIS | DT_CALCRECT,
+    )
 }
 
 /// What is selected, as the left side describes it.
@@ -270,11 +251,6 @@ pub fn total_size(
         .reduce(|a, b| a.saturating_add(b))
 }
 
-fn send(app: &App, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: a query to this thread's list.
-    unsafe { SendMessageW(app.list, msg, w, l) }
-}
-
 struct Part {
     text: String,
     colour: u32,
@@ -294,7 +270,7 @@ pub fn paint(app: &App, hdc: HDC) {
     // Options > View: one selected item's size, date and folder, and the
     // size at the right.
     let ui = app.ui();
-    let sel_count = send(app, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
+    let sel_count = lv::selected_count(app.list) as u64;
     let first_selected = if sel_count == 1 && ui.selected_in_status {
         app.selected(1).first().copied()
     } else {
@@ -428,11 +404,11 @@ pub fn paint(app: &App, hdc: HDC) {
     );
     // Each text drawn and where, for accessibility tools.
     let mut spoken: Vec<(String, RECT)> = Vec::new();
-    // SAFETY: draws into the paint buffer; the old font is put back.
-    unsafe {
+    // Draws into the paint buffer; the old font is put back.
+    {
         let bold = pal.is_bold(Item::StatusBar, State::Normal);
-        let old = SelectObject(hdc, if bold { fonts.bold } else { fonts.normal });
-        SetBkMode(hdc, TRANSPARENT as i32);
+        let old = gdi::Selected::of(hdc, if bold { fonts.bold } else { fonts.normal });
+        gdi::set_bk_mode(hdc, TRANSPARENT as i32);
         let y = rc.top + 1 + (rc.bottom - rc.top - 1 - fonts.height) / 2;
         let sep = |x: i32| {
             let r = RECT {
@@ -444,17 +420,8 @@ pub fn paint(app: &App, hdc: HDC) {
             fill(hdc, &r, pal.border);
         };
         let draw = |x: i32, clip: &RECT, text: &[u16], colour: u32| {
-            SetTextColor(hdc, colour);
-            ExtTextOutW(
-                hdc,
-                x,
-                y,
-                ETO_CLIPPED,
-                clip,
-                text.as_ptr(),
-                text.len() as u32,
-                core::ptr::null(),
-            );
+            gdi::set_text_color(hdc, colour);
+            gdi::ext_text_out(hdc, (x, y), ETO_CLIPPED, Some(clip), text);
         };
         // Right side first, so the left side can stop short of it: the
         // view buttons at the end, then the parts right to left.
@@ -524,7 +491,7 @@ pub fn paint(app: &App, hdc: HDC) {
             );
             x += w + pad;
         }
-        SelectObject(hdc, old);
+        drop(old);
     }
     *app.indicators.borrow_mut() = found;
     // What accessibility tools read of the bar (`crate::a11y`), left to
@@ -539,8 +506,7 @@ pub fn indicator_at(app: &App, pt: POINT) -> Option<Indicator> {
     app.indicators
         .borrow()
         .iter()
-        // SAFETY: reads two plain structs.
-        .find(|(_, rc)| unsafe { PtInRect(rc, pt) } != 0)
+        .find(|(_, rc)| contains(rc, pt))
         .map(|&(indicator, _)| indicator)
 }
 

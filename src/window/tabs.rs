@@ -15,23 +15,16 @@
 //! [`THAW_MS`]).
 
 use windows_sys::Win32::Foundation::{HWND, POINT};
-use windows_sys::Win32::Graphics::Gdi::{
-    RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow,
-};
-use windows_sys::Win32::UI::Controls::LVM_CANCELEDITLABEL;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyMenu, EnableMenuItem, GetMenuState, HMENU, KillTimer, MF_BYCOMMAND, MF_ENABLED,
-    MF_GRAYED, PostMessageW, SetTimer, WM_CLOSE, WM_SETREDRAW,
-};
+use windows_sys::Win32::Graphics::Gdi::{RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE};
+use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 
-use super::{App, send, slots};
+use super::{App, slots};
 use crate::dock::PaneId;
 use crate::menu::{self, Item};
 use crate::session::{Search, Session, View};
 use crate::strip::StripSlot;
 use crate::tabs::{self, Others, TabList, TabSettings};
-use crate::wide::window_text;
+use crate::win::{self, lv};
 
 /// The timer that lets the list paint again if a tab's rows are slow to
 /// come (gozd busy or gone).
@@ -64,7 +57,7 @@ impl App {
     /// Each tab's title, left to right: the shown one's as its search box
     /// has it now.
     pub(super) fn tab_titles(&self) -> Vec<String> {
-        let live = window_text(self.edit);
+        let live = win::text(self.edit);
         let t = self.tabs.borrow();
         t.tabs()
             .iter()
@@ -100,7 +93,7 @@ impl App {
     /// goes.
     fn leave_tab(&self) {
         if self.renaming() {
-            send(self.list, LVM_CANCELEDITLABEL, 0, 0);
+            lv::cancel_edit_label(self.list);
         }
         crate::celltip::hide(self);
     }
@@ -118,9 +111,9 @@ impl App {
         if self.list_frozen.replace(true) {
             return;
         }
-        send(self.list, WM_SETREDRAW, 0, 0);
-        // SAFETY: a timer of this window; WM_TIMER kills it.
-        unsafe { SetTimer(self.hwnd, TIMER_THAW, THAW_MS, None) };
+        win::set_redraw(self.list, false);
+        // WM_TIMER kills it.
+        win::set_timer(self.hwnd, TIMER_THAW, THAW_MS);
     }
 
     /// The list paints again, all of it, once: the new tab's rows are in
@@ -129,17 +122,13 @@ impl App {
         if !self.list_frozen.replace(false) {
             return;
         }
-        // SAFETY: this window's timer, and a repaint of its list.
-        unsafe {
-            KillTimer(self.hwnd, TIMER_THAW);
-            send(self.list, WM_SETREDRAW, 1, 0);
-            RedrawWindow(
-                self.list,
-                core::ptr::null(),
-                core::ptr::null_mut(),
-                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
-            );
-        }
+        win::kill_timer(self.hwnd, TIMER_THAW);
+        win::set_redraw(self.list, true);
+        win::redraw(
+            self.list,
+            None,
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
+        );
     }
 
     /// The tabs changed: the strip shows or goes (a layout), or repaints.
@@ -156,7 +145,7 @@ impl App {
     /// match options, filter and sort as they are), its view and columns.
     fn home_view(&self) -> View {
         let home = self.prefs.borrow().base.home();
-        let text = home.search.unwrap_or_else(|| window_text(self.edit));
+        let text = home.search.unwrap_or_else(|| win::text(self.edit));
         let o = self.opts.get();
         let h = home.options;
         View {
@@ -365,8 +354,7 @@ impl App {
     /// the keyboard between the window's parts as Tab and Shift+Tab do.
     fn cycle_tab(&self, forward: bool) {
         if self.tab_count() < 2 || !self.tab_settings().ctrl_tab_cycles() {
-            // SAFETY: reads this thread's focus.
-            let focus = unsafe { GetFocus() };
+            let focus = win::focus();
             self.tab_key(focus, !forward);
             return;
         }
@@ -384,9 +372,8 @@ impl App {
     /// its close box closes it (into the background with
     /// `run_in_background`).
     pub(super) fn close_window(&self) {
-        // SAFETY: posts to this thread's window; it closes once the
-        // command that asked is done.
-        unsafe { PostMessageW(self.hwnd, WM_CLOSE, 0, 0) };
+        // It closes once the command that asked is done.
+        win::post_close(self.hwnd);
     }
 
     /// A tab command (`crate::tabs`'s ids); false for any other.
@@ -471,10 +458,8 @@ impl App {
         ]
         .into_iter()
         .find(|&cmd| {
-            // SAFETY: reads an item's state by command; all bits set when
-            // the menu has no such item.
-            let state = unsafe { GetMenuState(history, u32::from(cmd), MF_BYCOMMAND) };
-            state != u32::MAX
+            // Whether the menu has such an item.
+            win::menu::state(history, win::menu::By::Command(u32::from(cmd))).is_some()
         });
         match after {
             Some(menu::RESTORE_SESSION) => {
@@ -528,14 +513,8 @@ impl App {
         }
         let m = menu::submenu(&items);
         let grey = |cmd: u16, on: bool| {
-            // SAFETY: an item of the menu made above, by command.
-            unsafe {
-                EnableMenuItem(
-                    m,
-                    u32::from(cmd),
-                    MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED },
-                )
-            };
+            // An item of the menu made above, by command.
+            win::menu::enable(m, win::menu::By::Command(u32::from(cmd)), on);
         };
         grey(tabs::CLOSE_TABS_LEFT, target > 0);
         grey(tabs::CLOSE_TABS_RIGHT, target + 1 < n);
@@ -638,7 +617,7 @@ fn popup_menu(owner: HWND, m: HMENU, pt: POINT, what: &str) -> u16 {
     // The owner gets its WM_INITMENUPOPUP (the window checks its items as
     // for its own menus); nothing is borrowed while it is up.
     let cmd = crate::popup::track(m, owner, pt, what, &|_| None);
-    // SAFETY: the menu made by the caller, no longer shown.
-    unsafe { DestroyMenu(m) };
+    // The menu made by the caller, no longer shown.
+    win::menu::destroy(m);
     u16::try_from(cmd).unwrap_or(0)
 }

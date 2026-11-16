@@ -32,41 +32,34 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::rc::Rc;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::System::SystemServices::{SS_ENDELLIPSIS, SS_LEFT, SS_NOPREFIX};
 use windows_sys::Win32::UI::Controls::{
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVM_EDITLABELW,
-    LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_INSERTCOLUMNW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVN_BEGINLABELEDITW, LVN_ENDLABELEDITW,
-    LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW, LVN_ODSTATECHANGED,
-    LVNI_FOCUSED, LVNI_SELECTED, LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NM_CUSTOMDRAW,
-    NM_DBLCLK, NMHDR, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN,
+    LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVN_BEGINLABELEDITW,
+    LVN_ENDLABELEDITW, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODFINDITEMW,
+    LVN_ODSTATECHANGED, LVNI_FOCUSED, LVNI_SELECTED, LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_OWNERDATA, LVS_REPORT,
+    LVS_SHOWSELALWAYS, NM_CUSTOMDRAW, NM_DBLCLK, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_F2, VK_INSERT,
-};
-use windows_sys::Win32::UI::Shell::{
-    DefSubclassProc, DragAcceptFiles, DragFinish, HDROP, RemoveWindowSubclass, SetWindowSubclass,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_DELETE, VK_F2, VK_INSERT};
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_DROPFILES;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, DWLP_MSGRESULT, EndDialog, GWLP_USERDATA, GetClientRect, GetParent,
-    GetWindowRect, IDCANCEL, IDOK, MB_ICONWARNING, MB_OK, MINMAXINFO, MoveWindow, PostMessageW,
-    SetWindowLongPtrW, SetWindowTextW, WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
-    WM_DROPFILES, WM_GETMINMAXINFO, WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY, WM_SIZE,
-    WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
+    BS_DEFPUSHBUTTON, IDCANCEL, IDOK, MB_ICONWARNING, MB_OK, WM_APP, WM_COMMAND, WM_CTLCOLOREDIT,
+    WM_DESTROY, WM_GETMINMAXINFO, WM_INITDIALOG, WM_NOTIFY, WM_SIZE, WS_EX_CLIENTEDGE,
+    WS_MAXIMIZEBOX, WS_TABSTOP, WS_THICKFRAME,
 };
 
-use crate::dialog::{self, Class, Look, Template, common, list_custom_draw, state};
+use crate::dialog::{self, Class, Look, Template, common, list_custom_draw};
 use crate::filelist::settings::{SLOT_EXPORT_KINDS, SlotKept};
-use crate::filetools::ui::{copy_text, item, send, set_state, units};
+use crate::filetools::ui::{item, set_state, units};
 use crate::listedit::scan::{Job, Source};
 use crate::listedit::{Entry, Export, items_text};
 use crate::places::{self, Which};
 use crate::store::location;
-use crate::wide::wz;
+use crate::win::{self, Msg, dlg, lv, subclass, sys};
 
 /// W7's commands, 4950..=4999.
 pub mod cmd {
@@ -93,8 +86,8 @@ pub const MSG_FIRST: u32 = WM_APP + 380;
 /// UTF-16 position `wParam` (Ctrl+click and F2 post it, so the dialog runs
 /// outside the box's own message).
 pub const WM_EDIT_TERM_AT: u32 = MSG_FIRST;
-/// The main window's: a `save-filelistN:` search's results were read
-/// (lParam: a `Box<window::lists::Saved>`).
+/// The main window's: a `save-filelistN:` search's results were read (a
+/// `win::parcel` of a `window::lists::Saved`).
 pub const WM_SLOT_SAVED: u32 = MSG_FIRST + 1;
 /// The dialog's own: Import...'s job has names, or ended.
 const WM_IMPORTED: u32 = MSG_FIRST + 2;
@@ -133,7 +126,7 @@ const BUTTONS: [(u16, &str); 9] = [
 /// The template's size, in dialog units.
 const SIZE: (i16, i16) = (300, 200);
 /// The list's subclass: its rename box in the dialog's colours.
-const LIST_SUBCLASS: usize = 0x534c;
+static LIST_SUBCLASS: subclass::Key = subclass::Key::new("file list slot list");
 
 /// Export...'s file types, Everything's three (`file_list_slot_export_type`
 /// counts them from 0), then All Files.
@@ -164,7 +157,7 @@ pub struct Outcome {
 /// Shows the dialog over `owner` until it closes.
 pub fn edit(owner: HWND, start: Start) -> Outcome {
     let state = Dlg {
-        look: Cell::new(start.look),
+        look: Rc::new(Cell::new(start.look)),
         title: start.title.clone(),
         names: RefCell::new(start.names),
         kept: RefCell::new(start.kept),
@@ -222,7 +215,7 @@ pub fn edit(owner: HWND, start: Start) -> Outcome {
         0,
         (cx - 61, cy - 21, 54, 14),
     );
-    t.run(owner, Some(dialog_proc), (&raw const state) as LPARAM);
+    t.show(owner, &|m| dialog_proc(&state, m));
     Outcome {
         names: state.result.into_inner(),
         kept: state.kept.into_inner(),
@@ -230,7 +223,8 @@ pub fn edit(owner: HWND, start: Start) -> Outcome {
 }
 
 struct Dlg {
-    look: Cell<Look>,
+    /// Shared with the list's subclass (its rename box's colours).
+    look: Rc<Cell<Look>>,
     title: String,
     names: RefCell<Vec<String>>,
     kept: RefCell<SlotKept>,
@@ -243,14 +237,11 @@ struct Dlg {
 }
 
 fn set_text(hwnd: HWND, text: &str) {
-    let z = wz(text);
-    // SAFETY: NUL-terminated text for a window of this thread.
-    unsafe { SetWindowTextW(hwnd, z.as_ptr()) };
+    win::set_text(hwnd, text);
 }
 
 fn beep() {
-    // SAFETY: plays a system sound.
-    unsafe { windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(MB_OK) };
+    sys::beep(MB_OK);
 }
 
 fn warn(dlg: HWND, title: &str, text: &str) {
@@ -307,29 +298,24 @@ impl Dlg {
     fn init(&self, dlg: HWND) {
         let list = Dlg::list(dlg);
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
-        send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
+        lv::set_extended_style(list, ex, ex);
         let (list_w, _) = units(dlg, i32::from(SIZE.0) - 74, 0);
-        let mut text = wz("Filename");
         let col = LVCOLUMNW {
-            mask: LVCF_TEXT | LVCF_WIDTH,
+            mask: LVCF_WIDTH,
             cx: list_w - units(dlg, 12, 0).0,
-            pszText: text.as_mut_ptr(),
-            // SAFETY: the rest of LVCOLUMNW is plain data.
-            ..unsafe { core::mem::zeroed() }
+            ..Default::default()
         };
-        send(list, LVM_INSERTCOLUMNW, 0, (&raw const col) as isize);
+        // Titled "Filename" (LVCF_TEXT).
+        lv::insert_column(list, 0, col, Some("Filename"));
         let dark = self.look.get().dark;
         dialog::theme_new(dlg, dark);
-        // SAFETY: subclasses this thread's list (the subclass goes with it)
-        // and lets files be dropped on the dialog.
-        unsafe {
-            SetWindowSubclass(list, Some(list_proc), LIST_SUBCLASS, 0);
-            DragAcceptFiles(dlg, 1);
-        }
+        // The list's subclass (it goes with the list), and files may be
+        // dropped on the dialog.
+        let look = Rc::clone(&self.look);
+        subclass::set(list, &LIST_SUBCLASS, move |m| list_proc(m, &look));
+        win::dropfiles::accept(dlg, true);
         dialog::center_on_owner(dlg);
-        let mut wr = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetWindowRect(dlg, &mut wr) };
+        let wr = win::window_rect(dlg);
         self.min.set((wr.right - wr.left, wr.bottom - wr.top));
         places::restore(dlg, Which::FileListSlotEdit, list, self.min.get());
         self.layout(dlg);
@@ -339,9 +325,7 @@ impl Dlg {
     /// The list takes the room, the buttons at the right, the count and OK
     /// and Cancel under it.
     fn layout(&self, dlg: HWND) {
-        let mut rc = RECT::default();
-        // SAFETY: reads this thread's dialog.
-        unsafe { GetClientRect(dlg, &mut rc) };
+        let rc = win::client_rect(dlg);
         let (w, h) = (rc.right, rc.bottom);
         let (m, my) = units(dlg, 7, 7);
         let (bw, bh) = units(dlg, 54, 14);
@@ -350,8 +334,7 @@ impl Dlg {
         let place = |id: u16, x: i32, y: i32, cw: i32, ch: i32| {
             let hwnd = item(dlg, id);
             if !hwnd.is_null() {
-                // SAFETY: moves a control of this thread's dialog.
-                unsafe { MoveWindow(hwnd, x, y, cw.max(0), ch.max(0), 1) };
+                win::move_window(hwnd, x, y, cw.max(0), ch.max(0), true);
             }
         };
         let bx = w - m - bw;
@@ -376,7 +359,7 @@ impl Dlg {
     fn show_rows(&self, dlg: HWND, select: Option<usize>) {
         let n = self.names.borrow().len();
         let list = Dlg::list(dlg);
-        send(list, LVM_SETITEMCOUNT, n, 0);
+        lv::set_item_count(list, n, 0);
         set_state(list, usize::MAX, 0, LVIS_SELECTED | LVIS_FOCUSED);
         if let Some(row) = select.filter(|_| n > 0).map(|r| r.min(n - 1)) {
             set_state(
@@ -385,18 +368,15 @@ impl Dlg {
                 LVIS_SELECTED | LVIS_FOCUSED,
                 LVIS_SELECTED | LVIS_FOCUSED,
             );
-            send(list, LVM_ENSUREVISIBLE, row, 0);
+            lv::ensure_visible(list, row as i32, false);
         }
-        // SAFETY: repaints this thread's list.
-        unsafe {
-            windows_sys::Win32::Graphics::Gdi::InvalidateRect(list, core::ptr::null(), 1);
-        }
+        win::invalidate(list, None, true);
         self.show_count(dlg);
     }
 
     fn show_count(&self, dlg: HWND) {
         let n = self.names.borrow().len();
-        let selected = send(Dlg::list(dlg), LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize;
+        let selected = lv::selected_count(Dlg::list(dlg));
         let text = if self.job.borrow().is_some() {
             format!("Importing... {}", items_text(n))
         } else if selected > 1 {
@@ -416,9 +396,7 @@ impl Dlg {
         let list = Dlg::list(dlg);
         let mut out = Vec::new();
         let mut at = usize::MAX;
-        while let Ok(next) =
-            usize::try_from(send(list, LVM_GETNEXTITEM, at, LVNI_SELECTED as isize))
-        {
+        while let Ok(next) = usize::try_from(lv::next_item(list, at as i32, LVNI_SELECTED)) {
             out.push(next);
             at = next;
         }
@@ -443,24 +421,19 @@ impl Dlg {
         self.fresh.set(Some(row));
         self.show_rows(dlg, Some(row));
         let list = Dlg::list(dlg);
-        // SAFETY: the keyboard to this thread's list, whose row is edited.
-        unsafe { SetFocus(list) };
-        send(list, LVM_EDITLABELW, row, 0);
+        // The keyboard to the list, whose row is edited.
+        win::set_focus(list);
+        lv::edit_label(list, row as i32);
     }
 
     fn edit_name(&self, dlg: HWND) {
         let list = Dlg::list(dlg);
-        let Ok(row) = usize::try_from(send(
-            list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        )) else {
+        let Ok(row) = usize::try_from(lv::next_item(list, -1, LVNI_FOCUSED)) else {
             return;
         };
-        // SAFETY: the keyboard to this thread's list, whose row is edited.
-        unsafe { SetFocus(list) };
-        send(list, LVM_EDITLABELW, row, 0);
+        // The keyboard to the list, whose row is edited.
+        win::set_focus(list);
+        lv::edit_label(list, row as i32);
     }
 
     /// The rename box closed: `text` (`None`: Esc) is the row's name; a
@@ -538,13 +511,9 @@ impl Dlg {
         self.add(dlg, names);
     }
 
-    fn dropped(&self, dlg: HWND, drop: HDROP) {
-        // SAFETY: the HDROP WM_DROPFILES brought, read whole, then freed.
-        let paths = unsafe {
-            let paths = crate::clipboard::dropped_files(drop);
-            DragFinish(drop);
-            paths
-        };
+    /// Files dropped on the dialog: `paths`, read whole from the drop,
+    /// which is freed by now.
+    fn dropped(&self, dlg: HWND, paths: Vec<Vec<u16>>) {
         self.add(
             dlg,
             paths.iter().map(|p| String::from_utf16_lossy(p)).collect(),
@@ -690,8 +659,7 @@ impl Dlg {
                 .collect();
             *self.result.borrow_mut() = Some(names);
         }
-        // SAFETY: ends this modal dialog.
-        unsafe { EndDialog(dlg, isize::from(ok)) };
+        dlg::end(dlg, isize::from(ok));
     }
 
     fn command(&self, dlg: HWND, id: u16) -> bool {
@@ -713,8 +681,7 @@ impl Dlg {
     }
 
     fn key(&self, dlg: HWND, vk: u16) {
-        // SAFETY: reads this thread's keyboard state.
-        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
+        let ctrl = sys::key_down(VK_CONTROL);
         match (ctrl, vk) {
             (false, VK_DELETE) => self.remove(dlg),
             (false, VK_F2) => self.edit_name(dlg),
@@ -729,106 +696,74 @@ impl Dlg {
     }
 
     /// The list's notifications; `Some` is DWLP_MSGRESULT's value.
-    ///
-    /// # Safety
-    /// `l` is a WM_NOTIFY's lParam from the list.
-    unsafe fn notify(&self, dlg: HWND, l: LPARAM) -> Option<isize> {
-        // SAFETY: as the caller promises; each code's struct is read as the
-        // list sends it.
-        unsafe {
-            let hdr = &*(l as *const NMHDR);
-            match hdr.code {
-                NM_CUSTOMDRAW => {
-                    let cd = &*(l as *const NMLVCUSTOMDRAW);
-                    return Some(list_custom_draw(hdr.hwndFrom, cd, self.look.get().dark));
-                }
-                LVN_GETDISPINFOW => {
-                    let info = &mut *(l as *mut NMLVDISPINFOW);
-                    if info.item.mask & LVIF_TEXT != 0 {
-                        let text: Vec<u16> = usize::try_from(info.item.iItem)
-                            .ok()
-                            .and_then(|r| self.names.borrow().get(r).cloned())
-                            .map(|n| n.encode_utf16().collect())
-                            .unwrap_or_default();
-                        copy_text(&text, info.item.pszText, info.item.cchTextMax);
-                    }
-                }
-                LVN_ODFINDITEMW => return Some(-1),
-                // The rename box may open (its colours: `list_proc`).
-                LVN_BEGINLABELEDITW => return Some(0),
-                LVN_ENDLABELEDITW => {
-                    let info = &*(l as *const NMLVDISPINFOW);
-                    let text = (!info.item.pszText.is_null()).then(|| {
-                        let p = info.item.pszText;
-                        let mut n = 0;
-                        while *p.add(n) != 0 {
-                            n += 1;
-                        }
-                        String::from_utf16_lossy(core::slice::from_raw_parts(p, n))
-                    });
-                    if let Ok(row) = usize::try_from(info.item.iItem) {
-                        self.renamed(dlg, row, text);
-                    }
-                    // The list keeps no text of its own (owner data).
-                    return Some(0);
-                }
-                NM_DBLCLK => self.edit_name(dlg),
-                LVN_KEYDOWN => self.key(dlg, (*(l as *const NMLVKEYDOWN)).wVKey),
-                LVN_ITEMCHANGED | LVN_ODSTATECHANGED => self.show_count(dlg),
-                _ => {}
+    fn notify(&self, dlg: HWND, m: &Msg) -> Option<isize> {
+        let n = m.notify()?;
+        match n.code() {
+            NM_CUSTOMDRAW => {
+                let cd = n.get::<NMLVCUSTOMDRAW>()?;
+                return Some(list_custom_draw(n.from(), &cd, self.look.get().dark));
             }
-            None
+            LVN_GETDISPINFOW => {
+                let mut info = n.get::<NMLVDISPINFOW>()?;
+                if info.item.mask & LVIF_TEXT != 0 {
+                    let text: Vec<u16> = usize::try_from(info.item.iItem)
+                        .ok()
+                        .and_then(|r| self.names.borrow().get(r).cloned())
+                        .map(|n| n.encode_utf16().collect())
+                        .unwrap_or_default();
+                    // Into the list's buffer of `cchTextMax` code units.
+                    info.set_text(&text);
+                }
+            }
+            LVN_ODFINDITEMW => return Some(-1),
+            // The rename box may open (its colours: `list_proc`).
+            LVN_BEGINLABELEDITW => return Some(0),
+            LVN_ENDLABELEDITW => {
+                let (text, row) = {
+                    let info = n.get::<NMLVDISPINFOW>()?;
+                    let text = info.text().map(|t| String::from_utf16_lossy(&t));
+                    (text, info.item.iItem)
+                };
+                if let Ok(row) = usize::try_from(row) {
+                    self.renamed(dlg, row, text);
+                }
+                // The list keeps no text of its own (owner data).
+                return Some(0);
+            }
+            NM_DBLCLK => self.edit_name(dlg),
+            LVN_KEYDOWN => {
+                let vk = n.get::<NMLVKEYDOWN>()?.wVKey;
+                self.key(dlg, vk);
+            }
+            LVN_ITEMCHANGED | LVN_ODSTATECHANGED => self.show_count(dlg),
+            _ => {}
         }
+        None
     }
 }
 
 /// The list's rename box takes the dialog's colours (it is the list's
-/// child, so the list is asked for them).
-unsafe extern "system" fn list_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
-    // SAFETY: the messages are the list's own, their parameters as Windows
-    // sends them; the dialog's state is read as its procedure keeps it.
-    unsafe {
-        match msg {
-            WM_CTLCOLOREDIT => {
-                let dark = state::<Dlg>(GetParent(hwnd)).is_some_and(|s| s.look.get().dark);
-                if let Some(brush) = dialog::ctl_color(msg, w as HDC, dark) {
-                    return brush;
-                }
-            }
-            WM_NCDESTROY => {
-                RemoveWindowSubclass(hwnd, Some(list_proc), LIST_SUBCLASS);
-            }
-            _ => {}
+/// child, so the list is asked for them); `look` is the dialog's.
+fn list_proc(m: &Msg, look: &Cell<Look>) -> isize {
+    if m.id == WM_CTLCOLOREDIT {
+        let dark = look.get().dark;
+        if let Some(brush) = dialog::ctl_color(m.id, m.w as HDC, dark) {
+            return brush;
         }
-        DefSubclassProc(hwnd, msg, w, l)
     }
+    m.def()
 }
 
-unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
-    if msg == WM_INITDIALOG {
-        // SAFETY: `l` is the `Dlg` that `edit` keeps alive until the dialog
-        // has ended.
-        unsafe { SetWindowLongPtrW(dlg, GWLP_USERDATA, l) };
-    }
-    // SAFETY: GWLP_USERDATA is the `Dlg` from `edit`, or null before.
-    let Some(s) = (unsafe { state::<Dlg>(dlg) }) else {
-        return 0;
-    };
-    if let Some(answer) = common(dlg, msg, w, l, &s.look) {
+fn dialog_proc(s: &Dlg, m: &Msg) -> isize {
+    let dlg = m.hwnd;
+    if let Some(answer) = common(m, &s.look) {
         return answer;
     }
-    match msg {
+    match m.id {
         WM_INITDIALOG => {
             s.init(dlg);
-            // SAFETY: the keyboard in the list, a control of this dialog.
-            unsafe { SetFocus(Dlg::list(dlg)) };
+            // The keyboard in the list, a control of this dialog.
+            win::set_focus(Dlg::list(dlg));
             0
         }
         WM_SIZE => {
@@ -837,28 +772,29 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
         }
         WM_GETMINMAXINFO => {
             let (w, h) = s.min.get();
-            // SAFETY: WM_GETMINMAXINFO's lParam is a MINMAXINFO to fill.
-            let mmi = unsafe { &mut *(l as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = w;
-            mmi.ptMinTrackSize.y = h;
+            if let Some(mut mmi) = m.min_max_info() {
+                mmi.ptMinTrackSize.x = w;
+                mmi.ptMinTrackSize.y = h;
+            }
             1
         }
         WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR.
-            let from_list = unsafe { (*(l as *const NMHDR)).idFrom } == usize::from(ID_LIST);
+            let from_list = m.notify().is_some_and(|n| n.id() == usize::from(ID_LIST));
             if !from_list {
                 return 0;
             }
-            // SAFETY: a notification from the list.
-            if let Some(answer) = unsafe { s.notify(dlg, l) } {
-                // SAFETY: the answer of this dialog's WM_NOTIFY.
-                unsafe { SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, answer) };
+            if let Some(answer) = s.notify(dlg, m) {
+                dlg::set_result(dlg, answer);
             }
             1
         }
-        WM_COMMAND => isize::from(s.command(dlg, (w & 0xffff) as u16)),
+        WM_COMMAND => isize::from(s.command(dlg, win::loword(m.w))),
         WM_DROPFILES => {
-            s.dropped(dlg, w as HDROP);
+            // The paths of files dropped on the dialog (the drop is finished
+            // once this returns).
+            if let Some(paths) = m.dropped_files() {
+                s.dropped(dlg, paths);
+            }
             1
         }
         WM_IMPORTED => {
@@ -878,8 +814,7 @@ unsafe extern "system" fn dialog_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM)
 
 /// Posts the main window W7's "edit the term at `unit`" (Ctrl+click, F2).
 pub fn post_edit_at(main: HWND, unit: usize) {
-    // SAFETY: a plain post to this thread's window.
-    unsafe { PostMessageW(main, WM_EDIT_TERM_AT, unit, 0) };
+    win::post_app(main, WM_EDIT_TERM_AT, unit, 0);
 }
 
 #[cfg(test)]

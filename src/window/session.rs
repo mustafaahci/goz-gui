@@ -26,26 +26,22 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use windows_sys::Win32::UI::Controls::{
-    LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_GETTOPINDEX, LVM_SCROLL,
-    LVNI_FOCUSED,
-};
+use windows_sys::Win32::UI::Controls::LVNI_FOCUSED;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowPlacement, IsIconic, IsWindowVisible, IsZoomed, KillTimer,
     SW_HIDE, SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNA, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOZORDER, SetTimer, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOWPLACEMENT,
-    WPF_RESTORETOMAXIMIZED,
+    SWP_NOZORDER, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
 };
 
 use super::nav::NavState;
 use super::reselect::{self, Reselect};
-use super::{App, TIMER_SESSION, prefs, send};
+use super::{App, TIMER_SESSION, prefs};
 use crate::history::NavHistory;
 use crate::placement;
 use crate::searchbox;
 use crate::session::{self, FILE_NAME, MAX_SELECTION, Session, SessionFile, View};
 use crate::settings::{Settings, WindowPos};
 use crate::store::location;
+use crate::win::{self, lv};
 
 /// A restored view waiting for the rows of its search.
 #[derive(Debug)]
@@ -158,9 +154,8 @@ impl App {
     /// Starts the clock that writes the session while it changes.
     pub(super) fn session_timer(&self) {
         if self.sessions.file.is_some() {
-            // SAFETY: a timer of this window; WM_TIMER kills it, and the
-            // handler sets it again.
-            unsafe { SetTimer(self.hwnd, TIMER_SESSION, self.sessions.delay_ms, None) };
+            // WM_TIMER kills it, and the handler sets it again.
+            win::set_timer(self.hwnd, TIMER_SESSION, self.sessions.delay_ms);
         }
     }
 
@@ -173,8 +168,7 @@ impl App {
             return;
         };
         if exit {
-            // SAFETY: a timer of this window.
-            unsafe { KillTimer(self.hwnd, TIMER_SESSION) };
+            win::kill_timer(self.hwnd, TIMER_SESSION);
         }
         let text = self.current_session().to_text();
         {
@@ -280,14 +274,8 @@ impl App {
             };
         }
         let top = self.top_index() as u64;
-        let focused = usize::try_from(send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        ))
-        .ok();
-        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
+        let focused = usize::try_from(lv::next_item(self.list, -1, LVNI_FOCUSED)).ok();
+        let selected = lv::selected_count(self.list) as u64;
         // Only Select All's: a selection that just covers every row (the
         // only row, clicked) is its files, as any other is.
         let all = reselect::all_chosen(self.select_all.get(), selected, self.model.borrow().total);
@@ -444,12 +432,12 @@ impl App {
             // Rows of cells, not of the rows' height: the saved item in
             // view.
             let top = view.top.min(total - 1) as usize;
-            send(self.list, LVM_ENSUREVISIBLE, top, 0);
+            lv::ensure_visible(self.list, top as i32, false);
         } else if total > 0 {
-            let now = send(self.list, LVM_GETTOPINDEX, 0, 0).max(0) as u64;
+            let now = lv::top_index(self.list).max(0) as u64;
             let dy = scroll_by(view.top, now, total, self.row_height());
             if dy != 0 {
-                send(self.list, LVM_SCROLL, 0, dy as isize);
+                lv::scroll(self.list, 0, dy);
             }
         }
         let mut reselect = Reselect::sought_again(view.selection, view.focus);
@@ -476,63 +464,55 @@ impl App {
     pub(super) fn restore_placement(&self, pos: Option<WindowPos>, maximized: bool) {
         let monitors = placement::monitors();
         let rect = pos.and_then(|w| placement::fit(&w, &monitors));
-        // SAFETY: reads and places this thread's window; the struct lives
-        // across the calls.
-        unsafe {
-            let hwnd = self.hwnd;
-            let visible = IsWindowVisible(hwnd) != 0;
-            let active = GetForegroundWindow() == hwnd;
-            let iconic = IsIconic(hwnd) != 0;
-            if iconic || IsZoomed(hwnd) != 0 {
-                // Minimized or maximized: the normal rectangle goes in the
-                // placement (workspace coordinates), and the state stays
-                // or leaves maximized without the window being activated.
-                let mut wp = WINDOWPLACEMENT {
-                    length: size_of::<WINDOWPLACEMENT>() as u32,
-                    ..core::mem::zeroed()
-                };
-                GetWindowPlacement(hwnd, &mut wp);
-                if let Some(r) = rect {
-                    let ws = placement::screen_to_workspace(r, &monitors);
-                    wp.rcNormalPosition = ws.to_win();
-                }
-                wp.showCmd = if !visible {
-                    SW_HIDE
-                } else if iconic {
-                    SW_SHOWMINNOACTIVE
-                } else if maximized {
-                    // Stays maximized; the normal rectangle changes.
-                    SW_SHOWNA
-                } else {
-                    SW_SHOWNOACTIVATE
-                } as u32;
-                if iconic {
-                    if maximized {
-                        wp.flags |= WPF_RESTORETOMAXIMIZED;
-                    } else {
-                        wp.flags &= !WPF_RESTORETOMAXIMIZED;
-                    }
-                }
-                SetWindowPlacement(hwnd, &wp);
-                self.maximize_deferred.set(maximized && !visible);
+        let hwnd = self.hwnd;
+        let visible = win::is_visible(hwnd);
+        let active = win::foreground() == hwnd;
+        let iconic = win::is_iconic(hwnd);
+        if iconic || win::is_zoomed(hwnd) {
+            // Minimized or maximized: the normal rectangle goes in the
+            // placement (workspace coordinates), and the state stays
+            // or leaves maximized without the window being activated.
+            let mut wp = win::placement(hwnd).unwrap_or(WINDOWPLACEMENT {
+                length: size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            });
+            if let Some(r) = rect {
+                let ws = placement::screen_to_workspace(r, &monitors);
+                wp.rcNormalPosition = ws.to_win();
+            }
+            wp.showCmd = if !visible {
+                SW_HIDE
+            } else if iconic {
+                SW_SHOWMINNOACTIVE
+            } else if maximized {
+                // Stays maximized; the normal rectangle changes.
+                SW_SHOWNA
             } else {
-                if let Some(r) = rect {
-                    SetWindowPos(
-                        hwnd,
-                        core::ptr::null_mut(),
-                        r.x,
-                        r.y,
-                        r.w,
-                        r.h,
-                        SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                }
-                if maximized && visible && active {
-                    ShowWindow(hwnd, SW_SHOWMAXIMIZED);
-                    self.maximize_deferred.set(false);
+                SW_SHOWNOACTIVATE
+            } as u32;
+            if iconic {
+                if maximized {
+                    wp.flags |= WPF_RESTORETOMAXIMIZED;
                 } else {
-                    self.maximize_deferred.set(maximized);
+                    wp.flags &= !WPF_RESTORETOMAXIMIZED;
                 }
+            }
+            win::set_placement(hwnd, &wp);
+            self.maximize_deferred.set(maximized && !visible);
+        } else {
+            if let Some(r) = rect {
+                win::set_pos(
+                    hwnd,
+                    core::ptr::null_mut(),
+                    (r.x, r.y, r.w, r.h),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            if maximized && visible && active {
+                win::show(hwnd, SW_SHOWMAXIMIZED);
+                self.maximize_deferred.set(false);
+            } else {
+                self.maximize_deferred.set(maximized);
             }
         }
         self.settings_changed();

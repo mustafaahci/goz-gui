@@ -31,31 +31,21 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BLENDFUNCTION, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, COLORONCOLOR, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLORONCOLOR,
     DEFAULT_CHARSET, DT_CALCRECT, DT_CENTER, DT_EDITCONTROL, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_WORDBREAK, DeleteDC, DeleteObject, DrawFocusRect, DrawTextW, EndPaint, FF_MODERN,
-    FIXED_PITCH, FW_NORMAL, HALFTONE, HBITMAP, HDC, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, SRCCOPY, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
-    StretchBlt, TRANSPARENT,
+    DT_WORDBREAK, FF_MODERN, FIXED_PITCH, FW_NORMAL, HALFTONE, HDC, LOGFONTW, OUT_DEFAULT_PRECIS,
+    SRCCOPY, TRANSPARENT,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::{EM_SETLIMITTEXT, EM_SETRECTNP, EM_SETSEL};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_MENU,
-};
+use windows_sys::Win32::UI::Controls::LVIS_SELECTED;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-    ES_READONLY, GW_CHILD, GWLP_USERDATA, GetClientRect, GetMessageTime, GetParent,
-    GetSystemMetrics, GetWindow, GetWindowLongPtrW, HMENU, HWND_MESSAGE, HWND_TOP, IDC_ARROW,
-    IsChild, IsIconic, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, MSG, MoveWindow,
-    PostMessageW, RegisterClassExW, SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_HIDE, SW_SHOWNA,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW, SetParent, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, WM_COMMAND, WM_CONTEXTMENU,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_PAINT, WM_SETFOCUS, WM_SETFONT,
-    WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_HSCROLL, WS_VSCROLL,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GW_CHILD, HWND_MESSAGE, HWND_TOP,
+    IDC_ARROW, MSG, SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, WM_COMMAND, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_PAINT, WM_SETFOCUS, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_HSCROLL, WS_VSCROLL,
 };
 
 use crate::client::Row;
@@ -64,7 +54,9 @@ use crate::dock::PaneId;
 use crate::paint::fill;
 use crate::pane::{PaneContent, PaneEvent, PaneSpec};
 use crate::theme::Ink;
-use crate::wide::wz;
+use crate::win::class::{self, Class, Create};
+use crate::win::gdi::{self, MemDc, Selected};
+use crate::win::{self, Msg, edit, lv, sys};
 use crate::window::App;
 use crate::window::slots::F1_MSG;
 use crate::{filetype, format, menu, theme};
@@ -123,7 +115,12 @@ thread_local! {
 
 /// Registers the preview pane, with the settings it starts with.
 pub fn register(app: &App, settings: PreviewSettings) {
-    register_host_class();
+    // Again is refused, harmlessly.
+    Class {
+        cursor: sys::system_cursor(IDC_ARROW),
+        ..Class::new(HOST_CLASS)
+    }
+    .register();
     app.register_pane(PaneSpec {
         min_high: 64,
         ..PaneSpec::new(
@@ -167,9 +164,9 @@ pub fn retired(host: usize) {
         at.map(|i| g.swap_remove(i)).is_some()
     });
     if known {
-        // SAFETY: a window of this thread that the graveyard held, so it
-        // was never destroyed meanwhile.
-        unsafe { DestroyWindow(host as HWND) };
+        // A window of this thread that the graveyard held, so it was never
+        // destroyed meanwhile.
+        win::destroy(host as HWND);
         worker::note("parked host destroyed");
     }
 }
@@ -181,73 +178,43 @@ fn retire_host(host: HWND) {
     if host.is_null() {
         return;
     }
-    // SAFETY: windows of this thread; the host's child, if any, is the
-    // handler's, which is only looked at.
-    unsafe {
-        if IsWindow(host) == 0 {
-            return;
-        }
-        // The keyboard, if it is in the handler's window, comes back to
-        // the pane rather than stay in a hidden window.
-        let focus = GetFocus();
-        if !focus.is_null() && (focus == host || IsChild(host, focus) != 0) {
-            SetFocus(GetParent(host));
-        }
-        ShowWindow(host, SW_HIDE);
-        if GetWindow(host, GW_CHILD).is_null() {
-            DestroyWindow(host);
-            worker::note("host destroyed");
-            return;
-        }
-        SetParent(host, HWND_MESSAGE);
+    // Windows of this thread; the host's child, if any, is the handler's,
+    // which is only looked at.
+    if !win::is_window(host) {
+        return;
     }
+    // The keyboard, if it is in the handler's window, comes back to the
+    // pane rather than stay in a hidden window.
+    let focus = win::focus();
+    if !focus.is_null() && (focus == host || win::is_child(host, focus)) {
+        win::set_focus(win::parent(host));
+    }
+    win::show(host, SW_HIDE);
+    if win::related(host, GW_CHILD).is_null() {
+        win::destroy(host);
+        worker::note("host destroyed");
+        return;
+    }
+    win::set_parent(host, HWND_MESSAGE);
     GRAVEYARD.with(|g| g.borrow_mut().push(host as usize));
     worker::note("host parked");
 }
 
-fn register_host_class() {
-    let class = wz(HOST_CLASS);
-    // SAFETY: registers a class of this module (again is refused,
-    // harmlessly).
-    unsafe {
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(host_proc),
-            hInstance: GetModuleHandleW(core::ptr::null()),
-            hCursor: LoadCursorW(core::ptr::null_mut(), IDC_ARROW),
-            lpszClassName: class.as_ptr(),
-            ..core::mem::zeroed()
-        };
-        RegisterClassExW(&wc);
-    }
-}
-
-/// The window preview handlers draw in: it paints the background (its
-/// GWLP_USERDATA) wherever the handler's window does not cover it.
-unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // SAFETY: a standard paint of this window; `w` is the DC with
-    // WM_ERASEBKGND.
-    unsafe {
-        match msg {
-            WM_ERASEBKGND => {
-                let mut rc = RECT::default();
-                GetClientRect(hwnd, &mut rc);
-                fill(w as HDC, &rc, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u32);
-                1
-            }
-            WM_PAINT => {
-                let mut ps: PAINTSTRUCT = core::mem::zeroed();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                fill(
-                    hdc,
-                    &ps.rcPaint,
-                    GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u32,
-                );
-                EndPaint(hwnd, &ps);
-                0
-            }
-            _ => DefWindowProcW(hwnd, msg, w, l),
+/// The window preview handlers draw in: it paints the background (`bg`,
+/// the pane's) wherever the handler's window does not cover it.
+fn host_proc(bg: &Cell<u32>, m: &Msg) -> LRESULT {
+    match m.id {
+        WM_ERASEBKGND => {
+            // `w` is the DC with WM_ERASEBKGND.
+            fill(m.w as HDC, &win::client_rect(m.hwnd), bg.get());
+            1
         }
+        WM_PAINT => {
+            let ps = gdi::Paint::begin(m.hwnd);
+            fill(ps.hdc(), &ps.area(), bg.get());
+            0
+        }
+        _ => m.def(),
     }
 }
 
@@ -312,15 +279,9 @@ struct Scaled {
     height: i32,
     bg: u32,
     smooth: bool,
-    handle: HBITMAP,
-}
-
-impl Drop for Scaled {
-    fn drop(&mut self) {
-        // SAFETY: the bitmap is owned here and selected into no DC (each
-        // draw selects it out again).
-        unsafe { DeleteObject(self.handle) };
-    }
+    /// The bitmap, owned here and selected into no DC (each draw selects
+    /// it out again), deleted as this drops.
+    bitmap: gdi::Owned,
 }
 
 /// What the pane shows.
@@ -359,31 +320,19 @@ enum Focus {
 /// The focused result: the focused row if it is selected, else the first
 /// selected one.
 fn focused(app: &App) -> Focus {
-    use windows_sys::Win32::UI::Controls::{
-        LVIS_SELECTED, LVM_GETITEMCOUNT, LVM_GETITEMSTATE, LVM_GETNEXTITEM, LVNI_FOCUSED,
-        LVNI_SELECTED,
-    };
+    use windows_sys::Win32::UI::Controls::{LVNI_FOCUSED, LVNI_SELECTED};
     let list = app.list;
-    // SAFETY: questions to this thread's list; nothing of goz-gui's state
-    // is borrowed across them.
-    let index = unsafe {
-        if SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) <= 0 {
-            return Focus::None;
-        }
-        let focus = SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize);
-        let selected = focus >= 0
-            && SendMessageW(
-                list,
-                LVM_GETITEMSTATE,
-                focus as usize,
-                LVIS_SELECTED as isize,
-            ) & LVIS_SELECTED as isize
-                != 0;
-        if selected {
-            focus
-        } else {
-            SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize)
-        }
+    // Questions to this thread's list; nothing of goz-gui's state is
+    // borrowed across them.
+    if lv::item_count(list) == 0 {
+        return Focus::None;
+    }
+    let focus = lv::next_item(list, -1, LVNI_FOCUSED);
+    let selected = focus >= 0 && lv::item_state(list, focus, LVIS_SELECTED) & LVIS_SELECTED != 0;
+    let index = if selected {
+        focus
+    } else {
+        lv::next_item(list, -1, LVNI_SELECTED)
     };
     if index < 0 {
         return Focus::None;
@@ -416,13 +365,12 @@ fn focused(app: &App) -> Focus {
 
 /// Whether the main window is on screen (not hidden, not minimized).
 fn on_screen(app: &App) -> bool {
-    // SAFETY: reads this thread's window's state.
-    unsafe { IsWindowVisible(app.hwnd) != 0 && IsIconic(app.hwnd) == 0 }
+    win::is_visible(app.hwnd) && !win::is_iconic(app.hwnd)
 }
 
 /// The text view's font at the window's DPI: Consolas at 13 px (100 %),
 /// or in Fonts and Colors' Preview face and size where it has its own.
-fn mono_font(app: &App) -> HFONT {
+fn mono_font(app: &App) -> Option<gdi::Owned> {
     let own = app.font_spec(crate::colors::Item::Preview);
     let height = if own.size > 0 {
         // Points at the DPI.
@@ -435,41 +383,29 @@ fn mono_font(app: &App) -> HFONT {
     } else {
         (own.face, 0)
     };
-    // SAFETY: a font the pane owns and deletes.
-    unsafe {
-        CreateFontW(
-            height,
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            u32::from(DEFAULT_CHARSET),
-            u32::from(OUT_DEFAULT_PRECIS),
-            u32::from(CLIP_DEFAULT_PRECIS),
-            u32::from(CLEARTYPE_QUALITY),
-            u32::from(pitch),
-            wz(&face).as_ptr(),
-        )
+    // The face, cut to the 31 units a font's face name holds.
+    let mut lf_face = [0u16; 32];
+    for (to, unit) in lf_face[..31].iter_mut().zip(face.encode_utf16()) {
+        *to = unit;
     }
+    // A font the pane owns and deletes.
+    gdi::create_font(&LOGFONTW {
+        lfHeight: height,
+        lfWeight: FW_NORMAL as i32,
+        lfCharSet: DEFAULT_CHARSET,
+        lfOutPrecision: OUT_DEFAULT_PRECIS,
+        lfClipPrecision: CLIP_DEFAULT_PRECIS,
+        lfQuality: CLEARTYPE_QUALITY,
+        lfPitchAndFamily: pitch,
+        lfFaceName: lf_face,
+        ..Default::default()
+    })
 }
 
 /// The preview's font (Fonts and Colors' Preview), as preview handlers
 /// that take one want it.
-fn logfont(app: &App) -> windows::Win32::Graphics::Gdi::LOGFONTW {
-    use windows::Win32::Graphics::Gdi::{GetObjectW, HGDIOBJ, LOGFONTW};
-    let mut lf = LOGFONTW::default();
-    // SAFETY: reads the font's description into a struct of its size.
-    unsafe {
-        GetObjectW(
-            HGDIOBJ(app.part_font(crate::colors::Item::Preview, false) as *mut _),
-            size_of::<LOGFONTW>() as i32,
-            Some((&raw mut lf).cast()),
-        )
-    };
-    lf
+fn logfont(app: &App) -> LOGFONTW {
+    gdi::font_info(app.part_font(crate::colors::Item::Preview, false)).unwrap_or_default()
 }
 
 fn width(rc: &RECT) -> i32 {
@@ -487,7 +423,9 @@ pub struct PreviewPane {
     /// The content's place in the pane window.
     rc: Cell<RECT>,
     text_box: Cell<HWND>,
-    mono: Cell<HFONT>,
+    mono: RefCell<Option<gdi::Owned>>,
+    /// The background the host windows paint, shared with their handlers.
+    host_bg: Rc<Cell<u32>>,
     worker: RefCell<Option<Worker>>,
     /// Each request's number; replies to older ones are dropped.
     generation: Cell<u64>,
@@ -508,7 +446,8 @@ impl PreviewPane {
             pane: Cell::new(core::ptr::null_mut()),
             rc: Cell::new(RECT::default()),
             text_box: Cell::new(core::ptr::null_mut()),
-            mono: Cell::new(core::ptr::null_mut()),
+            mono: RefCell::new(None),
+            host_bg: Rc::new(Cell::new(0)),
             worker: RefCell::new(None),
             generation: Cell::new(0),
             target: RefCell::new(None),
@@ -527,19 +466,16 @@ impl PreviewPane {
     }
 
     fn timer(&self, id: usize, ms: u32) {
-        // SAFETY: a timer of this pane's window.
-        unsafe { SetTimer(self.pane.get(), id, ms, None) };
+        win::set_timer(self.pane.get(), id, ms);
     }
 
     fn kill(&self, id: usize) {
-        // SAFETY: a timer of this pane's window.
-        unsafe { KillTimer(self.pane.get(), id) };
+        win::kill_timer(self.pane.get(), id);
     }
 
     fn invalidate(&self) {
         let rc = self.rc.get();
-        // SAFETY: repaints this thread's pane.
-        unsafe { InvalidateRect(self.pane.get(), &rc, 0) };
+        win::invalidate(self.pane.get(), Some(&rc), false);
     }
 
     /// Follows the focus after it rests.
@@ -553,33 +489,29 @@ impl PreviewPane {
             return true;
         }
         let rc = self.rc.get();
-        let class = wz(HOST_CLASS);
-        // SAFETY: a hidden child of this thread's pane window.
-        let host = unsafe {
-            CreateWindowExW(
-                0,
-                class.as_ptr(),
-                core::ptr::null(),
-                WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-                rc.left,
-                rc.top,
-                width(&rc).max(0),
-                height(&rc).max(0),
-                self.pane.get(),
-                ID_HOST as HMENU,
-                GetModuleHandleW(core::ptr::null()),
-                core::ptr::null(),
-            )
-        };
+        // The background the host paints.
+        self.host_bg.set(preview_ink(app).bg);
+        let bg = Rc::clone(&self.host_bg);
+        // A hidden child of this thread's pane window.
+        let host = class::create(
+            &Create {
+                ex_style: 0,
+                class: HOST_CLASS,
+                title: "",
+                style: WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                rect: (rc.left, rc.top, width(&rc).max(0), height(&rc).max(0)),
+                parent: self.pane.get(),
+                menu: class::id_menu(ID_HOST),
+            },
+            move |m| host_proc(&bg, m),
+        );
         if host.is_null() {
             return false;
         }
-        // SAFETY: the background the host paints, in its own data.
-        unsafe { SetWindowLongPtrW(host, GWLP_USERDATA, preview_ink(app).bg as isize) };
         let worker = Worker::spawn(app.hwnd, WM_REPLIES, WM_RETIRE, host, self.settings);
         let Some(worker) = worker else {
-            // SAFETY: the host just made, with nothing in it.
-            unsafe { DestroyWindow(host) };
+            // The host just made, with nothing in it.
+            win::destroy(host);
             return false;
         };
         *self.worker.borrow_mut() = Some(worker);
@@ -675,8 +607,7 @@ impl PreviewPane {
         let host = worker.host();
         if worker.wait(EXIT_WAIT) {
             // The thread ended: no handler's window is left in the host.
-            // SAFETY: this thread's host window.
-            unsafe { DestroyWindow(host) };
+            win::destroy(host);
         } else {
             retire_host(host);
         }
@@ -692,41 +623,36 @@ impl PreviewPane {
         // The old view's bitmaps go here.
         drop(self.view.replace(view));
         let (pane, edit, host) = (self.pane.get(), self.text_box.get(), self.host());
-        // SAFETY: shows and hides this thread's windows; the host's child,
-        // the handler's, is only asked about.
-        unsafe {
-            let focus = GetFocus();
-            if text {
-                ShowWindow(edit, SW_SHOWNA);
+        // Shows and hides this thread's windows; the host's child, the
+        // handler's, is only asked about.
+        let focus = win::focus();
+        if text {
+            win::show(edit, SW_SHOWNA);
+        }
+        if handler && !host.is_null() {
+            win::set_pos(
+                host,
+                HWND_TOP,
+                (0, 0, 0, 0),
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        let leaving = |w: HWND| !w.is_null() && (focus == w || win::is_child(w, focus));
+        if !text {
+            if leaving(edit) {
+                win::set_focus(pane);
             }
-            if handler && !host.is_null() {
-                SetWindowPos(
-                    host,
-                    HWND_TOP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                );
+            win::show(edit, SW_HIDE);
+            if was_text {
+                // The text's memory goes.
+                win::set_text(edit, "");
             }
-            let leaving = |w: HWND| !w.is_null() && (focus == w || IsChild(w, focus) != 0);
-            if !text {
-                if leaving(edit) {
-                    SetFocus(pane);
-                }
-                ShowWindow(edit, SW_HIDE);
-                if was_text {
-                    // The text's memory goes.
-                    SetWindowTextW(edit, [0u16].as_ptr());
-                }
+        }
+        if !handler && !host.is_null() {
+            if leaving(host) {
+                win::set_focus(pane);
             }
-            if !handler && !host.is_null() {
-                if leaving(host) {
-                    SetFocus(pane);
-                }
-                ShowWindow(host, SW_HIDE);
-            }
+            win::show(host, SW_HIDE);
         }
         self.invalidate();
     }
@@ -790,11 +716,8 @@ impl PreviewPane {
             Shown::Text(mut text) => {
                 text.push(0);
                 let edit = self.text_box.get();
-                // SAFETY: a NUL-terminated text for this thread's text box.
-                unsafe {
-                    SetWindowTextW(edit, text.as_ptr());
-                    SendMessageW(edit, EM_SETSEL, 0, 0);
-                }
+                win::set_text_wide(edit, &text);
+                edit::set_sel(edit, 0, 0);
                 View::Text
             }
             Shown::Handler => View::Handler,
@@ -865,18 +788,14 @@ impl PreviewPane {
     /// The text box's text keeps off its edges.
     fn text_margins(&self, app: &App) {
         let edit = self.text_box.get();
-        let mut rc = RECT::default();
-        // SAFETY: reads and sets this thread's text box's rectangles.
-        unsafe {
-            GetClientRect(edit, &mut rc);
-            let inner = RECT {
-                left: rc.left + app.scale(6),
-                top: rc.top + app.scale(4),
-                right: (rc.right - app.scale(4)).max(rc.left + app.scale(6)),
-                bottom: rc.bottom,
-            };
-            SendMessageW(edit, EM_SETRECTNP, 0, (&raw const inner) as isize);
-        }
+        let rc = win::client_rect(edit);
+        let inner = RECT {
+            left: rc.left + app.scale(6),
+            top: rc.top + app.scale(4),
+            right: (rc.right - app.scale(4)).max(rc.left + app.scale(6)),
+            bottom: rc.bottom,
+        };
+        edit::set_rect_np(edit, &inner);
     }
 
     /// Paints the image, icon or message in `rc`.
@@ -943,36 +862,36 @@ fn draw_image(
     if w <= 0 || h <= 0 {
         return;
     }
-    // SAFETY: memory DCs made and deleted here hold bitmaps owned by the
-    // view, selected out again before the DCs go.
-    unsafe {
-        let mem = CreateCompatibleDC(hdc);
-        if (w, h) == (src.width, src.height) {
-            // Its own size: blended straight onto the background.
-            let old = SelectObject(mem, src.handle());
-            AlphaBlend(hdc, at.left, at.top, w, h, mem, 0, 0, w, h, blend());
-            SelectObject(mem, old);
-            DeleteDC(mem);
-            return;
-        }
-        let smooth = if w < src.width {
-            settings.min_filter.smooth()
-        } else {
-            settings.mag_filter.smooth()
-        };
-        let fresh = cache
-            .borrow()
-            .as_ref()
-            .is_some_and(|s| s.width == w && s.height == h && s.bg == bg && s.smooth == smooth);
-        if !fresh {
-            *cache.borrow_mut() = scale(hdc, image, w, h, bg, smooth);
-        }
-        if let Some(s) = cache.borrow().as_ref() {
-            let old = SelectObject(mem, s.handle);
-            BitBlt(hdc, at.left, at.top, w, h, mem, 0, 0, SRCCOPY);
-            SelectObject(mem, old);
-        }
-        DeleteDC(mem);
+    // Memory DCs made and deleted here hold bitmaps owned by the view,
+    // selected out again before the DCs go.
+    let mem = MemDc::compatible(hdc);
+    if (w, h) == (src.width, src.height) {
+        // Its own size: blended straight onto the background.
+        let _picture = Selected::of(mem.hdc(), src.handle());
+        gdi::alpha_blend(
+            hdc,
+            (at.left, at.top, w, h),
+            mem.hdc(),
+            (0, 0, w, h),
+            blend(),
+        );
+        return;
+    }
+    let smooth = if w < src.width {
+        settings.min_filter.smooth()
+    } else {
+        settings.mag_filter.smooth()
+    };
+    let fresh = cache
+        .borrow()
+        .as_ref()
+        .is_some_and(|s| s.width == w && s.height == h && s.bg == bg && s.smooth == smooth);
+    if !fresh {
+        *cache.borrow_mut() = scale(hdc, image, w, h, bg, smooth);
+    }
+    if let Some(s) = cache.borrow().as_ref() {
+        let _scaled = Selected::new(mem.hdc(), &s.bitmap);
+        gdi::bit_blt(hdc, (at.left, at.top, w, h), mem.hdc(), (0, 0), SRCCOPY);
     }
 }
 
@@ -991,54 +910,65 @@ fn blend() -> BLENDFUNCTION {
 fn scale(hdc: HDC, image: &Decoded, w: i32, h: i32, bg: u32, smooth: bool) -> Option<Scaled> {
     let src = &image.bitmap;
     let (sw, sh) = (src.width, src.height);
-    // SAFETY: bitmaps and DCs made here; each is selected out before it is
+    // Bitmaps and DCs made here; each is selected out before it is
     // deleted, and the one returned is owned by `Scaled`.
-    unsafe {
-        let out = CreateCompatibleBitmap(hdc, w, h);
-        if out.is_null() {
-            return None;
-        }
-        let dst = CreateCompatibleDC(hdc);
-        let src_dc = CreateCompatibleDC(hdc);
-        let old_dst = SelectObject(dst, out);
-        let mut flat: HBITMAP = core::ptr::null_mut();
-        let old_src = if image.opaque {
-            SelectObject(src_dc, src.handle())
-        } else {
-            flat = CreateCompatibleBitmap(hdc, sw, sh);
-            let old = SelectObject(src_dc, flat);
-            let whole = RECT {
-                left: 0,
-                top: 0,
-                right: sw,
-                bottom: sh,
-            };
-            fill(src_dc, &whole, bg);
-            let pixels = CreateCompatibleDC(hdc);
-            let old_px = SelectObject(pixels, src.handle());
-            AlphaBlend(src_dc, 0, 0, sw, sh, pixels, 0, 0, sw, sh, blend());
-            SelectObject(pixels, old_px);
-            DeleteDC(pixels);
-            old
+    let out = gdi::create_compatible_bitmap(hdc, w, h)?;
+    let dst = MemDc::compatible(hdc);
+    let src_dc = MemDc::compatible(hdc);
+    let old_dst = Selected::new(dst.hdc(), &out);
+    let flat = if image.opaque {
+        None
+    } else {
+        gdi::create_compatible_bitmap(hdc, sw, sh)
+    };
+    let old_src = if image.opaque {
+        Selected::of(src_dc.hdc(), src.handle())
+    } else {
+        let old = Selected::of(
+            src_dc.hdc(),
+            flat.as_ref().map_or(core::ptr::null_mut(), gdi::Owned::get),
+        );
+        let whole = RECT {
+            left: 0,
+            top: 0,
+            right: sw,
+            bottom: sh,
         };
-        SetStretchBltMode(dst, if smooth { HALFTONE } else { COLORONCOLOR });
-        SetBrushOrgEx(dst, 0, 0, core::ptr::null_mut());
-        StretchBlt(dst, 0, 0, w, h, src_dc, 0, 0, sw, sh, SRCCOPY);
-        SelectObject(src_dc, old_src);
-        SelectObject(dst, old_dst);
-        DeleteDC(src_dc);
-        DeleteDC(dst);
-        if !flat.is_null() {
-            DeleteObject(flat);
-        }
-        Some(Scaled {
-            width: w,
-            height: h,
-            bg,
-            smooth,
-            handle: out,
-        })
-    }
+        fill(src_dc.hdc(), &whole, bg);
+        let pixels = MemDc::compatible(hdc);
+        let old_px = Selected::of(pixels.hdc(), src.handle());
+        gdi::alpha_blend(
+            src_dc.hdc(),
+            (0, 0, sw, sh),
+            pixels.hdc(),
+            (0, 0, sw, sh),
+            blend(),
+        );
+        drop(old_px);
+        drop(pixels);
+        old
+    };
+    gdi::set_stretch_blt_mode(dst.hdc(), if smooth { HALFTONE } else { COLORONCOLOR });
+    gdi::set_brush_org(dst.hdc(), 0, 0);
+    gdi::stretch_blt(
+        dst.hdc(),
+        (0, 0, w, h),
+        src_dc.hdc(),
+        (0, 0, sw, sh),
+        SRCCOPY,
+    );
+    drop(old_src);
+    drop(old_dst);
+    drop(src_dc);
+    drop(dst);
+    drop(flat);
+    Some(Scaled {
+        width: w,
+        height: h,
+        bg,
+        smooth,
+        bitmap: out,
+    })
 }
 
 /// The text's height in `w` pixels, at most `lines` lines.
@@ -1052,17 +982,13 @@ fn text_height(hdc: HDC, text: &[u16], w: i32, lines: i32, line: i32) -> i32 {
         right: w.max(1),
         bottom: 0,
     };
-    // SAFETY: measures into the rectangle; the text is not changed
-    // (DT_MODIFYSTRING is not given).
-    unsafe {
-        DrawTextW(
-            hdc,
-            text.as_ptr(),
-            text.len() as i32,
-            &mut rc,
-            DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX,
-        );
-    }
+    // Measures into the rectangle.
+    gdi::draw_text(
+        hdc,
+        text,
+        &mut rc,
+        DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX,
+    );
     rc.bottom.min(lines * line)
 }
 
@@ -1080,51 +1006,47 @@ fn caption(
     let w = (width(rc) - 2 * margin).max(1);
     // In Fonts and Colors' Preview font.
     let line = app.part_height(crate::colors::Item::Preview);
-    // SAFETY: draws into the paint buffer; the old font is put back.
-    unsafe {
-        let old = SelectObject(hdc, app.part_font(crate::colors::Item::Preview, false));
-        SetBkMode(hdc, TRANSPARENT as i32);
-        let shown = image.map(|(i, _, _)| fit(i.natural, (w, (height(rc) / 2).max(1)), false));
-        let heights: Vec<i32> = lines
-            .iter()
-            .map(|(t, _)| text_height(hdc, t, w, 6, line))
-            .collect();
-        let texts: i32 = heights.iter().sum::<i32>()
-            + gap / 2 * heights.iter().filter(|&&h| h > 0).count().saturating_sub(1) as i32;
-        let total = shown.map_or(0, |s| s.1 + gap) + texts;
-        let mut y = rc.top + ((height(rc) - total) / 2).max(margin.min(height(rc) / 4));
-        if let (Some((img, cache, settings)), Some((iw, ih))) = (image, shown) {
-            let left = rc.left + (width(rc) - iw) / 2;
-            let at = RECT {
-                left,
-                top: y,
-                right: left + iw,
-                bottom: y + ih,
-            };
-            draw_image(hdc, img, cache, &at, preview_ink(app).bg, settings);
-            y += ih + gap;
+    // Draws into the paint buffer; the old font is put back as this goes.
+    let _font = Selected::of(hdc, app.part_font(crate::colors::Item::Preview, false));
+    gdi::set_bk_mode(hdc, TRANSPARENT as i32);
+    let shown = image.map(|(i, _, _)| fit(i.natural, (w, (height(rc) / 2).max(1)), false));
+    let heights: Vec<i32> = lines
+        .iter()
+        .map(|(t, _)| text_height(hdc, t, w, 6, line))
+        .collect();
+    let texts: i32 = heights.iter().sum::<i32>()
+        + gap / 2 * heights.iter().filter(|&&h| h > 0).count().saturating_sub(1) as i32;
+    let total = shown.map_or(0, |s| s.1 + gap) + texts;
+    let mut y = rc.top + ((height(rc) - total) / 2).max(margin.min(height(rc) / 4));
+    if let (Some((img, cache, settings)), Some((iw, ih))) = (image, shown) {
+        let left = rc.left + (width(rc) - iw) / 2;
+        let at = RECT {
+            left,
+            top: y,
+            right: left + iw,
+            bottom: y + ih,
+        };
+        draw_image(hdc, img, cache, &at, preview_ink(app).bg, settings);
+        y += ih + gap;
+    }
+    for ((text, colour), h) in lines.iter().zip(heights) {
+        if h == 0 {
+            continue;
         }
-        for ((text, colour), h) in lines.iter().zip(heights) {
-            if h == 0 {
-                continue;
-            }
-            let mut at = RECT {
-                left: rc.left + margin,
-                top: y,
-                right: rc.left + margin + w,
-                bottom: (y + h).min(rc.bottom),
-            };
-            SetTextColor(hdc, *colour);
-            DrawTextW(
-                hdc,
-                text.as_ptr(),
-                text.len() as i32,
-                &mut at,
-                DT_CENTER | DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS | DT_NOPREFIX,
-            );
-            y += h + gap / 2;
-        }
-        SelectObject(hdc, old);
+        let mut at = RECT {
+            left: rc.left + margin,
+            top: y,
+            right: rc.left + margin + w,
+            bottom: (y + h).min(rc.bottom),
+        };
+        gdi::set_text_color(hdc, *colour);
+        gdi::draw_text(
+            hdc,
+            text,
+            &mut at,
+            DT_CENTER | DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        y += h + gap / 2;
     }
 }
 
@@ -1141,32 +1063,26 @@ impl PaneContent for PreviewPane {
     fn create(&self, app: &App, pane: HWND) {
         self.pane.set(pane);
         let font = mono_font(app);
-        self.mono.set(font);
+        let handle = font.as_ref().map_or(core::ptr::null_mut(), gdi::Owned::get);
+        *self.mono.borrow_mut() = font;
         let style = WS_CHILD
             | WS_VSCROLL
             | WS_HSCROLL
             | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL) as u32;
-        // SAFETY: a hidden child of this thread's pane window, given the
-        // pane's font; its text has no limit but the 64 KB read.
-        unsafe {
-            let edit = CreateWindowExW(
-                0,
-                wz("EDIT").as_ptr(),
-                core::ptr::null(),
-                style,
-                0,
-                0,
-                0,
-                0,
-                pane,
-                ID_TEXT as HMENU,
-                GetModuleHandleW(core::ptr::null()),
-                core::ptr::null(),
-            );
-            SendMessageW(edit, WM_SETFONT, font as usize, 0);
-            SendMessageW(edit, EM_SETLIMITTEXT, 0, 0);
-            self.text_box.set(edit);
-        }
+        // A hidden child of this thread's pane window, given the pane's
+        // font; its text has no limit but the 64 KB read.
+        let edit = class::create_plain(&Create {
+            ex_style: 0,
+            class: "EDIT",
+            title: "",
+            style,
+            rect: (0, 0, 0, 0),
+            parent: pane,
+            menu: class::id_menu(ID_TEXT),
+        });
+        win::set_font(edit, handle, false);
+        edit::set_limit(edit, 0);
+        self.text_box.set(edit);
         self.theme_text_box(app.pal.get().dark);
         self.window_shown.set(on_screen(app));
         // The first preview once the pane is in its place.
@@ -1177,12 +1093,9 @@ impl PaneContent for PreviewPane {
         self.rc.set(rc);
         let (w, h) = (width(&rc).max(0), height(&rc).max(0));
         let (edit, host) = (self.text_box.get(), self.host());
-        // SAFETY: moves this thread's windows.
-        unsafe {
-            MoveWindow(edit, rc.left, rc.top, w, h, 1);
-            if !host.is_null() {
-                MoveWindow(host, rc.left, rc.top, w, h, 1);
-            }
+        win::move_window(edit, rc.left, rc.top, w, h, true);
+        if !host.is_null() {
+            win::move_window(host, rc.left, rc.top, w, h, true);
         }
         self.text_margins(app);
         if let Some(worker) = self.worker.borrow().as_ref() {
@@ -1200,16 +1113,12 @@ impl PaneContent for PreviewPane {
         }
         self.release();
         let edit = self.text_box.replace(core::ptr::null_mut());
-        let font = self.mono.replace(core::ptr::null_mut());
-        // SAFETY: the text box goes before the font it uses.
-        unsafe {
-            if !edit.is_null() {
-                DestroyWindow(edit);
-            }
-            if !font.is_null() {
-                DeleteObject(font);
-            }
+        let font = self.mono.take();
+        // The text box goes before the font it uses (deleted as it drops).
+        if !edit.is_null() {
+            win::destroy(edit);
         }
+        drop(font);
     }
 
     fn focus(&self) -> Option<HWND> {
@@ -1219,24 +1128,21 @@ impl PaneContent for PreviewPane {
     fn key(&self, _app: &App, msg: &MSG) -> bool {
         // Ctrl+A selects all the text, which a multi-line text box does
         // not do by itself.
-        // SAFETY: reads this thread's keyboard state; selects in its text
-        // box.
-        unsafe {
-            if msg.hwnd == self.text_box.get()
-                && msg.message == WM_KEYDOWN
-                && msg.wParam == usize::from(b'A')
-                && GetKeyState(i32::from(VK_CONTROL)) < 0
-                && GetKeyState(i32::from(VK_MENU)) >= 0
-            {
-                SendMessageW(msg.hwnd, EM_SETSEL, 0, -1);
-                return true;
-            }
+        if msg.hwnd == self.text_box.get()
+            && msg.message == WM_KEYDOWN
+            && msg.wParam == usize::from(b'A')
+            && sys::key_down(VK_CONTROL)
+            && !sys::key_down(VK_MENU)
+        {
+            edit::set_sel(msg.hwnd, 0, -1);
+            return true;
         }
         false
     }
 
-    fn message(&self, app: &App, pane: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
-        match msg {
+    fn handle(&self, app: &App, pane: HWND, m: &Msg) -> Option<LRESULT> {
+        let (w, l) = (m.w, m.l);
+        match m.id {
             WM_TIMER => {
                 match w {
                     T_FOCUS => {
@@ -1284,16 +1190,14 @@ impl PaneContent for PreviewPane {
                     x: (l & 0xffff) as i16 as i32,
                     y: ((l >> 16) & 0xffff) as i16 as i32,
                 };
-                // SAFETY: reads the message's time and the system's
-                // double-click settings.
-                let (now, limit, dx, dy) = unsafe {
-                    (
-                        GetMessageTime() as u32,
-                        GetDoubleClickTime(),
-                        GetSystemMetrics(SM_CXDOUBLECLK) / 2,
-                        GetSystemMetrics(SM_CYDOUBLECLK) / 2,
-                    )
-                };
+                // The message's time and the system's double-click
+                // settings.
+                let (now, limit, dx, dy) = (
+                    sys::message_time(),
+                    sys::double_click_ms(),
+                    sys::metric(SM_CXDOUBLECLK) / 2,
+                    sys::metric(SM_CYDOUBLECLK) / 2,
+                );
                 let double = self.last_down.get().is_some_and(|(t, p)| {
                     now.wrapping_sub(t) <= limit
                         && (pt.x - p.x).abs() <= dx
@@ -1305,9 +1209,9 @@ impl PaneContent for PreviewPane {
                     View::Picture { .. } | View::Icon { .. } | View::Message(_)
                 );
                 if double && item {
-                    // SAFETY: posted to this thread's main window, as the
-                    // menu's File > Open.
-                    unsafe { PostMessageW(app.hwnd, WM_COMMAND, usize::from(menu::OPEN), 0) };
+                    // Posted to this thread's main window, as the menu's
+                    // File > Open.
+                    win::post_plain(app.hwnd, WM_COMMAND, usize::from(menu::OPEN), 0);
                 }
                 None
             }
@@ -1319,14 +1223,13 @@ impl PaneContent for PreviewPane {
                 if l == -1 {
                     // From the keyboard: at the content's top left.
                     let rc = self.rc.get();
-                    let mut pt = POINT {
-                        x: rc.left + app.scale(8),
-                        y: rc.top + app.scale(8),
-                    };
-                    // SAFETY: converts a point of this thread's window.
-                    unsafe {
-                        windows_sys::Win32::Graphics::Gdi::ClientToScreen(pane, &mut pt);
-                    }
+                    let pt = win::client_to_screen(
+                        pane,
+                        POINT {
+                            x: rc.left + app.scale(8),
+                            y: rc.top + app.scale(8),
+                        },
+                    );
                     (x, y) = (pt.x, pt.y);
                 }
                 app.layout_menu(x, y);
@@ -1341,18 +1244,15 @@ impl PaneContent for PreviewPane {
         self.paint_view(app, hdc, rc);
         let pane = self.pane.get();
         let inner = matches!(*self.view.borrow(), View::Text | View::Handler);
-        // SAFETY: reads this thread's focus; draws into the buffer.
-        unsafe {
-            if !inner && GetFocus() == pane {
-                let r = RECT {
-                    left: rc.left + 2,
-                    top: rc.top + 2,
-                    right: rc.right - 2,
-                    bottom: rc.bottom - 2,
-                };
-                SetTextColor(hdc, preview_ink(app).fg);
-                DrawFocusRect(hdc, &r);
-            }
+        if !inner && win::focus() == pane {
+            let r = RECT {
+                left: rc.left + 2,
+                top: rc.top + 2,
+                right: rc.right - 2,
+                bottom: rc.bottom - 2,
+            };
+            gdi::set_text_color(hdc, preview_ink(app).fg);
+            gdi::draw_focus_rect(hdc, &r);
         }
     }
 
@@ -1360,11 +1260,9 @@ impl PaneContent for PreviewPane {
         self.theme_text_box(dark);
         let host = self.host();
         if !host.is_null() {
-            // SAFETY: this thread's host's background, repainted.
-            unsafe {
-                SetWindowLongPtrW(host, GWLP_USERDATA, preview_ink(app).bg as isize);
-                InvalidateRect(host, core::ptr::null(), 1);
-            }
+            // The host's background, repainted.
+            self.host_bg.set(preview_ink(app).bg);
+            win::invalidate(host, None, true);
         }
         // A preview handler takes the colours as it loads a file.
         if matches!(*self.view.borrow(), View::Handler) {
@@ -1375,14 +1273,12 @@ impl PaneContent for PreviewPane {
 
     fn dpi(&self, app: &App, _dpi: u32) {
         let font = mono_font(app);
+        let handle = font.as_ref().map_or(core::ptr::null_mut(), gdi::Owned::get);
         let old = self.mono.replace(font);
-        // SAFETY: the text box takes the new font before the old one goes.
-        unsafe {
-            SendMessageW(self.text_box.get(), WM_SETFONT, font as usize, 1);
-            if !old.is_null() {
-                DeleteObject(old);
-            }
-        }
+        // The text box takes the new font before the old one goes (deleted
+        // as it drops).
+        win::set_font(self.text_box.get(), handle, true);
+        drop(old);
         // The icon is made at the window's DPI.
         if matches!(*self.view.borrow(), View::Icon { .. }) {
             self.reload(app);

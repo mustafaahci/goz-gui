@@ -5,6 +5,8 @@
 //! run on a background thread that talks to gozd's named pipe.
 
 #![windows_subsystem = "windows"]
+// Every `unsafe` is in `win`, the Win32 boundary (see its docs).
+#![deny(unsafe_code)]
 
 mod a11y;
 mod actions;
@@ -76,7 +78,7 @@ mod tray;
 mod typeahead;
 mod typeinfo;
 mod view;
-mod wide;
+mod win;
 mod window;
 mod zoom;
 // Wave 1: each feature declares its modules on its own lines below, so
@@ -129,35 +131,28 @@ mod indexes;
 mod organize_columns;
 mod props;
 
-use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
-};
 use windows_sys::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
-    ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+    ICC_TREEVIEW_CLASSES,
 };
 
 fn main() {
-    // SAFETY: once, on the UI thread, before any window exists.
-    unsafe {
-        CoInitializeEx(
-            core::ptr::null(),
-            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        );
-        let icc = INITCOMMONCONTROLSEX {
-            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-            // Bar classes bring the tooltips of the search box buttons;
-            // the tree view is Organize Bookmarks' folders and Options'
-            // pages, the tab Options' page name.
-            dwICC: ICC_LISTVIEW_CLASSES
-                | ICC_STANDARD_CLASSES
-                | ICC_BAR_CLASSES
-                | ICC_TREEVIEW_CLASSES
-                | ICC_TAB_CLASSES
-                | ICC_HOTKEY_CLASS,
-        };
-        InitCommonControlsEx(&icc);
+    // Once, on the UI thread, before any window exists; the apartment is
+    // the thread's until the process ends.
+    if let Some(apartment) = win::com::Apartment::sta() {
+        apartment.keep();
     }
+    // Bar classes bring the tooltips of the search box buttons; the tree
+    // view is Organize Bookmarks' folders and Options' pages, the tab
+    // Options' page name.
+    win::sys::init_common_controls(
+        ICC_LISTVIEW_CLASSES
+            | ICC_STANDARD_CLASSES
+            | ICC_BAR_CLASSES
+            | ICC_TREEVIEW_CLASSES
+            | ICC_TAB_CLASSES
+            | ICC_HOTKEY_CLASS,
+    );
     theme::init();
     std::process::exit(window::run());
 }

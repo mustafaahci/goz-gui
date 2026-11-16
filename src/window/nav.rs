@@ -12,13 +12,11 @@
 //! that state without adding one.
 
 use goz_core::types::{SortDir, SortSpec};
-use windows_sys::Win32::UI::Controls::EM_SETSEL;
-use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
 
-use super::{App, Options, send};
+use super::{App, Options};
 use crate::bookmarks::{one_line, sort_name};
 use crate::session::Search;
-use crate::wide::{window_text, wz};
+use crate::win::{self, edit};
 use crate::{dropdown, menu, searchbox};
 
 /// How long a search must stay as it is to become a navigation entry.
@@ -66,7 +64,7 @@ impl App {
     /// The search on screen.
     pub(super) fn nav_state(&self) -> NavState {
         NavState {
-            text: window_text(self.edit),
+            text: win::text(self.edit),
             opts: self.opts.get(),
             folder: self.folder_selection(),
         }
@@ -82,7 +80,7 @@ impl App {
             return;
         }
         if !self.recorded.replace(true) {
-            self.record_in_history(&window_text(self.edit));
+            self.record_in_history(&win::text(self.edit));
         }
         self.commit_nav();
         self.settle_search();
@@ -163,7 +161,7 @@ impl App {
     /// match case, match path, the filter and the sort unchanged.
     pub(super) fn go_home(&self) {
         let home = self.prefs.borrow().base.home();
-        let text = home.search.unwrap_or_else(|| window_text(self.edit));
+        let text = home.search.unwrap_or_else(|| win::text(self.edit));
         let o = self.opts.get();
         let h = home.options;
         self.navigate(
@@ -223,15 +221,14 @@ impl App {
     /// as a bookmark's are: the box shows one line.
     pub(super) fn set_search_text(&self, text: &str) {
         let text = one_line(text);
-        if window_text(self.edit) == text {
+        if win::text(self.edit) == text {
             self.start_search(false);
         } else {
-            // SAFETY: a NUL-terminated string for this thread's search box;
-            // the change searches through EN_CHANGE.
-            unsafe { SetWindowTextW(self.edit, wz(&text).as_ptr()) };
+            // The change searches through EN_CHANGE.
+            win::set_text(self.edit, &text);
         }
         let end = text.encode_utf16().count();
-        send(self.edit, EM_SETSEL, end, end as isize);
+        edit::set_sel(self.edit, end as i32, end as i32);
     }
 }
 

@@ -19,17 +19,12 @@ use std::cell::Cell;
 
 use windows_sys::Win32::Foundation::{POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, HDC,
-    ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, SM_CXDRAG, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    SM_CXDRAG, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
 use super::App;
@@ -39,6 +34,7 @@ use crate::searchbox::paint_cross;
 use crate::strip::{Strip, StripSlot};
 use crate::tabs::{self, Hit, Metrics, Placed};
 use crate::theme::{Palette, rgb};
+use crate::win::{self, gdi, sys};
 
 /// The room above the tabs: Everything's `tabs_margin_top` (3 px) and the
 /// 2 px its menu bar is taller than Windows'.
@@ -188,20 +184,14 @@ impl TabStrip {
     /// What is under the mouse now: after a tab closed or moved, the ×
     /// that slid under it lights at once.
     fn rehover(&self, app: &App) {
-        let mut pt = POINT::default();
-        // SAFETY: reads the cursor and maps it to this thread's window.
-        unsafe {
-            GetCursorPos(&mut pt);
-            ScreenToClient(app.hwnd, &mut pt);
-        }
+        let pt = win::screen_to_client(app.hwnd, sys::cursor_pos().unwrap_or_default());
         self.set_hot(app, self.hit_at(app, pt));
     }
 
     /// Holds the mouse for a press on the strip.
     fn press(&self, app: &App, down: Down) {
         self.down.set(Some(down));
-        // SAFETY: takes the mouse for this thread's window.
-        unsafe { SetCapture(app.hwnd) };
+        win::set_capture(app.hwnd);
         app.capture_strip(Some(StripSlot::Tabs));
         app.invalidate_strip(StripSlot::Tabs);
     }
@@ -210,11 +200,9 @@ impl TabStrip {
     fn release(&self, app: &App) -> Option<Down> {
         let down = self.down.take();
         app.capture_strip(None);
-        // SAFETY: lets go of this thread's capture if it is the window's.
-        unsafe {
-            if GetCapture() == app.hwnd {
-                ReleaseCapture();
-            }
+        // This thread's capture, if it is the window's.
+        if win::capture() == app.hwnd {
+            win::release_capture();
         }
         app.invalidate_strip(StripSlot::Tabs);
         down
@@ -227,8 +215,7 @@ impl TabStrip {
             return;
         };
         if !down.dragging {
-            // SAFETY: reads a system metric.
-            let threshold = unsafe { GetSystemMetricsForDpi(SM_CXDRAG, app.dpi.get()) }.max(1);
+            let threshold = sys::metric_for_dpi(SM_CXDRAG, app.dpi.get()).max(1);
             if (pt.x - down.x).abs() < threshold {
                 return;
             }
@@ -301,7 +288,7 @@ impl TabStrip {
             bottom: m.bottom,
         };
         if text_rc.right > text_rc.left {
-            let mut text: Vec<u16> = title.encode_utf16().collect();
+            let text: Vec<u16> = title.encode_utf16().collect();
             let state = if selected {
                 ColorState::Selected
             } else {
@@ -311,19 +298,15 @@ impl TabStrip {
                 ColorItem::Tabs,
                 app.pal.get().is_bold(ColorItem::Tabs, state),
             );
-            // SAFETY: draws into the paint buffer; the font is put back by
-            // the caller.
-            unsafe {
-                SelectObject(hdc, font);
-                SetTextColor(hdc, if selected { c.selected_text } else { c.text });
-                DrawTextW(
-                    hdc,
-                    text.as_mut_ptr(),
-                    text.len() as i32,
-                    &mut text_rc,
-                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-                );
-            }
+            // Into the paint buffer; the font is put back by the caller.
+            gdi::select(hdc, font);
+            gdi::set_text_color(hdc, if selected { c.selected_text } else { c.text });
+            gdi::draw_text(
+                hdc,
+                &text,
+                &mut text_rc,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
         }
         if m.close <= 0 {
             return;
@@ -467,18 +450,15 @@ impl Strip for TabStrip {
         let titles = app.tab_titles();
         let current = app.current_tab();
         let (m, p) = self.placed(app, rc);
-        // SAFETY: draws into the paint buffer; the old font is put back.
-        let old = unsafe {
-            let old = SelectObject(hdc, app.part_font(ColorItem::Tabs, false));
-            SetBkMode(hdc, TRANSPARENT as i32);
-            old
-        };
+        // Into the paint buffer; the old font is put back.
+        let old = gdi::select(hdc, app.part_font(ColorItem::Tabs, false));
+        gdi::set_bk_mode(hdc, TRANSPARENT as i32);
         for &(i, l, r) in &p.tabs {
             let title = titles.get(i).map_or("", String::as_str);
             self.paint_tab(app, hdc, &c, &m, (i, l, r), title, i == current);
         }
-        // SAFETY: puts back the font selected above.
-        unsafe { SelectObject(hdc, old) };
+        // The font selected above goes back.
+        old.restore(hdc);
         let button = |(l, r): (i32, i32)| RECT {
             left: l,
             top: m.top,
@@ -504,14 +484,8 @@ impl Strip for TabStrip {
         match msg {
             WM_MOUSEMOVE => {
                 if over {
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: app.hwnd,
-                        dwHoverTime: 0,
-                    };
-                    // SAFETY: asks for WM_MOUSELEAVE on this thread's window.
-                    unsafe { TrackMouseEvent(&mut tme) };
+                    // WM_MOUSELEAVE for the window.
+                    win::track_leave(app.hwnd);
                 }
                 if let Some(down) = self.down.get().filter(|d| !d.middle) {
                     self.drag(app, down, pt);
@@ -555,14 +529,11 @@ impl Strip for TabStrip {
                     }
                     Hit::Close(_) | Hit::Plus => self.press(app, down),
                     Hit::Overflow => {
-                        let mut at = POINT {
+                        let at = POINT {
                             x: overflow_left(self, app, &rc),
                             y: rc.bottom,
                         };
-                        // SAFETY: maps a point of this thread's window to
-                        // the screen.
-                        unsafe { ClientToScreen(app.hwnd, &mut at) };
-                        app.tab_overflow_menu(at);
+                        app.tab_overflow_menu(win::client_to_screen(app.hwnd, at));
                         self.rehover(app);
                     }
                     Hit::Empty => {}
@@ -616,11 +587,7 @@ impl Strip for TabStrip {
                     Hit::Tab(i) | Hit::Close(i) => Some(i),
                     _ => None,
                 };
-                let mut at = pt;
-                // SAFETY: maps a point of this thread's window to the
-                // screen.
-                unsafe { ClientToScreen(app.hwnd, &mut at) };
-                app.tab_menu(target, at);
+                app.tab_menu(target, win::client_to_screen(app.hwnd, pt));
                 self.rehover(app);
                 true
             }

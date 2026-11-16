@@ -18,8 +18,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::UI::WindowsAndMessaging::{HMENU, IsWindow, MB_ICONWARNING, PostMessageW};
+use windows_sys::Win32::UI::WindowsAndMessaging::{HMENU, MB_ICONWARNING};
 
 use super::{App, Options, WM_BOOKMARKS, prefs};
 use crate::bookmark_dialogs::{self, Chosen, Host, WM_REFRESH};
@@ -33,7 +32,7 @@ use crate::menu::{self, Mark};
 use crate::settings;
 use crate::store::location;
 use crate::theme::ThemeMode;
-use crate::wide::window_text;
+use crate::win::{self, parcel, sys};
 
 /// The name a new bookmark of an empty search is offered, Everything's.
 const NEW_BOOKMARK: &str = "New Bookmark";
@@ -94,16 +93,10 @@ fn marks(list: &Bookmarks, tree: &Tree, node: usize, opens: &mut Vec<Chosen>) ->
         .collect()
 }
 
-/// Posts `value` to the window as `msg`'s lParam; freed again if the window
-/// is gone.
-fn post<T>(hwnd: usize, msg: u32, value: T) {
-    let raw = Box::into_raw(Box::new(value));
-    // SAFETY: posts to the window; if that fails the box is taken back.
-    unsafe {
-        if PostMessageW(hwnd as HWND, msg, 0, raw as isize) == 0 {
-            drop(Box::from_raw(raw));
-        }
-    }
+/// Posts `value` to the window (`hwnd`, a number: an HWND is not Send) as
+/// `msg`, a parcel; dropped again if the window is gone.
+fn post<T: Send + 'static>(hwnd: usize, msg: u32, value: T) {
+    parcel::post(hwnd as HWND, msg, 0, value);
 }
 
 impl App {
@@ -167,7 +160,7 @@ impl App {
         self.writer.submit(
             &path,
             Box::new(move || match job.write_now() {
-                Ok(Some(note)) => post(hwnd, WM_BOOKMARKS, note),
+                Ok(Some(note)) => post::<Option<String>>(hwnd, WM_BOOKMARKS, note),
                 Ok(None) => {}
                 Err(why) => prefs::report(hwnd, why, true),
             }),
@@ -183,11 +176,8 @@ impl App {
         // F2: the write merged another goz-gui's changes in.
         self.bookmarks_changed();
         let dlg = self.bookmarks.dialog.get();
-        // SAFETY: checks and posts to a window of this thread.
-        unsafe {
-            if !dlg.is_null() && IsWindow(dlg) != 0 {
-                PostMessageW(dlg, WM_REFRESH, 0, 0);
-            }
+        if !dlg.is_null() && win::is_window(dlg) {
+            win::post_app(dlg, WM_REFRESH, 0, 0);
         }
     }
 
@@ -199,7 +189,7 @@ impl App {
             return;
         }
         self.refresh_bookmarks();
-        let text = window_text(self.edit);
+        let text = win::text(self.edit);
         let name = if text.is_empty() { NEW_BOOKMARK } else { &text };
         let mut row = Bookmark::new(&[], name, &text, &self.remembered());
         if !self.bookmarks.remember.search {
@@ -279,7 +269,7 @@ impl App {
         let s = c.settings;
         let text = match &c.search {
             Some(search) => one_line(search),
-            None => window_text(self.edit),
+            None => win::text(self.edit),
         };
         self.navigate(
             &text,
@@ -318,8 +308,7 @@ impl Host for App {
         let ok = clipboard::put_text(self.hwnd, &wide);
         if !ok {
             self.show_note(clipboard::BUSY.into());
-            // SAFETY: plays a system sound.
-            unsafe { MessageBeep(MB_ICONWARNING) };
+            sys::beep(MB_ICONWARNING);
         }
         ok
     }

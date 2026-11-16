@@ -35,15 +35,12 @@
 
 use std::collections::HashSet;
 
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
-use windows_sys::Win32::UI::Controls::{
-    LVIS_FOCUSED, LVIS_SELECTED, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_GETSELECTIONMARK,
-    LVM_SETSELECTIONMARK, LVNI_FOCUSED,
-};
+use windows_sys::Win32::UI::Controls::{LVIS_FOCUSED, LVIS_SELECTED, LVNI_FOCUSED};
 
+use super::App;
 use super::selecting::Step;
-use super::{App, send};
 use crate::pane::PaneEvent;
+use crate::win::{self, lv};
 
 /// The files a refresh is to select again, by path.
 #[derive(Debug, Default)]
@@ -230,8 +227,8 @@ impl App {
         if was {
             return;
         }
-        // SAFETY: repaints this thread's list.
-        unsafe { InvalidateRect(self.list, core::ptr::null(), 0) };
+        // Repaints this thread's list.
+        win::invalidate(self.list, None, false);
         if self.bulk_changed.take() {
             self.invalidate_status();
             self.pane_event(PaneEvent::SelectionChanged);
@@ -260,7 +257,7 @@ impl App {
     pub(super) fn note_selection(&self, refresh: bool, new_total: u64) -> Kept {
         // The selection as it is to be, rows still being set included.
         self.finish_selecting();
-        let count = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
+        let count = lv::selected_count(self.list) as u64;
         let again = if refresh {
             let total = self.model.borrow().total;
             Again::of(self.select_all.get(), count, total, new_total)
@@ -274,14 +271,9 @@ impl App {
         } else {
             Vec::new()
         };
-        let index = |v: isize| usize::try_from(v).ok();
-        let focused = index(send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_FOCUSED as isize,
-        ));
-        let mark = index(send(self.list, LVM_GETSELECTIONMARK, 0, 0));
+        let index = |v: i32| usize::try_from(v).ok();
+        let focused = index(lv::next_item(self.list, -1, LVNI_FOCUSED));
+        let mark = index(lv::selection_mark(self.list));
         let mut reselect = {
             let m = self.model.borrow();
             let path = |i: usize| m.peek(i).map(|row| row.path.clone());
@@ -338,7 +330,7 @@ impl App {
     /// rows past its end, and their selection with them. Any other
     /// selection stays on its rows: the new ones are not the user's.
     pub(super) fn recount(&self, old_total: u64, total: u64) {
-        let selected = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as u64;
+        let selected = lv::selected_count(self.list) as u64;
         let chosen = all_chosen(self.select_all.get(), selected, old_total);
         let add = new_rows_selected(self.select_all.get(), selected, old_total, total);
         self.set_count(total, true);
@@ -377,7 +369,7 @@ impl App {
                 self.set_state(i, LVIS_FOCUSED, LVIS_FOCUSED);
             }
             if let Some(i) = found.mark {
-                send(self.list, LVM_SETSELECTIONMARK, 0, i as isize);
+                lv::set_selection_mark(self.list, i as i32);
             }
         });
     }

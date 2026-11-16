@@ -12,20 +12,11 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HWND, PROPERTYKEY};
-use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
-use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
-    CoInitializeEx, CoTaskMemAlloc, CoUninitialize,
-};
-use windows::Win32::System::Variant::VT_LPWSTR;
-use windows::Win32::UI::Shell::Common::{IObjectArray, IObjectCollection};
-use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
-use windows::Win32::UI::Shell::{
-    DestinationList, EnumerableObjectCollection, ICustomDestinationList, IShellLinkW,
-    SetCurrentProcessExplicitAppUserModelID, ShellLink,
-};
-use windows::core::{GUID, HSTRING, Interface, PWSTR};
+use windows::Win32::Foundation::{E_FAIL, PROPERTYKEY};
+use windows::core::GUID;
+
+use crate::win::com::Apartment;
+use crate::win::shell::{self, JumpList, ObjectCollection, PropertyStore, ShellLink};
 
 /// The most searches, and bookmarks, the jump list shows.
 pub const MAX_ITEMS: usize = 10;
@@ -78,8 +69,7 @@ pub fn app_id_for(key: &str) -> String {
 /// is made.
 pub fn set_app_id(key: &str) {
     let id = APP_ID.get_or_init(|| app_id_for(key));
-    // SAFETY: a plain call with a string that outlives it.
-    let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(id.as_str())) };
+    let _ = shell::set_app_user_model_id(id);
 }
 
 /// A command-line argument quoted as `CommandLineToArgvW` reads it back.
@@ -160,37 +150,6 @@ pub fn entries(
     out
 }
 
-/// A PROPVARIANT holding a copy of `text` (VT_LPWSTR); the caller clears it.
-fn string_variant(text: &str) -> PROPVARIANT {
-    let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
-    let mut pv = PROPVARIANT::default();
-    // SAFETY: the string is copied into task memory, which PropVariantClear
-    // frees; the union is written as a VT_LPWSTR value.
-    unsafe {
-        let mem = CoTaskMemAlloc(wide.len() * 2).cast::<u16>();
-        if mem.is_null() {
-            return pv;
-        }
-        core::ptr::copy_nonoverlapping(wide.as_ptr(), mem, wide.len());
-        let inner = &mut *pv.Anonymous.Anonymous;
-        inner.vt = VT_LPWSTR;
-        inner.Anonymous.pwszVal = PWSTR(mem);
-    }
-    pv
-}
-
-fn set_string(store: &IPropertyStore, key: &PROPERTYKEY, text: &str) -> windows::core::Result<()> {
-    let mut pv = string_variant(text);
-    // SAFETY: the key and value outlive the call; the value is cleared
-    // after (the store keeps its own copy).
-    let r = unsafe { store.SetValue(key, &pv) };
-    // SAFETY: a value made by `string_variant`.
-    unsafe {
-        let _ = PropVariantClear(&mut pv);
-    }
-    r
-}
-
 fn exe_path() -> String {
     std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
@@ -208,17 +167,15 @@ pub fn set_relaunch(hwnd: windows_sys::Win32::Foundation::HWND, instance: Option
         command.push_str(" -instance ");
         command.push_str(&quote_arg(name));
     }
-    // SAFETY: the window is this thread's; the store is released as it
-    // drops.
-    let store: windows::core::Result<IPropertyStore> =
-        unsafe { SHGetPropertyStoreForWindow(HWND(hwnd)) };
-    let Ok(store) = store else { return };
-    let _ = set_string(&store, &PKEY_ID, id);
-    let _ = set_string(&store, &PKEY_RELAUNCH_COMMAND, &command);
-    let _ = set_string(&store, &PKEY_RELAUNCH_NAME, "goz-gui");
-    let _ = set_string(&store, &PKEY_RELAUNCH_ICON, &format!("{exe},0"));
-    // SAFETY: as above.
-    let _ = unsafe { store.Commit() };
+    // The window is this thread's; the store is released as it drops.
+    let Ok(store) = PropertyStore::for_window(hwnd) else {
+        return;
+    };
+    let _ = store.set_string(&PKEY_ID, id);
+    let _ = store.set_string(&PKEY_RELAUNCH_COMMAND, &command);
+    let _ = store.set_string(&PKEY_RELAUNCH_NAME, "goz-gui");
+    let _ = store.set_string(&PKEY_RELAUNCH_ICON, &format!("{exe},0"));
+    let _ = store.commit();
 }
 
 /// The data folder's `jump-list.log` when the test hook
@@ -273,61 +230,50 @@ pub fn update(searches: Vec<String>, marks: Vec<(String, Vec<String>)>, instance
 /// Builds and commits the list; the number of entries left out because
 /// the user removed them.
 fn commit(id: &str, items: &[(&'static str, String, String)]) -> windows::core::Result<usize> {
-    // SAFETY: this thread's own apartment, ended before it returns; every
-    // COM object is released as it drops, before CoUninitialize.
-    unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).ok()?;
-        let r = (|| {
-            let list: ICustomDestinationList =
-                CoCreateInstance(&DestinationList, None, CLSCTX_INPROC_SERVER)?;
-            list.SetAppID(&HSTRING::from(id))?;
-            let mut slots = 0u32;
-            let removed: IObjectArray = list.BeginList(&mut slots)?;
-            let mut gone = REMOVED.lock().unwrap_or_else(|p| p.into_inner());
-            let gone = gone.get_or_insert_with(HashSet::new);
-            for i in 0..removed.GetCount().unwrap_or(0) {
-                if let Ok(link) = removed.GetAt::<IShellLinkW>(i) {
-                    let mut buf = [0u16; 1024];
-                    if link.GetArguments(&mut buf).is_ok() {
-                        let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-                        gone.insert(String::from_utf16_lossy(&buf[..n]));
-                    }
-                }
+    // This thread's own apartment, for the rest of its life; every COM
+    // object is released as it drops.
+    Apartment::sta().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+    (|| {
+        let list = JumpList::new()?;
+        list.set_app_id(id)?;
+        let removed = list.begin_list()?;
+        let mut gone = REMOVED.lock().unwrap_or_else(|p| p.into_inner());
+        let gone = gone.get_or_insert_with(HashSet::new);
+        for i in 0..removed.count().unwrap_or(0) {
+            if let Ok(link) = removed.link_at(i)
+                && let Ok(args) = link.arguments()
+            {
+                gone.insert(args);
             }
-            let exe = exe_path();
-            let mut skipped = 0;
-            for category in ["Recent Searches", "Bookmarks"] {
-                let collection: IObjectCollection =
-                    CoCreateInstance(&EnumerableObjectCollection, None, CLSCTX_INPROC_SERVER)?;
-                let mut any = false;
-                for (_, title, args) in items.iter().filter(|(c, _, _)| *c == category) {
-                    if gone.contains(args) {
-                        skipped += 1;
-                        continue;
-                    }
-                    let link: IShellLinkW =
-                        CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
-                    link.SetPath(&HSTRING::from(exe.as_str()))?;
-                    link.SetArguments(&HSTRING::from(args.as_str()))?;
-                    link.SetIconLocation(&HSTRING::from(exe.as_str()), 0)?;
-                    link.SetDescription(&HSTRING::from(title.as_str()))?;
-                    let store: IPropertyStore = link.cast()?;
-                    set_string(&store, &PKEY_TITLE, title)?;
-                    store.Commit()?;
-                    collection.AddObject(&link)?;
-                    any = true;
+        }
+        let exe = exe_path();
+        let mut skipped = 0;
+        for category in ["Recent Searches", "Bookmarks"] {
+            let collection = ObjectCollection::new()?;
+            let mut any = false;
+            for (_, title, args) in items.iter().filter(|(c, _, _)| *c == category) {
+                if gone.contains(args) {
+                    skipped += 1;
+                    continue;
                 }
-                if any {
-                    let array: IObjectArray = collection.cast()?;
-                    list.AppendCategory(&HSTRING::from(category), &array)?;
-                }
+                let link = ShellLink::new()?;
+                link.set_path(&exe)?;
+                link.set_arguments(args)?;
+                link.set_icon_location(&exe, 0)?;
+                link.set_description(title)?;
+                let store = link.property_store()?;
+                store.set_string(&PKEY_TITLE, title)?;
+                store.commit()?;
+                collection.add(&link)?;
+                any = true;
             }
-            list.CommitList()?;
-            Ok(skipped)
-        })();
-        CoUninitialize();
-        r
-    }
+            if any {
+                list.append_category(category, &collection)?;
+            }
+        }
+        list.commit_list()?;
+        Ok(skipped)
+    })()
 }
 
 /// The test hook's clean-up: a test instance's jump list goes as it ends.
@@ -336,19 +282,12 @@ pub fn delete_for_test() {
         return;
     }
     let Some(id) = APP_ID.get() else { return };
-    // SAFETY: as in `commit`.
-    unsafe {
-        if CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_err() {
-            return;
-        }
-        if let Ok(list) = CoCreateInstance::<_, ICustomDestinationList>(
-            &DestinationList,
-            None,
-            CLSCTX_INPROC_SERVER,
-        ) {
-            let _ = list.DeleteList(&HSTRING::from(id.as_str()));
-        }
-        CoUninitialize();
+    // As in `commit`.
+    if Apartment::sta().is_none() {
+        return;
+    }
+    if let Ok(list) = JumpList::new() {
+        let _ = list.delete_list(id);
     }
 }
 

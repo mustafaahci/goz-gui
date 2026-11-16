@@ -30,7 +30,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use windows_sys::Win32::Globalization::{NormalizationD, NormalizeString};
+use crate::win;
+use windows_sys::Win32::Globalization::NormalizationD;
 
 /// The renamer's switches, Everything's `rename_match_case`,
 /// `rename_match_diacritics`, `rename_regex`, `rename_ignore_extension`.
@@ -119,16 +120,7 @@ pub(crate) fn base_letter(c: char) -> char {
     let mut unit = [0u16; 2];
     let src = c.encode_utf16(&mut unit);
     let mut out = [0u16; 8];
-    // SAFETY: the source and its length; the buffer and its length.
-    let n = unsafe {
-        NormalizeString(
-            NormalizationD,
-            src.as_ptr(),
-            src.len() as i32,
-            out.as_mut_ptr(),
-            out.len() as i32,
-        )
-    };
+    let n = win::locale::normalize(NormalizationD, src, &mut out);
     let base = usize::try_from(n)
         .ok()
         .filter(|&n| n > 0 && n <= out.len())

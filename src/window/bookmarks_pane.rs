@@ -27,31 +27,25 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, HDC, InvalidateRect, ScreenToClient};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::UI::Controls::{
-    EM_SETCUEBANNER, EM_SETSEL, HTREEITEM, NM_CLICK, NM_CUSTOMDRAW, NM_DBLCLK, NM_SETFOCUS, NMHDR,
-    NMTREEVIEWW, NMTVGETINFOTIPW, TVE_COLLAPSE, TVE_EXPAND, TVHT_ONITEM, TVHT_ONITEMINDENT,
-    TVHT_ONITEMRIGHT, TVM_SETEXTENDEDSTYLE, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW, TVS_EX_AUTOHSCROLL,
-    TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_INFOTIP, TVS_LINESATROOT,
-    TVS_NOHSCROLL, TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS, TVS_TRACKSELECT, WC_TREEVIEWW,
-    WM_MOUSELEAVE,
+    NM_CLICK, NM_CUSTOMDRAW, NM_DBLCLK, NM_SETFOCUS, NMTREEVIEWW, NMTVCUSTOMDRAW, NMTVGETINFOTIPW,
+    TVE_COLLAPSE, TVE_EXPAND, TVHT_ONITEM, TVHT_ONITEMINDENT, TVHT_ONITEMRIGHT, TVN_GETINFOTIPW,
+    TVN_ITEMEXPANDEDW, TVS_EX_AUTOHSCROLL, TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS,
+    TVS_INFOTIP, TVS_LINESATROOT, TVS_NOHSCROLL, TVS_NONEVENHEIGHT, TVS_SHOWSELALWAYS,
+    TVS_TRACKSELECT, WM_MOUSELEAVE,
 };
-use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
     VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F2, VK_RETURN, VK_SHIFT, VK_UP,
 };
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyMenu, EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, GetWindowTextLengthW,
-    HMENU, MSG, MoveWindow, PostMessageW, SM_CXSMICON, SendMessageW, SetWindowTextW, WM_APP,
-    WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_SETFONT, WM_SYSKEYDOWN, WS_CHILD,
-    WS_TABSTOP, WS_VISIBLE,
+    EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, MSG, SM_CXSMICON, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
+    WM_COMMAND, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NOTIFY, WM_SYSKEYDOWN, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
 };
 
 use super::sidebars::{MARK_DELETE, MARK_EDIT, MARK_EXPAND, MARK_OPEN};
@@ -64,8 +58,10 @@ use crate::menu::{self, Item as MenuItem};
 use crate::paint::fill;
 use crate::pane::PaneContent;
 use crate::sidebars::{self, Shown};
-use crate::treeview::{self, Images, NONE, New, Source};
-use crate::wide::{window_text, wz};
+use crate::treeview::{self, Images, New, Source, TreeItem};
+use crate::win::class::{self, Create};
+use crate::win::tv::After;
+use crate::win::{self, Msg, edit, subclass, sys, tv};
 use crate::{searchbox, theme};
 
 /// The children's ids in the pane.
@@ -107,8 +103,9 @@ pub(super) struct BookmarksPane {
     entries: RefCell<Vec<Entry>>,
     /// The tree is being filled: its notifications are goz-gui's.
     filling: Cell<bool>,
-    /// Where the left button last went down on the tree (its subclass).
-    click: Cell<POINT>,
+    /// Where the left button last went down on the tree (its subclass,
+    /// which shares it).
+    click: Rc<Cell<POINT>>,
     /// The mouse is over the box's ×; it went down on it (and holds the
     /// mouse until it comes up: the × clears the box on release over it).
     hot: Cell<bool>,
@@ -127,7 +124,7 @@ impl BookmarksPane {
             generation: Cell::new(None),
             entries: RefCell::new(Vec::new()),
             filling: Cell::new(false),
-            click: Cell::new(POINT::default()),
+            click: Rc::new(Cell::new(POINT::default())),
             hot: Cell::new(false),
             pressed: Cell::new(false),
         }
@@ -136,8 +133,7 @@ impl BookmarksPane {
     /// Whether the box holds text (its button is the ×, not the
     /// magnifier).
     fn has_text(&self) -> bool {
-        // SAFETY: reads the length of this pane's box.
-        unsafe { GetWindowTextLengthW(self.edit.get()) > 0 }
+        win::text_len(self.edit.get()) > 0
     }
 
     /// The box's button in pane window `pane`.
@@ -149,8 +145,7 @@ impl BookmarksPane {
     fn set_hot(&self, app: &App, pane: HWND, hot: bool) {
         if self.hot.replace(hot) != hot {
             let rc = Self::button_in(app, pane);
-            // SAFETY: repaints part of this pane's window.
-            unsafe { InvalidateRect(pane, &rc, 0) };
+            win::invalidate(pane, Some(&rc), false);
         }
     }
 
@@ -159,14 +154,8 @@ impl BookmarksPane {
     fn mouse_move(&self, app: &App, pane: HWND, pt: POINT) {
         let over = inside(&Self::button_in(app, pane), pt) && self.has_text();
         if over && !self.pressed.get() {
-            let mut tme = TRACKMOUSEEVENT {
-                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                dwFlags: TME_LEAVE,
-                hwndTrack: pane,
-                dwHoverTime: 0,
-            };
-            // SAFETY: asks for WM_MOUSELEAVE on this pane's window.
-            unsafe { TrackMouseEvent(&mut tme) };
+            // WM_MOUSELEAVE, when the mouse leaves this pane's window.
+            win::track_leave(pane);
         }
         self.set_hot(app, pane, over);
     }
@@ -202,12 +191,12 @@ impl BookmarksPane {
     }
 
     fn filter(&self) -> String {
-        window_text(self.edit.get())
+        win::text(self.edit.get())
     }
 
     /// The entry of a tree item.
-    fn entry(&self, item: HTREEITEM) -> Option<Entry> {
-        let i = usize::try_from(treeview::param(self.tree.get(), item)?).ok()?;
+    fn entry(&self, item: Option<TreeItem>) -> Option<Entry> {
+        let i = usize::try_from(treeview::param(item?)?).ok()?;
         self.entries.borrow().get(i).cloned()
     }
 
@@ -227,16 +216,16 @@ impl BookmarksPane {
 
     /// The tree item, and its entry, that stands for `keep` now; `None`
     /// when it is not shown any more.
-    fn find(&self, keep: &Keep) -> Option<(HTREEITEM, Entry)> {
+    fn find(&self, keep: &Keep) -> Option<(TreeItem, Entry)> {
         let tree = self.tree.get();
-        let mut todo = treeview::children(tree, NONE);
+        let mut todo = treeview::children(tree, None);
         while let Some(item) = todo.pop() {
-            if let Some(entry) = self.entry(item)
+            if let Some(entry) = self.entry(Some(item))
                 && self.keep_of(&entry) == *keep
             {
                 return Some((item, entry));
             }
-            todo.extend(treeview::children(tree, item));
+            todo.extend(treeview::children(tree, Some(item)));
         }
         None
     }
@@ -266,21 +255,21 @@ impl BookmarksPane {
         };
         let tree = self.tree.get();
         let was = self.filling.replace(true);
-        treeview::delete(tree, NONE);
+        treeview::delete_all(tree);
         self.entries.borrow_mut().clear();
         let mut again = None;
-        let mut first = NONE;
+        let mut first = None;
         self.insert(
             &shown,
-            NONE,
+            None,
             (folder_image, mark_image),
             &list,
             keep.as_ref(),
             &mut again,
             &mut first,
         );
-        if let Some(item) = again.or((first != NONE && !filter.is_empty()).then_some(first)) {
-            treeview::select(tree, item);
+        if let Some(item) = again.or(first.filter(|_| !filter.is_empty())) {
+            treeview::select(tree, Some(item));
         }
         self.filling.set(was);
         *self.list.borrow_mut() = list;
@@ -293,12 +282,12 @@ impl BookmarksPane {
     fn insert(
         &self,
         shown: &[Shown],
-        parent: HTREEITEM,
+        parent: Option<TreeItem>,
         images: (i32, i32),
         list: &Bookmarks,
         keep: Option<&Keep>,
-        found: &mut Option<HTREEITEM>,
-        first: &mut HTREEITEM,
+        found: &mut Option<TreeItem>,
+        first: &mut Option<TreeItem>,
     ) {
         let tree = self.tree.get();
         for s in shown {
@@ -328,20 +317,19 @@ impl BookmarksPane {
                 entries.len() as isize - 1
             };
             let text: Vec<u16> = text.encode_utf16().collect();
-            let item = treeview::insert(
+            let Some(item) = treeview::insert(
                 tree,
                 &New {
                     parent,
-                    after: None,
+                    after: After::Last,
                     text: &text,
                     image,
                     children,
                     param,
                 },
-            );
-            if item == NONE {
+            ) else {
                 continue;
-            }
+            };
             let key = match &entry {
                 Entry::Folder { place, .. } => Keep::Folder(place.join("/")),
                 Entry::Mark { row } => Keep::Mark(Id::of(list, *row)),
@@ -351,12 +339,12 @@ impl BookmarksPane {
             }
             match s {
                 Shown::Folder { items, open, .. } => {
-                    self.insert(items, item, images, list, keep, found, first);
+                    self.insert(items, Some(item), images, list, keep, found, first);
                     if *open {
-                        treeview::expand(tree, item, true);
+                        treeview::expand(item, true);
                     }
                 }
-                Shown::Mark { .. } if *first == NONE => *first = item,
+                Shown::Mark { .. } if first.is_none() => *first = Some(item),
                 Shown::Mark { .. } => {}
             }
         }
@@ -442,32 +430,31 @@ impl BookmarksPane {
 
     /// What Enter (or the menu's first item) does to `item`: opens a
     /// bookmark, opens or closes a folder.
-    fn activate(&self, app: &App, item: HTREEITEM) {
-        match self.entry(item) {
-            Some(Entry::Mark { row }) => self.open(app, row),
-            Some(Entry::Folder { .. }) => {
-                let tree = self.tree.get();
-                treeview::expand(tree, item, !treeview::is_expanded(tree, item));
+    fn activate(&self, app: &App, item: Option<TreeItem>) {
+        match (self.entry(item), item) {
+            (Some(Entry::Mark { row }), _) => self.open(app, row),
+            (Some(Entry::Folder { .. }), Some(item)) => {
+                treeview::expand(item, !treeview::is_expanded(item));
             }
-            None => {}
+            _ => {}
         }
     }
 
     /// A folder opened or closed by the user: the open ones are kept, while
     /// the box filters nothing (filtered, they all show open).
-    fn expanded(&self, app: &App, nm: &NMTREEVIEWW) {
+    fn expanded(&self, app: &App, item: Option<TreeItem>, action: u32) {
         if self.filling.get() || !self.filter().is_empty() {
             return;
         }
-        let Some(Entry::Folder { place, .. }) = self.entry(nm.itemNew.hItem) else {
+        let Some(Entry::Folder { place, .. }) = self.entry(item) else {
             return;
         };
         let place = place.join("/");
         let mut open = app.sidebar_settings().bookmarks_expanded;
         open.retain(|p| !p.eq_ignore_ascii_case(&place));
-        if nm.action == TVE_EXPAND {
+        if action == TVE_EXPAND {
             open.push(place);
-        } else if nm.action != TVE_COLLAPSE {
+        } else if action != TVE_COLLAPSE {
             return;
         }
         app.set_bookmarks_expanded(open);
@@ -483,19 +470,18 @@ impl BookmarksPane {
         self.sync(app);
         let (item, pt) = if l == -1 {
             let item = treeview::selected(tree);
-            let rc = treeview::item_rect(tree, item, true);
-            let mut pt = POINT {
-                x: rc.left,
-                y: rc.bottom,
-            };
-            // SAFETY: converts a point of this pane's tree.
-            unsafe { ClientToScreen(tree, &mut pt) };
+            let rc = item.map_or_else(RECT::default, |i| treeview::item_rect(i, true));
+            let pt = win::client_to_screen(
+                tree,
+                POINT {
+                    x: rc.left,
+                    y: rc.bottom,
+                },
+            );
             (item, pt)
         } else {
             let pt = point(l);
-            let mut at = pt;
-            // SAFETY: converts a screen point to this pane's tree's.
-            unsafe { ScreenToClient(tree, &mut at) };
+            let at = win::screen_to_client(tree, pt);
             (treeview::hit(tree, at).0, pt)
         };
         let entry = self.entry(item);
@@ -508,7 +494,7 @@ impl BookmarksPane {
                 Some(MARK_OPEN)
             }
             Some(Entry::Folder { .. }) => {
-                let label = if treeview::is_expanded(tree, item) {
+                let label = if item.is_some_and(treeview::is_expanded) {
                     "Collap&se"
                 } else {
                     "Exp&and"
@@ -541,10 +527,10 @@ impl BookmarksPane {
         }
         let id = app.track_with_shell(popup, pt, "bookmarks menu", None);
         if marked {
-            treeview::drop_highlight(tree, NONE);
+            treeview::drop_highlight(tree, None);
         }
-        // SAFETY: the menu made above.
-        unsafe { DestroyMenu(popup) };
+        // The menu made above.
+        win::menu::destroy(popup);
         // The menu's loop may have filled the tree again (another goz-gui
         // changed the bookmarks, read as the pane took the keyboard): the
         // item and its row are what they stand for now, or nothing if it
@@ -552,7 +538,7 @@ impl BookmarksPane {
         let now = keep.as_ref().and_then(|k| self.find(k));
         match (id as u16, now) {
             (0, _) => {}
-            (MARK_OPEN | MARK_EXPAND, Some((item, _))) => self.activate(app, item),
+            (MARK_OPEN | MARK_EXPAND, Some((item, _))) => self.activate(app, Some(item)),
             (MARK_EDIT, Some((_, e))) => self.edit_entry(app, &e),
             (MARK_DELETE, Some((_, e))) => self.delete_entry(app, &e),
             (MARK_OPEN | MARK_EXPAND | MARK_EDIT | MARK_DELETE, None) => {}
@@ -561,22 +547,26 @@ impl BookmarksPane {
     }
 
     /// A tree notification.
-    fn notify(&self, app: &App, l: LPARAM) -> Option<LRESULT> {
-        // SAFETY: a control's notification carries an NMHDR.
-        let hdr = unsafe { &*(l as *const NMHDR) };
-        if hdr.hwndFrom != self.tree.get() {
+    fn notify(&self, app: &App, m: &Msg) -> Option<LRESULT> {
+        let n = m.notify()?;
+        if n.from() != self.tree.get() {
             return None;
         }
         let tree = self.tree.get();
-        match hdr.code {
+        match n.code() {
             // Options > Fonts and Colors' Bookmarks Sidebar states.
-            NM_CUSTOMDRAW => Some(treeview::custom_draw(
-                tree,
-                l,
-                &app.pal.get(),
-                crate::colors::Item::BookmarksSidebar,
-                app.part_font(crate::colors::Item::BookmarksSidebar, true),
-            )),
+            NM_CUSTOMDRAW => {
+                let pal = app.pal.get();
+                let bold = app.part_font(crate::colors::Item::BookmarksSidebar, true);
+                let mut cd = n.get::<NMTVCUSTOMDRAW>()?;
+                Some(treeview::custom_draw(
+                    tree,
+                    &mut cd,
+                    &pal,
+                    crate::colors::Item::BookmarksSidebar,
+                    bold,
+                ))
+            }
             NM_CLICK => {
                 // A click on a bookmark opens it, whichever part of its row
                 // (not the button of a folder): where the button went down
@@ -605,16 +595,19 @@ impl BookmarksPane {
                 Some(0)
             }
             TVN_ITEMEXPANDEDW => {
-                // SAFETY: this code carries an NMTREEVIEWW.
-                let nm = unsafe { &*(l as *const NMTREEVIEWW) };
-                self.expanded(app, nm);
+                // Copied out: nothing of the message is held meanwhile.
+                if let Some((item, action)) =
+                    n.get::<NMTREEVIEWW>().map(|v| (v.item_new(), v.action))
+                {
+                    self.expanded(app, item, action);
+                }
                 Some(0)
             }
             TVN_GETINFOTIPW => {
-                // SAFETY: this code carries an NMTVGETINFOTIPW, whose buffer
-                // holds `cchTextMax` code units.
-                let tip = unsafe { &mut *(l as *mut NMTVGETINFOTIPW) };
-                if let Some(Entry::Mark { row }) = self.entry(tip.hItem) {
+                let Some(mut tip) = n.get::<NMTVGETINFOTIPW>() else {
+                    return Some(0);
+                };
+                if let Some(Entry::Mark { row }) = self.entry(tip.item()) {
                     let text = {
                         let list = self.list.borrow();
                         list.rows().get(row).map(|r| {
@@ -625,17 +618,10 @@ impl BookmarksPane {
                             }
                         })
                     };
-                    if let Some(text) = text
-                        && !tip.pszText.is_null()
-                        && tip.cchTextMax > 0
-                    {
+                    if let Some(text) = text {
+                        // Into the tree's buffer, cut to fit.
                         let units: Vec<u16> = text.encode_utf16().collect();
-                        let n = units.len().min(tip.cchTextMax as usize - 1);
-                        // SAFETY: the tree's buffer holds `cchTextMax` units.
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(units.as_ptr(), tip.pszText, n);
-                            *tip.pszText.add(n) = 0;
-                        }
+                        tip.set_text(&units);
                     }
                 }
                 Some(0)
@@ -647,21 +633,19 @@ impl BookmarksPane {
     /// Reads the bookmarks file again (if another program changed it) once
     /// the message being handled is done with.
     fn refresh_soon(&self) {
-        // SAFETY: posts to this pane's own window.
-        unsafe { PostMessageW(self.pane.get(), WM_REFRESH, 0, 0) };
+        win::post_app(self.pane.get(), WM_REFRESH, 0, 0);
     }
 
     /// Clears the box (the search through the bookmarks).
     fn clear(&self) {
-        // SAFETY: empties this pane's box; EN_CHANGE fills the tree again.
-        unsafe { SetWindowTextW(self.edit.get(), wz("").as_ptr()) };
+        // EN_CHANGE fills the tree again.
+        win::set_text(self.edit.get(), "");
     }
 
     /// The tree's font, rows and icons for the window's DPI.
     fn fit_dpi(&self, app: &App) {
         let dpi = app.dpi.get();
-        // SAFETY: reads a metric.
-        let icon = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) };
+        let icon = sys::metric_for_dpi(SM_CXSMICON, dpi);
         let resized = {
             let images = self.images.borrow();
             match images.as_ref() {
@@ -683,9 +667,8 @@ impl BookmarksPane {
         }
         let font = app.part_font(crate::colors::Item::BookmarksSidebar, false);
         let fh = app.part_height(crate::colors::Item::BookmarksSidebar);
-        treeview::set_font(tree, font as isize, fh, icon, |v| app.scale(v));
-        // SAFETY: a message to this pane's box.
-        unsafe { SendMessageW(self.edit.get(), WM_SETFONT, font as usize, 1) };
+        treeview::set_font(tree, font, fh, icon, |v| app.scale(v));
+        win::set_font(self.edit.get(), font, true);
     }
 
     fn apply_theme(&self, app: &App) {
@@ -712,28 +695,17 @@ fn clear_colours(pal: &crate::theme::Palette, bg: u32, hot: bool, pressed: bool)
     }
 }
 
-/// The tree's subclass id.
-const TREE_SUBCLASS: usize = 1;
+/// The tree's subclass.
+static TREE: subclass::Key = subclass::Key::new("the Bookmarks pane's tree");
 
-/// The tree's subclass: notes where its left button goes down (the tree's
-/// coordinates), which its NM_CLICK then hit-tests.
-unsafe extern "system" fn tree_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    data: usize,
-) -> LRESULT {
-    // SAFETY: `data` is the pane's `click` cell, which outlives the tree
-    // (the subclass goes in `destroy`, before the tree); `l` is the
-    // button's point.
-    unsafe {
-        if matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
-            (*(data as *const Cell<POINT>)).set(point(l));
-        }
-        DefSubclassProc(hwnd, msg, w, l)
+/// The tree's subclass, `click` the pane's cell: notes where its left
+/// button goes down (the tree's coordinates), which its NM_CLICK then
+/// hit-tests.
+fn tree_proc(click: &Cell<POINT>, m: &Msg) -> LRESULT {
+    if matches!(m.id, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
+        click.set(m.point());
     }
+    m.def()
 }
 
 impl PaneContent for BookmarksPane {
@@ -746,67 +718,45 @@ impl PaneContent for BookmarksPane {
 
     fn create(&self, app: &App, pane: HWND) {
         self.pane.set(pane);
-        // SAFETY: children of this thread's pane window.
-        let (edit, tree) = unsafe {
-            let hinst = GetModuleHandleW(core::ptr::null());
-            let edit = CreateWindowExW(
-                0,
-                wz("EDIT").as_ptr(),
-                core::ptr::null(),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
-                0,
-                0,
-                0,
-                0,
-                pane,
-                EDIT_ID as HMENU,
-                hinst,
-                core::ptr::null(),
-            );
-            let tree = CreateWindowExW(
-                0,
-                WC_TREEVIEWW,
-                core::ptr::null(),
-                WS_CHILD
-                    | WS_VISIBLE
-                    | WS_TABSTOP
-                    | TVS_HASBUTTONS
-                    | TVS_LINESATROOT
-                    | TVS_SHOWSELALWAYS
-                    | TVS_TRACKSELECT
-                    | TVS_FULLROWSELECT
-                    | TVS_NOHSCROLL
-                    | TVS_NONEVENHEIGHT
-                    | TVS_INFOTIP,
-                0,
-                0,
-                0,
-                0,
-                pane,
-                TREE_ID as HMENU,
-                hinst,
-                core::ptr::null(),
-            );
-            (edit, tree)
-        };
+        // Children of this thread's pane window.
+        let edit = class::create_plain(&Create {
+            ex_style: 0,
+            class: "EDIT",
+            title: "",
+            style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            rect: (0, 0, 0, 0),
+            parent: pane,
+            menu: class::id_menu(EDIT_ID),
+        });
+        let tree = class::create_plain(&Create {
+            ex_style: 0,
+            class: tv::CLASS,
+            title: "",
+            style: WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | TVS_HASBUTTONS
+                | TVS_LINESATROOT
+                | TVS_SHOWSELALWAYS
+                | TVS_TRACKSELECT
+                | TVS_FULLROWSELECT
+                | TVS_NOHSCROLL
+                | TVS_NONEVENHEIGHT
+                | TVS_INFOTIP,
+            rect: (0, 0, 0, 0),
+            parent: pane,
+            menu: class::id_menu(TREE_ID),
+        });
         self.edit.set(edit);
         self.tree.set(tree);
-        // SAFETY: the cell lives in this pane, which outlives the subclass
-        // (`destroy` takes it off before the tree goes).
-        unsafe {
-            SetWindowSubclass(
-                tree,
-                Some(tree_proc),
-                TREE_SUBCLASS,
-                (&raw const self.click) as usize,
-            );
-        }
-        let cue = wz("Search bookmarks");
-        // SAFETY: the box copies its cue; shown even with the keyboard in it.
-        unsafe { SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize) };
+        // The subclass shares the pane's cell; `destroy` takes it off
+        // before the tree goes.
+        let click = Rc::clone(&self.click);
+        subclass::set(tree, &TREE, move |m| tree_proc(&click, m));
+        // The box copies its cue; shown even with the keyboard in it.
+        edit::set_cue_banner(edit, "Search bookmarks", true);
         let ex = TVS_EX_DOUBLEBUFFER | TVS_EX_AUTOHSCROLL;
-        // SAFETY: a message to this pane's tree.
-        unsafe { SendMessageW(tree, TVM_SETEXTENDEDSTYLE, ex as usize, ex as isize) };
+        tv::set_extended_style(tree, ex, ex);
         self.plain.set(treeview::plain_icons());
         self.fit_dpi(app);
         self.apply_theme(app);
@@ -822,32 +772,29 @@ impl PaneContent for BookmarksPane {
         let fh = app.part_height(crate::colors::Item::BookmarksSidebar);
         let left = frame.left + app.scale(4);
         let top = frame.top + (frame.bottom - frame.top - fh) / 2;
-        // SAFETY: moves this pane's children and repaints its bar.
-        unsafe {
-            MoveWindow(
-                self.edit.get(),
-                left,
-                top,
-                (button.left - left).max(0),
-                fh.min(frame.bottom - top).max(0),
-                1,
-            );
-            MoveWindow(
-                self.tree.get(),
-                rc.left,
-                bar.bottom,
-                rc.right - rc.left,
-                (rc.bottom - bar.bottom).max(0),
-                1,
-            );
-            InvalidateRect(self.pane.get(), &bar, 0);
-        }
+        win::move_window(
+            self.edit.get(),
+            left,
+            top,
+            (button.left - left).max(0),
+            fh.min(frame.bottom - top).max(0),
+            true,
+        );
+        win::move_window(
+            self.tree.get(),
+            rc.left,
+            bar.bottom,
+            rc.right - rc.left,
+            (rc.bottom - bar.bottom).max(0),
+            true,
+        );
+        win::invalidate(self.pane.get(), Some(&bar), false);
     }
 
     fn destroy(&self, _app: &App) {
         let tree = self.tree.get();
-        // SAFETY: takes off the subclass `create` put on this pane's tree.
-        unsafe { RemoveWindowSubclass(tree, Some(tree_proc), TREE_SUBCLASS) };
+        // Takes off the subclass `create` put on this pane's tree.
+        subclass::remove(tree, &TREE);
         treeview::set_images(tree, None);
         self.images.borrow_mut().take();
     }
@@ -863,11 +810,9 @@ impl PaneContent for BookmarksPane {
             (false, false) if from == tree => edit,
             _ => return false,
         };
-        // SAFETY: focuses a child of this pane.
-        unsafe { SetFocus(to) };
+        win::set_focus(to);
         if to == edit {
-            // SAFETY: a message to this pane's box.
-            unsafe { SendMessageW(edit, EM_SETSEL, 0, -1) };
+            edit::select_all(edit);
         }
         true
     }
@@ -884,14 +829,12 @@ impl PaneContent for BookmarksPane {
             return match msg.message {
                 WM_KEYDOWN => match vk {
                     VK_DOWN => {
-                        let tree_item = treeview::selected(tree);
-                        if tree_item == NONE
-                            && let Some(&first) = treeview::children(tree, NONE).first()
+                        if treeview::selected(tree).is_none()
+                            && let Some(&first) = treeview::children(tree, None).first()
                         {
-                            treeview::select(tree, first);
+                            treeview::select(tree, Some(first));
                         }
-                        // SAFETY: focuses a child of this pane.
-                        unsafe { SetFocus(tree) };
+                        win::set_focus(tree);
                         true
                     }
                     VK_RETURN => {
@@ -915,15 +858,13 @@ impl PaneContent for BookmarksPane {
                     // Shift+Esc is Close Pane: it goes on to the window's
                     // shortcuts.
                     VK_ESCAPE if !key_down(VK_SHIFT) => {
-                        // SAFETY: reads the length of this pane's box.
-                        if unsafe { GetWindowTextLengthW(edit) } > 0 {
+                        if win::text_len(edit) > 0 {
                             self.clear();
                         }
                         true
                     }
                     k if k == u16::from(b'A') && key_down(VK_CONTROL) => {
-                        // SAFETY: a message to this pane's box.
-                        unsafe { SendMessageW(edit, EM_SETSEL, 0, -1) };
+                        edit::select_all(edit);
                         true
                     }
                     VK_DELETE if key_down(VK_CONTROL) => {
@@ -965,23 +906,26 @@ impl PaneContent for BookmarksPane {
         }
     }
 
-    fn message(&self, app: &App, pane: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
-        match msg {
-            WM_NOTIFY => self.notify(app, l),
+    fn handle(&self, app: &App, pane: HWND, m: &Msg) -> Option<LRESULT> {
+        let (w, l) = (m.w, m.l);
+        match m.id {
+            WM_NOTIFY => self.notify(app, m),
+            // lParam is the control that sent it.
             WM_COMMAND if l as HWND == self.edit.get() => {
                 match u32::from((w >> 16) as u16) {
                     EN_CHANGE => {
                         self.fill(app);
                         let rc = Self::bar(app, &crate::pane::content_rect(app, pane));
-                        // SAFETY: the box's button turns from × to the
-                        // magnifier and back.
-                        unsafe { InvalidateRect(self.pane.get(), &rc, 0) };
+                        // The box's button turns from × to the magnifier
+                        // and back.
+                        win::invalidate(self.pane.get(), Some(&rc), false);
                     }
                     EN_SETFOCUS => self.refresh_soon(),
                     _ => {}
                 }
                 Some(0)
             }
+            // wParam is the window clicked.
             WM_CONTEXTMENU if w as HWND == self.tree.get() => {
                 self.menu(app, l);
                 Some(0)
@@ -999,15 +943,14 @@ impl PaneContent for BookmarksPane {
                     // round the text: the box.
                     if inside(&Self::button(&frame), pt) && self.has_text() {
                         self.pressed.set(true);
-                        // SAFETY: the mouse goes to this pane's window until
-                        // the button comes up.
-                        unsafe { SetCapture(pane) };
+                        // The mouse goes to this pane's window until the
+                        // button comes up.
+                        win::set_capture(pane);
                         // Repainted darker, whether it was lit or not.
                         self.hot.set(false);
                         self.set_hot(app, pane, true);
                     }
-                    // SAFETY: focuses a child of this pane.
-                    unsafe { SetFocus(self.edit.get()) };
+                    win::set_focus(self.edit.get());
                     return Some(0);
                 }
                 None
@@ -1024,12 +967,10 @@ impl PaneContent for BookmarksPane {
             }
             WM_LBUTTONUP if self.pressed.get() => {
                 self.pressed.set(false);
-                // SAFETY: lets go of the mouse the press took, if it is
-                // still this pane's.
-                unsafe {
-                    if GetCapture() == pane {
-                        ReleaseCapture();
-                    }
+                // Lets go of the mouse the press took, if it is still this
+                // pane's.
+                if win::capture() == pane {
+                    win::release_capture();
                 }
                 let pt = point(l);
                 let over = inside(&Self::button_in(app, pane), pt);
@@ -1091,11 +1032,8 @@ impl PaneContent for BookmarksPane {
 
     fn theme(&self, app: &App, _dark: bool) {
         self.apply_theme(app);
-        // SAFETY: repaints this pane's children.
-        unsafe {
-            InvalidateRect(self.tree.get(), core::ptr::null(), 1);
-            InvalidateRect(self.edit.get(), core::ptr::null(), 1);
-        }
+        win::invalidate(self.tree.get(), None, true);
+        win::invalidate(self.edit.get(), None, true);
     }
 
     fn dpi(&self, app: &App, _dpi: u32) {

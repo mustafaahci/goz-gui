@@ -36,6 +36,9 @@ memchr = "2.7"
 [dependencies.windows-sys]
 version = "0.61"
 features = [
+    # RtlGetVersion: the Windows build, whatever the manifest says (uxtheme's
+    # dark mode exists from 10.0.17763 on).
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Dwm",

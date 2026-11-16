@@ -3,12 +3,12 @@
 //! their actions.
 
 use windows_sys::Win32::Foundation::{HWND, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetParent, GetWindowTextLengthW, PostMessageW};
 
 use super::App;
 use crate::a11y::{self, Action, Kind, Part, Server, Source};
 use crate::searchbox::{self, Button};
 use crate::strip::StripSlot;
+use crate::win::{self, gdi};
 
 /// The `App` behind a main window, for its object.
 fn source_of_main(hwnd: HWND) -> Option<&'static dyn Source> {
@@ -17,8 +17,7 @@ fn source_of_main(hwnd: HWND) -> Option<&'static dyn Source> {
 
 /// The `App` behind a pane window (a child of the main window).
 fn source_of_pane(hwnd: HWND) -> Option<&'static dyn Source> {
-    // SAFETY: reads the parent of a window of this thread.
-    let parent = unsafe { GetParent(hwnd) };
+    let parent = win::parent(hwnd);
     super::app_of(parent).map(|a| a as &dyn Source)
 }
 
@@ -51,28 +50,27 @@ impl App {
     /// buffer of its size (a window off screen, or not repainted since its
     /// text changed, has drawn nothing).
     fn fresh_status_parts(&self) -> Vec<(String, RECT)> {
-        use windows_sys::Win32::Graphics::Gdi::{
-            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-            SelectObject, SetViewportOrgEx,
-        };
         let rc = self.status_rc.get();
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         if w <= 0 || h <= 0 {
             return Vec::new();
         }
-        // SAFETY: a memory DC and bitmap of this thread's window, released
-        // here; the status bar draws into it at its own coordinates.
-        unsafe {
-            let hdc = GetDC(self.hwnd);
-            let mem = CreateCompatibleDC(hdc);
-            let bmp = CreateCompatibleBitmap(hdc, w, h);
-            let old = SelectObject(mem, bmp);
-            SetViewportOrgEx(mem, -rc.left, -rc.top, core::ptr::null_mut());
-            crate::status::paint(self, mem);
-            SelectObject(mem, old);
-            DeleteObject(bmp);
-            DeleteDC(mem);
-            ReleaseDC(self.hwnd, hdc);
+        // A memory DC and bitmap of this thread's window, released here (the
+        // guards drop in the reverse of their order); the status bar draws
+        // into it at its own coordinates.
+        {
+            let dc = gdi::WindowDc::get(self.hwnd);
+            let mem = gdi::MemDc::compatible(dc.hdc());
+            let Some(bmp) = gdi::create_compatible_bitmap(dc.hdc(), w, h) else {
+                return Vec::new();
+            };
+            let old = gdi::Selected::new(mem.hdc(), &bmp);
+            gdi::set_viewport_org(mem.hdc(), -rc.left, -rc.top);
+            crate::status::paint(self, mem.hdc());
+            drop(old);
+            drop(bmp);
+            drop(mem);
+            drop(dc);
         }
         self.custom.status_parts()
     }
@@ -119,8 +117,7 @@ impl App {
             buttons.push((Button::History, f.history, "Search History"));
         }
         buttons.push((Button::Clear, f.clear, "Clear"));
-        // SAFETY: reads the length of this thread's search box.
-        let empty = unsafe { GetWindowTextLengthW(self.edit) } == 0;
+        let empty = win::text_len(self.edit) == 0;
         for (b, rc, name) in buttons {
             let mut p = Part::new(name, a11y::ROLE_PUSHBUTTON, rc);
             if !searchbox::enabled(self, b) || (b == Button::Clear && empty) {
@@ -201,9 +198,9 @@ impl Source for App {
             }),
             Action::ClosePane => {
                 if let Kind::Pane(code) = kind {
-                    // SAFETY: posts to this thread's window; the pane goes
-                    // from the window's own queue, not inside the call.
-                    unsafe { PostMessageW(self.hwnd, super::WM_PANE_CLOSE, code, 0) };
+                    // Posted to this thread's window: the pane goes from the
+                    // window's own queue, not inside the call.
+                    win::post_app(self.hwnd, super::WM_PANE_CLOSE, code, 0);
                 }
             }
         }

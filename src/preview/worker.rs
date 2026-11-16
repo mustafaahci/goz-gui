@@ -15,49 +15,25 @@
 //! returns, and a new thread takes over.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{
-    COLORREF, E_NOINTERFACE, E_POINTER, HWND as WHWND, RECT as WRECT, REGDB_E_CLASSNOTREG, S_FALSE,
-    SIZE,
-};
-use windows::Win32::Graphics::Gdi::LOGFONTW;
-use windows::Win32::System::Com::{
-    CLSCTX_ACTIVATE_32_BIT_SERVER, CLSCTX_LOCAL_SERVER, CoCreateInstance, STGM_READ,
-};
-use windows::Win32::System::Ole::IObjectWithSite;
-use windows::Win32::UI::Shell::PropertiesSystem::{IInitializeWithFile, IInitializeWithStream};
-use windows::Win32::UI::Shell::{
-    IInitializeWithItem, IPreviewHandler, IPreviewHandlerFrame, IPreviewHandlerFrame_Impl,
-    IPreviewHandlerVisuals, IShellItem, IShellItemImageFactory, PREVIEWHANDLERFRAMEINFO,
-    SHCreateItemFromParsingName, SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT, SIIGBF_THUMBNAILONLY,
-};
-use windows::Win32::UI::WindowsAndMessaging::{HACCEL as WHACCEL, MSG as WMSG};
-use windows::core::{GUID, Interface, PCWSTR, implement};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_OBJECT_0};
-use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
-use windows_sys::Win32::Graphics::Gdi::{DeleteObject, HBITMAP};
+use windows::Win32::Foundation::{E_NOINTERFACE, REGDB_E_CLASSNOTREG};
+use windows::Win32::System::Com::{CLSCTX_ACTIVATE_32_BIT_SERVER, CLSCTX_LOCAL_SERVER};
+use windows::Win32::UI::Shell::{SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT, SIIGBF_THUMBNAILONLY};
+use windows::core::GUID;
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Graphics::Gdi::LOGFONTW;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-    GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
 };
-use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoFreeUnusedLibrariesEx, CoInitializeEx,
-    CoUninitialize,
-};
-use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
-use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT, VK_TAB,
-};
-use windows_sys::Win32::UI::Shell::{ASSOCF_NONE, ASSOCSTR_SHELLEXTENSION, AssocQueryStringW};
+use windows_sys::Win32::System::Threading::INFINITE;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT, VK_TAB};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ACCEL, CopyAcceleratorTableW, CreateAcceleratorTableW, DestroyAcceleratorTable,
-    DispatchMessageW, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL, MSG, MWMO_INPUTAVAILABLE,
-    MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT,
-    TranslateMessage, WM_COMMAND, WM_KEYDOWN, WM_SYSKEYDOWN,
+    ACCEL, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL, MSG, MWMO_INPUTAVAILABLE, QS_ALLINPUT,
+    WM_COMMAND, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 use super::image::{Decoded, Wic};
@@ -65,7 +41,13 @@ use super::settings::{Handlers, PreviewSettings};
 use super::stream::FileStream;
 use super::text;
 use crate::thumbs::{Picture, premultiplied};
-use crate::wide::{nul, wz};
+use crate::win::com::Apartment;
+use crate::win::preview::{Frame as HandlerFrame, Handler as PreviewHandler};
+use crate::win::queue::{self, AccelTable, Woke};
+use crate::win::reg::{self, Hive};
+use crate::win::shell::{self, ImageFactory};
+use crate::win::sync::Event;
+use crate::win::{file, locale, sys};
 
 /// What the pane asks to see.
 pub struct Request {
@@ -147,9 +129,9 @@ const TXT_PREVIEWER: GUID = GUID::from_u128(0x1531d583_8375_4d3f_b5fb_d23bbd169f
 struct Shared {
     jobs: Mutex<Jobs>,
     /// Set when a job is queued (auto-reset).
-    work: usize,
+    work: Event,
     /// Set as the thread ends (manual reset).
-    done: usize,
+    done: Event,
     replies: Mutex<Vec<Reply>>,
     phase: Mutex<Option<Phase>>,
     /// The main window, which outlives the pane: told of replies with
@@ -173,8 +155,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Shared {
     fn wake(&self) {
-        // SAFETY: a live event handle, owned by `Shared`.
-        unsafe { SetEvent(self.work as HANDLE) };
+        self.work.set();
     }
 
     fn set_phase(&self, generation: u64, handler: bool) {
@@ -187,20 +168,9 @@ impl Shared {
 
     fn reply(&self, reply: Reply) {
         lock(&self.replies).push(reply);
-        // SAFETY: posting to the main window; if it is gone the reply
-        // waits in the queue and drops with it.
-        unsafe { PostMessageW(self.main as HWND, self.reply_msg, 0, 0) };
-    }
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // SAFETY: the events are owned here and closed once, after both
-        // the thread and the pane let go.
-        unsafe {
-            CloseHandle(self.work as HANDLE);
-            CloseHandle(self.done as HANDLE);
-        }
+        // Posted to the main window; if it is gone the reply waits in the
+        // queue and drops with it.
+        crate::win::post_app(self.main as HWND, self.reply_msg, 0, 0);
     }
 }
 
@@ -221,33 +191,20 @@ impl Worker {
         host: HWND,
         settings: PreviewSettings,
     ) -> Option<Worker> {
-        // SAFETY: two unnamed events, closed by `Shared`'s drop.
-        let (work, done) = unsafe {
-            (
-                CreateEventW(core::ptr::null(), 0, 0, core::ptr::null()),
-                CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()),
-            )
-        };
-        if work.is_null() || done.is_null() {
-            // SAFETY: whichever was made is closed again.
-            unsafe {
-                if !work.is_null() {
-                    CloseHandle(work);
-                }
-                if !done.is_null() {
-                    CloseHandle(done);
-                }
-            }
+        // Two unnamed events, closed as `Shared` drops (whichever was made
+        // is closed again if the other could not be).
+        let (work, done) = (Event::new(false, false), Event::new(true, false));
+        let (Some(work), Some(done)) = (work, done) else {
             return None;
-        }
+        };
         let stall_ms = std::env::var("GOZ_GUI_PREVIEW_STALL_MS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
         let shared = Arc::new(Shared {
             jobs: Mutex::new(Jobs::default()),
-            work: work as usize,
-            done: done as usize,
+            work,
+            done,
             replies: Mutex::new(Vec::new()),
             phase: Mutex::new(None),
             main: main as usize,
@@ -328,37 +285,32 @@ impl Worker {
     /// unloading tells its window's parent, which is ours). True when it
     /// ended.
     pub fn wait(&self, timeout: Duration) -> bool {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{PM_NOREMOVE, PM_QS_SENDMESSAGE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PM_NOREMOVE, PM_QS_SENDMESSAGE, QS_SENDMESSAGE,
+        };
         let end = Instant::now() + timeout;
-        let done = self.shared.done as HANDLE;
+        let done = &self.shared.done;
         loop {
             let left = end.saturating_duration_since(Instant::now());
-            // SAFETY: waits on a live event; PeekMessage with
-            // PM_QS_SENDMESSAGE only answers sent messages, leaving every
-            // posted one in the queue.
-            unsafe {
-                let r = MsgWaitForMultipleObjectsEx(
-                    1,
-                    &done,
-                    left.as_millis() as u32,
-                    windows_sys::Win32::UI::WindowsAndMessaging::QS_SENDMESSAGE,
-                    MWMO_INPUTAVAILABLE,
-                );
-                if r == WAIT_OBJECT_0 {
-                    return true;
-                }
-                if left.is_zero() {
-                    return false;
-                }
-                let mut msg: MSG = core::mem::zeroed();
-                PeekMessageW(
-                    &mut msg,
-                    core::ptr::null_mut(),
-                    0,
-                    0,
-                    PM_NOREMOVE | PM_QS_SENDMESSAGE,
-                );
+            let r = queue::msg_wait(
+                &[done],
+                left.as_millis() as u32,
+                QS_SENDMESSAGE,
+                MWMO_INPUTAVAILABLE,
+            );
+            if r == Woke::Event(0) {
+                return true;
             }
+            if left.is_zero() {
+                return false;
+            }
+            // A peek with PM_QS_SENDMESSAGE only answers sent messages,
+            // leaving every posted one in the queue.
+            let _ = queue::peek(
+                core::ptr::null_mut(),
+                (0, 0),
+                PM_NOREMOVE | PM_QS_SENDMESSAGE,
+            );
         }
     }
 }
@@ -381,24 +333,13 @@ fn handlers_allowed(settings: &PreviewSettings) -> bool {
         Handlers::Always => true,
         Handlers::Never => false,
         Handlers::System => {
-            let key = wz(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
-            let value = wz("ShowPreviewHandlers");
-            let mut data: u32 = 1;
-            let mut size = size_of::<u32>() as u32;
-            // SAFETY: reads one DWORD into `data`, whose size is passed.
-            let rc = unsafe {
-                RegGetValueW(
-                    HKEY_CURRENT_USER,
-                    key.as_ptr(),
-                    value.as_ptr(),
-                    RRF_RT_REG_DWORD,
-                    core::ptr::null_mut(),
-                    (&raw mut data).cast(),
-                    &mut size,
-                )
-            };
+            let data = reg::get_dword(
+                Hive::CurrentUser,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+                "ShowPreviewHandlers",
+            );
             // Missing is Explorer's default, on.
-            rc != 0 || data != 0
+            data.is_none_or(|d| d != 0)
         }
     }
 }
@@ -427,26 +368,8 @@ pub fn parse_guid(text: &str) -> Option<GUID> {
 
 /// The preview handler registered for extension `ext` (with its dot).
 fn handler_for(ext: &[u16]) -> Option<GUID> {
-    let ext = nul(ext);
-    let iid = wz(PREVIEW_HANDLER);
-    let mut buf = [0u16; 64];
-    let mut len = buf.len() as u32;
-    // SAFETY: NUL-terminated strings; the buffer with its length.
-    let hr = unsafe {
-        AssocQueryStringW(
-            ASSOCF_NONE,
-            ASSOCSTR_SHELLEXTENSION,
-            ext.as_ptr(),
-            iid.as_ptr(),
-            buf.as_mut_ptr(),
-            &mut len,
-        )
-    };
-    if hr != 0 {
-        return None;
-    }
-    let text = buf.split(|&c| c == 0).next().unwrap_or_default();
-    parse_guid(&String::from_utf16_lossy(text))
+    let text = shell::assoc_shell_extension(ext, PREVIEW_HANDLER)?;
+    parse_guid(&String::from_utf16_lossy(&text))
 }
 
 /// `path`'s extension, lower case with its dot; empty with none.
@@ -493,23 +416,7 @@ fn log(what: &str, took: Duration, path: &[u16]) {
 
 /// The system's text for error `code`.
 fn error_text(code: u32) -> String {
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
-    };
-    let mut buf = [0u16; 512];
-    // SAFETY: the buffer with its length; no inserts are read.
-    let n = unsafe {
-        FormatMessageW(
-            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            core::ptr::null(),
-            code,
-            0,
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-            core::ptr::null(),
-        )
-    };
-    let text = String::from_utf16_lossy(&buf[..n as usize]);
+    let text = sys::error_message(code);
     let text = text.trim();
     if text.is_empty() {
         format!("Error {code}.")
@@ -537,25 +444,7 @@ fn read_text(path: &[u16]) -> Option<Vec<u16>> {
 
 /// `bytes` in the system's ANSI code page.
 fn ansi(bytes: &[u8]) -> Vec<u16> {
-    if bytes.is_empty() {
-        return Vec::new();
-    }
-    let len = bytes.len().min(i32::MAX as usize) as i32;
-    let mut out = vec![0u16; bytes.len()];
-    // SAFETY: both buffers with their lengths; a code page character is
-    // never more UTF-16 units than bytes.
-    let n = unsafe {
-        MultiByteToWideChar(
-            CP_ACP,
-            0,
-            bytes.as_ptr(),
-            len,
-            out.as_mut_ptr(),
-            out.len() as i32,
-        )
-    };
-    out.truncate(n.max(0) as usize);
-    out
+    locale::ansi_to_wide(bytes)
 }
 
 /// A shell image of `path` `side` pixels square, premultiplied.
@@ -564,24 +453,19 @@ fn shell_image(
     side: i32,
     flags: windows::Win32::UI::Shell::SIIGBF,
 ) -> Option<Decoded> {
-    let path = nul(path);
-    // SAFETY: COM calls on this thread's objects; the bitmap the shell
-    // returns is ours, copied and deleted.
-    unsafe {
-        let factory: IShellItemImageFactory =
-            SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None).ok()?;
-        let made = factory.GetImage(SIZE { cx: side, cy: side }, flags).ok()?;
-        let made = made.0 as HBITMAP;
-        let bitmap = premultiplied(made);
-        DeleteObject(made);
-        let bitmap = bitmap?;
-        let natural = (bitmap.width, bitmap.height);
-        Some(Decoded {
-            bitmap,
-            natural,
-            opaque: false,
-        })
-    }
+    // COM calls on this thread's objects; the bitmap the shell returns is
+    // ours, copied, then deleted as it drops.
+    let factory = ImageFactory::of_path(path)?;
+    let made = factory.image(side, flags).ok()?;
+    let bitmap = premultiplied(made.get());
+    drop(made);
+    let bitmap = bitmap?;
+    let natural = (bitmap.width, bitmap.height);
+    Some(Decoded {
+        bitmap,
+        natural,
+        opaque: false,
+    })
 }
 
 /// The icon of the file `path` (extension `ext`, lower case with its dot),
@@ -611,7 +495,7 @@ fn icon_image(path: &[u16], ext: &[u16], side: i32) -> Option<Decoded> {
 /// A preview handler held: its class, and whether a file is loaded in it.
 struct Loaded {
     clsid: GUID,
-    handler: IPreviewHandler,
+    handler: PreviewHandler,
     loaded: bool,
 }
 
@@ -620,7 +504,7 @@ struct State<'a> {
     shared: &'a Shared,
     wic: Option<Wic>,
     handler: Option<Loaded>,
-    frame: Option<IPreviewHandlerFrame>,
+    frame: Option<HandlerFrame>,
     /// The content's size now.
     size: (i32, i32),
     /// The request shown last, for phases outside a request.
@@ -680,14 +564,10 @@ impl State<'_> {
 
     fn make(&mut self, r: &Request) -> Shown {
         let settings = self.shared.settings;
-        let path = nul(&r.path);
-        // SAFETY: a NUL-terminated path.
-        let attrs = unsafe { GetFileAttributesW(path.as_ptr()) };
-        if attrs == INVALID_FILE_ATTRIBUTES {
-            // SAFETY: reads this thread's last error.
-            let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-            return Shown::Failed(error_text(code));
-        }
+        let attrs = match file::attributes(&r.path) {
+            Ok(attrs) => attrs,
+            Err(code) => return Shown::Failed(error_text(code)),
+        };
         if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
             if !settings.folders {
                 return Shown::Nothing;
@@ -789,8 +669,7 @@ impl State<'_> {
             }
             Err(e) => {
                 // Kept, unloaded, for the next file of its type.
-                // SAFETY: a COM call on this thread's handler.
-                let _ = unsafe { handler.Unload() };
+                let _ = handler.unload();
                 self.handler = Some(Loaded {
                     clsid,
                     handler,
@@ -802,31 +681,17 @@ impl State<'_> {
     }
 
     /// Hands `r`'s file to `handler` and has it draw in the host window.
-    fn load(&mut self, handler: &IPreviewHandler, r: &Request) -> windows::core::Result<()> {
+    fn load(&mut self, handler: &PreviewHandler, r: &Request) -> windows::core::Result<()> {
         self.init = Some(initialize(handler, &r.path)?);
         let frame = self.frame();
-        // SAFETY: COM calls on this thread's handler; the rectangle and the
-        // font outlive the calls.
-        unsafe {
-            if let Ok(visuals) = handler.cast::<IPreviewHandlerVisuals>() {
-                let _ = visuals.SetBackgroundColor(COLORREF(r.bg));
-                let _ = visuals.SetTextColor(COLORREF(r.fg));
-                let _ = visuals.SetFont(&r.font);
-            }
-            if let (Ok(site), Some(frame)) = (handler.cast::<IObjectWithSite>(), frame) {
-                let _ = site.SetSite(&frame);
-            }
-            let rc = WRECT {
-                left: 0,
-                top: 0,
-                right: r.size.0.max(1),
-                bottom: r.size.1.max(1),
-            };
-            handler.SetWindow(WHWND(self.shared.host as *mut _), &rc)?;
-            if let Err(e) = handler.DoPreview() {
-                let _ = handler.Unload();
-                return Err(e);
-            }
+        handler.set_visuals(r.bg, r.fg, &r.font);
+        if let Some(frame) = frame {
+            handler.set_site(Some(&frame));
+        }
+        handler.set_window(self.shared.host as HWND, r.size)?;
+        if let Err(e) = handler.do_preview() {
+            let _ = handler.unload();
+            return Err(e);
         }
         if self.shared.stall_ms > 0 {
             // The test hook's stand-in for a DoPreview that does not
@@ -839,13 +704,17 @@ impl State<'_> {
     }
 
     /// The frame preview handlers pass keys to.
-    fn frame(&mut self) -> Option<IPreviewHandlerFrame> {
+    fn frame(&mut self) -> Option<HandlerFrame> {
         if self.frame.is_none() {
-            let frame = Frame {
+            let frame = Rc::new(Frame {
                 main: self.shared.main,
                 keys: RefCell::new(Keys::new(crate::keymap::generation(), Accel::new())),
-            };
-            self.frame = Some(frame.into());
+            });
+            let context = Rc::clone(&frame);
+            self.frame = Some(HandlerFrame::new(
+                move || context.context(),
+                move |msg| frame.translate(msg),
+            ));
         }
         self.frame.clone()
     }
@@ -858,24 +727,18 @@ impl State<'_> {
         {
             self.shared.set_phase(generation, true);
             held.loaded = false;
-            // SAFETY: a COM call on this thread's handler.
-            let _ = unsafe { held.handler.Unload() };
+            let _ = held.handler.unload();
         }
     }
 
-    /// Lets `held` go: its file, its site and the object.
+    /// Lets `held` go: its file, its site and the object (released by the
+    /// drop, after these calls).
     fn release(&self, held: Loaded) {
         self.shared.set_phase(self.generation, true);
-        // SAFETY: COM calls on this thread's handler, before it is
-        // released by the drop.
-        unsafe {
-            if held.loaded {
-                let _ = held.handler.Unload();
-            }
-            if let Ok(site) = held.handler.cast::<IObjectWithSite>() {
-                let _ = site.SetSite(None);
-            }
+        if held.loaded {
+            let _ = held.handler.unload();
         }
+        held.handler.set_site(None);
     }
 
     fn clear(&mut self) {
@@ -894,14 +757,7 @@ impl State<'_> {
             && held.loaded
         {
             self.shared.set_phase(self.generation, true);
-            let rc = WRECT {
-                left: 0,
-                top: 0,
-                right: size.0.max(1),
-                bottom: size.1.max(1),
-            };
-            // SAFETY: a COM call on this thread's handler.
-            let _ = unsafe { held.handler.SetRect(&rc) };
+            let _ = held.handler.set_rect(size);
             *lock(&self.shared.phase) = None;
         }
     }
@@ -911,8 +767,7 @@ impl State<'_> {
             && held.loaded
         {
             self.shared.set_phase(self.generation, true);
-            // SAFETY: a COM call on this thread's handler.
-            let _ = unsafe { held.handler.SetFocus() };
+            let _ = held.handler.set_focus();
             *lock(&self.shared.phase) = None;
         }
     }
@@ -929,17 +784,13 @@ impl State<'_> {
 
 /// A new preview handler of class `clsid`, in a surrogate process; a
 /// 32-bit handler where only that is registered.
-fn create(clsid: GUID) -> windows::core::Result<IPreviewHandler> {
-    // SAFETY: COM is initialized on this thread.
-    unsafe {
-        match CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER) {
-            Err(e) if e.code() == REGDB_E_CLASSNOTREG => CoCreateInstance(
-                &clsid,
-                None,
-                CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_32_BIT_SERVER,
-            ),
-            other => other,
+fn create(clsid: GUID) -> windows::core::Result<PreviewHandler> {
+    // COM is initialized on this thread.
+    match PreviewHandler::create(&clsid, CLSCTX_LOCAL_SERVER) {
+        Err(e) if e.code() == REGDB_E_CLASSNOTREG => {
+            PreviewHandler::create(&clsid, CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_32_BIT_SERVER)
         }
+        other => other,
     }
 }
 
@@ -955,29 +806,16 @@ enum Init {
 /// opens sharing it with everyone (so the file can be renamed or deleted
 /// while it is previewed), by path (it opens the file itself, as it
 /// likes), or as a shell item.
-fn initialize(handler: &IPreviewHandler, path: &[u16]) -> windows::core::Result<Init> {
-    let file = nul(path);
-    let at = PCWSTR(file.as_ptr());
-    // SAFETY: COM calls on this thread's handler with a NUL-terminated
-    // path that outlives them.
-    unsafe {
-        if let Ok(init) = handler.cast::<IInitializeWithStream>()
-            && let Some(stream) = FileStream::open(path)
-            && init.Initialize(&stream, STGM_READ.0).is_ok()
-        {
-            return Ok(Init::Stream);
-        }
-        if let Ok(init) = handler.cast::<IInitializeWithFile>()
-            && init.Initialize(at, STGM_READ.0).is_ok()
-        {
-            return Ok(Init::File);
-        }
-        if let Ok(init) = handler.cast::<IInitializeWithItem>()
-            && let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(at, None)
-            && init.Initialize(&item, STGM_READ.0).is_ok()
-        {
-            return Ok(Init::Item);
-        }
+fn initialize(handler: &PreviewHandler, path: &[u16]) -> windows::core::Result<Init> {
+    // The stream is opened only for a handler that takes one.
+    if handler.init_with_stream(|| FileStream::open(path)) {
+        return Ok(Init::Stream);
+    }
+    if handler.init_with_file(path) {
+        return Ok(Init::File);
+    }
+    if handler.init_with_item(path) {
+        return Ok(Init::Item);
     }
     Err(E_NOINTERFACE.into())
 }
@@ -985,7 +823,8 @@ fn initialize(handler: &IPreviewHandler, path: &[u16]) -> windows::core::Result<
 /// The keys a preview handler passes on to its frame: the window's
 /// shortcuts, and Tab and Shift+Tab leaving the handler.
 struct Accel {
-    handle: HACCEL,
+    /// The table of `entries`; `None` if Windows would not make it.
+    table: Option<AccelTable>,
     entries: Vec<ACCEL>,
 }
 
@@ -997,24 +836,11 @@ pub const TAB_BACK_OUT: u16 = crate::menu::F1_FIRST + 1;
 
 impl Accel {
     fn new() -> Accel {
-        let window = crate::keys::accelerators();
-        let mut entries = Vec::new();
-        // SAFETY: asks for the table's size, then copies it into a buffer
-        // of that size; the temporary table is destroyed.
-        unsafe {
-            let n = CopyAcceleratorTableW(window, core::ptr::null_mut(), 0).max(0);
-            entries.resize(
-                n as usize,
-                ACCEL {
-                    fVirt: 0,
-                    key: 0,
-                    cmd: 0,
-                },
-            );
-            let got = CopyAcceleratorTableW(window, entries.as_mut_ptr(), n).max(0);
-            entries.truncate(got as usize);
-            DestroyAcceleratorTable(window);
-        }
+        // A copy of the window's table; the temporary table is destroyed.
+        let mut entries = crate::keys::accelerators()
+            .as_ref()
+            .map(AccelTable::entries)
+            .unwrap_or_default();
         entries.push(ACCEL {
             fVirt: FVIRTKEY,
             key: VK_TAB,
@@ -1025,9 +851,9 @@ impl Accel {
             key: VK_TAB,
             cmd: TAB_BACK_OUT,
         });
-        // SAFETY: the entries and their count; Windows copies them.
-        let handle = unsafe { CreateAcceleratorTableW(entries.as_ptr(), entries.len() as i32) };
-        Accel { handle, entries }
+        // Windows copies the entries.
+        let table = AccelTable::new(&entries);
+        Accel { table, entries }
     }
 }
 
@@ -1063,15 +889,6 @@ impl Keys {
     }
 }
 
-impl Drop for Accel {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            // SAFETY: the table made in `new`, destroyed once.
-            unsafe { DestroyAcceleratorTable(self.handle) };
-        }
-    }
-}
-
 /// The command `entries` give key `vk` with the modifiers held (`ctrl`,
 /// `shift`, `alt`), if any.
 pub fn command_for(entries: &[ACCEL], vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<u16> {
@@ -1084,11 +901,10 @@ pub fn command_for(entries: &[ACCEL], vk: u16, ctrl: bool, shift: bool, alt: boo
         .map(|e| e.cmd)
 }
 
-/// goz-gui's side of a preview handler: the keys the handler does not use
-/// come back here, and the window's shortcuts among them go to the main
-/// window, so F6, Shift+Esc, Alt+P... work while the handler has the
-/// keyboard.
-#[implement(IPreviewHandlerFrame)]
+/// goz-gui's side of a preview handler (the frame `win::preview::Frame`
+/// makes of it): the keys the handler does not use come back here, and the
+/// window's shortcuts among them go to the main window, so F6, Shift+Esc,
+/// Alt+P... work while the handler has the keyboard.
 struct Frame {
     main: usize,
     /// Calls come on the preview thread only (an STA), one at a time.
@@ -1102,38 +918,44 @@ impl Frame {
         let accel = keys.at(crate::keymap::generation(), Accel::new);
         command_for(&accel.entries, vk, ctrl, shift, alt)
     }
-}
 
-impl IPreviewHandlerFrame_Impl for Frame_Impl {
-    fn GetWindowContext(&self) -> windows::core::Result<PREVIEWHANDLERFRAMEINFO> {
+    /// GetWindowContext: the table of the keys in force, and its count.
+    fn context(&self) -> (HACCEL, u32) {
         let mut keys = self.keys.borrow_mut();
         let accel = keys.at(crate::keymap::generation(), Accel::new);
-        Ok(PREVIEWHANDLERFRAMEINFO {
-            haccel: WHACCEL(accel.handle as *mut _),
-            cAccelEntries: accel.entries.len() as u32,
-        })
+        let table = accel
+            .table
+            .as_ref()
+            .map_or(core::ptr::null_mut(), AccelTable::handle);
+        (table, accel.entries.len() as u32)
     }
 
-    fn TranslateAccelerator(&self, pmsg: *const WMSG) -> windows::core::Result<()> {
-        // SAFETY: the handler passes a message of its own, alive across
-        // the call, or null.
-        let msg = unsafe { pmsg.as_ref() }.ok_or(windows::core::Error::from(E_POINTER))?;
+    /// TranslateAccelerator: whether `msg` was one of the window's keys,
+    /// now passed to the main window as its command.
+    fn translate(&self, msg: &MSG) -> bool {
         if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
-            return Err(S_FALSE.into());
+            return false;
         }
         // The key went to the handler's process: what is held now is the
         // keyboard's own state, not this thread's.
-        // SAFETY: reads the keyboard's state.
-        let held = |vk: u16| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
+        let held = sys::key_down_now;
         let alt = msg.message == WM_SYSKEYDOWN || held(VK_MENU);
-        let cmd = self.command(msg.wParam.0 as u16, held(VK_CONTROL), held(VK_SHIFT), alt);
+        let cmd = self.command(msg.wParam as u16, held(VK_CONTROL), held(VK_SHIFT), alt);
         let Some(cmd) = cmd else {
-            return Err(S_FALSE.into());
+            return false;
         };
-        // SAFETY: posts to the main window, which may be gone (then
-        // nothing happens).
-        unsafe { PostMessageW(self.main as HWND, WM_COMMAND, usize::from(cmd), 0) };
-        Ok(())
+        // Posted to the main window, which may be gone (then nothing
+        // happens).
+        crate::win::post_plain(self.main as HWND, WM_COMMAND, usize::from(cmd), 0);
+        true
+    }
+}
+
+/// Dispatches every message waiting in this thread's queue.
+fn dispatch_all() {
+    while let Some(q) = queue::take(core::ptr::null_mut(), (0, 0)) {
+        queue::translate(&q);
+        queue::dispatch(q);
     }
 }
 
@@ -1145,54 +967,32 @@ fn pump_for(time: Duration) {
         if left.is_zero() {
             return;
         }
-        // SAFETY: waits for this thread's messages and dispatches them.
-        unsafe {
-            MsgWaitForMultipleObjectsEx(
-                0,
-                core::ptr::null(),
-                left.as_millis() as u32,
-                QS_ALLINPUT,
-                MWMO_INPUTAVAILABLE,
-            );
-            let mut msg: MSG = core::mem::zeroed();
-            while PeekMessageW(&mut msg, core::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
+        queue::msg_wait(
+            &[],
+            left.as_millis() as u32,
+            QS_ALLINPUT,
+            MWMO_INPUTAVAILABLE,
+        );
+        dispatch_all();
     }
 }
 
 /// Waits for a job, answering messages meanwhile (COM's calls into this
 /// apartment come as messages).
 fn wait_for_work(shared: &Shared) {
-    let work = shared.work as HANDLE;
     loop {
-        // SAFETY: waits on a live event; the messages are this thread's.
-        unsafe {
-            let r =
-                MsgWaitForMultipleObjectsEx(1, &work, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-            if r == WAIT_OBJECT_0 {
-                return;
-            }
-            let mut msg: MSG = core::mem::zeroed();
-            while PeekMessageW(&mut msg, core::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
+        let r = queue::msg_wait(&[&shared.work], INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if r == Woke::Event(0) {
+            return;
         }
+        dispatch_all();
     }
 }
 
 fn run(shared: &Shared) {
-    // SAFETY: COM for this thread, as an apartment of its own: preview
-    // handlers, WIC and the shell's image factories want one.
-    let hr = unsafe {
-        CoInitializeEx(
-            core::ptr::null(),
-            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        )
-    };
+    // COM for this thread, as an apartment of its own: preview handlers,
+    // WIC and the shell's image factories want one.
+    let apartment = Apartment::sta();
     let mut state = State {
         shared,
         wic: None,
@@ -1225,32 +1025,27 @@ fn run(shared: &Shared) {
     }
     state.end();
     drop(state);
-    if hr >= 0 {
-        // SAFETY: every COM object of the thread is released above; the
-        // libraries none uses any more (WIC's codecs, the shell's image
-        // makers) go at once rather than in ten minutes, then COM ends on
-        // this thread.
-        unsafe {
-            CoFreeUnusedLibrariesEx(0, 0);
-            CoUninitialize();
-        }
+    if let Some(apartment) = apartment {
+        // Every COM object of the thread is released above; the libraries
+        // none uses any more (WIC's codecs, the shell's image makers) go at
+        // once rather than in ten minutes. COM stays until the thread ends.
+        apartment.end_unloading_unused();
     }
     if shared.abandoned.load(Ordering::SeqCst) {
         HUNG.fetch_sub(1, Ordering::SeqCst);
         note("ended after being given up on");
     }
     *lock(&shared.phase) = None;
-    // SAFETY: a live event; then the host window goes back to the main
-    // window, which destroys it (it may be gone itself: then nothing).
-    unsafe {
-        SetEvent(shared.done as HANDLE);
-        PostMessageW(shared.main as HWND, shared.retire_msg, shared.host, 0);
-    }
+    // Then the host window goes back to the main window, which destroys it
+    // (it may be gone itself: then nothing).
+    shared.done.set();
+    crate::win::post_app(shared.main as HWND, shared.retire_msg, shared.host, 0);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::win::wz;
 
     #[test]
     fn guids_parse_with_or_without_braces() {
@@ -1308,7 +1103,7 @@ mod tests {
         );
         // The window's own table, with Tab out added.
         let accel = Accel::new();
-        assert!(!accel.handle.is_null());
+        assert!(accel.table.is_some());
         assert_eq!(
             command_for(&accel.entries, VK_TAB, false, false, false),
             Some(TAB_OUT)
@@ -1328,7 +1123,7 @@ mod tests {
     #[test]
     fn the_frames_keys_follow_the_keyboard_page() {
         let table = |cmd: u16| Accel {
-            handle: core::ptr::null_mut(),
+            table: None,
             entries: vec![ACCEL {
                 fVirt: FVIRTKEY,
                 key: 0x76, // F7

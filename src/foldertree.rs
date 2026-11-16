@@ -16,30 +16,26 @@
 //!
 //! Each job runs on a thread of its own (a job stuck on a dead mount holds
 //! up only itself) and posts its answer to the pane's window as `msg`, a
-//! `Box<Reply>` in lParam, unless the pane has closed meanwhile ([`Alive`]);
-//! a reply posted just before it closed is freed as it closes ([`close`]).
+//! [`Reply`] sent as a `win::parcel`, unless the pane has closed meanwhile
+//! ([`Alive`]); a reply posted just before it closed is freed as it closes
+//! ([`close`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
-    FILE_ATTRIBUTE_SYSTEM, FIND_FIRST_EX_LARGE_FETCH, FindClose, FindExInfoBasic,
-    FindExSearchLimitToDirectories, FindFirstFileExW, FindNextFileW, GetDriveTypeW,
-    GetLogicalDrives, GetVolumeInformationW, WIN32_FIND_DATAW,
+    FILE_ATTRIBUTE_SYSTEM, WIN32_FIND_DATAW,
 };
-use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
-};
-use windows_sys::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetThreadErrorMode};
+use windows_sys::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS;
 use windows_sys::Win32::UI::Shell::{
-    SHELLSTATEA, SHFILEINFOW, SHGFI_DISPLAYNAME, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
-    SHGetFileInfoW, SHGetSetSettings, SSF_SHOWALLOBJECTS, SSF_SHOWSUPERHIDDEN, StrCmpLogicalW,
+    SHGFI_DISPLAYNAME, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SSF_SHOWALLOBJECTS, SSF_SHOWSUPERHIDDEN,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, PostMessageW};
 
-use crate::wide::nul;
+use crate::win::com::Apartment;
+use crate::win::file::{Find, Search};
+use crate::win::{self, Msg, parcel, queue};
 
 const BACKSLASH: u16 = b'\\' as u16;
 
@@ -64,11 +60,7 @@ pub struct Shown {
 impl Shown {
     /// Explorer's setting now.
     pub fn now() -> Shown {
-        let mut state = SHELLSTATEA::default();
-        // SAFETY: fills the two flags asked for in a plain struct.
-        unsafe {
-            SHGetSetSettings(&mut state, SSF_SHOWALLOBJECTS | SSF_SHOWSUPERHIDDEN, 0);
-        }
+        let state = win::shell::state(SSF_SHOWALLOBJECTS | SSF_SHOWSUPERHIDDEN);
         // `fShowAllObjects` is the bit field's first bit, `fShowSuperHidden`
         // its sixteenth (shlobj_core.h's SHELLSTATE).
         Shown {
@@ -162,52 +154,33 @@ fn each_folder(
     limit: usize,
     mut each: impl FnMut(&[u16], u32) -> bool,
 ) -> Result<bool, u32> {
-    let pattern = nul(&join(folder, &[b'*' as u16]));
+    let pattern = join(folder, &[b'*' as u16]);
     // A long listing reads in large fetches; a probe wants its first few.
-    let flags = if limit == usize::MAX {
-        FIND_FIRST_EX_LARGE_FETCH
-    } else {
-        0
-    };
-    // SAFETY: a NUL-terminated pattern and a plain out-struct; the find
-    // handle is closed on every path out.
-    unsafe {
-        let mut data: WIN32_FIND_DATAW = core::mem::zeroed();
-        let find = FindFirstFileExW(
-            pattern.as_ptr(),
-            FindExInfoBasic,
-            (&raw mut data).cast(),
-            FindExSearchLimitToDirectories,
-            core::ptr::null(),
-            flags,
-        );
-        if find == INVALID_HANDLE_VALUE {
-            return Err(windows_sys::Win32::Foundation::GetLastError());
+    // The find is closed on every path out, as it drops.
+    let (mut find, mut data) = Find::first(&pattern, Search::Folders, limit == usize::MAX)?;
+    let mut read = 0usize;
+    let complete = loop {
+        let attributes = data.dwFileAttributes;
+        let name = name_of(&data);
+        // The search's "directories only" is a hint a file system may
+        // ignore (NTFS does): the attribute decides.
+        if attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+            && !is_dots(name)
+            && shown.shows(attributes)
+            && !each(name, attributes)
+        {
+            break false;
         }
-        let mut read = 0usize;
-        let complete = loop {
-            let attributes = data.dwFileAttributes;
-            let name = name_of(&data);
-            // The search's "directories only" is a hint a file system may
-            // ignore (NTFS does): the attribute decides.
-            if attributes & FILE_ATTRIBUTE_DIRECTORY != 0
-                && !is_dots(name)
-                && shown.shows(attributes)
-                && !each(name, attributes)
-            {
-                break false;
-            }
-            read += 1;
-            if read >= limit {
-                break false;
-            }
-            if FindNextFileW(find, &mut data) == 0 {
-                break true;
-            }
-        };
-        FindClose(find);
-        Ok(complete)
-    }
+        read += 1;
+        if read >= limit {
+            break false;
+        }
+        match find.next() {
+            Some(next) => data = next,
+            None => break true,
+        }
+    };
+    Ok(complete)
 }
 
 /// The folders directly in `folder` that show, each with its attributes,
@@ -243,44 +216,28 @@ fn has_folders(folder: &[u16], shown: Shown) -> Option<bool> {
 
 /// Sorts names as Explorer does: `2` before `10`, case aside.
 pub fn sort_names<T>(items: &mut [T], name: impl Fn(&T) -> &[u16]) {
-    items.sort_by(|a, b| {
-        let (a, b) = (nul(name(a)), nul(name(b)));
-        // SAFETY: two NUL-terminated strings.
-        let c = unsafe { StrCmpLogicalW(a.as_ptr(), b.as_ptr()) };
-        c.cmp(&0)
-    });
+    items.sort_by(|a, b| win::locale::cmp_logical(name(a), name(b)).cmp(&0));
 }
 
 /// The icon of the item at `path` in the system's small image list.
 fn icon_of(path: &[u16], display_name: bool) -> (Option<i32>, Option<Vec<u16>>) {
-    let p = nul(path);
     let mut flags = SHGFI_SYSICONINDEX | SHGFI_SMALLICON;
     if display_name {
         flags |= SHGFI_DISPLAYNAME;
     }
-    // SAFETY: a NUL-terminated path and a plain out-struct.
-    unsafe {
-        let mut info: SHFILEINFOW = core::mem::zeroed();
-        let list = SHGetFileInfoW(
-            p.as_ptr(),
-            0,
-            &mut info,
-            size_of::<SHFILEINFOW>() as u32,
-            flags,
-        );
-        if list == 0 {
-            return (None, None);
-        }
-        let name = display_name.then(|| {
-            let n = info
-                .szDisplayName
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(info.szDisplayName.len());
-            info.szDisplayName[..n].to_vec()
-        });
-        (Some(info.iIcon), name.filter(|n| !n.is_empty()))
+    let (list, info) = win::shell::file_info(path, 0, flags);
+    if list == 0 {
+        return (None, None);
     }
+    let name = display_name.then(|| {
+        let n = info
+            .szDisplayName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(info.szDisplayName.len());
+        info.szDisplayName[..n].to_vec()
+    });
+    (Some(info.iIcon), name.filter(|n| !n.is_empty()))
 }
 
 /// The subfolders of `folder`, sorted, probed for subfolders of their own
@@ -323,35 +280,21 @@ fn searchable_drive(kind: u32) -> bool {
 /// The drives at the top of the tree, `labels` naming them as Explorer
 /// does. A removable drive with no disk in is left out.
 pub fn roots(labels: bool, shown: Shown) -> Vec<Root> {
-    // SAFETY: takes no arguments.
-    let mask = unsafe { GetLogicalDrives() };
+    let mask = win::file::logical_drives();
     let mut out = Vec::new();
     for i in 0..26u16 {
         if mask & (1 << i) == 0 {
             continue;
         }
         let path: Vec<u16> = vec![b'A' as u16 + i, b':' as u16, BACKSLASH];
-        let p = nul(&path);
-        // SAFETY: a NUL-terminated root path.
-        let kind = unsafe { GetDriveTypeW(p.as_ptr()) };
+        let kind = win::file::drive_type(&path);
         if !searchable_drive(kind) {
             continue;
         }
         if kind == DRIVE_REMOVABLE {
-            // SAFETY: asks about the volume with no buffers; fails when no
-            // disk is in (without a dialog: the thread's error mode).
-            let ready = unsafe {
-                GetVolumeInformationW(
-                    p.as_ptr(),
-                    core::ptr::null_mut(),
-                    0,
-                    core::ptr::null_mut(),
-                    core::ptr::null_mut(),
-                    core::ptr::null_mut(),
-                    core::ptr::null_mut(),
-                    0,
-                )
-            } != 0;
+            // Fails when no disk is in (without a dialog: the thread's
+            // error mode).
+            let ready = win::file::volume_ready(&path);
             if !ready {
                 continue;
             }
@@ -521,19 +464,15 @@ pub fn alive() -> Alive {
 /// unless the pane closed meanwhile (`alive` false). The reply is freed
 /// again if the post fails.
 pub fn spawn(job: Job, hwnd: HWND, msg: u32, alive: Alive) {
+    // An HWND is not Send: the window goes to the thread as a number.
     let hwnd = hwnd as usize;
     let spawned = std::thread::Builder::new()
         .name("goz-folders".into())
         .spawn(move || {
-            // SAFETY: no dialog for a drive without a disk on this thread;
-            // COM for the shell's icons and names, released below.
-            let com = unsafe {
-                SetThreadErrorMode(SEM_FAILCRITICALERRORS, core::ptr::null_mut());
-                CoInitializeEx(
-                    core::ptr::null(),
-                    (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-                )
-            };
+            // No dialog for a drive without a disk on this thread; COM for
+            // the shell's icons and names, for the rest of the thread.
+            win::process::set_thread_error_mode(SEM_FAILCRITICALERRORS);
+            let _com = Apartment::sta();
             let shown = Shown::now();
             let reply = match job {
                 Job::Roots { labels } => Reply::Roots(roots(labels, shown)),
@@ -547,22 +486,12 @@ pub fn spawn(job: Job, hwnd: HWND, msg: u32, alive: Alive) {
                     found: list(&path, shown),
                 },
             };
-            if com >= 0 {
-                // SAFETY: pairs the successful CoInitializeEx above.
-                unsafe { CoUninitialize() };
-            }
             let open = alive.lock().unwrap_or_else(|e| e.into_inner());
             if !*open {
                 return;
             }
-            let raw = Box::into_raw(Box::new(reply));
-            // SAFETY: posts to the pane's window; if that fails the box is
-            // taken back.
-            unsafe {
-                if PostMessageW(hwnd as HWND, msg, 0, raw as isize) == 0 {
-                    drop(Box::from_raw(raw));
-                }
-            }
+            // If the post fails the reply is dropped.
+            parcel::post(hwnd as HWND, msg, 0, reply);
             drop(open);
         });
     // Without a thread the folder stays unlisted, as a failed listing
@@ -580,15 +509,13 @@ pub fn close(alive: &Alive, hwnd: HWND, msg: u32) {
 
 /// Frees the replies still queued for `hwnd` as `msg`.
 fn drain(hwnd: HWND, msg: u32) {
-    // SAFETY: takes this thread's own posted messages off its queue; each
-    // lParam is a `Box<Reply>` from `spawn`.
-    unsafe {
-        let mut m: MSG = core::mem::zeroed();
-        while PeekMessageW(&mut m, hwnd, msg, msg, PM_REMOVE) != 0 {
-            if m.lParam != 0 {
-                drop(Box::from_raw(m.lParam as *mut Reply));
-            }
-        }
+    // Takes this thread's own posted messages off its queue; each one's
+    // parcel is a `Reply` from `spawn`.
+    while let Some(q) = queue::take(hwnd, (msg, msg)) {
+        let m = q.msg();
+        drop(parcel::take::<Reply>(&Msg::new(
+            m.hwnd, m.message, m.wParam, m.lParam,
+        )));
     }
 }
 

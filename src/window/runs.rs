@@ -27,14 +27,9 @@ use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::System::Memory::{HeapOptimizeResources, HeapSetInformation};
-use windows_sys::Win32::UI::Controls::{
-    EM_SETSEL, LVIS_FOCUSED, LVIS_SELECTED, LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT, LVM_GETNEXTITEM,
-    LVM_SETSELECTIONMARK, LVNI_FOCUSED,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer};
+use windows_sys::Win32::UI::Controls::{LVIS_FOCUSED, LVIS_SELECTED, LVNI_FOCUSED};
 
-use super::{App, TIMER_RUNS, WM_RUNS, prefs, send};
+use super::{App, TIMER_RUNS, WM_RUNS, prefs};
 use crate::actions::{self, Target};
 use crate::dialog::Quiet;
 use crate::history::{self, Keep, Op, deleted_at, filetime_now};
@@ -43,6 +38,7 @@ use crate::run_history::{self, Pick, Ran, RunHistory};
 use crate::run_history_file::{self, FILE_NAME, RunFile, Written};
 use crate::settings::{EnterAction, Settings};
 use crate::store::location;
+use crate::win::{self, edit, lv, parcel};
 
 /// How long after the last change the run history is written.
 const SAVE_DELAY_MS: u32 = 1000;
@@ -104,39 +100,15 @@ impl Runs {
 /// largest burst it ever had (a write reads, parses and writes the whole
 /// file, several times the history's own size).
 pub(super) fn give_back_memory() {
-    /// `HEAP_OPTIMIZE_RESOURCES_INFORMATION`.
-    #[repr(C)]
-    struct Optimize {
-        version: u32,
-        flags: u32,
-    }
-    let info = Optimize {
-        version: 1,
-        flags: 0,
-    };
-    // SAFETY: asks Windows to decommit what the process's heaps hold free
-    // (any thread may; each heap is locked meanwhile). `info` is the
-    // documented structure, version 1.
-    unsafe {
-        HeapSetInformation(
-            core::ptr::null_mut(),
-            HeapOptimizeResources,
-            (&raw const info).cast(),
-            size_of::<Optimize>(),
-        )
-    };
+    // Windows decommits what the process's heaps hold free (any thread
+    // may; each heap is locked meanwhile).
+    win::process::optimize_heaps();
 }
 
-/// Posts `value` to the window as `msg`'s lParam; freed again if the window
-/// is gone.
-fn post<T>(hwnd: usize, msg: u32, value: T) {
-    let raw = Box::into_raw(Box::new(value));
-    // SAFETY: posts to the window; if that fails the box is taken back.
-    unsafe {
-        if PostMessageW(hwnd as HWND, msg, 0, raw as isize) == 0 {
-            drop(Box::from_raw(raw));
-        }
-    }
+/// Posts `value` to the window with `msg`, as a parcel (`win::parcel`);
+/// freed again if the window is gone.
+fn post<T: Send + 'static>(hwnd: usize, msg: u32, value: T) {
+    parcel::post(hwnd as HWND, msg, 0, value);
 }
 
 impl App {
@@ -177,15 +149,14 @@ impl App {
         for op in ops {
             file.log(op);
         }
-        // SAFETY: a timer of this window; setting it again restarts it.
-        unsafe { SetTimer(self.hwnd, TIMER_RUNS, SAVE_DELAY_MS, None) };
+        // Setting the timer again restarts it.
+        win::set_timer(self.hwnd, TIMER_RUNS, SAVE_DELAY_MS);
     }
 
     /// Hands the changes made to the run history to the store thread, if
     /// any are waiting (new ones, or those of a write that failed).
     pub(super) fn save_runs(&self) {
-        // SAFETY: a timer of this window.
-        unsafe { KillTimer(self.hwnd, TIMER_RUNS) };
+        win::kill_timer(self.hwnd, TIMER_RUNS);
         let Some(file) = self.runs.file.clone() else {
             return;
         };
@@ -262,22 +233,17 @@ impl App {
         let pick = match self.runs.enter.get() {
             EnterAction::None => return,
             EnterAction::SelectSearch => {
-                send(self.edit, EM_SETSEL, 0, -1);
+                edit::set_sel(self.edit, 0, -1);
                 return;
             }
             EnterAction::Top => return self.select_row(0),
             EnterAction::Result => {
-                let focused = send(
-                    self.list,
-                    LVM_GETNEXTITEM,
-                    usize::MAX,
-                    LVNI_FOCUSED as isize,
-                );
+                let focused = lv::next_item(self.list, -1, LVNI_FOCUSED);
                 return self.select_row(usize::try_from(focused).unwrap_or(0));
             }
             EnterAction::Bottom => {
-                let count = send(self.list, LVM_GETITEMCOUNT, 0, 0);
-                return self.select_row(usize::try_from(count - 1).unwrap_or(0));
+                let count = lv::item_count(self.list);
+                return self.select_row(count.saturating_sub(1));
             }
             EnterAction::MostRun => Pick::MostRun,
             EnterAction::LastRun => Pick::LastRun,
@@ -308,8 +274,8 @@ impl App {
     /// Selects and focuses result `row` alone, in view (the keyboard stays
     /// where it is).
     pub(super) fn select_row(&self, row: usize) {
-        let count = send(self.list, LVM_GETITEMCOUNT, 0, 0);
-        if count <= 0 || row >= count as usize {
+        let count = lv::item_count(self.list);
+        if count == 0 || row >= count {
             return;
         }
         self.clear_selection();
@@ -318,8 +284,8 @@ impl App {
             LVIS_SELECTED | LVIS_FOCUSED,
             LVIS_SELECTED | LVIS_FOCUSED,
         );
-        send(self.list, LVM_SETSELECTIONMARK, 0, row as isize);
-        send(self.list, LVM_ENSUREVISIBLE, row, 0);
+        lv::set_selection_mark(self.list, row as i32);
+        lv::ensure_visible(self.list, row as i32, false);
     }
 
     fn forget_runs(&self, files: &[String]) {
