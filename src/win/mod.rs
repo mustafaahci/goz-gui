@@ -101,9 +101,9 @@
 //!   procedure is the system's, refused otherwise), with no subclass in
 //!   between: the length that sizes LB_GETTEXT's buffer ([`listbox`]), the
 //!   image list a list view shows or gives back (LVM_GETIMAGELIST,
-//!   LVM_SETIMAGELIST) and the one a tree takes (TVM_SETIMAGELIST), a
-//!   tree's new items and every walk of its items (TVM_INSERTITEMW,
-//!   TVM_GETNEXTITEM). So does a message whose item a subclass could
+//!   LVM_SETIMAGELIST) and the one a tree takes and shows
+//!   (TVM_SETIMAGELIST, TVM_GETIMAGELIST), a tree's new items and every
+//!   walk of its items (TVM_INSERTITEMW, TVM_GETNEXTITEM). So does a message whose item a subclass could
 //!   delete before passing it on (every [`tv`] message naming an item);
 //!   another's code's come through the chain, which passes one on only
 //!   while the tree has its items (above). Any other answer that comes
