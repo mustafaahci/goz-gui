@@ -58,6 +58,31 @@
 //!     address: wrong, not unsound. After a deletion passed on, the record
 //!     is changed, and the tree walked, only if the window is still the same
 //!     tree (a record's serial, the class's procedure looked up again).
+//! - **A window is destroyed only out of the processing of the controls in
+//!   it.** A window's handle is checked, but a control destroyed in the
+//!   middle of an operation of its own (sending its parent a notification
+//!   as it deletes, expands or selects) goes on using the memory it freed,
+//!   and the common controls do not survive it. goz-gui's code runs inside
+//!   such an operation only where a trampoline hands it a message, and each
+//!   holds the control busy while it runs: a procedure of goz-gui's handed
+//!   a message a control sends its parent (WM_NOTIFY, WM_COMMAND,
+//!   WM_DRAWITEM and the like, by the control they name), a subclass
+//!   passing a message on to a control's procedure, [`queue::dispatch`]
+//!   handing one to a control, a hook's closure (the window a sent message
+//!   or a CBT event is about, the control it comes from), [`tv`]'s calls to
+//!   a tree. [`destroy`] of a window that is or holds a busy control
+//!   destroys it once the stack has unwound instead, from the thread's
+//!   message loop, by a message-only window of the layer's; a window of
+//!   goz-gui's answers WM_CLOSE so, and WM_CLOSE and WM_SYSCOMMAND go
+//!   through [`send_plain`], [`post_plain`] and [`post_close`] only to
+//!   goz-gui's own windows. Left to the controls: a control with no
+//!   subclass of goz-gui's in a loop of its own (a drag's) entered from a
+//!   loop that is not goz-gui's (a modal dialog's, a menu's), while a
+//!   handler a message dispatched there runs destroys a window holding it;
+//!   and a WH_GETMESSAGE or low-level keyboard hook's closure doing so
+//!   while a control waits for input in such a loop. Each is a control of
+//!   the system's destroyed from inside its own modal loop by code that has
+//!   no handle on what it is doing, which any Win32 program trusts it with.
 //! - **A message's parameters mean what its documentation says.** A message
 //!   below `WM_USER` is the system's: every window class of the system and
 //!   of the common controls means by it what the system documents, so a
@@ -153,6 +178,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod a11y;
+mod busy;
 pub mod button;
 pub mod class;
 pub mod clipboard;

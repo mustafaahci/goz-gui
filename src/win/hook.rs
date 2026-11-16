@@ -5,6 +5,13 @@
 //! One system hook per kind and thread, put in for the first closure of its
 //! kind and taken out with the last; every closure of a kind sees each
 //! event, in the order they were set, until one answers it.
+//!
+//! A hook may run in the middle of a control's processing (a message it
+//! sends, a window it makes): while the closures of a WH_CALLWNDPROC,
+//! WH_CALLWNDPROCRET or WH_CBT event run, the control a message is for or
+//! comes from, and the window a CBT event is about (and the parent of one
+//! being made, the window losing the keyboard), are busy
+//! ([`super::destroy`] of a window holding one waits).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -12,9 +19,9 @@ use std::rc::Rc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CBT_CREATEWNDW, CBTACTIVATESTRUCT, CWPRETSTRUCT, CWPSTRUCT, CallNextHookEx, HC_ACTION,
-    HCBT_ACTIVATE, HCBT_CREATEWND, HHOOK, HOOKPROC, KBDLLHOOKSTRUCT, MSG, PM_REMOVE,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_CALLWNDPROC, WH_CALLWNDPROCRET, WH_CBT,
-    WH_GETMESSAGE, WH_KEYBOARD_LL, WINDOWS_HOOK_ID,
+    HCBT_ACTIVATE, HCBT_CREATEWND, HCBT_DESTROYWND, HCBT_MINMAX, HCBT_MOVESIZE, HCBT_SETFOCUS,
+    HHOOK, HOOKPROC, KBDLLHOOKSTRUCT, MSG, PM_REMOVE, SetWindowsHookExW, UnhookWindowsHookEx,
+    WH_CALLWNDPROC, WH_CALLWNDPROCRET, WH_CBT, WH_GETMESSAGE, WH_KEYBOARD_LL, WINDOWS_HOOK_ID,
 };
 
 /// The kinds of hook goz-gui sets.
@@ -185,10 +192,29 @@ unsafe extern "system" fn cbt_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if code < 0 {
         return next(code, w, l);
     }
+    // The windows the event is about, by its code: wParam's, and the parent
+    // of a window being made or the window losing the keyboard.
+    let mut about = [core::ptr::null_mut(); 2];
+    if [
+        HCBT_CREATEWND,
+        HCBT_DESTROYWND,
+        HCBT_ACTIVATE,
+        HCBT_MINMAX,
+        HCBT_MOVESIZE,
+        HCBT_SETFOCUS,
+    ]
+    .contains(&(code as u32))
+    {
+        about[0] = w as HWND;
+    }
+    if code == HCBT_SETFOCUS as i32 {
+        about[1] = l as HWND;
+    }
     let event = if code == HCBT_CREATEWND as i32 && l != 0 {
         // SAFETY: HCBT_CREATEWND's lParam is a CBT_CREATEWNDW whose lpcs is
         // the CREATESTRUCTW of window `w`; both copied out.
         let cs = unsafe { *(*(l as *const CBT_CREATEWNDW)).lpcs };
+        about[1] = cs.hwndParent;
         Event::Create {
             hwnd: w as HWND,
             style: cs.style as u32,
@@ -202,6 +228,7 @@ unsafe extern "system" fn cbt_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     } else {
         Event::Cbt { code, w }
     };
+    let _busy = about.map(super::busy::hold_control);
     dispatch(Kind::Cbt, &event).unwrap_or_else(|| next(code, w, l))
 }
 
@@ -229,6 +256,9 @@ unsafe extern "system" fn call_wnd_proc(code: i32, w: WPARAM, l: LPARAM) -> LRES
             message: c.message,
             w: c.wParam,
         };
+        // SAFETY: the message's parameters as sent to the window, which the
+        // system passes the hook before the window's procedure has them.
+        let _busy = unsafe { held(c.hwnd, c.message, c.wParam, c.lParam) };
         if let Some(answer) = dispatch(Kind::CallWndProc, &event) {
             return answer;
         }
@@ -245,11 +275,27 @@ unsafe extern "system" fn call_wnd_proc_ret(code: i32, w: WPARAM, l: LPARAM) -> 
             message: c.message,
             w: c.wParam,
         };
+        // SAFETY: the message's parameters as sent to the window, which the
+        // system passes the hook before the send returns to its sender.
+        let _busy = unsafe { held(c.hwnd, c.message, c.wParam, c.lParam) };
         if let Some(answer) = dispatch(Kind::CallWndProcRet, &event) {
             return answer;
         }
     }
     next(code, w, l)
+}
+
+/// Holds busy, while a hook's closures see message `msg` sent to `hwnd`,
+/// the control it is for and the control it comes from.
+///
+/// # Safety
+/// As for [`super::busy::sender`]: the parameters as sent.
+unsafe fn held(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> [Option<super::busy::Hold>; 2] {
+    [
+        super::busy::hold_control(hwnd),
+        // SAFETY: as the caller promises.
+        unsafe { super::busy::hold_sender(hwnd, msg, w, l) },
+    ]
 }
 
 unsafe extern "system" fn keyboard_ll_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {

@@ -261,8 +261,22 @@ pub fn enable(hwnd: HWND, on: bool) -> bool {
     unsafe { EnableWindow(hwnd, on.into()) != 0 }
 }
 
-/// Destroys the window; false if it could not.
+/// Destroys the window (with its children and the windows it owns); false
+/// if it could not.
+///
+/// While a control in it (it, a child of it, a window it owns, theirs) is
+/// in the middle of its own processing as goz-gui sees it (sending its
+/// parent a notification or a command that a procedure of goz-gui's is
+/// handed, a tree in a call of [`super::tv`]'s: see `busy`'s
+/// documentation), the window is not destroyed now, as that control would
+/// go on using what it freed. It is destroyed once the stack has unwound,
+/// from this thread's message loop, if it is still there and nothing in it
+/// is busy by then; and this answers true at once (the window is there
+/// until then).
 pub fn destroy(hwnd: HWND) -> bool {
+    if super::busy::within(hwnd) {
+        return super::busy::doom(hwnd);
+    }
     // SAFETY: no pointers. What goz-gui keeps for a window (its handler,
     // its subclasses) is freed at WM_NCDESTROY, by the trampolines.
     unsafe { DestroyWindow(hwnd) != 0 }
@@ -561,10 +575,26 @@ pub fn set_redraw(hwnd: HWND, on: bool) {
     unsafe { super::send_raw(hwnd, WM_SETREDRAW, usize::from(on), 0) };
 }
 
-/// Asks the window to close (posts WM_CLOSE).
+/// Asks one of goz-gui's own windows to close (posts WM_CLOSE); false if
+/// it could not, or `hwnd` is not one of goz-gui's own windows (see
+/// [`closes_safely`]).
 pub fn post_close(hwnd: HWND) -> bool {
+    if !closes_safely(WM_CLOSE, hwnd) {
+        return false;
+    }
     // SAFETY: WM_CLOSE has no parameters.
     unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 }
+}
+
+/// Whether `msg` may go to `hwnd` without destroying it past [`destroy`]'s
+/// wait: anything but WM_CLOSE and WM_SYSCOMMAND (whose SC_CLOSE sends
+/// WM_CLOSE), and those to one of goz-gui's own windows, whose default
+/// processing of WM_CLOSE is [`destroy`] ([`super::Msg::def`]). Another
+/// window's (a control's) is DestroyWindow, which may come while a control
+/// in it is in the middle of its processing.
+fn closes_safely(msg: u32, hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND;
+    !(msg == WM_CLOSE || msg == WM_SYSCOMMAND) || is_goz_window(hwnd)
 }
 
 /// Whether `msg` is one of goz-gui's private messages, which carry no
@@ -637,22 +667,32 @@ pub fn send_app(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
 
 /// Posts a system message that carries only integers and handles: the
 /// commands and notifications goz-gui sends itself (WM_COMMAND, WM_SYSCOMMAND,
-/// WM_CLOSE, WM_NULL, keys).
+/// WM_CLOSE, WM_NULL, keys). False if it could not, and for WM_CLOSE or
+/// WM_SYSCOMMAND to a window that is not one of goz-gui's own (see
+/// [`closes_safely`]).
 ///
 /// # Panics
 /// If `msg` is not one of those (see [`plain`]).
 pub fn post_plain(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
     assert!(plain(msg), "message {msg:#x} may carry pointers");
+    if !closes_safely(msg, hwnd) {
+        return false;
+    }
     // SAFETY: the message's parameters are integers or handles.
     unsafe { PostMessageW(hwnd, msg, w, l) != 0 }
 }
 
-/// Sends a system message that carries only integers and handles.
+/// Sends a system message that carries only integers and handles; 0,
+/// unsent, for WM_CLOSE or WM_SYSCOMMAND to a window that is not one of
+/// goz-gui's own (see [`closes_safely`]).
 ///
 /// # Panics
 /// If `msg` is not one of those (see [`plain`]).
 pub fn send_plain(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     assert!(plain(msg), "message {msg:#x} may carry pointers");
+    if !closes_safely(msg, hwnd) {
+        return 0;
+    }
     // SAFETY: the message's parameters are integers or handles.
     unsafe { super::send_raw(hwnd, msg, w, l) }
 }

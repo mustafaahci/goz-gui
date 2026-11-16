@@ -21,9 +21,9 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::Shell::DefSubclassProc;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, MINMAXINFO, WINDOWPOS, WM_COPYDATA, WM_DPICHANGED, WM_DRAWITEM, WM_DROPFILES,
-    WM_GETMINMAXINFO, WM_MEASUREITEM, WM_NOTIFY, WM_PAINT, WM_SETTINGCHANGE, WM_WINDOWPOSCHANGED,
-    WM_WINDOWPOSCHANGING,
+    DefWindowProcW, MINMAXINFO, WINDOWPOS, WM_CLOSE, WM_COPYDATA, WM_DPICHANGED, WM_DRAWITEM,
+    WM_DROPFILES, WM_GETMINMAXINFO, WM_MEASUREITEM, WM_NOTIFY, WM_PAINT, WM_SETTINGCHANGE,
+    WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
 };
 
 use super::class_is;
@@ -113,6 +113,10 @@ impl Msg {
     /// for a message goz-gui made. A subclass's message to a tree view kept
     /// track of that names an item the tree no longer has (its handler may
     /// have deleted it) goes no further, and answers 0 ([`super::tv`]).
+    /// A window's WM_CLOSE is [`super::destroy`] of it, as DefWindowProcW
+    /// destroys it, but waiting while a control in it is busy. A subclass
+    /// passing a message on to a control's own procedure holds the control
+    /// busy meanwhile.
     ///
     /// # Panics
     /// If a [`View`] of the message's `lParam` is still out: the default
@@ -120,10 +124,15 @@ impl Msg {
     pub fn def(&self) -> LRESULT {
         assert!(!self.lent.get(), "a view of the message is still out");
         match self.via {
+            Via::Window if self.id == WM_CLOSE => {
+                super::destroy(self.hwnd);
+                0
+            }
             // SAFETY: the parameters as the system delivered them, to the
             // window they were delivered to.
             Via::Window => unsafe { DefWindowProcW(self.hwnd, self.id, self.w, self.l) },
             Via::Subclass => {
+                let _busy = super::busy::hold_control(self.hwnd);
                 let next = || {
                     // SAFETY: as above, from within the subclass procedure
                     // the system called (the trampoline's call is still
@@ -147,6 +156,7 @@ impl Msg {
         if self.id != WM_PAINT || self.via != Via::Subclass {
             return 0;
         }
+        let _busy = super::busy::hold_control(self.hwnd);
         // SAFETY: WM_PAINT with a DC handle, which GDI checks, and no
         // lParam: no pointers. From within the subclass procedure the
         // system called, for the window it was called for.

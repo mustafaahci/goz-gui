@@ -327,6 +327,9 @@ struct Busy {
     /// The serial of the record it counts in ([`Tree::serial`]): the tree's
     /// as this began, if it had one.
     serial: Option<u64>,
+    /// The tree held busy for [`super::destroy`] too: a window holding it
+    /// is destroyed once it is out of its processing.
+    _held: Option<super::busy::Hold>,
 }
 
 impl Busy {
@@ -340,7 +343,12 @@ impl Busy {
                 t.serial
             })
         });
-        Some(Busy { tree, proc, serial })
+        Some(Busy {
+            tree,
+            proc,
+            serial,
+            _held: super::busy::hold(tree),
+        })
     }
 
     /// Calls the tree's class's own procedure with message `msg`: the tree
@@ -2164,6 +2172,85 @@ mod tests {
             assert_eq!(live(i), left.contains(&i.h), "{i:?}");
         }
         super::super::destroy(host);
+    }
+
+    /// Dispatches what waits in this thread's queue (the deferred destroys
+    /// among it).
+    fn pump() {
+        while let Some(q) = super::super::queue::take(core::ptr::null_mut(), (0, 0)) {
+            super::super::queue::dispatch(q);
+        }
+    }
+
+    /// What a parent does as the tree notifies it, in
+    /// [`a_tree_destroyed_while_it_notifies_goes_once_it_is_done`].
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Doom {
+        /// Destroys the tree.
+        Tree,
+        /// Destroys the tree's parent (the window it is in).
+        Host,
+    }
+
+    #[test]
+    fn a_tree_destroyed_while_it_notifies_goes_once_it_is_done() {
+        use windows_sys::Win32::UI::Controls::{
+            TVE_EXPAND, TVN_ITEMEXPANDEDW, TVN_ITEMEXPANDINGW, TVN_SELCHANGINGW,
+        };
+        // A tree whose parent destroys it (or itself) at the first
+        // notification `code`; `act` makes the tree send it.
+        let run = |code: u32, doom: Doom, act: &dyn Fn(HWND, Item, Item)| {
+            let armed = Rc::new(Cell::new(true));
+            let a = Rc::clone(&armed);
+            let (tree, host) = hidden_tree(move |m| {
+                if let Some(n) = m.notify()
+                    && n.code() == code
+                    && a.replace(false)
+                {
+                    let target = match doom {
+                        Doom::Tree => n.from(),
+                        Doom::Host => m.hwnd,
+                    };
+                    assert!(super::super::destroy(target));
+                }
+                m.def()
+            });
+            let p = insert(tree, None, After::Last, item(1), Some("p")).expect("p");
+            let c = insert(tree, Some(p), After::Last, item(2), Some("c")).expect("c");
+            insert(tree, None, After::Last, item(3), Some("q")).expect("q");
+            act(tree, p, c);
+            assert!(!armed.get(), "{code}: the parent was asked");
+            // Still there until the stack has unwound, then gone.
+            assert!(super::super::is_window(tree), "{code} {doom:?}");
+            pump();
+            assert!(!super::super::is_window(tree), "{code} {doom:?}");
+            assert_eq!(super::super::is_window(host), doom == Doom::Tree);
+            super::super::destroy(host);
+        };
+        for doom in [Doom::Tree, Doom::Host] {
+            // A deletion: of an item, of every item, a collapse that resets.
+            run(TVN_DELETEITEMW, doom, &|_, p, _| assert!(delete_item(p)));
+            run(TVN_DELETEITEMW, doom, &|tree, _, _| {
+                assert!(delete_all(tree))
+            });
+            run(TVN_DELETEITEMW, doom, &|_, p, _| {
+                assert!(expand(p, TVE_EXPAND));
+                assert!(expand(p, TVE_COLLAPSE | TVE_COLLAPSERESET));
+            });
+            // An expansion.
+            run(TVN_ITEMEXPANDINGW, doom, &|_, p, _| {
+                expand(p, TVE_EXPAND);
+            });
+            run(TVN_ITEMEXPANDEDW, doom, &|_, p, _| {
+                expand(p, TVE_EXPAND);
+            });
+            // The selection moving off an item being deleted.
+            run(TVN_SELCHANGINGW, doom, &|tree, p, c| {
+                assert!(expand(p, TVE_EXPAND));
+                assert!(select(tree, Select::Caret, Some(c)));
+                assert!(delete_item(c));
+            });
+        }
     }
 
     static RECYCLES: subclass::Key = subclass::Key::new("test tree destroyed while it deletes");

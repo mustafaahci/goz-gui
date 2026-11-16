@@ -124,8 +124,11 @@ pub fn translate(q: &Queued) {
     unsafe { TranslateMessage(&q.0) };
 }
 
-/// Hands the message to its window's procedure, once: it is used up.
+/// Hands the message to its window's procedure, once: it is used up. A
+/// control (a window not goz-gui's) is busy meanwhile, with what its own
+/// loops dispatch (see [`super::destroy`]).
 pub fn dispatch(q: Queued) -> LRESULT {
+    let _busy = super::busy::hold_control(q.0.hwnd);
     // SAFETY: a message the queue gave, taken off it, dispatched as it
     // came, and only this once (`Queued` is moved in).
     unsafe { DispatchMessageW(&q.0) }

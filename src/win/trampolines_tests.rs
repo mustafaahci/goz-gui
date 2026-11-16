@@ -1100,3 +1100,116 @@ fn a_list_s_nested_image_lists_are_let_go_as_it_gives_them_back() {
     }
     super::destroy(host);
 }
+
+/// Dispatches what waits in this thread's queue (the deferred destroys
+/// among it).
+fn pump_all() {
+    while let Some(q) = queue::take(core::ptr::null_mut(), (0, 0)) {
+        queue::dispatch(q);
+    }
+}
+
+#[test]
+fn a_list_destroyed_while_it_deletes_goes_once_it_is_done() {
+    use super::lv;
+    use windows_sys::Win32::UI::Controls::LVN_DELETEITEM;
+    for host_too in [false, true] {
+        let armed = Rc::new(Cell::new(true));
+        let a = Rc::clone(&armed);
+        let (view, host) = hidden_list(0, move |m| {
+            if let Some(n) = m.notify()
+                && n.code() == LVN_DELETEITEM
+                && a.replace(false)
+            {
+                assert!(super::destroy(if host_too { m.hwnd } else { n.from() }));
+            }
+            m.def()
+        });
+        assert!(lv::delete_all_items(view));
+        assert!(!armed.get(), "the parent was asked");
+        // Still there until the stack has unwound, then gone.
+        assert!(super::is_window(view));
+        pump_all();
+        assert!(!super::is_window(view));
+        assert_eq!(super::is_window(host), !host_too);
+        super::destroy(host);
+    }
+}
+
+#[test]
+fn a_window_closed_while_a_control_in_it_notifies_goes_once_it_is_done() {
+    use super::lv;
+    use windows_sys::Win32::UI::Controls::LVN_DELETEITEM;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE;
+    // The parent closes itself as a list in it deletes: its default
+    // processing of WM_CLOSE destroys it, once the list is done.
+    let armed = Rc::new(Cell::new(true));
+    let a = Rc::clone(&armed);
+    let (view, host) = hidden_list(0, move |m| {
+        if let Some(n) = m.notify()
+            && n.code() == LVN_DELETEITEM
+            && a.replace(false)
+        {
+            super::send_plain(m.hwnd, WM_CLOSE, 0, 0);
+        }
+        m.def()
+    });
+    assert!(lv::delete_all_items(view));
+    assert!(!armed.get(), "the parent was asked");
+    assert!(super::is_window(host));
+    pump_all();
+    assert!(!super::is_window(host) && !super::is_window(view));
+    // Nothing busy: at once.
+    let (view, host) = hidden_list(0, |m| m.def());
+    // A control's own WM_CLOSE would destroy it past the wait: not sent.
+    assert_eq!(super::send_plain(view, WM_CLOSE, 0, 0), 0);
+    assert!(!super::post_close(view));
+    assert!(super::is_window(view));
+    super::send_plain(host, WM_CLOSE, 0, 0);
+    assert!(!super::is_window(host));
+}
+
+#[test]
+fn a_list_destroyed_from_a_hook_while_it_deletes_goes_once_it_is_done() {
+    use super::lv;
+    use windows_sys::Win32::UI::Controls::{LVIF_TEXT, LVITEMW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_NOTIFY;
+    // A list in a window of the system's (no procedure of goz-gui's sees
+    // what it sends), destroyed by a hook's closure as the list notifies
+    // its parent while it deletes its items.
+    let (frame, host) = hidden_control("Static", 0);
+    let view = class::create_plain(&Create {
+        ex_style: 0,
+        class: lv::CLASS,
+        title: "",
+        style: WS_CHILD,
+        rect: (0, 0, 100, 100),
+        parent: frame,
+        menu: class::id_menu(2),
+    });
+    assert!(!view.is_null());
+    let it = LVITEMW {
+        mask: LVIF_TEXT,
+        ..Default::default()
+    };
+    assert_eq!(lv::insert_item(view, it, Some("row")), 0);
+    let armed = Rc::new(Cell::new(true));
+    let a = Rc::clone(&armed);
+    let hook = hook::set(Kind::CallWndProc, move |event| {
+        if let Event::Sent { hwnd, message, .. } = *event
+            && hwnd == frame
+            && message == WM_NOTIFY
+            && a.replace(false)
+        {
+            assert!(super::destroy(view));
+        }
+        None
+    });
+    assert!(lv::delete_all_items(view));
+    drop(hook);
+    assert!(!armed.get(), "the hook saw it");
+    assert!(super::is_window(view));
+    pump_all();
+    assert!(!super::is_window(view));
+    super::destroy(host);
+}

@@ -251,6 +251,8 @@ unsafe extern "system" fn modal_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) 
     }
     let handler = slot.handler;
     let _drop = super::dropfiles::Delivery::enter(msg, w);
+    // SAFETY: the parameters as delivered.
+    let _sending = unsafe { super::busy::hold_sender(dlg, msg, w, l) };
     // SAFETY: the parameters the system delivered, for this call.
     handler(&unsafe { Msg::delivered(dlg, msg, w, l, Via::Dialog) })
 }
@@ -279,6 +281,8 @@ unsafe extern "system" fn child_proc(dlg: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         return 0;
     };
     let _drop_hold = super::dropfiles::Delivery::enter(msg, w);
+    // SAFETY: the parameters as delivered.
+    let _sending = unsafe { super::busy::hold_sender(dlg, msg, w, l) };
     // SAFETY: the parameters the system delivered, for this call.
     let answer = handler(&unsafe { Msg::delivered(dlg, msg, w, l, Via::Dialog) });
     if msg == WM_NCDESTROY {

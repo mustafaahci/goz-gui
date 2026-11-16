@@ -278,6 +278,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     let slot = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Handler;
     // A drop is held until this call (and any it nests in) returns.
     let _drop = super::dropfiles::Delivery::enter(msg, w);
+    // SAFETY: the parameters as delivered.
+    let _sending = unsafe { super::busy::hold_sender(hwnd, msg, w, l) };
     // SAFETY: as above; the handler is cloned, so it lives through the call
     // even if the call destroys the window and so frees the box.
     let Some(handler) = (unsafe { slot.as_ref() }).map(Rc::clone) else {
