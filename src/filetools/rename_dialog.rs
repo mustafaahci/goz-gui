@@ -1185,7 +1185,7 @@ impl Dlg {
 
     /// The list's drawing: a new name the old format does not match dim, one
     /// with a problem red; the rest as dialog lists draw.
-    fn custom_draw(&self, list: HWND, cd: &mut NMLVCUSTOMDRAW) -> isize {
+    fn custom_draw(&self, list: HWND, cd: &mut View<'_, NMLVCUSTOMDRAW>) -> isize {
         let dark = self.look.get().dark;
         let stage = cd.nmcd.dwDrawStage;
         if stage == CDDS_ITEMPREPAINT {
@@ -1209,9 +1209,9 @@ impl Dlg {
             } else {
                 pal.fg
             };
-            cd.clrText = colour;
+            cd.set_text_color(colour);
             if dark {
-                cd.clrTextBk = pal.bg;
+                cd.set_text_bk_color(pal.bg);
             }
             return CDRF_NEWFONT as isize;
         }

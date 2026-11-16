@@ -27,7 +27,7 @@ use crate::win::icon::Icon;
 use crate::win::imagelist::{ImageList, SystemList};
 pub use crate::win::tv::Item as TreeItem;
 use crate::win::tv::{After, Select};
-use crate::win::{self, gdi, imagelist, tv};
+use crate::win::{self, View, gdi, imagelist, tv};
 
 /// A new item: under `parent` (`None` for the top level), placed as
 /// `after` says, with `text`, `image` and a `param` of the caller's;
@@ -184,15 +184,15 @@ pub fn apply_theme(tree: HWND, pal: &Palette, item: Item) {
 /// tree's own, [`apply_theme`]).
 const ROW_STATES: [State; 3] = [State::Selected, State::InactiveSelected, State::Mouseover];
 
-/// A sidebar tree's `NM_CUSTOMDRAW` (`cd`, which the tree reads back after
-/// this returns), for Options > Fonts and Colors' `item`: a row in a state
+/// A sidebar tree's `NM_CUSTOMDRAW` (`cd`, whose colours and state the
+/// tree reads back after this returns), for Options > Fonts and Colors' `item`: a row in a state
 /// whose colours are not the theme's (chosen, or tinted by an accent) is
 /// filled with them and keeps no selection or hover of the visual style; a
 /// row whose style is Bold gets `bold`. Every other row is the visual
 /// style's.
 pub fn custom_draw(
     tree: HWND,
-    cd: &mut NMTVCUSTOMDRAW,
+    cd: &mut View<'_, NMTVCUSTOMDRAW>,
     pal: &Palette,
     item: Item,
     bold: HFONT,
@@ -216,9 +216,9 @@ pub fn custom_draw(
             if state != State::Normal && pal.is_own(item, state) {
                 let ink = pal.ink(item, state);
                 crate::paint::fill(cd.nmcd.hdc, &cd.nmcd.rc, ink.bg);
-                cd.nmcd.uItemState &= !(CDIS_SELECTED | CDIS_HOT);
-                cd.clrText = ink.fg;
-                cd.clrTextBk = ink.bg;
+                cd.set_item_state(st & !(CDIS_SELECTED | CDIS_HOT));
+                cd.set_text_color(ink.fg);
+                cd.set_text_bk_color(ink.bg);
                 answer = CDRF_NEWFONT;
             }
             if pal.is_bold(item, state) {

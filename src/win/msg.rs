@@ -6,7 +6,7 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, LVIF_IMAGE, LVIF_TEXT, LVN_BEGINDRAG, LVN_BEGINLABELEDITW, LVN_BEGINRDRAG,
@@ -66,10 +66,10 @@ pub struct Msg {
     lent: Cell<bool>,
     /// A WM_NOTIFY's header as [`Msg::notify`] first read it, before any
     /// view of the structure was lent: what decides which structure the
-    /// notification comes with ([`Notify::get`]), and what is put back in
-    /// the structure before the message goes on and as the procedure
-    /// returns (a custom draw structure is lent writable whole, header
-    /// and all).
+    /// notification comes with ([`Notify::get`]). No view lends the header
+    /// writable (none of the structures [`Writable`] lists has one), but
+    /// the next procedure a message is passed on to may write it: what
+    /// this procedure reads is told by the header it was delivered.
     header: Cell<Option<NMHDR>>,
 }
 
@@ -119,7 +119,6 @@ impl Msg {
     /// processing may write to what it points at.
     pub fn def(&self) -> LRESULT {
         assert!(!self.lent.get(), "a view of the message is still out");
-        self.restore_header();
         match self.via {
             // SAFETY: the parameters as the system delivered them, to the
             // window they were delivered to.
@@ -200,31 +199,6 @@ impl Msg {
             }
         };
         Some(Notify { msg: self, hdr })
-    }
-
-    /// Puts back the WM_NOTIFY header [`Msg::notify`] read, if a view of
-    /// the structure changed it: the next procedure, and the control the
-    /// answer goes back to, find the header as it was delivered, and so
-    /// the structure it came with. Nothing for any other message, or for
-    /// one whose notification was not asked for (no view of it was lent).
-    fn restore_header(&self) {
-        let Some(hdr) = self.header.get() else {
-            return;
-        };
-        let p = self.l as *mut NMHDR;
-        // SAFETY: the header was read from this delivered WM_NOTIFY's
-        // lParam (`notify`), a structure valid for reads and writes while
-        // the procedure runs (see `view_lparam`), which it still does. No
-        // reference into it lives: `def` checks no view is out, and the
-        // message drops after every view, which borrows it (a view that
-        // was forgotten makes a reference only while it is dereferenced,
-        // which it no longer can be).
-        unsafe {
-            let now = p.read();
-            if now.hwndFrom != hdr.hwndFrom || now.idFrom != hdr.idFrom || now.code != hdr.code {
-                p.write(hdr);
-            }
-        }
     }
 
     /// `WM_DRAWITEM`'s DRAWITEMSTRUCT.
@@ -328,15 +302,6 @@ impl Msg {
     }
 }
 
-impl Drop for Msg {
-    /// A notification's header goes back as it was delivered before its
-    /// procedure returns (see [`Msg::notify`]): whoever reads the structure
-    /// after (an outer procedure of the chain, the control) finds it so.
-    fn drop(&mut self) {
-        self.restore_header();
-    }
-}
-
 /// What a message's `lParam` points at, lent for as long as the procedure
 /// runs: one view of a message at a time (see [`Msg::def`]).
 pub struct View<'a, T> {
@@ -387,12 +352,13 @@ mod sealed {
 }
 
 /// A structure a message's `lParam` points at that safe code may write
-/// whole through a [`View`]: none of its fields is a pointer (or a
-/// buffer's length) that Windows or this layer follows. Sealed: only the
-/// structures listed here. The others are read through [`View`]'s `Deref`
-/// and written through typed setters (`set_text` and the like), which
-/// write only what the notification asks of its procedure, through the
-/// pointers the system gave.
+/// whole through a [`View`]: none of its fields is a pointer, a buffer's
+/// length, an index or a handle that Windows or this layer follows
+/// unchecked once written. Sealed: only the structures listed here. The
+/// others are read through [`View`]'s `Deref` and written through typed
+/// setters (`set_text`, `set_text_color` and the like), which write only
+/// what the notification asks of its procedure, through the pointers the
+/// system gave.
 pub trait Writable: sealed::Sealed {}
 
 macro_rules! writable {
@@ -404,20 +370,12 @@ macro_rules! writable {
     };
 }
 
-// Handles and integers only. A custom draw structure's `dwItemSpec` (an
-// index, or a tree's item) is not read back by its control, and nothing
-// here makes a tree item of it; its `hdc` is a handle GDI checks. Its
-// header decides nothing once written: a notification's structure is told
-// by the header its message read first, and the header goes back as it was
-// before anything else reads the structure (`Msg::restore_header`).
-writable!(
-    WINDOWPOS,
-    MINMAXINFO,
-    MEASUREITEMSTRUCT,
-    NMCUSTOMDRAW,
-    NMLVCUSTOMDRAW,
-    NMTVCUSTOMDRAW,
-);
+// Handles and integers only, none of which the system reads back as an
+// index or an address. Not the custom draw structures: a control reads
+// some of their fields back after its parent answers (a list view its
+// `dwItemSpec`, as the index of the row it goes on to draw), so they are
+// read-only, their colours and state set through setters.
+writable!(WINDOWPOS, MINMAXINFO, MEASUREITEMSTRUCT);
 
 impl<T> Drop for View<'_, T> {
     fn drop(&mut self) {
@@ -645,6 +603,43 @@ impl View<'_, NMTVGETINFOTIPW> {
         // cchTextMax units, both as the tree gave them (a view of this
         // structure is read-only to safe code).
         unsafe { write_text(buf, cap, text) };
+    }
+}
+
+/// A custom draw structure's fields that its parent may set: the colours
+/// of the text and behind it, which the control reads back as colours.
+macro_rules! custom_draw_colours {
+    ($t:ty) => {
+        impl View<'_, $t> {
+            /// The colour the item's text is drawn in (`clrText`): read back
+            /// by the control at CDDS_ITEMPREPAINT (and a subitem's).
+            pub fn set_text_color(&mut self, c: COLORREF) {
+                // SAFETY: the structure the view lends (see
+                // `Msg::view_lparam`), the only view of it; a colour field.
+                unsafe { (*self.as_ptr()).clrText = c };
+            }
+
+            /// The colour behind the item's text (`clrTextBk`).
+            pub fn set_text_bk_color(&mut self, c: COLORREF) {
+                // SAFETY: as in `set_text_color`.
+                unsafe { (*self.as_ptr()).clrTextBk = c };
+            }
+        }
+    };
+}
+
+custom_draw_colours!(NMLVCUSTOMDRAW);
+custom_draw_colours!(NMTVCUSTOMDRAW);
+
+impl View<'_, NMTVCUSTOMDRAW> {
+    /// The item's CDIS_* state as the tree goes on to draw it
+    /// (`nmcd.uItemState`, flags it reads back as flags): without
+    /// CDIS_SELECTED and CDIS_HOT, say, the visual style draws no
+    /// selection or hover behind the colours set.
+    pub fn set_item_state(&mut self, state: u32) {
+        // SAFETY: the structure the view lends (see `Msg::view_lparam`),
+        // the only view of it; a field of flags.
+        unsafe { (*self.as_ptr()).nmcd.uItemState = state };
     }
 }
 

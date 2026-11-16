@@ -780,69 +780,59 @@ fn a_notification_is_read_by_its_header_as_delivered() {
     // What a procedure makes of the notification: its code and sender, and
     // whether it is read as a list view's custom draw or display info.
     type Seen = (u32, HWND, bool, bool);
-    // The window's own procedure, after the subclass.
+    let seen_of = |n: &super::Notify| -> Seen {
+        (
+            n.code(),
+            n.from(),
+            n.get::<NMLVCUSTOMDRAW>().is_some(),
+            n.get::<NMLVDISPINFOW>().is_some(),
+        )
+    };
+    // The window's own procedure, after the subclass: it reads the
+    // notification, then (as code that is not goz-gui's could) writes a
+    // list view's display-info header over it.
     let seen: Rc<RefCell<Vec<Seen>>> = Rc::new(RefCell::new(Vec::new()));
     let s = Rc::clone(&seen);
     let hwnd = window(move |m| {
         if let Some(n) = m.notify() {
-            s.borrow_mut().push((
-                n.code(),
-                n.from(),
-                n.get::<NMLVCUSTOMDRAW>().is_some(),
-                n.get::<NMLVDISPINFOW>().is_some(),
-            ));
+            s.borrow_mut().push(seen_of(&n));
+            // SAFETY: the delivered WM_NOTIFY's header, valid for writes
+            // while the procedure runs; no view of it is out.
+            unsafe {
+                let hdr = m.l as *mut NMHDR;
+                (*hdr).hwndFrom = list;
+                (*hdr).code = LVN_GETDISPINFOW;
+            }
         }
         m.def()
     });
-    // The subclass writes the header through its (writable) custom draw
-    // view: 0, the sender a list view; 1, the code too; 2, the same, the
-    // view forgotten and the message not passed on.
-    let how = Rc::new(Cell::new(0));
+    // The subclass reads it before and after passing it on: the same.
     let same: Rc<RefCell<Vec<Seen>>> = Rc::new(RefCell::new(Vec::new()));
-    let (h, s) = (Rc::clone(&how), Rc::clone(&same));
+    let s = Rc::clone(&same);
     assert!(subclass::set(hwnd, &FORGER, move |m| {
         let Some(n) = m.notify() else {
             return m.def();
         };
-        let mut cd = n.get::<NMCUSTOMDRAW>().expect("a custom draw");
-        cd.hdr.hwndFrom = list;
-        if h.get() > 0 {
-            cd.hdr.code = LVN_GETDISPINFOW;
-        }
-        if h.get() == 2 {
-            core::mem::forget(cd);
-            return 0;
-        }
-        drop(cd);
-        // The same message, however asked: read as delivered.
+        s.borrow_mut().push(seen_of(&n));
+        let answer = m.def();
         let again = m.notify().expect("again");
-        s.borrow_mut().push((
-            again.code(),
-            again.from(),
-            again.get::<NMLVCUSTOMDRAW>().is_some(),
-            n.get::<NMLVDISPINFOW>().is_some(),
-        ));
-        m.def()
+        s.borrow_mut().push(seen_of(&again));
+        answer
     }));
-    for forge in 0..3 {
-        how.set(forge);
-        let mut cd = NMCUSTOMDRAW {
-            hdr: NMHDR {
-                hwndFrom: button,
-                idFrom: 1,
-                code: NM_CUSTOMDRAW,
-            },
-            ..Default::default()
-        };
-        // SAFETY: WM_NOTIFY's lParam is an NMHDR, here a button's
-        // NMCUSTOMDRAW (no bigger), alive for the call.
-        unsafe { super::send_raw(hwnd, WM_NOTIFY, 1, (&raw mut cd) as isize) };
-        // The control finds the header as it gave it.
-        assert_eq!((cd.hdr.code, cd.hdr.hwndFrom), (NM_CUSTOMDRAW, button));
-    }
+    let mut cd = NMCUSTOMDRAW {
+        hdr: NMHDR {
+            hwndFrom: button,
+            idFrom: 1,
+            code: NM_CUSTOMDRAW,
+        },
+        ..Default::default()
+    };
+    // SAFETY: WM_NOTIFY's lParam is an NMHDR, here a button's NMCUSTOMDRAW
+    // (no bigger), alive for the call.
+    unsafe { super::send_raw(hwnd, WM_NOTIFY, 1, (&raw mut cd) as isize) };
     let delivered: Seen = (NM_CUSTOMDRAW, button, false, false);
     assert_eq!(*same.borrow(), vec![delivered; 2]);
-    assert_eq!(*seen.borrow(), vec![delivered; 2]);
+    assert_eq!(*seen.borrow(), vec![delivered]);
     super::destroy(hwnd);
     super::destroy(parent);
     super::destroy(list_parent);
@@ -963,4 +953,100 @@ fn a_tree_is_taken_only_kept_track_of_from_its_birth() {
     let made = tv::insert(tree, None, After::Last, item, Some("y")).expect("an item");
     assert_eq!(tv::root(tree), Some(made));
     super::destroy(parent);
+}
+
+/// A hidden list view (WS_CHILD and `style`) with one item, child of a
+/// hidden top-level window of the test class whose messages go to
+/// `parent`: (the list, its parent).
+fn hidden_list(style: u32, parent: impl Fn(&Msg) -> isize + 'static) -> (HWND, HWND) {
+    use super::lv;
+    use windows_sys::Win32::UI::Controls::{ICC_LISTVIEW_CLASSES, LVCOLUMNW, LVIF_TEXT, LVITEMW};
+    super::sys::init_common_controls(ICC_LISTVIEW_CLASSES);
+    let _ = Class::new(CLASS).register();
+    let host = class::create(
+        &Create {
+            ex_style: 0,
+            class: CLASS,
+            title: "",
+            style: WS_POPUP,
+            rect: (0, 0, 200, 200),
+            parent: core::ptr::null_mut(),
+            menu: core::ptr::null_mut(),
+        },
+        parent,
+    );
+    assert!(!host.is_null());
+    let view = class::create_plain(&Create {
+        ex_style: 0,
+        class: lv::CLASS,
+        title: "",
+        style: WS_CHILD | style,
+        rect: (0, 0, 200, 200),
+        parent: host,
+        menu: class::id_menu(1),
+    });
+    assert!(!view.is_null());
+    let col = LVCOLUMNW {
+        cx: 100,
+        ..Default::default()
+    };
+    lv::insert_column(view, 0, col, Some("Name"));
+    for i in 0..2 {
+        let it = LVITEMW {
+            mask: LVIF_TEXT,
+            iItem: i,
+            ..Default::default()
+        };
+        assert_eq!(lv::insert_item(view, it, Some("row")), i);
+    }
+    (view, host)
+}
+
+#[test]
+fn a_custom_draw_structure_is_read_and_its_colours_set() {
+    use super::msg::View;
+    use windows_sys::Win32::Graphics::Gdi::HDC;
+    use windows_sys::Win32::UI::Controls::{
+        CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, LVS_REPORT,
+        NM_CUSTOMDRAW, NMCUSTOMDRAW, NMLVCUSTOMDRAW, NMTVCUSTOMDRAW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PRF_CLIENT, WM_PRINTCLIENT};
+    // Read-only but for its setters: no DerefMut (the call would be
+    // ambiguous if there were one).
+    trait Ambiguous<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> Ambiguous<()> for T {}
+    impl<T: ?Sized + core::ops::DerefMut> Ambiguous<u8> for T {}
+    <View<'_, NMCUSTOMDRAW> as Ambiguous<_>>::check();
+    <View<'_, NMLVCUSTOMDRAW> as Ambiguous<_>>::check();
+    <View<'_, NMTVCUSTOMDRAW> as Ambiguous<_>>::check();
+    // A report list's rows, coloured by its parent.
+    let rows = Rc::new(RefCell::new(Vec::new()));
+    let r = Rc::clone(&rows);
+    let (view, host) = hidden_list(LVS_REPORT, move |m| {
+        if let Some(n) = m.notify()
+            && n.code() == NM_CUSTOMDRAW
+            && let Some(mut cd) = n.get::<NMLVCUSTOMDRAW>()
+        {
+            match cd.nmcd.dwDrawStage {
+                CDDS_PREPAINT => return CDRF_NOTIFYITEMDRAW as isize,
+                CDDS_ITEMPREPAINT => {
+                    r.borrow_mut().push(cd.nmcd.dwItemSpec);
+                    cd.set_text_color(0x00ff_0000);
+                    cd.set_text_bk_color(0x0000_00ff);
+                    assert_eq!((cd.clrText, cd.clrTextBk), (0x00ff_0000, 0x0000_00ff));
+                    return CDRF_NEWFONT as isize;
+                }
+                _ => {}
+            }
+        }
+        m.def()
+    });
+    let canvas = super::dib::Canvas::new(200, 200).expect("a canvas");
+    let hdc: HDC = canvas.hdc();
+    // SAFETY: WM_PRINTCLIENT takes a DC handle and flags, no pointers.
+    unsafe { super::send_raw(view, WM_PRINTCLIENT, hdc as usize, PRF_CLIENT as isize) };
+    assert_eq!(*rows.borrow(), vec![0, 1]);
+    super::destroy(host);
 }

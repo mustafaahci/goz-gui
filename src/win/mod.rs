@@ -80,15 +80,18 @@
 //! - **What the system delivers is what it documents.** A procedure's
 //!   `lParam` for `WM_NOTIFY`, `WM_DRAWITEM` and the like points at the
 //!   structure the message defines. Only a [`Msg`] the system delivered
-//!   hands those out, as a [`View`]: read-only, but for the structures with
-//!   no pointer field ([`msg::Writable`]); what a notification asks its
-//!   procedure to write goes in through a setter that checks the
-//!   notification and writes through the pointers the system gave. Which
-//!   structure a `WM_NOTIFY` comes with is told by its header as delivered:
-//!   copied once per message before any view is lent, and put back before
-//!   the message goes on and as its procedure returns, as a custom draw
-//!   structure is lent writable whole. A message made by goz-gui's own code
-//!   hands out nothing.
+//!   hands those out, as a [`View`]: read-only, but for the structures none
+//!   of whose fields the system reads back as an address, a length or an
+//!   index ([`msg::Writable`]: WINDOWPOS, MINMAXINFO, MEASUREITEMSTRUCT).
+//!   What a notification asks its procedure to write goes in through a
+//!   setter that checks the notification and writes through the pointers
+//!   the system gave; a custom draw structure's colours and state through
+//!   setters of their own, as its control reads its other fields back (a
+//!   list view its `dwItemSpec`, as the row it goes on to draw). Which
+//!   structure a `WM_NOTIFY` comes with is told by its header as
+//!   delivered, copied once per message before any view is lent (none
+//!   lends it writable). A message made by goz-gui's own code hands out
+//!   nothing.
 //! - **Another process of the user is as trusted as goz-gui.** A process of
 //!   the same user and integrity can send or post goz-gui's windows any
 //!   message with any parameters, and the system marshals few of them:
