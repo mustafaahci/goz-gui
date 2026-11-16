@@ -29,31 +29,35 @@
 //!     in its tree, which comctl32 checks only by a signature there, never
 //!     against the tree it is sent to. Items are [`tv::Item`]s, made only
 //!     from the tree's own answers and notifications and naming their tree,
-//!     and taken only while the tree has them, for a tree kept track of
-//!     from its birth (made by [`class::create_plain`] or from a
+//!     and taken only while the tree has them, for a tree kept track of from
+//!     its birth (made by [`class::create_plain`] or from a
 //!     [`dlg::Template`]). [`tv`]'s messages that name an item go to the
 //!     tree's class's own procedure, so no subclass runs between the check
 //!     that the item is in the tree and the tree's reading it; an item is
 //!     noted as [`tv::insert`] puts it in, by the tree's own answer; each
 //!     deletion (TVM_DELETEITEM of an item, of an item above it or of every
-//!     item, a collapse that resets an item above it, the tree's end) takes
-//!     its items out of the record before the tree sees it, [`tv`]'s own
-//!     and, by a subclass put in as the tree is made, another's code's
-//!     through the window; so an item is refused from the moment its
-//!     deletion starts, and while one is under way the tree takes no
-//!     insert, deletion or reset of goz-gui's. Another's code's message
-//!     that names an item comes through the window's subclasses, any of
-//!     which may delete the item before passing it on: each pass of one by
-//!     a subclass of goz-gui's ([`Msg::def`]) checks every item it names
-//!     (in its parameters, or copied from the structure its `lParam` points
-//!     at) against the record first, and stops it, answering 0, if one is
-//!     not there; so the last check before the tree is made whatever the
-//!     order of the subclasses. A stale item names, at worst, a new item
-//!     the same tree put at its address: wrong, not unsound. What is
-//!     trusted to comctl32 is the tree's own handling of an item deleted
-//!     from inside one of its notifications about that item (TVN_SELCHANGED,
-//!     TVN_ITEMEXPANDED…, sent while the tree is already using it), as any
-//!     program with a tree view trusts it.
+//!     item, a collapse that resets an item above it or the top, the tree's
+//!     end) takes its items out of the record before the tree sees it,
+//!     [`tv`]'s own and, by a subclass put in as the tree is made, another's
+//!     code's through the window; so an item is refused from the moment its
+//!     deletion starts, and while one is under way the tree takes no insert,
+//!     deletion or reset of goz-gui's. A tree is busy while it is in its own
+//!     processing as far as goz-gui sees (a message passing that subclass, a
+//!     call of [`tv`]'s to its class's procedure), when it may be using any
+//!     item (one it notifies about, draws, selects, hit): a deletion goz-gui
+//!     asks for meanwhile waits until it is out of it, its items refused
+//!     from the moment it is asked for, and a collapse that resets is
+//!     refused. Another's code's message that names an item comes through
+//!     the window's subclasses, any of which may delete the item before
+//!     passing it on: each pass of one by a subclass of goz-gui's
+//!     ([`Msg::def`]) checks every item it names (in its parameters, or
+//!     copied from the structure its `lParam` points at) against the record
+//!     first, and stops it, answering 0, if one is not there; so the last
+//!     check before the tree is made whatever the order of the subclasses. A
+//!     stale item names, at worst, a new item the same tree put at its
+//!     address: wrong, not unsound. After a deletion passed on, the record
+//!     is changed, and the tree walked, only if the window is still the same
+//!     tree (a record's serial, the class's procedure looked up again).
 //! - **A message's parameters mean what its documentation says.** A message
 //!   below `WM_USER` is the system's: every window class of the system and
 //!   of the common controls means by it what the system documents, so a

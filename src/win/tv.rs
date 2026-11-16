@@ -23,13 +23,24 @@
 //! tree's own answer. A deletion takes what goes out of the record before
 //! the tree sees it, so an item is refused from the moment its deletion
 //! starts (TVM_DELETEITEM of it, of an item above it or of every item; a
-//! collapse that resets an item above it; the tree's end): this module's
-//! own deletions so, and those another's code sends through the window
-//! by a subclass of the tree put in as it is made. While a deletion is
-//! under way the tree takes no insert, deletion or reset of goz-gui's. A
+//! collapse that resets an item above it, or the top; the tree's end): this
+//! module's own deletions so, and those another's code sends through the
+//! window by a subclass of the tree put in as it is made. While a deletion
+//! is under way the tree takes no insert, deletion or reset of goz-gui's. A
 //! stale item is so refused, unless the tree has since put a new item at
 //! the same address: then it names that item of the same tree (wrong, not
 //! unsound).
+//!
+//! A tree is busy while it is in its own processing, as far as goz-gui can
+//! see: while a message passes the subclass that keeps track of it, and
+//! while this module calls its class's procedure ([`Busy`]). It may then be
+//! using any of its items (a notification it sends is about one, the hit
+//! one, the one it draws or selects...), and comctl32 does not survive
+//! every one of them being deleted under it. So a deletion goz-gui asks for
+//! meanwhile ([`delete_item`], [`delete_all`]) waits: what it takes is out
+//! of the record at once, as for any deletion, and the tree deletes it once
+//! it is out of its processing; a collapse that resets is refused. An image
+//! list the tree no longer shows is let go then too.
 //!
 //! A message another's code sends through the window that names an item
 //! (TVM_GETITEMW, TVM_EXPAND, an insert's parent...) reaches the tree
@@ -44,7 +55,7 @@
 //! track of it).
 
 use core::mem::offset_of;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LRESULT, POINT, RECT};
@@ -53,12 +64,13 @@ use windows_sys::Win32::UI::Controls::{
     TVGN_CHILD, TVGN_DROPHILITE, TVGN_NEXT, TVGN_PARENT, TVGN_ROOT, TVHITTESTINFO, TVI_FIRST,
     TVI_LAST, TVI_ROOT, TVI_SORT, TVIF_EXPANDEDIMAGE, TVIF_INTEGRAL, TVIF_STATEEX, TVIF_TEXT,
     TVINSERTSTRUCTA, TVINSERTSTRUCTW, TVITEMA, TVITEMEXW, TVITEMW, TVM_CREATEDRAGIMAGE,
-    TVM_DELETEITEM, TVM_EDITLABELA, TVM_EDITLABELW, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMA,
-    TVM_GETITEMPARTRECT, TVM_GETITEMRECT, TVM_GETITEMSTATE, TVM_GETITEMW, TVM_GETNEXTITEM,
-    TVM_GETTOOLTIPS, TVM_HITTEST, TVM_INSERTITEMA, TVM_INSERTITEMW, TVM_MAPHTREEITEMTOACCID,
-    TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETHOT, TVM_SETIMAGELIST,
-    TVM_SETINSERTMARK, TVM_SETITEMA, TVM_SETITEMHEIGHT, TVM_SETITEMW, TVM_SETLINECOLOR,
-    TVM_SETTEXTCOLOR, TVM_SHOWINFOTIP, TVM_SORTCHILDREN, TVM_SORTCHILDRENCB, TVSORTCB,
+    TVM_DELETEITEM, TVM_EDITLABELA, TVM_EDITLABELW, TVM_ENSUREVISIBLE, TVM_EXPAND,
+    TVM_GETIMAGELIST, TVM_GETITEMA, TVM_GETITEMPARTRECT, TVM_GETITEMRECT, TVM_GETITEMSTATE,
+    TVM_GETITEMW, TVM_GETNEXTITEM, TVM_GETTOOLTIPS, TVM_HITTEST, TVM_INSERTITEMA, TVM_INSERTITEMW,
+    TVM_MAPHTREEITEMTOACCID, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETHOT,
+    TVM_SETIMAGELIST, TVM_SETINSERTMARK, TVM_SETITEMA, TVM_SETITEMHEIGHT, TVM_SETITEMW,
+    TVM_SETLINECOLOR, TVM_SETTEXTCOLOR, TVM_SHOWINFOTIP, TVM_SORTCHILDREN, TVM_SORTCHILDRENCB,
+    TVSORTCB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{CallWindowProcW, WM_DESTROY, WM_NCDESTROY};
 
@@ -119,6 +131,10 @@ pub enum After {
 /// What is kept of a tree of this thread, from its birth until it is
 /// destroyed.
 struct Tree {
+    /// Which record this is, a number no other record of the thread has:
+    /// a window's handle may name another window once it is gone, which
+    /// may be a tree with a record of its own.
+    serial: u64,
     /// Its items, as it has them; `None` from the moment it is destroyed
     /// (WM_DESTROY, while its items go), when none is taken any more. An
     /// item is noted only under one noted (or at the top), so an item not
@@ -141,11 +157,24 @@ struct Tree {
     /// kept alive (a clone of each) while it does, as a tree never
     /// destroys its lists.
     lists: HashMap<u32, ImageList>,
+    /// How deep it is in its own processing, as far as goz-gui sees
+    /// ([`Busy`]).
+    busy: u32,
+    /// Items goz-gui deleted while the tree was busy, each out of the
+    /// record with what is under it ([`postpone`]): the tree deletes them
+    /// once it is not. Each is in the tree: one a deletion took meanwhile
+    /// is taken off ([`recheck_waiting`]).
+    waiting: Vec<HTREEITEM>,
+    /// Image lists it no longer shows, let go once it is not busy: it may
+    /// still be using one it just gave up.
+    retired: Vec<ImageList>,
 }
 
 thread_local! {
     /// The trees of this thread kept track of, by window.
     static TREES: RefCell<HashMap<usize, Tree>> = RefCell::new(HashMap::new());
+    /// The serial of the last record made ([`Tree::serial`]).
+    static SERIALS: Cell<u64> = const { Cell::new(0) };
 }
 
 static TRACK: super::subclass::Key = super::subclass::Key::new("tree view items and lists");
@@ -160,12 +189,9 @@ static TRACK: super::subclass::Key = super::subclass::Key::new("tree view items 
 /// under way, whose end the subclass put in now would not see) is not
 /// known here.
 fn adopt(tree: HWND, born: bool) -> bool {
-    if !super::class_is(tree, CLASS) {
+    if !super::class_is(tree, CLASS) || class_proc(tree).is_none() {
         return false;
     }
-    let Some(proc) = class_proc(tree) else {
-        return false;
-    };
     if tracked(tree) {
         return true;
     }
@@ -176,23 +202,28 @@ fn adopt(tree: HWND, born: bool) -> bool {
     if !super::subclass::set(tree, &TRACK, track_proc) {
         return false;
     }
-    let items = if born {
-        HashSet::new()
-    } else {
-        walk(tree, proc)
-    };
+    let serial = SERIALS.get() + 1;
+    SERIALS.set(serial);
     TREES.with_borrow_mut(|t| {
         t.insert(
             tree as usize,
             Tree {
-                items: Some(items),
+                serial,
+                items: Some(HashSet::new()),
                 deleting: 0,
                 deletions: 0,
                 passing: Vec::new(),
                 lists: HashMap::new(),
+                busy: 0,
+                waiting: Vec::new(),
+                retired: Vec::new(),
             },
         )
     });
+    if !born && let Some(busy) = Busy::enter(tree) {
+        let items = busy.walk();
+        note(tree, |noted| *noted = items);
+    }
     true
 }
 
@@ -280,46 +311,171 @@ fn calm(tree: HWND) -> Option<u64> {
     })
 }
 
-/// Every item of `tree` now, walked from its first top-level item by its
-/// class's own procedure `proc`.
-fn walk(tree: HWND, proc: WndProc) -> HashSet<HTREEITEM> {
-    let mut all = HashSet::new();
-    let mut todo = vec![next_raw(tree, proc, 0, TVGN_ROOT)];
-    while let Some(first) = todo.pop() {
-        let mut at = first;
-        while at != 0 && all.insert(at) {
-            todo.push(next_raw(tree, proc, at, TVGN_CHILD));
-            at = next_raw(tree, proc, at, TVGN_NEXT);
-        }
-    }
-    all
+/// Whether `tree` is busy: in its own processing ([`Busy`]).
+fn is_busy(tree: HWND) -> bool {
+    TREES.with_borrow(|t| t.get(&(tree as usize)).is_some_and(|t| t.busy > 0))
 }
 
-/// Every item under `h` (not `h` itself), an item in `tree`, as its
-/// class's own procedure `proc` walks them.
-fn under(tree: HWND, proc: WndProc, h: HTREEITEM) -> Vec<HTREEITEM> {
-    let mut out = Vec::new();
-    let mut todo = vec![next_raw(tree, proc, h, TVGN_CHILD)];
-    while let Some(first) = todo.pop() {
-        let mut at = first;
-        while at != 0 {
+/// A tree view and its class's own procedure, for calls to it: the tree is
+/// busy while one lives (counted in its record, if it has one), and as the
+/// last one drops ([`settle`]) the deletions that waited are made and the
+/// image lists it gave up let go. Every call this module makes to a tree's
+/// class's procedure is made through one.
+struct Busy {
+    tree: HWND,
+    proc: WndProc,
+    /// The serial of the record it counts in ([`Tree::serial`]): the tree's
+    /// as this began, if it had one.
+    serial: Option<u64>,
+}
+
+impl Busy {
+    /// `tree` busy until this drops, if it is a tree view of this thread
+    /// whose class's procedure is the system's.
+    fn enter(tree: HWND) -> Option<Busy> {
+        let proc = class_proc(tree)?;
+        let serial = TREES.with_borrow_mut(|t| {
+            t.get_mut(&(tree as usize)).map(|t| {
+                t.busy += 1;
+                t.serial
+            })
+        });
+        Some(Busy { tree, proc, serial })
+    }
+
+    /// Calls the tree's class's own procedure with message `msg`: the tree
+    /// itself answers, with no subclass of it in between, so nothing runs
+    /// between the caller's check of what it passes and the tree's reading
+    /// it.
+    ///
+    /// # Safety
+    /// `w` and `l` are what `msg` defines for a tree view: an item among
+    /// them is one the tree has now.
+    unsafe fn call(&self, msg: u32, w: usize, l: isize) -> isize {
+        // SAFETY: `proc` is the tree's class's own procedure, for this tree
+        // (`enter`); the parameters as the caller promises.
+        unsafe { CallWindowProcW(Some(self.proc), self.tree, msg, w, l) }
+    }
+
+    /// TVM_GETNEXTITEM of `h`, an item the tree has (or 0, for the codes
+    /// that take none), as `code`; 0 for none.
+    fn next(&self, h: HTREEITEM, code: u32) -> HTREEITEM {
+        // SAFETY: TVM_GETNEXTITEM takes a code and an item the tree has
+        // (noted as in it, or its own answer just now) or none. The answer
+        // is an item of it, or 0.
+        unsafe { self.call(TVM_GETNEXTITEM, code as usize, h) }
+    }
+
+    /// Every item of the tree now, walked from its first top-level item.
+    fn walk(&self) -> HashSet<HTREEITEM> {
+        let mut all = HashSet::new();
+        let mut todo = vec![self.next(0, TVGN_ROOT)];
+        while let Some(first) = todo.pop() {
+            let mut at = first;
+            while at != 0 && all.insert(at) {
+                todo.push(self.next(at, TVGN_CHILD));
+                at = self.next(at, TVGN_NEXT);
+            }
+        }
+        all
+    }
+
+    /// Every item under `h` (not `h` itself), an item the tree has.
+    fn under(&self, h: HTREEITEM) -> Vec<HTREEITEM> {
+        let mut out = Vec::new();
+        let mut todo = vec![self.next(h, TVGN_CHILD)];
+        while let Some(first) = todo.pop() {
+            let mut at = first;
+            while at != 0 {
+                out.push(at);
+                todo.push(self.next(at, TVGN_CHILD));
+                at = self.next(at, TVGN_NEXT);
+            }
+        }
+        out
+    }
+
+    /// The tree's top-level items now, first to last.
+    fn tops(&self) -> Vec<HTREEITEM> {
+        let mut out = Vec::new();
+        let mut at = self.next(0, TVGN_ROOT);
+        while at != 0 && !out.contains(&at) {
             out.push(at);
-            todo.push(next_raw(tree, proc, at, TVGN_CHILD));
-            at = next_raw(tree, proc, at, TVGN_NEXT);
+            at = self.next(at, TVGN_NEXT);
         }
+        out
     }
-    out
+
+    /// Whether the window is still the tree this began on: kept track of,
+    /// under the same record, its class's procedure the same. A call to it
+    /// may have let it be destroyed (by another's code), and its handle
+    /// name another window since.
+    fn same(&self) -> bool {
+        self.serial.is_some()
+            && tracked(self.tree)
+            && TREES.with_borrow(|t| t.get(&(self.tree as usize)).map(|t| t.serial)) == self.serial
+            && class_proc(self.tree).is_some_and(|p| p as usize == self.proc as usize)
+    }
 }
 
-/// TVM_GETNEXTITEM of `h`, an item `tree` has (or 0, for the codes that
-/// take none), as `code`, asked of the tree's class's own procedure
-/// `proc`; 0 for none.
-fn next_raw(tree: HWND, proc: WndProc, h: HTREEITEM, code: u32) -> HTREEITEM {
-    // SAFETY: TVM_GETNEXTITEM takes a code and an item the tree has (noted
-    // as in it, or its own answer just now) or none; called on the tree's
-    // class's own procedure (`class_proc`). The answer is an item of it, or
-    // 0.
-    unsafe { class_call(tree, proc, TVM_GETNEXTITEM, code as usize, h) }
+impl Drop for Busy {
+    fn drop(&mut self) {
+        let Some(serial) = self.serial else {
+            return;
+        };
+        let key = self.tree as usize;
+        let settles = TREES
+            .try_with(|t| match t.borrow_mut().get_mut(&key) {
+                Some(t) if t.serial == serial => {
+                    t.busy = t.busy.saturating_sub(1);
+                    t.busy == 0 && !(t.waiting.is_empty() && t.retired.is_empty())
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+        if settles {
+            settle(self.tree, serial);
+        }
+    }
+}
+
+/// `tree` (whose record is `serial`'s) is out of its own processing: the
+/// deletions that waited are made, first asked first, and the image lists
+/// it gave up meanwhile let go. Busy again meanwhile, so what is asked for
+/// during these deletions waits in turn (or is refused, as any deletion is
+/// while another is under way).
+fn settle(tree: HWND, serial: u64) {
+    let key = tree as usize;
+    let Some(busy) = Busy::enter(tree) else {
+        return;
+    };
+    if busy.serial != Some(serial) {
+        return;
+    }
+    loop {
+        let next = TREES.with_borrow_mut(|t| match t.get_mut(&key) {
+            Some(t) if t.serial == serial && !t.waiting.is_empty() => Some(t.waiting.remove(0)),
+            _ => None,
+        });
+        let Some(h) = next else {
+            break;
+        };
+        deletion(&busy, Deletion::Item(h), || {
+            // SAFETY: TVM_DELETEITEM of an item the tree has: one that
+            // waits is in it (`recheck_waiting`, after every deletion), and
+            // `deletion` only walked the tree since this took it off.
+            unsafe { busy.call(TVM_DELETEITEM, 0, h) }
+        });
+        if !busy.same() {
+            return;
+        }
+    }
+    let retired = TREES.with_borrow_mut(|t| match t.get_mut(&key) {
+        Some(t) if t.serial == serial => core::mem::take(&mut t.retired),
+        _ => Vec::new(),
+    });
+    // Out of the record first, then let go: the tree shows none of them.
+    drop(retired);
 }
 
 /// Changes the items noted of `tree` (nothing for a tree not kept track of,
@@ -362,6 +518,10 @@ fn item_of(tree: HWND, h: HTREEITEM) -> Option<Item> {
 enum Deletion {
     /// Every item (TVM_DELETEITEM of TVI_ROOT).
     All,
+    /// Every item, by a collapse that resets the top (TVM_EXPAND of
+    /// TVI_ROOT with TVE_COLLAPSERESET): what the tree still has after,
+    /// whatever it answered, is noted again.
+    Top,
     /// An item noted, and every item under it (TVM_DELETEITEM of it).
     Item(HTREEITEM),
     /// Every item under an item noted, which stays (a collapse that resets
@@ -369,26 +529,30 @@ enum Deletion {
     Under(HTREEITEM),
 }
 
-/// Runs `pass`, which deletes of `tree`'s items what `what` names (the
+/// Runs `pass`, which deletes of the tree's items what `what` names (the
 /// message passed on by the tree's subclass, or sent by this module to its
-/// class's own procedure `proc`): those of them noted are out of the
-/// record before the tree sees the deletion, and the tree is marked as
+/// class's own procedure, through `busy`): those of them noted are out of
+/// the record before the tree sees the deletion, and the tree is marked as
 /// deleting until it is done. Those the tree still has after (it did not
 /// delete them, whatever it answered) are noted again. `pass`'s answer.
-fn deletion(tree: HWND, proc: WndProc, what: Deletion, pass: impl FnOnce() -> LRESULT) -> LRESULT {
+fn deletion(busy: &Busy, what: Deletion, pass: impl FnOnce() -> LRESULT) -> LRESULT {
+    let Some(serial) = busy.serial else {
+        return pass();
+    };
+    let tree = busy.tree;
     let key = tree as usize;
     // What goes, walked before anything of it goes.
     let these = match what {
-        Deletion::All => None,
+        Deletion::All | Deletion::Top => None,
         Deletion::Item(h) => {
-            let mut gone = under(tree, proc, h);
+            let mut gone = busy.under(h);
             gone.push(h);
             Some(gone)
         }
-        Deletion::Under(h) => Some(under(tree, proc, h)),
+        Deletion::Under(h) => Some(busy.under(h)),
     };
     let taken: Vec<HTREEITEM> = TREES.with_borrow_mut(|t| {
-        let Some(t) = t.get_mut(&key) else {
+        let Some(t) = t.get_mut(&key).filter(|t| t.serial == serial) else {
             return Vec::new();
         };
         t.deleting += 1;
@@ -402,11 +566,20 @@ fn deletion(tree: HWND, proc: WndProc, what: Deletion, pass: impl FnOnce() -> LR
         }
     });
     let answer = pass();
-    TREES.with_borrow_mut(|t| {
-        if let Some(t) = t.get_mut(&key) {
+    // The tree may be gone meanwhile (by another's code), its handle another
+    // window's since: only the same tree's record is changed, and only that
+    // tree is walked, by its class's own procedure, the same as before.
+    let same = TREES.with_borrow_mut(|t| match t.get_mut(&key) {
+        Some(t) if t.serial == serial => {
             t.deleting = t.deleting.saturating_sub(1);
+            true
         }
+        _ => false,
     });
+    if !same || !busy.same() {
+        return answer;
+    }
+    recheck_waiting(busy);
     if taken.is_empty() {
         return answer;
     }
@@ -416,11 +589,11 @@ fn deletion(tree: HWND, proc: WndProc, what: Deletion, pass: impl FnOnce() -> LR
         // refused: wrong, not unsound). One that answers it did not is
         // checked: a subclass may answer so having passed it on.
         Deletion::All | Deletion::Item(_) if answer != 0 => return answer,
-        Deletion::All | Deletion::Item(_) => walk(tree, proc),
+        Deletion::All | Deletion::Item(_) | Deletion::Top => busy.walk(),
         // The item stays (unless a deletion of it ran meanwhile, which took
         // it out of the record): what is still under it was not reset (it
         // was not a collapse, or the tree did not reset it).
-        Deletion::Under(h) if has(tree, h) => under(tree, proc, h).into_iter().collect(),
+        Deletion::Under(h) if has(tree, h) => busy.under(h).into_iter().collect(),
         Deletion::Under(_) => return answer,
     };
     note(tree, |items| {
@@ -429,16 +602,64 @@ fn deletion(tree: HWND, proc: WndProc, what: Deletion, pass: impl FnOnce() -> LR
     answer
 }
 
+/// Has `roots`, items of `busy`'s tree (busy before `busy` began), deleted
+/// once the tree is out of its processing: each is out of the record now,
+/// with every item under it, so refused from now on, as an item is from
+/// the moment its deletion starts.
+fn postpone(busy: &Busy, roots: Vec<HTREEITEM>) {
+    let mut gone = Vec::new();
+    for &h in &roots {
+        gone.push(h);
+        gone.extend(busy.under(h));
+    }
+    TREES.with_borrow_mut(|t| {
+        let Some(t) = t
+            .get_mut(&(busy.tree as usize))
+            .filter(|t| Some(t.serial) == busy.serial)
+        else {
+            return;
+        };
+        if let Some(items) = t.items.as_mut() {
+            for h in &gone {
+                items.remove(h);
+            }
+        }
+        for h in roots {
+            if !t.waiting.contains(&h) {
+                t.waiting.push(h);
+            }
+        }
+    });
+}
+
+/// Takes off the deletions waiting in `busy`'s tree ([`postpone`]) whose
+/// item it no longer has: after any deletion, which may have taken one
+/// (with an item above it), so that each that waits is in the tree.
+fn recheck_waiting(busy: &Busy) {
+    let key = busy.tree as usize;
+    let waits = TREES.with_borrow(|t| t.get(&key).is_some_and(|t| !t.waiting.is_empty()));
+    if !waits {
+        return;
+    }
+    let present = busy.walk();
+    TREES.with_borrow_mut(|t| {
+        if let Some(t) = t.get_mut(&key).filter(|t| Some(t.serial) == busy.serial) {
+            t.waiting.retain(|h| present.contains(h));
+        }
+    });
+}
+
 /// The subclass that keeps track of a tree: each message passed on as it
-/// came (checked, as every subclass's pass is: [`pass_on`]); what
-/// another's code deletes through the window (goz-gui's own deletions go
-/// to the class's own procedure, see [`deletion`]) taken out of the items
-/// noted first.
+/// came (checked, as every subclass's pass is: [`pass_on`]), the tree busy
+/// meanwhile ([`Busy`]); what another's code deletes through the window
+/// (goz-gui's own deletions go to the class's own procedure, see
+/// [`deletion`]) taken out of the items noted first.
 fn track_proc(m: &Msg) -> LRESULT {
     let tree = m.hwnd;
+    let busy = Busy::enter(tree);
     match m.id {
         TVM_DELETEITEM => {
-            let Some(proc) = class_proc(tree) else {
+            let Some(busy) = &busy else {
                 return 0;
             };
             let what = if m.l == 0 || m.l == TVI_ROOT {
@@ -449,31 +670,34 @@ fn track_proc(m: &Msg) -> LRESULT {
                 // An item not noted is refused: it may be one deleted
                 // already (a deletion passed on twice by a subclass in
                 // front), which the tree would follow. A tree kept track of
-                // has no other, but another's code's inserts.
+                // has no other, but another's code's inserts and the items
+                // whose deletion waits.
                 return 0;
             };
             match what {
                 // Out of the record now, the item goes on through the
                 // subclasses nearer the tree for one pass ([`through`]).
-                Deletion::Item(h) => deletion(tree, proc, what, || through(tree, h, || m.def())),
-                _ => deletion(tree, proc, what, || m.def()),
+                Deletion::Item(h) => deletion(busy, what, || through(busy, h, || m.def())),
+                _ => deletion(busy, what, || m.def()),
             }
         }
-        TVM_EXPAND if m.w & TVE_COLLAPSERESET as usize != 0 => {
-            match class_proc(tree) {
-                Some(proc) if has(tree, m.l) => {
-                    deletion(tree, proc, Deletion::Under(m.l), || m.def())
-                }
-                // An item not noted has none noted under it.
-                _ => m.def(),
-            }
-        }
+        TVM_EXPAND if m.w & TVE_COLLAPSERESET as usize != 0 => match &busy {
+            // Every item goes, as for TVM_DELETEITEM of TVI_ROOT.
+            Some(busy) if m.l == TVI_ROOT => deletion(busy, Deletion::Top, || m.def()),
+            Some(busy) if has(tree, m.l) => deletion(busy, Deletion::Under(m.l), || m.def()),
+            // An item not noted has none noted under it (and is refused at
+            // the pass, [`pass_on`]).
+            Some(_) => m.def(),
+            None => 0,
+        },
         WM_DESTROY => {
-            // The tree's items go now: none is taken from here on.
+            // The tree's items go now: none is taken from here on, and none
+            // waits to be deleted.
             TREES.with_borrow_mut(|t| {
                 if let Some(t) = t.get_mut(&(tree as usize)) {
                     t.items = None;
                     t.deletions += 1;
+                    t.waiting.clear();
                 }
             });
             m.def()
@@ -491,27 +715,33 @@ fn track_proc(m: &Msg) -> LRESULT {
 }
 
 /// Runs `pass`, which passes on a TVM_DELETEITEM of `h` that another's code
-/// sent `tree` through its window, `h` out of the record already (see
-/// [`deletion`]): meanwhile the deletion goes on through the subclasses
+/// sent `busy`'s tree through its window, `h` out of the record already
+/// (see [`deletion`]): meanwhile the deletion goes on through the subclasses
 /// nearer the tree until one of them has passed it on and had the answer
 /// back; a second pass of it goes no further ([`pass_on`]), as the tree
 /// would follow the item it freed.
-fn through(tree: HWND, h: HTREEITEM, pass: impl FnOnce() -> LRESULT) -> LRESULT {
-    let key = tree as usize;
-    TREES.with_borrow_mut(|t| {
-        if let Some(t) = t.get_mut(&key) {
-            t.passing.push((h, false));
-        }
-    });
+fn through(busy: &Busy, h: HTREEITEM, pass: impl FnOnce() -> LRESULT) -> LRESULT {
+    passing_of(busy, |p| p.push((h, false)));
     let answer = pass();
-    TREES.with_borrow_mut(|t| {
-        if let Some(t) = t.get_mut(&key)
-            && let Some(at) = t.passing.iter().rposition(|&(p, _)| p == h)
-        {
-            t.passing.remove(at);
+    passing_of(busy, |p| {
+        if let Some(at) = p.iter().rposition(|&(q, _)| q == h) {
+            p.remove(at);
         }
     });
     answer
+}
+
+/// Changes [`Tree::passing`] of `busy`'s tree (nothing if its record is
+/// not the one `busy` began on).
+fn passing_of(busy: &Busy, f: impl FnOnce(&mut Vec<(HTREEITEM, bool)>)) {
+    TREES.with_borrow_mut(|t| {
+        if let Some(t) = t
+            .get_mut(&(busy.tree as usize))
+            .filter(|t| Some(t.serial) == busy.serial)
+        {
+            f(&mut t.passing);
+        }
+    });
 }
 
 /// Whether tree message `id` names an item of the tree it is sent to (in
@@ -717,19 +947,6 @@ fn pass_deletion(tree: HWND, h: HTREEITEM, next: impl FnOnce() -> LRESULT) -> LR
     answer
 }
 
-/// Calls `tree`'s class's own procedure `proc` with message `msg`: the
-/// tree itself answers, with no subclass of it in between, so nothing runs
-/// between the caller's check of what it passes and the tree's reading it.
-///
-/// # Safety
-/// `proc` is `tree`'s class's own procedure ([`class_proc`]), and `w` and
-/// `l` are what `msg` defines for a tree view: an item among them is one
-/// the tree has now.
-unsafe fn class_call(tree: HWND, proc: WndProc, msg: u32, w: usize, l: isize) -> isize {
-    // SAFETY: as the caller promises.
-    unsafe { CallWindowProcW(Some(proc), tree, msg, w, l) }
-}
-
 /// Sends `msg` with item `item` as its lParam (and an integer as wParam)
 /// to the item's tree's class's own procedure, if the item is in it;
 /// `None` if it is not.
@@ -737,11 +954,11 @@ fn send_item(item: Item, msg: u32, w: usize) -> Option<isize> {
     if !live(item) {
         return None;
     }
-    let proc = class_proc(item.tree)?;
+    let busy = Busy::enter(item.tree)?;
     // SAFETY: the callers' messages take an item of the tree as lParam and
     // an integer as wParam; the item is in the tree (`live`), and is so
     // when the tree reads it (its own procedure, called directly).
-    Some(unsafe { class_call(item.tree, proc, msg, w, item.h) })
+    Some(unsafe { busy.call(msg, w, item.h) })
 }
 
 /// TVM_GETNEXTITEM as `code` of `h` (0 for the codes that take no item)
@@ -750,8 +967,8 @@ fn next_of(tree: HWND, h: HTREEITEM, code: u32) -> Option<Item> {
     if !tracked(tree) || (h != 0 && !has(tree, h)) {
         return None;
     }
-    let proc = class_proc(tree)?;
-    item_of(tree, next_raw(tree, proc, h, code))
+    let busy = Busy::enter(tree)?;
+    item_of(tree, busy.next(h, code))
 }
 
 /// The tree's first top-level item.
@@ -795,37 +1012,39 @@ pub fn select(tree: HWND, how: Select, item: Option<Item>) -> bool {
             item.tree == tree
                 && send_item(item, TVM_SELECTITEM, code as usize).is_some_and(|r| r != 0)
         }
-        None => match class_proc(tree) {
+        None => match Busy::enter(tree) {
             // SAFETY: TVM_SELECTITEM of no item: a code and null; to the
             // tree's class's own procedure.
-            Some(proc) if tracked(tree) => unsafe {
-                class_call(tree, proc, TVM_SELECTITEM, code as usize, 0) != 0
+            Some(busy) if tracked(tree) => unsafe {
+                busy.call(TVM_SELECTITEM, code as usize, 0) != 0
             },
             _ => false,
         },
     }
 }
 
-/// TVM_EXPAND of `item` with TVE_* `code`. False if it did not, and for a
+/// TVM_EXPAND of `item` with TVE_* `code`. False if it did not; and for a
 /// collapse that resets the item (TVE_COLLAPSERESET, which deletes what is
-/// under it) while another deletion of the tree's items is under way.
+/// under it) while another deletion of the tree's items is under way, or
+/// while the tree is in its own processing (see the module's
+/// documentation), as from one of its notifications.
 pub fn expand(item: Item, code: u32) -> bool {
     if code & TVE_COLLAPSERESET == 0 {
         return send_item(item, TVM_EXPAND, code as usize).is_some_and(|r| r != 0);
     }
     let tree = item.tree;
-    let Some(proc) = class_proc(tree) else {
-        return false;
-    };
-    if calm(tree).is_none() || !live(item) {
+    if calm(tree).is_none() || !live(item) || is_busy(tree) {
         return false;
     }
-    deletion(tree, proc, Deletion::Under(item.h), || {
+    let Some(busy) = Busy::enter(tree) else {
+        return false;
+    };
+    deletion(&busy, Deletion::Under(item.h), || {
         // SAFETY: TVM_EXPAND takes a code and an item of the tree: this
         // one, still in it (a reset keeps it; `deletion` only walks the
         // tree before this, which sends nothing); to its class's own
         // procedure.
-        unsafe { class_call(tree, proc, TVM_EXPAND, code as usize, item.h) }
+        unsafe { busy.call(TVM_EXPAND, code as usize, item.h) }
     }) != 0
 }
 
@@ -835,36 +1054,52 @@ pub fn ensure_visible(item: Item) {
 }
 
 /// Deletes `item` and its children; false if it did not, and while
-/// another deletion of the tree's items is under way.
+/// another deletion of the tree's items is under way. While the tree is
+/// in its own processing (as from one of its notifications, see the
+/// module's documentation), the item and its children are refused from
+/// now on and the tree deletes them once it is out of it: true then.
 pub fn delete_item(item: Item) -> bool {
     let tree = item.tree;
-    let Some(proc) = class_proc(tree) else {
-        return false;
-    };
     if calm(tree).is_none() || !live(item) {
         return false;
     }
-    deletion(tree, proc, Deletion::Item(item.h), || {
+    let waits = is_busy(tree);
+    let Some(busy) = Busy::enter(tree) else {
+        return false;
+    };
+    if waits {
+        postpone(&busy, vec![item.h]);
+        return true;
+    }
+    deletion(&busy, Deletion::Item(item.h), || {
         // SAFETY: TVM_DELETEITEM of an item of the tree, still in it (it
         // is out of the record, but `deletion` only walked the tree since
         // `live`, which sends nothing); to its class's own procedure.
-        unsafe { class_call(tree, proc, TVM_DELETEITEM, 0, item.h) }
+        unsafe { busy.call(TVM_DELETEITEM, 0, item.h) }
     }) != 0
 }
 
 /// Deletes every item of the tree; false if it did not, and while another
-/// deletion of its items is under way.
+/// deletion of its items is under way. While the tree is in its own
+/// processing, as [`delete_item`] of each of its top-level items (those
+/// put in after are left).
 pub fn delete_all(tree: HWND) -> bool {
-    let Some(proc) = class_proc(tree) else {
-        return false;
-    };
     if calm(tree).is_none() {
         return false;
     }
-    deletion(tree, proc, Deletion::All, || {
+    let waits = is_busy(tree);
+    let Some(busy) = Busy::enter(tree) else {
+        return false;
+    };
+    if waits {
+        let tops = busy.tops();
+        postpone(&busy, tops);
+        return true;
+    }
+    deletion(&busy, Deletion::All, || {
         // SAFETY: TVM_DELETEITEM of TVI_ROOT: every item; to the tree's
         // class's own procedure.
-        unsafe { class_call(tree, proc, TVM_DELETEITEM, 0, TVI_ROOT) }
+        unsafe { busy.call(TVM_DELETEITEM, 0, TVI_ROOT) }
     }) != 0
 }
 
@@ -895,19 +1130,15 @@ pub fn set_extended_style(tv: HWND, mask: u32, style: u32) {
 
 /// Gives the tree `tv` image list `which` (TVSIL_*): `list` (`None`:
 /// none). A tree never destroys its lists, so this keeps `list` alive (a
-/// clone of it) for as long as the tree shows it: until it is given
-/// another, or is destroyed. Sent to the tree's class's own procedure, so
-/// no subclass keeps the tree from taking it. False if `tv` is not a tree
+/// clone of it) for as long as the tree shows it: until it shows another,
+/// or is destroyed. Sent to the tree's class's own procedure, so no
+/// subclass keeps the tree from taking it. False if `tv` is not a tree
 /// kept track of (see the module's documentation).
 pub fn set_image_list(tv: HWND, which: u32, list: Option<&ImageList>) -> bool {
-    let il = list.map_or(0, imagelist::raw_of);
-    if !give_list(tv, which, il) {
+    let Some(busy) = given_list(tv, which, list.map_or(0, imagelist::raw_of)) else {
         return false;
-    }
-    // The list it showed before, if it was one given here, is let go
-    // after the tree no longer shows it.
-    let before = keep_list(tv, which, list.cloned());
-    drop(before);
+    };
+    keep_shown(&busy, which, list.cloned());
     true
 }
 
@@ -915,41 +1146,62 @@ pub fn set_image_list(tv: HWND, which: u32, list: Option<&ImageList>) -> bool {
 /// list `which` (TVSIL_*): the list lives as long as the process. False if
 /// `tv` is not a tree kept track of.
 pub fn set_system_image_list(tv: HWND, which: u32, list: SystemList) -> bool {
-    if !give_list(tv, which, imagelist::raw_of(&list)) {
+    let Some(busy) = given_list(tv, which, imagelist::raw_of(&list)) else {
         return false;
-    }
-    let before = keep_list(tv, which, None);
-    drop(before);
+    };
+    keep_shown(&busy, which, None);
     true
 }
 
 /// TVM_SETIMAGELIST of `il` as list `which` to `tv`'s class's own
-/// procedure, if `tv` is a tree kept track of: the tree shows `il` after,
-/// whatever a subclass of it would answer.
-fn give_list(tv: HWND, which: u32, il: isize) -> bool {
+/// procedure, if `tv` is a tree kept track of: the tree takes `il`,
+/// whatever a subclass of it would answer. The tree, still busy.
+fn given_list(tv: HWND, which: u32, il: isize) -> Option<Busy> {
     if !tracked(tv) {
-        return false;
+        return None;
     }
-    let Some(proc) = class_proc(tv) else {
-        return false;
-    };
+    let busy = Busy::enter(tv)?;
     // SAFETY: TVM_SETIMAGELIST takes a kind and a list's handle (alive
-    // while the tree shows it: kept by the caller, or a system list) or
-    // none; called on the tree's class's own procedure.
-    unsafe { class_call(tv, proc, TVM_SETIMAGELIST, which as usize, il) };
-    true
+    // while the tree shows it: held by the caller across the call, then
+    // kept by `keep_shown`; or a system list) or none; called on the tree's
+    // class's own procedure.
+    unsafe { busy.call(TVM_SETIMAGELIST, which as usize, il) };
+    Some(busy)
 }
 
-/// Keeps `list` as what tree `tv` (kept track of) shows as list `which`;
-/// the one kept before.
-fn keep_list(tv: HWND, which: u32, list: Option<ImageList>) -> Option<ImageList> {
-    TREES.with_borrow_mut(|t| {
-        let lists = &mut t.get_mut(&(tv as usize))?.lists;
-        match list {
-            Some(list) => lists.insert(which, list),
-            None => lists.remove(&which),
-        }
-    })
+/// After an image list was given to `busy`'s tree as `which`: keeps alive
+/// the list of goz-gui's the tree shows now, as its own procedure answers.
+/// That is `offered`, the one just given; or the one kept before, given by
+/// a call nested in the giving (from a notification the tree sent as it
+/// took `offered`), which the tree took after; or none (a system list, or
+/// nothing). The list kept before, if the tree no longer shows it, is let
+/// go once the tree is out of its processing.
+fn keep_shown(busy: &Busy, which: u32, offered: Option<ImageList>) {
+    if !busy.same() {
+        return;
+    }
+    // SAFETY: TVM_GETIMAGELIST takes a kind and answers a handle; to the
+    // tree's class's own procedure.
+    let shown = unsafe { busy.call(TVM_GETIMAGELIST, which as usize, 0) };
+    let key = busy.tree as usize;
+    let unused = TREES.with_borrow_mut(|t| {
+        let Some(t) = t.get_mut(&key).filter(|t| Some(t.serial) == busy.serial) else {
+            return offered;
+        };
+        let kept = t.lists.get(&which).map(imagelist::raw_of);
+        let given_back = match offered {
+            Some(list) if imagelist::raw_of(&list) == shown => t.lists.insert(which, list),
+            // The caller's: it holds its own.
+            not_shown if kept == Some(shown) => return not_shown,
+            not_shown => {
+                t.retired.extend(t.lists.remove(&which));
+                return not_shown;
+            }
+        };
+        t.retired.extend(given_back);
+        None
+    });
+    drop(unused);
 }
 
 /// The tree's tooltip control.
@@ -962,7 +1214,7 @@ pub fn item_rect(item: Item, text_only: bool) -> Option<RECT> {
     if !live(item) {
         return None;
     }
-    let proc = class_proc(item.tree)?;
+    let busy = Busy::enter(item.tree)?;
     let mut rc = RECT::default();
     // TVM_GETITEMRECT takes the item in the rectangle's first bytes.
     // SAFETY: a RECT is 16 bytes, room for the handle; the item is in the
@@ -970,9 +1222,7 @@ pub fn item_rect(item: Item, text_only: bool) -> Option<RECT> {
     // it; written by the tree, read during the call.
     let ok = unsafe {
         (&raw mut rc).cast::<HTREEITEM>().write_unaligned(item.h);
-        class_call(
-            item.tree,
-            proc,
+        busy.call(
             TVM_GETITEMRECT,
             usize::from(text_only),
             (&raw mut rc) as isize,
@@ -1007,7 +1257,7 @@ pub fn get_item(item: Item, fields: TVITEMW, max: usize) -> Option<(TVITEMW, Opt
     if !live(item) {
         return None;
     }
-    let proc = class_proc(item.tree)?;
+    let busy = Busy::enter(item.tree)?;
     let mut it = fields;
     it.mask &= !EX_ONLY;
     it.hItem = item.h;
@@ -1025,7 +1275,7 @@ pub fn get_item(item: Item, fields: TVITEMW, max: usize) -> Option<(TVITEMW, Opt
     // asked for) whose only pointer is the text buffer of cchTextMax units;
     // its item is in the tree (`live`), and so when the tree's own
     // procedure, called directly, reads it.
-    let ok = unsafe { class_call(item.tree, proc, TVM_GETITEMW, 0, (&raw mut it) as isize) } != 0;
+    let ok = unsafe { busy.call(TVM_GETITEMW, 0, (&raw mut it) as isize) } != 0;
     if !ok {
         return None;
     }
@@ -1060,7 +1310,7 @@ pub fn set_item(item: Item, fields: TVITEMW, text: Option<&str>) -> bool {
     if !live(item) {
         return false;
     }
-    let Some(proc) = class_proc(item.tree) else {
+    let Some(busy) = Busy::enter(item.tree) else {
         return false;
     };
     let mut it = fields;
@@ -1082,25 +1332,23 @@ pub fn set_item(item: Item, fields: TVITEMW, text: Option<&str>) -> bool {
     // named) whose text is set above, mutable as the tree may write it; its
     // item is in the tree (`live`), and so when the tree's own procedure,
     // called directly, reads it.
-    unsafe { class_call(item.tree, proc, TVM_SETITEMW, 0, (&raw mut it) as isize) != 0 }
+    unsafe { busy.call(TVM_SETITEMW, 0, (&raw mut it) as isize) != 0 }
 }
 
 /// Where an insert goes: its parent and place as TVINSERTSTRUCTW takes
-/// them, the tree's class's own procedure, and the count of deletions the
-/// tree had begun ([`calm`]).
+/// them, and the count of deletions the tree had begun ([`calm`]).
 struct Place {
     parent: HTREEITEM,
     after: HTREEITEM,
-    proc: WndProc,
     begun: u64,
 }
 
-/// Where an insert in `tree` under `parent`, placed as `after` says, goes;
-/// `None` if `tree` takes no insert now, `parent` or `after` is not an
-/// item of `tree`, or `after` is not a child of `parent`.
-fn place(tree: HWND, parent: Option<Item>, after: After) -> Option<Place> {
+/// Where an insert in `busy`'s tree under `parent`, placed as `after`
+/// says, goes; `None` if the tree takes no insert now, `parent` or `after`
+/// is not an item of the tree, or `after` is not a child of `parent`.
+fn place(busy: &Busy, parent: Option<Item>, after: After) -> Option<Place> {
+    let tree = busy.tree;
     let begun = calm(tree)?;
-    let proc = class_proc(tree)?;
     let parent = match parent {
         Some(p) if p.tree == tree && live(p) => p.h,
         Some(_) => return None,
@@ -1111,7 +1359,7 @@ fn place(tree: HWND, parent: Option<Item>, after: After) -> Option<Place> {
         After::Last => TVI_LAST,
         After::Item(a) => {
             let under = if parent == TVI_ROOT { 0 } else { parent };
-            if a.tree != tree || !live(a) || next_raw(tree, proc, a.h, TVGN_PARENT) != under {
+            if a.tree != tree || !live(a) || busy.next(a.h, TVGN_PARENT) != under {
                 return None;
             }
             a.h
@@ -1120,29 +1368,32 @@ fn place(tree: HWND, parent: Option<Item>, after: After) -> Option<Place> {
     Some(Place {
         parent,
         after,
-        proc,
         begun,
     })
 }
 
 /// Sends TVM_INSERTITEMW of `ins` (its parent and place from `at`) to
-/// `tree`'s class's own procedure, and notes the item it answers: the
-/// tree's own new item, which no subclass answered for. Not noted (`None`)
-/// if a deletion of the tree's items began meanwhile, as it may have taken
-/// the item already.
-fn insert_struct(tree: HWND, ins: &mut TVINSERTSTRUCTW, at: &Place) -> Option<Item> {
+/// `busy`'s tree's class's own procedure, and notes the item it answers:
+/// the tree's own new item, which no subclass answered for. Not noted
+/// (`None`) if a deletion of the tree's items began meanwhile, as it may
+/// have taken the item already, or the item's parent is out of the record
+/// since (its deletion waits, and so does the new item's with it).
+fn insert_struct(busy: &Busy, ins: &mut TVINSERTSTRUCTW, at: &Place) -> Option<Item> {
+    let tree = busy.tree;
     // SAFETY: TVM_INSERTITEMW's lParam is a TVINSERTSTRUCTW whose text the
     // caller set (a NUL-terminated string alive across the call, or the
     // callback marker), mutable as the tree may write it; its parent and
     // place are items in the tree, or its markers (`place`, which only
     // walked the tree since it checked them). Called on the tree's class's
-    // own procedure.
-    let h = unsafe { class_call(tree, at.proc, TVM_INSERTITEMW, 0, (&raw mut *ins) as isize) };
-    if h == 0 {
+    // own procedure; the tree is busy meanwhile, so no deletion of goz-gui's
+    // takes them while it reads them.
+    let h = unsafe { busy.call(TVM_INSERTITEMW, 0, (&raw mut *ins) as isize) };
+    if h == 0 || !busy.same() {
         return None;
     }
+    let under_noted = at.parent == TVI_ROOT || noted(tree, at.parent);
     let noted = TREES.with_borrow_mut(|t| match t.get_mut(&(tree as usize)) {
-        Some(t) if t.deletions == at.begun && t.deleting == 0 => {
+        Some(t) if t.deletions == at.begun && t.deleting == 0 && under_noted => {
             t.items.as_mut().is_some_and(|items| {
                 items.insert(h);
                 true
@@ -1165,7 +1416,8 @@ pub fn insert(
     item: TVITEMEXW,
     text: Option<&str>,
 ) -> Option<Item> {
-    let at = place(tree, parent, after)?;
+    let busy = Busy::enter(tree)?;
+    let at = place(&busy, parent, after)?;
     let mut it = item;
     let z = text.map(super::wz);
     match &z {
@@ -1188,7 +1440,7 @@ pub fn insert(
         ..Default::default()
     };
     ins.Anonymous.itemex = it;
-    insert_struct(tree, &mut ins, &at)
+    insert_struct(&busy, &mut ins, &at)
 }
 
 /// [`insert`] with UTF-16 text (a file name need not be valid Unicode, and
@@ -1202,7 +1454,8 @@ pub fn insert_units(
     item: TVITEMW,
     text: &[u16],
 ) -> Option<Item> {
-    let at = place(tree, parent, after)?;
+    let busy = Busy::enter(tree)?;
+    let at = place(&busy, parent, after)?;
     let z = super::wz_units(super::until_nul(text));
     let mut it = item;
     it.mask = (it.mask | TVIF_TEXT) & !EX_ONLY;
@@ -1214,7 +1467,7 @@ pub fn insert_units(
         ..Default::default()
     };
     ins.Anonymous.item = it;
-    insert_struct(tree, &mut ins, &at)
+    insert_struct(&busy, &mut ins, &at)
 }
 
 /// Sets tree item `item`'s text from UTF-16 (up to a NUL, if it has one).
@@ -1222,7 +1475,7 @@ pub fn set_text_units(item: Item, text: &[u16]) -> bool {
     if !live(item) {
         return false;
     }
-    let Some(proc) = class_proc(item.tree) else {
+    let Some(busy) = Busy::enter(item.tree) else {
         return false;
     };
     let z = super::wz_units(super::until_nul(text));
@@ -1236,7 +1489,7 @@ pub fn set_text_units(item: Item, text: &[u16]) -> bool {
     // text set above, read during the call (the structure mutable, as the
     // tree may write it); its item is in the tree, and so when the tree's
     // own procedure, called directly, reads it.
-    unsafe { class_call(item.tree, proc, TVM_SETITEMW, 0, (&raw mut it) as isize) != 0 }
+    unsafe { busy.call(TVM_SETITEMW, 0, (&raw mut it) as isize) != 0 }
 }
 
 /// An item a tree notified, as an [`Item`]: `tree` is the notifying tree.
@@ -1261,12 +1514,15 @@ impl View<'_, NMTVGETINFOTIPW> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use windows_sys::Win32::UI::Controls::{TVE_COLLAPSE, TVE_EXPAND, TVIF_PARAM, TVN_DELETEITEMW};
+    use windows_sys::Win32::UI::Controls::{
+        TVE_COLLAPSE, TVE_EXPAND, TVIF_PARAM, TVM_GETIMAGELIST, TVN_DELETEITEMW,
+    };
 
     use super::super::hook::{self, Event, Kind};
+    use super::super::imagelist::ImageList;
     use super::super::subclass;
     use super::super::trampolines_tests::hidden_tree;
     use super::*;
@@ -1357,7 +1613,6 @@ mod tests {
 
     #[test]
     fn goz_gui_s_item_messages_go_to_the_tree_itself() {
-        use std::cell::Cell;
         let (tree, host) = hidden_tree(|m| m.def());
         let x = insert(tree, None, After::Last, item(5), Some("x")).expect("x");
         // A subclass that would delete the item a message names before
@@ -1542,7 +1797,6 @@ mod tests {
 
     #[test]
     fn a_subclass_passes_on_no_item_message_to_a_tree_it_destroyed() {
-        use std::cell::Cell;
         let (tree, host) = hidden_tree(|m| m.def());
         let x = insert(tree, None, After::Last, item(1), Some("x")).expect("x");
         let passed = Rc::new(Cell::new(None));
@@ -1755,5 +2009,273 @@ mod tests {
             super::super::destroy(host);
         });
         assert_eq!(seen, vec![none_taken; 3]);
+    }
+
+    /// Every item `tree` has, as its own procedure walks them.
+    fn walked(tree: HWND) -> HashSet<HTREEITEM> {
+        Busy::enter(tree)
+            .expect("a tree view of this thread")
+            .walk()
+    }
+
+    /// The image list `tree` shows as `which`, as its own procedure answers.
+    fn shown_list(tree: HWND, which: u32) -> isize {
+        let busy = Busy::enter(tree).expect("a tree view of this thread");
+        // SAFETY: TVM_GETIMAGELIST takes a kind and answers a handle; to
+        // the tree's class's own procedure.
+        unsafe { busy.call(TVM_GETIMAGELIST, which as usize, 0) }
+    }
+
+    /// The image list goz-gui keeps alive for `tree` as `which` (0: none).
+    fn kept_list(tree: HWND, which: u32) -> isize {
+        TREES.with_borrow(|t| {
+            t.get(&(tree as usize))
+                .and_then(|t| t.lists.get(&which))
+                .map_or(0, imagelist::raw_of)
+        })
+    }
+
+    #[test]
+    fn a_tree_keeps_the_list_it_shows_whatever_is_given_meanwhile() {
+        use windows_sys::Win32::UI::Controls::{ILC_COLOR32, NM_CUSTOMDRAW, TVSIL_NORMAL};
+        let list = || ImageList::create(16, 16, ILC_COLOR32, 1, 1).expect("an image list");
+        // While the tree takes a list it notifies its parent, which gives
+        // it another: an image list of its own, which goes as the handler
+        // returns (`Some(false)`), or a system list (`Some(true)`).
+        let nested: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
+        let n = Rc::clone(&nested);
+        let (tree, host) = hidden_tree(move |m| {
+            if let Some(note) = m.notify()
+                && note.code() == NM_CUSTOMDRAW
+                && let Some(system) = n.take()
+            {
+                if system {
+                    let small = imagelist::system(1).expect("the small icons");
+                    assert!(set_system_image_list(note.from(), TVSIL_NORMAL, small));
+                } else {
+                    let b = list();
+                    assert!(set_image_list(note.from(), TVSIL_NORMAL, Some(&b)));
+                }
+            }
+            m.def()
+        });
+        let a = list();
+        nested.set(Some(false));
+        assert!(set_image_list(tree, TVSIL_NORMAL, Some(&a)));
+        assert_eq!(nested.get(), None, "the tree notified as it took A");
+        // What the tree shows is what goz-gui keeps alive: the nested list
+        // (A is the caller's), not one let go.
+        let shown = shown_list(tree, TVSIL_NORMAL);
+        assert_ne!(shown, imagelist::raw_of(&a));
+        assert_eq!(kept_list(tree, TVSIL_NORMAL), shown);
+        // A system list given meanwhile: no list of goz-gui's is kept.
+        let c = list();
+        nested.set(Some(true));
+        assert!(set_image_list(tree, TVSIL_NORMAL, Some(&c)));
+        assert_eq!(nested.get(), None);
+        assert_ne!(shown_list(tree, TVSIL_NORMAL), imagelist::raw_of(&c));
+        assert_eq!(kept_list(tree, TVSIL_NORMAL), 0);
+        super::super::destroy(host);
+    }
+
+    #[test]
+    fn an_item_deleted_inside_a_notification_about_it_goes_after() {
+        use windows_sys::Win32::UI::Controls::TVN_SELCHANGINGW;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DOWN;
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+        // The parent deletes the item a TVN_SELCHANGINGW is about, as the
+        // tree is about to select it.
+        let doomed: Rc<Cell<Option<Item>>> = Rc::new(Cell::new(None));
+        let d = Rc::clone(&doomed);
+        let (tree, host) = hidden_tree(move |m| {
+            if let Some(n) = m.notify()
+                && n.code() == TVN_SELCHANGINGW
+                && let Some(item) = d.take()
+            {
+                let about = n.get::<NMTREEVIEWW>().and_then(|v| v.item_new());
+                assert_eq!(about, Some(item));
+                assert!(delete_item(item));
+                // Refused from the moment its deletion is asked for.
+                assert!(!live(item));
+            }
+            m.def()
+        });
+        let a = insert(tree, None, After::Last, item(1), Some("a")).expect("a");
+        let b = insert(tree, None, After::Last, item(2), Some("b")).expect("b");
+        insert(tree, Some(b), After::Last, item(3), Some("b1")).expect("b1");
+        doomed.set(Some(b));
+        select(tree, Select::Caret, Some(b));
+        assert_eq!(doomed.get(), None, "the parent was asked");
+        // Gone by the time the selection is done.
+        assert_eq!(walked(tree), HashSet::from([a.h]));
+        assert_eq!((root(tree), next_sibling(a)), (Some(a), None));
+        // The same from the keyboard: the tree moves the selection itself.
+        assert!(select(tree, Select::Caret, Some(a)));
+        let c = insert(tree, None, After::Last, item(4), Some("c")).expect("c");
+        doomed.set(Some(c));
+        super::super::send_plain(tree, WM_KEYDOWN, usize::from(VK_DOWN), 0);
+        assert_eq!(doomed.get(), None, "the parent was asked");
+        assert_eq!(walked(tree), HashSet::from([a.h]));
+        assert_eq!(selection(tree), Some(a));
+        super::super::destroy(host);
+    }
+
+    #[test]
+    fn an_insert_s_place_stays_while_the_item_goes_in() {
+        use windows_sys::Win32::UI::Controls::NM_CUSTOMDRAW;
+        // While an item goes in, the parent deletes the item it goes after.
+        let doomed: Rc<Cell<Option<Item>>> = Rc::new(Cell::new(None));
+        let d = Rc::clone(&doomed);
+        let (tree, host) = hidden_tree(move |m| {
+            if let Some(n) = m.notify()
+                && n.code() == NM_CUSTOMDRAW
+                && let Some(item) = d.take()
+            {
+                assert!(delete_item(item));
+            }
+            m.def()
+        });
+        let a = insert(tree, None, After::Last, item(1), Some("a")).expect("a");
+        doomed.set(Some(a));
+        let b = insert(tree, None, After::Item(a), item(2), Some("b")).expect("b");
+        assert_eq!(doomed.get(), None, "the parent was asked");
+        assert_eq!(walked(tree), HashSet::from([b.h]));
+        assert!(live(b) && !live(a));
+        super::super::destroy(host);
+    }
+
+    #[test]
+    fn a_collapse_that_resets_the_top_takes_every_item() {
+        use super::super::send_raw;
+        let (tree, host) = hidden_tree(|m| m.def());
+        let x = insert(tree, None, After::Last, item(1), Some("x")).expect("x");
+        let c = insert(tree, Some(x), After::Last, item(2), Some("c")).expect("c");
+        let code = (TVE_COLLAPSE | TVE_COLLAPSERESET) as usize;
+        // 0 names no item there: refused before the tree.
+        // SAFETY: TVM_EXPAND of a code and no item.
+        assert_eq!(unsafe { send_raw(tree, TVM_EXPAND, code, 0) }, 0);
+        assert!(live(x) && live(c));
+        // Another's code resets the top through the window: whatever the
+        // tree takes out goes out of the record too.
+        // SAFETY: TVM_EXPAND of a code and TVI_ROOT, a special handle.
+        unsafe { send_raw(tree, TVM_EXPAND, code, TVI_ROOT) };
+        let left = walked(tree);
+        for i in [x, c] {
+            assert_eq!(live(i), left.contains(&i.h), "{i:?}");
+        }
+        super::super::destroy(host);
+    }
+
+    static RECYCLES: subclass::Key = subclass::Key::new("test tree destroyed while it deletes");
+
+    /// A tree with a subclass nearest it, put in at its birth: it passes a
+    /// deletion of every item on, then destroys the tree (as another's code
+    /// would, past goz-gui), runs `then` with the tree's handle, and answers
+    /// that nothing was deleted (so the deletion is checked by a walk).
+    fn tree_destroyed_while_it_deletes(then: fn(HWND)) -> (HWND, HWND, Rc<Cell<bool>>) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow;
+        let gone = Rc::new(Cell::new(false));
+        let g = Rc::clone(&gone);
+        let hook = hook::set(Kind::Cbt, move |event| {
+            if let Event::Create { hwnd, .. } = *event
+                && super::super::class_is(hwnd, CLASS)
+            {
+                let g = Rc::clone(&g);
+                subclass::set(hwnd, &RECYCLES, move |m| {
+                    if m.id == TVM_DELETEITEM && m.l == TVI_ROOT {
+                        m.def();
+                        // SAFETY: no pointers; a window of this thread.
+                        g.set(unsafe { DestroyWindow(m.hwnd) } != 0);
+                        then(m.hwnd);
+                        return 0;
+                    }
+                    m.def()
+                });
+            }
+            None
+        });
+        let (tree, host) = hidden_tree(|m| m.def());
+        drop(hook);
+        (tree, host, gone)
+    }
+
+    #[test]
+    fn a_tree_gone_while_it_deletes_is_not_walked() {
+        let (tree, host, gone) = tree_destroyed_while_it_deletes(|_| {});
+        let x = insert(tree, None, After::Last, item(1), Some("x")).expect("x");
+        // SAFETY: TVM_DELETEITEM of TVI_ROOT: every item.
+        unsafe { super::super::send_raw(tree, TVM_DELETEITEM, 0, TVI_ROOT) };
+        assert!(gone.get() && !super::super::is_window(tree));
+        assert!(!live(x));
+        assert!(!TREES.with_borrow(|t| t.contains_key(&(tree as usize))));
+        super::super::destroy(host);
+    }
+
+    /// Makes and destroys windows until the next one made gets `handle`
+    /// again, then makes a list view there. A handle is a slot's index and
+    /// a count of the slot's reuses, which goes round; a slot freed last is
+    /// the next one taken.
+    fn list_view_at(handle: HWND) {
+        use super::super::class::{self, Create};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyWindow, HWND_MESSAGE};
+        let make = |class: &str| {
+            class::create_plain(&Create {
+                ex_style: 0,
+                class,
+                title: "",
+                style: 0,
+                rect: (0, 0, 10, 10),
+                parent: HWND_MESSAGE,
+                menu: core::ptr::null_mut(),
+            })
+        };
+        // SAFETY: no pointers; a window made here.
+        let destroy = |w: HWND| unsafe { DestroyWindow(w) };
+        let slot = |w: HWND| w as usize & 0xffff;
+        // Windows made and kept until one is in `handle`'s slot; that one
+        // freed last, so the windows made next take its slot.
+        let mut held = Vec::new();
+        let mut at = make("Static");
+        while slot(at) != slot(handle) {
+            assert!(held.len() < 10_000, "the slot is not free");
+            held.push(at);
+            at = make("Static");
+        }
+        held.into_iter().for_each(|w| {
+            destroy(w);
+        });
+        destroy(at);
+        // The handle made just before `handle` comes round, once seen.
+        let mut before = None;
+        let mut last = at;
+        for _ in 0..100_000 {
+            let w = make("Static");
+            if w == handle {
+                before = Some(last);
+            }
+            destroy(w);
+            let next = (w as usize).wrapping_add(0x1_0000) as HWND;
+            if next == handle || Some(w) == before {
+                let lv = make(super::super::lv::CLASS);
+                assert_eq!(lv, handle, "the handle came round");
+                return;
+            }
+            last = w;
+        }
+        panic!("the handle did not come round");
+    }
+
+    #[test]
+    #[ignore = "recycles a window handle: some 33,000 windows made and destroyed"]
+    fn a_tree_whose_handle_is_now_a_list_view_s_is_not_walked() {
+        let (tree, host, gone) = tree_destroyed_while_it_deletes(list_view_at);
+        let x = insert(tree, None, After::Last, item(1), Some("x")).expect("x");
+        // SAFETY: TVM_DELETEITEM of TVI_ROOT: every item.
+        unsafe { super::super::send_raw(tree, TVM_DELETEITEM, 0, TVI_ROOT) };
+        assert!(gone.get());
+        assert!(super::super::class_is(tree, super::super::lv::CLASS));
+        assert!(!live(x));
+        super::super::destroy(tree);
+        super::super::destroy(host);
     }
 }
