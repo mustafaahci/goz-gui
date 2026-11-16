@@ -61,14 +61,14 @@ use std::collections::{HashMap, HashSet};
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LRESULT, POINT, RECT};
 use windows_sys::Win32::UI::Controls::{
     HTREEITEM, NMTREEVIEWW, NMTVGETINFOTIPW, TVE_COLLAPSERESET, TVGETITEMPARTRECTINFO, TVGN_CARET,
-    TVGN_CHILD, TVGN_DROPHILITE, TVGN_NEXT, TVGN_PARENT, TVGN_ROOT, TVHITTESTINFO, TVI_FIRST,
-    TVI_LAST, TVI_ROOT, TVI_SORT, TVIF_EXPANDEDIMAGE, TVIF_INTEGRAL, TVIF_STATEEX, TVIF_TEXT,
-    TVINSERTSTRUCTA, TVINSERTSTRUCTW, TVITEMA, TVITEMEXW, TVITEMW, TVM_CREATEDRAGIMAGE,
-    TVM_DELETEITEM, TVM_EDITLABELA, TVM_EDITLABELW, TVM_ENSUREVISIBLE, TVM_EXPAND,
-    TVM_GETIMAGELIST, TVM_GETITEMA, TVM_GETITEMPARTRECT, TVM_GETITEMRECT, TVM_GETITEMSTATE,
-    TVM_GETITEMW, TVM_GETNEXTITEM, TVM_GETTOOLTIPS, TVM_HITTEST, TVM_INSERTITEMA, TVM_INSERTITEMW,
-    TVM_MAPHTREEITEMTOACCID, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETHOT,
-    TVM_SETIMAGELIST, TVM_SETINSERTMARK, TVM_SETITEMA, TVM_SETITEMHEIGHT, TVM_SETITEMW,
+    TVGN_CHILD, TVGN_DROPHILITE, TVGN_FIRSTVISIBLE, TVGN_NEXT, TVGN_PARENT, TVGN_ROOT,
+    TVHITTESTINFO, TVI_FIRST, TVI_LAST, TVI_ROOT, TVI_SORT, TVIF_EXPANDEDIMAGE, TVIF_INTEGRAL,
+    TVIF_STATEEX, TVIF_TEXT, TVINSERTSTRUCTA, TVINSERTSTRUCTW, TVITEMA, TVITEMEXW, TVITEMW,
+    TVM_CREATEDRAGIMAGE, TVM_DELETEITEM, TVM_EDITLABELA, TVM_EDITLABELW, TVM_ENSUREVISIBLE,
+    TVM_EXPAND, TVM_GETIMAGELIST, TVM_GETITEMA, TVM_GETITEMPARTRECT, TVM_GETITEMRECT,
+    TVM_GETITEMSTATE, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_GETTOOLTIPS, TVM_HITTEST, TVM_INSERTITEMA,
+    TVM_INSERTITEMW, TVM_MAPHTREEITEMTOACCID, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETEXTENDEDSTYLE,
+    TVM_SETHOT, TVM_SETIMAGELIST, TVM_SETINSERTMARK, TVM_SETITEMA, TVM_SETITEMHEIGHT, TVM_SETITEMW,
     TVM_SETLINECOLOR, TVM_SETTEXTCOLOR, TVM_SHOWINFOTIP, TVM_SORTCHILDREN, TVM_SORTCHILDRENCB,
     TVSORTCB,
 };
@@ -451,7 +451,11 @@ impl Drop for Busy {
 /// deletions that waited are made, first asked first, and the image lists
 /// it gave up meanwhile let go. Busy again meanwhile, so what is asked for
 /// during these deletions waits in turn (or is refused, as any deletion is
-/// while another is under way).
+/// while another is under way). The item first in view stays so, if it is
+/// still there: what was shown since the deletions were asked for (an item
+/// selected and scrolled to, among items put in meanwhile) was arranged
+/// with their items still in, and a tree that deletes items above the view
+/// may scroll back to its top.
 fn settle(tree: HWND, serial: u64) {
     let key = tree as usize;
     let Some(busy) = Busy::enter(tree) else {
@@ -460,6 +464,12 @@ fn settle(tree: HWND, serial: u64) {
     if busy.serial != Some(serial) {
         return;
     }
+    let waits = TREES.with_borrow(|t| t.get(&key).is_some_and(|t| !t.waiting.is_empty()));
+    let first = if waits {
+        busy.next(0, TVGN_FIRSTVISIBLE)
+    } else {
+        0
+    };
     loop {
         let next = TREES.with_borrow_mut(|t| match t.get_mut(&key) {
             Some(t) if t.serial == serial && !t.waiting.is_empty() => Some(t.waiting.remove(0)),
@@ -477,6 +487,11 @@ fn settle(tree: HWND, serial: u64) {
         if !busy.same() {
             return;
         }
+    }
+    if first != 0 && busy.walk().contains(&first) {
+        // SAFETY: TVM_SELECTITEM of a code and an item the tree has (just
+        // walked).
+        unsafe { busy.call(TVM_SELECTITEM, TVGN_FIRSTVISIBLE as usize, first) };
     }
     let retired = TREES.with_borrow_mut(|t| match t.get_mut(&key) {
         Some(t) if t.serial == serial => core::mem::take(&mut t.retired),
@@ -2250,6 +2265,83 @@ mod tests {
                 assert!(select(tree, Select::Caret, Some(c)));
                 assert!(delete_item(c));
             });
+        }
+    }
+
+    /// A tree of `n` top-level items, each with three children, all open,
+    /// with item params from `base`; the item of param `base + 4 * k`
+    /// selected and scrolled to.
+    fn fill(tree: HWND, base: isize, k: isize) {
+        use windows_sys::Win32::UI::Controls::TVE_EXPAND;
+        let mut chosen = None;
+        for i in 0..8 {
+            let top = base + 4 * i;
+            let t = insert(tree, None, After::Last, item(top), Some("top")).expect("top");
+            for j in 1..4 {
+                insert(tree, Some(t), After::Last, item(top + j), Some("child")).expect("child");
+            }
+            expand(t, TVE_EXPAND);
+            if i == k {
+                chosen = Some(t);
+            }
+        }
+        assert!(select(tree, Select::Caret, chosen));
+        ensure_visible(chosen.expect("chosen"));
+    }
+
+    /// What `tree` shows: every item's param in order, the selected one's,
+    /// and the first one in view's.
+    fn shown(tree: HWND) -> (Vec<isize>, Option<isize>, Option<isize>) {
+        use windows_sys::Win32::UI::Controls::TVGN_FIRSTVISIBLE;
+        let mut params = Vec::new();
+        let mut at = root(tree);
+        while let Some(t) = at {
+            params.push(item_param(t).expect("a param"));
+            let mut c = child(t);
+            while let Some(ch) = c {
+                params.push(item_param(ch).expect("a param"));
+                c = next_sibling(ch);
+            }
+            at = next_sibling(t);
+        }
+        let first = next_of(tree, 0, TVGN_FIRSTVISIBLE).and_then(item_param);
+        (params, selection(tree).and_then(item_param), first)
+    }
+
+    #[test]
+    fn a_tree_refilled_from_its_notification_ends_as_one_refilled_after() {
+        use windows_sys::Win32::UI::Controls::TVN_KEYDOWN;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+        // The item selected before the refill, and after.
+        for (was, now) in [(2, 6), (0, 0), (7, 0), (0, 7), (5, 5)] {
+            // As Organize Bookmarks refills its tree on Delete: from the
+            // tree's TVN_KEYDOWN, its deletion waits until the key is done.
+            let refill = Rc::new(Cell::new(false));
+            let r = Rc::clone(&refill);
+            let (inside, host) = hidden_tree(move |m| {
+                if let Some(n) = m.notify()
+                    && n.code() == TVN_KEYDOWN
+                    && r.replace(false)
+                {
+                    assert!(delete_all(n.from()));
+                    fill(n.from(), 100, now);
+                }
+                m.def()
+            });
+            fill(inside, 0, was);
+            refill.set(true);
+            super::super::send_plain(inside, WM_KEYDOWN, usize::from(VK_DELETE), 0);
+            assert!(!refill.get(), "the parent was asked");
+            // The same done outside any notification.
+            let (outside, other) = hidden_tree(|m| m.def());
+            fill(outside, 0, was);
+            assert!(delete_all(outside));
+            fill(outside, 100, now);
+            assert_eq!(shown(inside), shown(outside), "{was} {now}");
+            assert_eq!(shown(inside).0.len(), 32);
+            super::super::destroy(host);
+            super::super::destroy(other);
         }
     }
 
